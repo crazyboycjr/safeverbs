@@ -1,0 +1,3 @@
+[submodule "rust-ibverbs"]
+	path = rust-ibverbs
+	url = ./rust-ibverbs
