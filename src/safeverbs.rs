@@ -441,6 +441,22 @@ impl_modify_qp!(modify_init_to_rtr, INIT, RTR,
     alt_path: (RC, UC) [IBV_QP_ALT_PATH] alt_path: Option<AltPath>,
 );
 
+impl_modify_qp!(modify_rtr_to_rts, RTR, RTS,
+    required: (RC, UC, UD) [IBV_QP_SQ_PSN] sq_psn: Option<u32>,
+    required: (RC) [IBV_QP_TIMEOUT] timeout: Option<u8>,
+    required: (RC) [IBV_QP_RETRY_CNT] retry_cnt: Option<u8>,
+    required: (RC) [IBV_QP_RNR_RETRY] rnr_retry: Option<u8>,
+    required: (RC) [IBV_QP_MAX_QP_RD_ATOMIC] max_rd_atomic: Option<u8>,
+
+    optional: (RC, UC, UD) [IBV_QP_CUR_STATE] cur_qp_state: Option<ffi::ibv_qp_state::Type>,
+    optional: (RC, UC) [IBV_QP_ACCESS_FLAGS] qp_access_flags: Option<u32>,
+    optional: (RC, UC) [IBV_QP_PATH_MIG_STATE] path_mig_state: Option<ffi::ibv_mig_state>,
+    optional: (RC) [IBV_QP_MIN_RNR_TIMER] min_rnr_timer: Option<u8>,
+    optional: (UD) [IBV_QP_QKEY] qkey: Option<u32>,
+
+    alt_path: (RC, UC) [IBV_QP_ALT_PATH] alt_path: Option<AltPath>,
+);
+
 // fn modify_init_to_rtr2<T: ToQpType>(
 //     qp: QueuePair<T, INIT>,
 //     ah_attr: ffi::ibv_ah_attr,
@@ -610,6 +626,88 @@ impl QueuePair<UD, INIT> {
     ) -> io::Result<QueuePair<UD, RTR>> {
         modify_init_to_rtr(
             self, None, None, None, None, None, None, pkey_index, None, qkey, None,
+        )
+    }
+}
+
+// RTR -> RTS
+impl QueuePair<UC, RTR> {
+    pub fn modify_to_rts(
+        self,
+        sq_psn: u32,
+        cur_qp_state: Option<ffi::ibv_qp_state::Type>,
+        access: Option<ffi::ibv_access_flags>,
+        alt_path: Option<AltPath>,
+        path_mig_state: Option<ffi::ibv_mig_state>,
+    ) -> io::Result<QueuePair<UC, RTS>> {
+        modify_rtr_to_rts(
+            self,
+            Some(sq_psn),
+            None,
+            None,
+            None,
+            None,
+            cur_qp_state,
+            access.map(|x| x.0),
+            path_mig_state,
+            None, // min_rnr_timer
+            None, // qkey
+            alt_path,
+        )
+    }
+}
+
+impl QueuePair<RC, RTR> {
+    pub fn modify_to_rts(
+        self,
+        sq_psn: u32,
+        timeout: u8,
+        retry_cnt: u8,
+        rnr_retry: u8,
+        max_rd_atomic: u8,
+        cur_qp_state: Option<ffi::ibv_qp_state::Type>,
+        access: Option<ffi::ibv_access_flags>,
+        min_rnr_timer: Option<u8>,
+        alt_path: Option<AltPath>,
+        path_mig_state: Option<ffi::ibv_mig_state>,
+    ) -> io::Result<QueuePair<RC, RTS>> {
+        modify_rtr_to_rts(
+            self,
+            Some(sq_psn),
+            Some(timeout),
+            Some(retry_cnt),
+            Some(rnr_retry),
+            Some(max_rd_atomic),
+            cur_qp_state,
+            access.map(|x| x.0),
+            path_mig_state,
+            min_rnr_timer,
+            None, // qkey
+            alt_path,
+        )
+    }
+}
+
+impl QueuePair<UD, RTR> {
+    pub fn modify_to_rts(
+        self,
+        sq_psn: u32,
+        cur_qp_state: Option<ffi::ibv_qp_state::Type>,
+        qkey: Option<u32>,
+    ) -> io::Result<QueuePair<UD, RTS>> {
+        modify_rtr_to_rts(
+            self,
+            Some(sq_psn),
+            None,
+            None,
+            None,
+            None,
+            cur_qp_state,
+            None,
+            None,
+            None,
+            qkey,
+            None,
         )
     }
 }
