@@ -199,6 +199,7 @@ define_qp_state!(RESET, IBV_QPS_RESET);
 define_qp_state!(INIT, IBV_QPS_INIT);
 define_qp_state!(RTR, IBV_QPS_RTR);
 define_qp_state!(RTS, IBV_QPS_RTS);
+define_qp_state!(ERR, IBV_QPS_ERR);
 
 // #[derive(Clone)]
 // pub struct QueuePairBuilder<T: ToQpType> {
@@ -292,6 +293,17 @@ impl<T: ToQpType, S: ToQpState> QueuePair<T, S> {
     pub fn modify_to_reset(self) -> io::Result<QueuePair<T, RESET>> {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RESET,
+            ..Default::default()
+        };
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
+        // SAFETY: FFI call. The FFI object obtained from a valid QueuePair object is
+        // guaranteed to be valid.
+        unsafe { self.modify(&mut attr, mask) }
+    }
+
+    pub fn modify_to_err(self) -> io::Result<QueuePair<T, ERR>> {
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_ERR,
             ..Default::default()
         };
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
