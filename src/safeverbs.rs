@@ -4,13 +4,14 @@
 use crate::{ffi, ibv};
 use core::any::TypeId;
 use core::mem;
+use core::ops::Deref;
 use core::ptr;
 use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 // Re-exports
-pub use ibv::{devices, Device, DeviceList, DeviceListIter, Gid, Guid, QueuePairEndpoint};
+pub use ibv::{devices, Device, DeviceList, DeviceListIter, Gid, Guid};
 
 #[derive(Clone)]
 pub struct Context {
@@ -19,6 +20,13 @@ pub struct Context {
 
 impl AsRef<ibv::Context> for Context {
     fn as_ref(&self) -> &ibv::Context {
+        &self.ctx
+    }
+}
+
+impl Deref for Context {
+    type Target = ibv::Context;
+    fn deref(&self) -> &Self::Target {
         &self.ctx
     }
 }
@@ -64,6 +72,13 @@ impl<'a> AsRef<ibv::CompletionQueue<'a>> for CompletionQueue {
     }
 }
 
+impl Deref for CompletionQueue {
+    type Target = ibv::CompletionQueue<'static>;
+    fn deref(&self) -> &Self::Target {
+        &self.cq
+    }
+}
+
 #[derive(Clone)]
 pub struct ProtectionDomain {
     pd: Arc<ibv::ProtectionDomain<'static>>,
@@ -76,12 +91,19 @@ impl<'a> AsRef<ibv::ProtectionDomain<'a>> for ProtectionDomain {
     }
 }
 
+impl Deref for ProtectionDomain {
+    type Target = ibv::ProtectionDomain<'static>;
+    fn deref(&self) -> &Self::Target {
+        &self.pd
+    }
+}
+
 // NOTE(cjr): Perhaps I need both the builder pattern and the type state pattern.
 
 impl ProtectionDomain {
     pub fn create_qp<T: ToQpType>(
         &self,
-        qp_init_attr: QpInitAttr<T>,
+        qp_init_attr: &QpInitAttr<T>,
     ) -> io::Result<QueuePair<T, RESET>> {
         let mut attr = qp_init_attr.to_ibv_qp_init_attr();
         // SAFETY: FFI calls, FFI object (PD) obtained from a safe object is
@@ -103,6 +125,7 @@ pub struct QpType(pub ffi::ibv_qp_type::Type);
 pub trait ToQpType: 'static {
     fn to_qp_type() -> QpType;
 }
+pub trait ConnectionOrientedQpType: ToQpType {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RC;
@@ -110,6 +133,9 @@ pub struct RC;
 pub struct UC;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UD;
+
+impl ConnectionOrientedQpType for UC {}
+impl ConnectionOrientedQpType for RC {}
 
 #[inline]
 fn is<S: ToQpType, T: ToQpType>() -> bool {
@@ -138,6 +164,7 @@ impl ToQpType for UD {
 pub struct QpCapability(pub ffi::ibv_qp_cap);
 
 /// The attributes to initialize a QP.
+#[derive(Clone)]
 pub struct QpInitAttr<T: ToQpType> {
     /// Associated user context of the QP.
     pub qp_context: usize,
@@ -157,14 +184,8 @@ impl<T: ToQpType> QpInitAttr<T> {
     pub fn to_ibv_qp_init_attr(&self) -> ffi::ibv_qp_init_attr {
         ffi::ibv_qp_init_attr {
             qp_context: self.qp_context as *mut _,
-            send_cq: self
-                .send_cq
-                .as_ref()
-                .map_or(ptr::null_mut(), |cq| cq.cq.cq()),
-            recv_cq: self
-                .recv_cq
-                .as_ref()
-                .map_or(ptr::null_mut(), |cq| cq.cq.cq()),
+            send_cq: self.send_cq.as_ref().map_or(ptr::null_mut(), |cq| cq.cq()),
+            recv_cq: self.recv_cq.as_ref().map_or(ptr::null_mut(), |cq| cq.cq()),
             srq: ptr::null_mut(),
             cap: self.cap.0,
             qp_type: T::to_qp_type().0,
@@ -201,27 +222,275 @@ define_qp_state!(RTR, IBV_QPS_RTR);
 define_qp_state!(RTS, IBV_QPS_RTS);
 define_qp_state!(ERR, IBV_QPS_ERR);
 
-// #[derive(Clone)]
-// pub struct QueuePairBuilder<T: ToQpType> {
-//     builder: Arc<ibv::QueuePairBuilder<'static>>,
-//     _pd: ProtectionDomain,
-//     _send_cq: CompletionQueue,
-//     _recv_cq: CompletionQueue,
-//     _marker: PhantomData<T>,
-// }
+// Type aliases
+pub type UcQueuePairBuilder = QueuePairBuilder<UC>;
+pub type RcQueuePairBuilder = QueuePairBuilder<RC>;
+pub type UdQueuePairBuilder = QueuePairBuilder<UD>;
 
-// impl<T: ToQpType> QueuePairBuilder<T> {
-//     pub fn new(
-//         pd: ProtectionDomain,
-//         send_cq: CompletionQueue,
-//         max_send_wr: u32,
-//         recv_cq: CompletionQueue,
-//         max_recv_wr: u32,
-//     ) -> QueuePairBuilder<T> {
-//         let inner = ibv::QueuePairBuilder::new(pd.as_ref(), send_cq.as_ref(), max_send_wr, recv_cq.as_ref(), max_recv_wr, T::as_ibv_qp_type());
-//         todo!()
-//     }
-// }
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+struct QueuePairSetting {
+    /// valid for RC and UC
+    access: ffi::ibv_access_flags,
+    /// valid for RC and UC
+    path_mtu: u32,
+    /// valid for RC and UC
+    rq_psn: u32,
+    /// valid for RC and UC
+    sq_psn: u32,
+    /// only valid for RC
+    timeout: Option<u8>,
+    /// only valid for RC
+    retry_count: Option<u8>,
+    /// only valid for RC
+    rnr_retry: Option<u8>,
+    /// only valid for RC
+    min_rnr_timer: Option<u8>,
+    /// only valid for RC
+    max_rd_atomic: Option<u8>,
+    /// only valid for RC
+    max_dest_rd_atomic: Option<u8>,
+    /// traffic class, the default value is 0.
+    /// Note that the setting can be overwritten by a global system setting.
+    traffic_class: u8,
+}
+
+/// An unconfigured `QueuePair`.
+///
+/// A `QueuePairBuilder<T>` is used to configure a `QueuePair` before it is allocated and initialized.
+/// See also [RDMAmojo] for many more details.
+///
+/// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
+#[derive(Clone)]
+pub struct QueuePairBuilder<T: ConnectionOrientedQpType> {
+    // Required fields
+    pd: ProtectionDomain,
+    qp_init_attr: QpInitAttr<T>,
+    // carried along to handshake phase
+    setting: QueuePairSetting,
+}
+
+impl<T: ConnectionOrientedQpType> QueuePairBuilder<T> {
+    pub fn new(pd: ProtectionDomain, qp_init_attr: QpInitAttr<T>) -> QueuePairBuilder<T> {
+        QueuePairBuilder {
+            pd: pd.clone(),
+            qp_init_attr,
+            setting: QueuePairSetting {
+                access: ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE,
+                path_mtu: pd.context().port_attr().unwrap().active_mtu,
+                rq_psn: 0,
+                sq_psn: 0,
+                min_rnr_timer: is::<T, RC>().then_some(16),
+                retry_count: is::<T, RC>().then_some(6),
+                rnr_retry: is::<T, RC>().then_some(6),
+                timeout: is::<T, RC>().then_some(4),
+                max_rd_atomic: is::<T, RC>().then_some(1),
+                max_dest_rd_atomic: is::<T, RC>().then_some(1),
+                traffic_class: 0,
+            },
+        }
+    }
+
+    pub fn set_access(&mut self, access: ffi::ibv_access_flags) -> &mut Self {
+        self.setting.access = access;
+        self
+    }
+
+    pub fn allow_remote_rw(&mut self) -> &mut Self {
+        assert!(is::<T, RC>() || is::<T, UC>());
+        self.setting.access = self.setting.access
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ;
+        self
+    }
+
+    pub fn set_path_mtu(&mut self, path_mtu: u32) -> &mut Self {
+        assert!((1..=5).contains(&path_mtu));
+        self.setting.path_mtu = path_mtu;
+        self
+    }
+
+    pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
+        self.setting.rq_psn = rq_psn;
+        self
+    }
+
+    pub fn set_sq_psn(&mut self, sq_psn: u32) -> &mut Self {
+        self.setting.sq_psn = sq_psn;
+        self
+    }
+
+    pub fn set_traffic_class(&mut self, traffic_class: u8) -> &mut Self {
+        self.setting.traffic_class = traffic_class;
+        self
+    }
+
+    pub fn set_qp_context(&mut self, qp_context: usize) -> &mut Self {
+        self.qp_init_attr.qp_context = qp_context;
+        self
+    }
+
+    pub fn build(&self) -> io::Result<PreparedQueuePair<T>> {
+        let qp = self.pd.create_qp(&self.qp_init_attr)?;
+        Ok(PreparedQueuePair {
+            port_attr: self.pd.context().port_attr()?,
+            gid: self.pd.context().gid(0)?,
+            qp,
+            setting: self.setting.clone(),
+        })
+    }
+}
+
+impl QueuePairBuilder<RC> {
+    pub fn set_min_rnr_timer(&mut self, timer: u8) -> &mut Self {
+        self.setting.min_rnr_timer = Some(timer);
+        self
+    }
+
+    pub fn set_timeout(&mut self, timeout: u8) -> &mut Self {
+        self.setting.timeout = Some(timeout);
+        self
+    }
+
+    pub fn set_retry_count(&mut self, count: u8) -> &mut Self {
+        assert!(count <= 7);
+        self.setting.retry_count = Some(count);
+        self
+    }
+
+    pub fn set_rnr_retry(&mut self, n: u8) -> &mut Self {
+        assert!(n <= 7);
+        self.setting.rnr_retry = Some(n);
+        self
+    }
+
+    pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
+        self.setting.max_rd_atomic = Some(max_rd_atomic);
+        self
+    }
+
+    pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
+        self.setting.max_dest_rd_atomic = Some(max_dest_rd_atomic);
+        self
+    }
+}
+
+pub struct PreparedQueuePair<T: ConnectionOrientedQpType> {
+    port_attr: ffi::ibv_port_attr,
+    gid: Gid,
+    qp: QueuePair<T, RESET>,
+
+    // carried along from builder
+    setting: QueuePairSetting,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct QueuePairEndpoint {
+    /// the `QueuePair`'s `qp_num`
+    pub num: u32,
+    /// the context's `lid`
+    pub lid: u16,
+    /// the context's `gid`, used for global routing
+    pub gid: Option<Gid>,
+}
+
+impl<T: ConnectionOrientedQpType> PreparedQueuePair<T> {
+    pub fn endpoint(&self) -> QueuePairEndpoint {
+        // SAFETY: QP cannot be dropped when there's outstanding references,
+        // so it is safe to access qp_num field.
+        let num = unsafe { &*self.qp.qp.qp }.qp_num;
+
+        QueuePairEndpoint {
+            num,
+            lid: self.port_attr.lid,
+            gid: Some(self.gid),
+        }
+    }
+}
+
+impl PreparedQueuePair<RC> {
+    pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair<RC, RTS>> {
+        let init_qp = self.qp.modify_to_init(0, 1, self.setting.access)?;
+        let mut ah_attr = ffi::ibv_ah_attr {
+            dlid: remote.lid,
+            sl: 0,
+            src_path_bits: 0,
+            port_num: 1,
+            grh: Default::default(),
+            ..Default::default()
+        };
+        if let Some(gid) = remote.gid {
+            ah_attr.is_global = 1;
+            ah_attr.grh = ffi::ibv_global_route {
+                dgid: gid.into(),
+                flow_label: 0,
+                sgid_index: 0,
+                hop_limit: 0xff,
+                traffic_class: self.setting.traffic_class,
+            };
+        }
+        let rtr_qp = init_qp.modify_to_rtr(
+            ah_attr,
+            self.setting.path_mtu,
+            remote.num,
+            self.setting.rq_psn,
+            self.setting.max_dest_rd_atomic.expect("RC"),
+            self.setting.min_rnr_timer.expect("RC"),
+            None, // pkey_index already set
+            None, // access_flags already set
+            None,
+        )?;
+        let rts_qp = rtr_qp.modify_to_rts(
+            self.setting.sq_psn,
+            self.setting.timeout.expect("RC"),
+            self.setting.retry_count.expect("RC"),
+            self.setting.rnr_retry.expect("RC"),
+            self.setting.max_rd_atomic.expect("RC"),
+            None, // cur_qp_state
+            None, // access_flags already set
+            None, // min_rnr_timer already set
+            None,
+            None,
+        )?;
+        Ok(rts_qp)
+    }
+}
+
+impl PreparedQueuePair<UC> {
+    pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair<UC, RTS>> {
+        let init_qp = self.qp.modify_to_init(0, 1, self.setting.access)?;
+        let mut ah_attr = ffi::ibv_ah_attr {
+            dlid: remote.lid,
+            sl: 0,
+            src_path_bits: 0,
+            port_num: 1,
+            grh: Default::default(),
+            ..Default::default()
+        };
+        if let Some(gid) = remote.gid {
+            ah_attr.is_global = 1;
+            ah_attr.grh = ffi::ibv_global_route {
+                dgid: gid.into(),
+                flow_label: 0,
+                sgid_index: 0,
+                hop_limit: 0xff,
+                traffic_class: self.setting.traffic_class,
+            };
+        }
+        let rtr_qp = init_qp.modify_to_rtr(
+            ah_attr,
+            self.setting.path_mtu,
+            remote.num,
+            self.setting.rq_psn,
+            None, // pkey_index already set
+            None, // access_flags already set
+            None, // alt_path
+        )?;
+        let rts_qp = rtr_qp.modify_to_rts(self.setting.sq_psn, None, None, None, None)?;
+        Ok(rts_qp)
+    }
+}
 
 #[repr(transparent)]
 struct OwnedQueuePair {
@@ -272,6 +541,11 @@ pub struct QueuePair<T: ToQpType, S: ToQpState> {
     qp: Arc<OwnedQueuePair>,
     _marker: PhantomData<(T, S)>,
 }
+
+// Type aliases
+pub type UcQueuePair<S> = QueuePair<UC, S>;
+pub type RcQueuePair<S> = QueuePair<RC, S>;
+pub type UdQueuePair<S> = QueuePair<UD, S>;
 
 impl<T: ToQpType, S: ToQpState> QueuePair<T, S> {
     /// Bioperlate code to `ibv_modify_qp`.
@@ -478,34 +752,6 @@ impl_modify_qp!(modify_rts_to_rts, RTS, RTS,
 
     alt_path: (RC, UC) [IBV_QP_ALT_PATH] alt_path: Option<AltPath>,
 );
-
-// fn modify_init_to_rtr2<T: ToQpType>(
-//     qp: QueuePair<T, INIT>,
-//     ah_attr: ffi::ibv_ah_attr,
-//     path_mtu: u32,
-//     dest_qpn: u32,
-//     rq_psn: u32,
-//     max_dest_rd_atomic: Option<u8>,
-//     min_rnr_timer: Option<u8>,
-//     pkey_index: Option<u16>,
-//     access: Option<ffi::ibv_access_flags>,
-//     alt_path: Option<AltPath>,
-// ) -> io::Result<QueuePair<T, RTR>> {
-//     let mut attr = ffi::ibv_qp_attr {
-//         qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
-//         ..Default::default()
-//     };
-//     let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
-//     if is::<T, RC>() {
-//         if let Some(max_dest_rd_atomic) = max_dest_rd_atomic {
-//             attr.max_dest_rd_atomic = max_dest_rd_atomic;
-//             mask |= ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC;
-//         }
-//     }
-//     // SAFETY: FFI call. The FFI object obtained from a valid QueuePair object is
-//     // guaranteed to be valid.
-//     unsafe { qp.modify(&mut attr, mask) }
-// }
 
 // RESET -> INIT
 impl QueuePair<UC, RESET> {

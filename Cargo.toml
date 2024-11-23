@@ -8,3 +8,7 @@ edition = "2021"
 [dependencies]
 ibverbs = { path = "rust-ibverbs/ibverbs" }
 ibverbs-sys = { path = "rust-ibverbs/ibverbs-sys" }
+serde = { version = "1.0.215", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
