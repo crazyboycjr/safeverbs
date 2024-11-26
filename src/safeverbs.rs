@@ -9,9 +9,10 @@ use core::ptr;
 use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::future::Future;
 
 // Re-exports
-pub use ibv::{devices, Device, DeviceList, DeviceListIter, Gid, Guid};
+pub use ibv::{devices, Device, DeviceList, DeviceListIter, Gid, Guid, MemoryRegion, RemoteKey};
 
 #[derive(Clone)]
 pub struct Context {
@@ -112,6 +113,9 @@ impl ProtectionDomain {
         let qp = unsafe { OwnedQueuePair::create(self.pd.pd(), &mut attr) }?;
         Ok(QueuePair {
             qp: Arc::new(qp),
+            pd: self.clone(),
+            send_cq: qp_init_attr.send_cq.clone(),
+            recv_cq: qp_init_attr.recv_cq.clone(),
             _marker: PhantomData,
         })
     }
@@ -122,7 +126,7 @@ impl ProtectionDomain {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QpType(pub ffi::ibv_qp_type::Type);
 
-pub trait ToQpType: 'static {
+pub trait ToQpType: 'static + Clone + Copy {
     fn to_qp_type() -> QpType;
 }
 pub trait ConnectionOrientedQpType: ToQpType {}
@@ -169,9 +173,9 @@ pub struct QpInitAttr<T: ToQpType> {
     /// Associated user context of the QP.
     pub qp_context: usize,
     /// CQ to be associated with the Send Queue (SQ).
-    pub send_cq: Option<CompletionQueue>,
+    pub send_cq: CompletionQueue,
     /// CQ to be associated with the Receive Queue (RQ).
-    pub recv_cq: Option<CompletionQueue>,
+    pub recv_cq: CompletionQueue,
     /// Qp capabilities.
     pub cap: QpCapability,
     /// QP Transport Service Type: IBV_QPT_RC, IBV_QPT_UC, iBV_QPT_UD.
@@ -184,8 +188,8 @@ impl<T: ToQpType> QpInitAttr<T> {
     pub fn to_ibv_qp_init_attr(&self) -> ffi::ibv_qp_init_attr {
         ffi::ibv_qp_init_attr {
             qp_context: self.qp_context as *mut _,
-            send_cq: self.send_cq.as_ref().map_or(ptr::null_mut(), |cq| cq.cq()),
-            recv_cq: self.recv_cq.as_ref().map_or(ptr::null_mut(), |cq| cq.cq()),
+            send_cq: self.send_cq.cq(),
+            recv_cq: self.recv_cq.cq(),
             srq: ptr::null_mut(),
             cap: self.cap.0,
             qp_type: T::to_qp_type().0,
@@ -199,7 +203,7 @@ impl<T: ToQpType> QpInitAttr<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QpState(pub ffi::ibv_qp_state::Type);
 
-pub trait ToQpState: 'static {
+pub trait ToQpState: 'static + Clone + Copy {
     fn to_qp_state() -> QpState;
 }
 
@@ -524,6 +528,13 @@ impl OwnedQueuePair {
             Ok(OwnedQueuePair { qp })
         }
     }
+
+    fn post_send<T>(&self, _mr: &MemoryRegion<T>) -> io::Result<()> {
+        todo!()
+    }
+    // fn post_send_batch<T>(&self, mr: &MemoryRegion<T>) -> io::Result<()> {
+    //     todo!()
+    // }
 }
 
 impl Drop for OwnedQueuePair {
@@ -537,8 +548,12 @@ impl Drop for OwnedQueuePair {
     }
 }
 
+#[derive(Clone)]
 pub struct QueuePair<T: ToQpType, S: ToQpState> {
     qp: Arc<OwnedQueuePair>,
+    pd: ProtectionDomain,
+    send_cq: CompletionQueue,
+    recv_cq: CompletionQueue,
     _marker: PhantomData<(T, S)>,
 }
 
@@ -560,6 +575,9 @@ impl<T: ToQpType, S: ToQpState> QueuePair<T, S> {
         }
         Ok(QueuePair {
             qp: self.qp,
+            pd: self.pd,
+            send_cq: self.send_cq,
+            recv_cq: self.recv_cq,
             _marker: PhantomData,
         })
     }
@@ -1031,3 +1049,59 @@ impl QueuePair<UD, RTS> {
         modify_rts_to_rts(self, cur_qp_state, None, None, None, qkey, None)
     }
 }
+
+pub struct WorkRequest<'m, T: ToQpType> {
+    qp: QueuePair<T, RTS>,
+    _mr: PhantomData<&'m MemoryRegion<()>>,
+}
+
+struct WorkCompletion {
+    wc: ffi::ibv_wc,
+}
+
+impl<'m, T: ToQpType> Future for WorkRequest<'m, T> {
+    type Output = ffi::ibv_wc;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        // let send_cq = unsafe  { &*self.qp.qp }.send_cq;
+        let send_cq = self.qp.send_cq;
+    }
+}
+
+// Data-verbs
+impl<T: ToQpType> QueuePair<T, RTS> {
+    #[inline]
+    pub fn post_send(&self, mr: &MemoryRegion<T>) -> io::Result<WorkRequest<'_, T>> {
+        self.qp.post_send(mr)?;
+        Ok(WorkRequest {
+            qp: self.clone(),
+            _mr: PhantomData,
+        })
+    }
+}
+
+// use core::ops::Range;
+// use std::sync::atomic::AtomicIsize;
+// use std::sync::atomic::Ordering;
+//
+// pub struct MemorySegment {
+//     range: Range<usize>,
+//     mr: Arc<MemoryRegion<u8>>,
+// }
+//
+// pub struct MemoryRegion<T> {
+//     mr: *mut ffi::ibv_mr,
+//     data: Box<[T]>,
+//     refcnt: AtomicIsize,
+// }
+//
+// unsafe impl<T> Send for MemoryRegion<T> {}
+// unsafe impl<T> Sync for MemoryRegion<T> {}
+//
+// impl<T> MemoryRegion<T> {
+//     fn get_readonly<R>(&self, range: R) -> Option<MemorySegment> {
+//         self.refcnt.fetch_update(Ordering::Acquire, Ordering::Relaxed, |c| );
+//     }
+//
+//     fn get_readwrite<R>(&mut self, range: R) -> Option<MemorySegment> {
+//     }
+// }
