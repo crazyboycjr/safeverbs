@@ -6,10 +6,11 @@ use core::any::TypeId;
 use core::mem;
 use core::ops::Deref;
 use core::ptr;
+use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
-use std::sync::Arc;
-use std::future::Future;
+use std::sync::{Arc, OnceLock};
+use std::task::{Poll, Waker};
 
 // Re-exports
 pub use ibv::{devices, Device, DeviceList, DeviceListIter, Gid, Guid, MemoryRegion, RemoteKey};
@@ -46,6 +47,7 @@ impl Context {
         Ok(CompletionQueue {
             cq: Arc::new(cq),
             _ctx: self.clone(),
+            wr_slab: sharded_slab::Slab::new(),
         })
     }
 
@@ -65,6 +67,7 @@ impl Context {
 pub struct CompletionQueue {
     cq: Arc<ibv::CompletionQueue<'static>>,
     _ctx: Context,
+    wr_slab: sharded_slab::Slab<WorkRequestInner>,
 }
 
 impl<'a> AsRef<ibv::CompletionQueue<'a>> for CompletionQueue {
@@ -73,10 +76,34 @@ impl<'a> AsRef<ibv::CompletionQueue<'a>> for CompletionQueue {
     }
 }
 
-impl Deref for CompletionQueue {
-    type Target = ibv::CompletionQueue<'static>;
-    fn deref(&self) -> &Self::Target {
-        &self.cq
+// impl Deref for CompletionQueue {
+//     type Target = ibv::CompletionQueue<'static>;
+//     fn deref(&self) -> &Self::Target {
+//         &self.cq
+//     }
+// }
+
+impl CompletionQueue {
+    #[inline]
+    pub fn poll<'c>(
+        &self,
+        completions: &'c mut [ffi::ibv_wc],
+    ) -> io::Result<&'c mut [ffi::ibv_wc]> {
+        let comp = self.cq.poll(completions)?;
+        for c in comp.iter_mut() {
+            let wr: &mut WorkRequestInner = self
+                .wr_slab
+                .get_mut(c.wr_id() as usize)
+                .expect("something gets wrong");
+            mem::swap(&mut c.wr_id, &mut wr.wr_id);
+            // A completion should only be fetched from one CQ, so set
+            // should return successfully.
+            wr.wc.set(*c).unwrap();
+            if let Some(waker) = wr.waker.take() {
+                waker.wake();
+            }
+        }
+        Ok(comp)
     }
 }
 
@@ -188,8 +215,8 @@ impl<T: ToQpType> QpInitAttr<T> {
     pub fn to_ibv_qp_init_attr(&self) -> ffi::ibv_qp_init_attr {
         ffi::ibv_qp_init_attr {
             qp_context: self.qp_context as *mut _,
-            send_cq: self.send_cq.cq(),
-            recv_cq: self.recv_cq.cq(),
+            send_cq: self.send_cq.as_ref().cq(),
+            recv_cq: self.recv_cq.as_ref().cq(),
             srq: ptr::null_mut(),
             cap: self.cap.0,
             qp_type: T::to_qp_type().0,
@@ -529,7 +556,7 @@ impl OwnedQueuePair {
         }
     }
 
-    fn post_send<T>(&self, _mr: &MemoryRegion<T>) -> io::Result<()> {
+    fn post_send<T>(&self, _mr: &MemoryRegion<T>, _wr_id: u64) -> io::Result<()> {
         todo!()
     }
     // fn post_send_batch<T>(&self, mr: &MemoryRegion<T>) -> io::Result<()> {
@@ -1050,38 +1077,113 @@ impl QueuePair<UD, RTS> {
     }
 }
 
-pub struct WorkRequest<'m, T: ToQpType> {
-    qp: QueuePair<T, RTS>,
-    _mr: PhantomData<&'m MemoryRegion<()>>,
+struct WorkRequestInner {
+    wr_id: u64,
+    wc: OnceLock<ffi::ibv_wc>,
+    waker: OnceLock<Waker>,
 }
 
-struct WorkCompletion {
-    wc: ffi::ibv_wc,
+pub struct WorkRequest<'w> {
+    cq: CompletionQueue,
+    wr_key: usize,
+    _marker: PhantomData<&'w ()>,
 }
 
-impl<'m, T: ToQpType> Future for WorkRequest<'m, T> {
+impl<'m> Future for WorkRequest<'m> {
     type Output = ffi::ibv_wc;
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        // let send_cq = unsafe  { &*self.qp.qp }.send_cq;
-        let send_cq = self.qp.send_cq;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let inner = self.cq.wr_slab.get(self.wr_key).unwrap();
+        if let Some(wc) = inner.wc.get() {
+            // NOTE: Now wr_id must be the wr_key in the slab
+            self.cq.wr_slab.remove(inner.wr_id as usize);
+            Poll::Ready(*wc)
+        } else {
+            // The inner waker should only be set by one thread
+            inner.waker.set(cx.waker().clone()).unwrap();
+            Poll::Pending
+        }
     }
 }
 
 // Data-verbs
 impl<T: ToQpType> QueuePair<T, RTS> {
     #[inline]
-    pub fn post_send(&self, mr: &MemoryRegion<T>) -> io::Result<WorkRequest<'_, T>> {
-        self.qp.post_send(mr)?;
-        Ok(WorkRequest {
-            qp: self.clone(),
-            _mr: PhantomData,
-        })
+    pub fn post_send<'q, 'm, 'w>(
+        &'q self,
+        mr: &'m MemoryRegion<T>,
+        wr_id: u64,
+    ) -> io::Result<WorkRequest<'w>>
+    where
+        'q: 'w,
+        'm: 'w,
+    {
+        let inner = WorkRequestInner {
+            wr_id,
+            wc: OnceLock::new(),
+            waker: OnceLock::new(),
+        };
+        let wr_key = self.send_cq.wr_slab.insert(inner);
+        self.qp.post_send(mr, wr_key as u64)?;
+        let wr = WorkRequest {
+            cq: self.send_cq.clone(),
+            wr_key,
+            _marker: PhantomData,
+        };
+        Ok(wr)
+    }
+}
+
+mod sharded_slab {
+    use std::sync::Arc;
+    pub struct Slab<T> {
+        storage: Arc<Vec<Vec<T>>>,
+    }
+
+    impl<T> Clone for Slab<T> {
+        fn clone(&self) -> Self {
+            Slab {
+                storage: Arc::clone(&self.storage),
+            }
+        }
+    }
+
+    impl<T: Sized> Slab<T> {
+        pub fn new() -> Self {
+            let nshards = std::thread::available_parallelism().unwrap();
+            let mut storage = Vec::with_capacity(nshards.get());
+            storage.resize_with(nshards.get(), || Vec::new());
+            Slab {
+                storage: Arc::new(storage),
+            }
+        }
+
+        pub fn insert(&self, _value: T) -> usize {
+            // let ret = self.storage.len();
+            // // let tid = unsafe { libc::gettid() };
+            // let tid: u64 = todo!();
+            // // self.storage.push(value);
+            // ret
+            todo!()
+        }
+
+        pub fn remove(&self, _key: usize) -> T {
+            todo!()
+        }
+
+        pub fn get(&self, _key: usize) -> Option<&T> {
+            // self.storage.get(key)
+            todo!();
+        }
+
+        pub fn get_mut(&self, _key: usize) -> Option<&mut T> {
+            // self.storage.get(key)
+            todo!();
+        }
     }
 }
 
 // use core::ops::Range;
 // use std::sync::atomic::AtomicIsize;
-// use std::sync::atomic::Ordering;
 //
 // pub struct MemorySegment {
 //     range: Range<usize>,
