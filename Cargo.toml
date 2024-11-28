@@ -9,6 +9,8 @@ edition = "2021"
 ibverbs = { path = "rust-ibverbs/ibverbs" }
 ibverbs-sys = { path = "rust-ibverbs/ibverbs-sys" }
 serde = { version = "1.0.215", features = ["derive"], optional = true }
+sharded-slab = "0.1.7"
+slab = "0.4.9"
 zerocopy = { version = "0.8.10", features = ["derive"] }
 
 [features]

@@ -4,8 +4,9 @@
 use crate::{ffi, ibv};
 use core::any::TypeId;
 use core::mem;
-use core::ops::Deref;
+use core::ops::{Deref, DerefMut};
 use core::ptr;
+use core::slice;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -13,7 +14,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Poll, Waker};
 
 // Re-exports
-pub use ibv::{devices, Device, DeviceList, DeviceListIter, Gid, Guid, MemoryRegion, RemoteKey};
+pub use ibv::{devices, Device, DeviceList, DeviceListIter, Gid, Guid, RemoteKey};
 
 #[derive(Clone)]
 pub struct Context {
@@ -44,11 +45,11 @@ impl Context {
         // SAFETY: This is safe as long as `cq: Arc<ibv::CompletionQueue<'static>>` cannot
         // be constructed from the outside by any means.
         let cq: ibv::CompletionQueue<'static> = unsafe { mem::transmute(inner) };
-        Ok(CompletionQueue {
-            cq: Arc::new(cq),
+        Ok(CompletionQueue(Arc::new(CompletionQueueInner {
+            cq,
             _ctx: self.clone(),
             wr_slab: sharded_slab::Slab::new(),
-        })
+        })))
     }
 
     pub fn alloc_pd(&self) -> io::Result<ProtectionDomain> {
@@ -56,30 +57,32 @@ impl Context {
         // SAFETY: This is safe as long as `cq: Arc<ibv::ProtectionDomain<'static>>` cannot
         // be constructed from the outside by any means.
         let pd: ibv::ProtectionDomain<'static> = unsafe { mem::transmute(inner) };
-        Ok(ProtectionDomain {
-            pd: Arc::new(pd),
+        Ok(ProtectionDomain(Arc::new(ProtectionDomainInner {
+            pd,
             _ctx: self.clone(),
-        })
+        })))
     }
 }
 
-#[derive(Clone)]
-pub struct CompletionQueue {
-    cq: Arc<ibv::CompletionQueue<'static>>,
+struct CompletionQueueInner {
+    cq: ibv::CompletionQueue<'static>,
     _ctx: Context,
     wr_slab: sharded_slab::Slab<WorkRequestInner>,
 }
 
+#[derive(Clone)]
+pub struct CompletionQueue(Arc<CompletionQueueInner>);
+
 impl<'a> AsRef<ibv::CompletionQueue<'a>> for CompletionQueue {
     fn as_ref(&self) -> &ibv::CompletionQueue<'a> {
-        &self.cq
+        &self.0.cq
     }
 }
 
 // impl Deref for CompletionQueue {
 //     type Target = ibv::CompletionQueue<'static>;
 //     fn deref(&self) -> &Self::Target {
-//         &self.cq
+//         &self.0.cq
 //     }
 // }
 
@@ -89,40 +92,44 @@ impl CompletionQueue {
         &self,
         completions: &'c mut [ffi::ibv_wc],
     ) -> io::Result<&'c mut [ffi::ibv_wc]> {
-        let comp = self.cq.poll(completions)?;
+        let comp = self.0.cq.poll(completions)?;
         for c in comp.iter_mut() {
-            let wr: &mut WorkRequestInner = self
+            let wr = self
+                .0
                 .wr_slab
-                .get_mut(c.wr_id() as usize)
+                .get(c.wr_id() as usize)
                 .expect("something gets wrong");
-            mem::swap(&mut c.wr_id, &mut wr.wr_id);
+            // mem::swap(&mut c.wr_id, &mut wr.wr_id);
+            c.wr_id = wr.wr_id;
             // A completion should only be fetched from one CQ, so set
             // should return successfully.
             wr.wc.set(*c).unwrap();
-            if let Some(waker) = wr.waker.take() {
-                waker.wake();
+            if let Some(waker) = wr.waker.get() {
+                waker.wake_by_ref();
             }
         }
         Ok(comp)
     }
 }
 
-#[derive(Clone)]
-pub struct ProtectionDomain {
-    pd: Arc<ibv::ProtectionDomain<'static>>,
+struct ProtectionDomainInner {
+    pd: ibv::ProtectionDomain<'static>,
     _ctx: Context,
 }
 
+#[derive(Clone)]
+pub struct ProtectionDomain(Arc<ProtectionDomainInner>);
+
 impl<'a> AsRef<ibv::ProtectionDomain<'a>> for ProtectionDomain {
     fn as_ref(&self) -> &ibv::ProtectionDomain<'a> {
-        &self.pd
+        &self.0.pd
     }
 }
 
 impl Deref for ProtectionDomain {
     type Target = ibv::ProtectionDomain<'static>;
     fn deref(&self) -> &Self::Target {
-        &self.pd
+        &self.0.pd
     }
 }
 
@@ -137,12 +144,14 @@ impl ProtectionDomain {
         // SAFETY: FFI calls, FFI object (PD) obtained from a safe object is
         // guaranteed to be valid. ibv_qp_init_attr is also valid because we
         // take the reference from QpInitAttr.
-        let qp = unsafe { OwnedQueuePair::create(self.pd.pd(), &mut attr) }?;
+        let qp = unsafe { OwnedQueuePair::create(self.0.pd.pd(), &mut attr) }?;
         Ok(QueuePair {
-            qp: Arc::new(qp),
-            pd: self.clone(),
-            send_cq: qp_init_attr.send_cq.clone(),
-            recv_cq: qp_init_attr.recv_cq.clone(),
+            inner: Arc::new(QueuePairInner {
+                qp,
+                pd: self.clone(),
+                send_cq: qp_init_attr.send_cq.clone(),
+                recv_cq: qp_init_attr.recv_cq.clone(),
+            }),
             _marker: PhantomData,
         })
     }
@@ -430,7 +439,7 @@ impl<T: ConnectionOrientedQpType> PreparedQueuePair<T> {
     pub fn endpoint(&self) -> QueuePairEndpoint {
         // SAFETY: QP cannot be dropped when there's outstanding references,
         // so it is safe to access qp_num field.
-        let num = unsafe { &*self.qp.qp.qp }.qp_num;
+        let num = unsafe { &*self.qp.inner.qp.qp }.qp_num;
 
         QueuePairEndpoint {
             num,
@@ -575,12 +584,16 @@ impl Drop for OwnedQueuePair {
     }
 }
 
-#[derive(Clone)]
-pub struct QueuePair<T: ToQpType, S: ToQpState> {
-    qp: Arc<OwnedQueuePair>,
+struct QueuePairInner {
+    qp: OwnedQueuePair,
     pd: ProtectionDomain,
     send_cq: CompletionQueue,
     recv_cq: CompletionQueue,
+}
+
+#[derive(Clone)]
+pub struct QueuePair<T: ToQpType, S: ToQpState> {
+    inner: Arc<QueuePairInner>,
     _marker: PhantomData<(T, S)>,
 }
 
@@ -596,15 +609,12 @@ impl<T: ToQpType, S: ToQpState> QueuePair<T, S> {
         attr: *mut ffi::ibv_qp_attr,
         mask: ffi::ibv_qp_attr_mask,
     ) -> io::Result<QueuePair<T, D>> {
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, attr, mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(self.inner.qp.qp, attr, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
         Ok(QueuePair {
-            qp: self.qp,
-            pd: self.pd,
-            send_cq: self.send_cq,
-            recv_cq: self.recv_cq,
+            inner: self.inner,
             _marker: PhantomData,
         })
     }
@@ -1083,19 +1093,25 @@ struct WorkRequestInner {
     waker: OnceLock<Waker>,
 }
 
-pub struct WorkRequest<'w> {
+pub struct WorkRequest {
     cq: CompletionQueue,
     wr_key: usize,
-    _marker: PhantomData<&'w ()>,
+    _qp: Arc<QueuePairInner>,
+    _mr: Arc<OwnedMemoryRegionOpaque>,
 }
 
-impl<'m> Future for WorkRequest<'m> {
+impl Future for WorkRequest {
     type Output = ffi::ibv_wc;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let inner = self.cq.wr_slab.get(self.wr_key).unwrap();
+        // NOTE(cjr): Do not use the slab.take because it may block.
+        // Simply get and remove would be nicer here.
+
+        // `wr_key`` should exists otherwise something is wrong
+        let inner = self.cq.0.wr_slab.get(self.wr_key).unwrap();
         if let Some(wc) = inner.wc.get() {
             // NOTE: Now wr_id must be the wr_key in the slab
-            self.cq.wr_slab.remove(inner.wr_id as usize);
+            let removed = self.cq.0.wr_slab.remove(self.wr_key);
+            assert!(removed);
             Poll::Ready(*wc)
         } else {
             // The inner waker should only be set by one thread
@@ -1108,87 +1124,105 @@ impl<'m> Future for WorkRequest<'m> {
 // Data-verbs
 impl<T: ToQpType> QueuePair<T, RTS> {
     #[inline]
-    pub fn post_send<'q, 'm, 'w>(
-        &'q self,
-        mr: &'m MemoryRegion<T>,
-        wr_id: u64,
-    ) -> io::Result<WorkRequest<'w>>
-    where
-        'q: 'w,
-        'm: 'w,
-    {
+    pub fn post_send(&self, mr: &MemoryRegion<T>, wr_id: u64) -> io::Result<WorkRequest> {
         let inner = WorkRequestInner {
             wr_id,
             wc: OnceLock::new(),
             waker: OnceLock::new(),
         };
-        let wr_key = self.send_cq.wr_slab.insert(inner);
-        self.qp.post_send(mr, wr_key as u64)?;
+        // Panics if too many items in the slab.
+        let wr_key = self.inner.send_cq.0.wr_slab.insert(inner).unwrap();
+        self.inner.qp.post_send(mr, wr_key as u64)?;
         let wr = WorkRequest {
-            cq: self.send_cq.clone(),
+            cq: self.inner.send_cq.clone(),
             wr_key,
-            _marker: PhantomData,
+            _qp: Arc::clone(&self.inner),
+            _mr: Arc::clone(&mr.inner),
         };
         Ok(wr)
     }
 }
 
-mod sharded_slab {
-    use std::sync::Arc;
-    pub struct Slab<T> {
-        storage: Arc<Vec<Vec<T>>>,
-    }
+struct OwnedMemoryRegionOpaque {
+    mr: *mut ffi::ibv_mr,
+    data: Box<[u8]>,
+}
 
-    impl<T> Clone for Slab<T> {
-        fn clone(&self) -> Self {
-            Slab {
-                storage: Arc::clone(&self.storage),
-            }
-        }
-    }
+unsafe impl Send for OwnedMemoryRegionOpaque {}
+unsafe impl Sync for OwnedMemoryRegionOpaque {}
 
-    impl<T: Sized> Slab<T> {
-        pub fn new() -> Self {
-            let nshards = std::thread::available_parallelism().unwrap();
-            let mut storage = Vec::with_capacity(nshards.get());
-            storage.resize_with(nshards.get(), || Vec::new());
-            Slab {
-                storage: Arc::new(storage),
-            }
-        }
-
-        pub fn insert(&self, _value: T) -> usize {
-            // let ret = self.storage.len();
-            // // let tid = unsafe { libc::gettid() };
-            // let tid: u64 = todo!();
-            // // self.storage.push(value);
-            // ret
-            todo!()
-        }
-
-        pub fn remove(&self, _key: usize) -> T {
-            todo!()
-        }
-
-        pub fn get(&self, _key: usize) -> Option<&T> {
-            // self.storage.get(key)
-            todo!();
-        }
-
-        pub fn get_mut(&self, _key: usize) -> Option<&mut T> {
-            // self.storage.get(key)
-            todo!();
+impl Drop for OwnedMemoryRegionOpaque {
+    fn drop(&mut self) {
+        let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{}", e);
         }
     }
 }
 
-// use core::ops::Range;
-// use std::sync::atomic::AtomicIsize;
+pub struct MemoryRegion<T> {
+    inner: Arc<OwnedMemoryRegionOpaque>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> Deref for MemoryRegion<T> {
+    type Target = [T];
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: data must have correct alignment for T.
+        // This is guaranteed because OwnedMemoryRegionOpaque is created
+        // by OwnedMemoryRegion<T>.
+        unsafe {
+            slice::from_raw_parts(
+                self.inner.data.as_ptr().cast(),
+                self.inner.data.len() / size_of::<T>(),
+            )
+        }
+    }
+}
+
+impl<T> DerefMut for MemoryRegion<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {
+            slice::from_raw_parts_mut(
+                Arc::get_mut(&mut self.inner)
+                    .unwrap()
+                    .data
+                    .as_mut_ptr()
+                    .cast(),
+                self.inner.data.len() / size_of::<T>(),
+            )
+        }
+    }
+}
+
+use core::ops::Range;
+
+pub struct MemorySegment {
+    mr: Arc<OwnedMemoryRegionOpaque>,
+    range: Range<usize>,
+}
+
+// impl<T> MemoryRegion<T> {
+//     /// Get the remote authentication key used to allow direct remote access to this memory region.
+//     pub fn rkey(&self) -> RemoteKey {
+//         RemoteKey {
+//             key: unsafe { &*self.inner.mr }.rkey,
+//         }
+//     }
 //
-// pub struct MemorySegment {
-//     range: Range<usize>,
-//     mr: Arc<MemoryRegion<u8>>,
+//     pub fn get_readonly(&self) -> MemorySegment<RO> {
+//     }
+//     pub fn get_readwrite(self) -> MemorySegment<RW> {
+//     }
 // }
+//
+// impl MemorySegment<RO> {
+//     pub fn get_readonly(&self) -> MemorySegment<RO> {
+//     }
+// }
+
+// use std::sync::atomic::AtomicIsize;
 //
 // pub struct MemoryRegion<T> {
 //     mr: *mut ffi::ibv_mr,
