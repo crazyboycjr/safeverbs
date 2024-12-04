@@ -1,16 +1,17 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::too_many_arguments)]
 
-use crate::{ffi, ibv};
+use crate::{ffi, ibv, sliceindex::SliceIndex};
 use core::any::TypeId;
 use core::mem;
+use core::ops::Range;
 use core::ops::{Deref, DerefMut};
 use core::ptr;
 use core::slice;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Poll, Waker};
 
 // Re-exports
@@ -148,12 +149,54 @@ impl ProtectionDomain {
         Ok(QueuePair {
             inner: Arc::new(QueuePairInner {
                 qp,
-                pd: self.clone(),
+                _pd: self.clone(),
                 send_cq: qp_init_attr.send_cq.clone(),
                 recv_cq: qp_init_attr.recv_cq.clone(),
             }),
             _marker: PhantomData,
         })
+    }
+
+    pub fn allocate<T: Sized + Clone + Default + zerocopy::FromBytes>(
+        &self,
+        n: usize,
+        access: ffi::ibv_access_flags,
+    ) -> io::Result<MemoryRegion<T>> {
+        assert!(n > 0);
+        assert!(mem::size_of::<T>() > 0);
+
+        let mut data = Vec::with_capacity(n);
+        data.resize(n, T::default());
+
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                self.0.pd.pd(),
+                data.as_mut_ptr() as *mut _,
+                n * mem::size_of::<T>(),
+                access.0 as i32,
+            )
+        };
+
+        if mr.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            let slice = data.into_boxed_slice();
+            let leaked = Box::leak(slice);
+            // SAFETY: memory is obtained by Vec::with_capacity. Downcasting it to [u8]
+            // still satisfies the alignment requirement for [u8].
+            let bytes = unsafe {
+                slice::from_raw_parts_mut(leaked.as_mut_ptr().cast(), mem::size_of_val(leaked))
+            };
+            Ok(MemoryRegion {
+                inner: Arc::new(OwnedMemoryRegionOpaque {
+                    mr,
+                    // SAFETY: `bytes` is previously leaked from Box<[T]>.
+                    data: unsafe { Box::from_raw(bytes) },
+                    intervals: Mutex::new(IntervalTree::new()),
+                }),
+                _marker: PhantomData,
+            })
+        }
     }
 }
 
@@ -565,7 +608,48 @@ impl OwnedQueuePair {
         }
     }
 
-    fn post_send<T>(&self, _mr: &MemoryRegion<T>, _wr_id: u64) -> io::Result<()> {
+    fn post_send<T>(&self, mr: &MemoryRegion<T>, wr_id: u64) -> io::Result<()> {
+        let ms = mr.get_readonly(..).expect("Failed to get MemorySegment");
+        self.post_send_gather(&[ms], wr_id)
+    }
+    fn post_send_gather(&self, ms: &[MemorySegment<RO>], wr_id: u64) -> io::Result<()> {
+        let mut sglist = Vec::with_capacity(ms.len());
+        for m in ms {
+            let range = m.range.clone().index(&m.mr.data);
+            sglist.push(ffi::ibv_sge {
+                addr: range.as_ptr() as u64,
+                length: mem::size_of_val(range) as u32,
+                // SAFETY: mr is guarded by Arc, so it should be valid.
+                lkey: unsafe { *m.mr.mr }.lkey,
+            });
+        }
+        let mut wr = ffi::ibv_send_wr {
+            wr_id,
+            next: ptr::null_mut(),
+            sg_list: sglist.as_mut_ptr(),
+            num_sge: sglist.len() as i32,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
+            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            ..Default::default()
+        };
+        let mut bad_wr = ptr::null_mut();
+
+        // SAFETY: qp is valid since it cannot be destoryed by other means.
+        let ctx = unsafe { *self.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr, &mut bad_wr)
+        };
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
+    fn post_recv<T>(&self, _mr: &mut MemoryRegion<T>, _wr_id: u64) -> io::Result<()> {
+        todo!()
+    }
+    fn post_recv_scatter(&self, _mr: &[MemorySegment<RW>], _wr_id: u64) -> io::Result<()> {
         todo!()
     }
     // fn post_send_batch<T>(&self, mr: &MemoryRegion<T>) -> io::Result<()> {
@@ -586,7 +670,7 @@ impl Drop for OwnedQueuePair {
 
 struct QueuePairInner {
     qp: OwnedQueuePair,
-    pd: ProtectionDomain,
+    _pd: ProtectionDomain,
     send_cq: CompletionQueue,
     recv_cq: CompletionQueue,
 }
@@ -1093,14 +1177,13 @@ struct WorkRequestInner {
     waker: OnceLock<Waker>,
 }
 
-pub struct WorkRequest {
+pub struct WorkRequest<'w> {
     cq: CompletionQueue,
     wr_key: usize,
-    _qp: Arc<QueuePairInner>,
-    _mr: Arc<OwnedMemoryRegionOpaque>,
+    _marker: PhantomData<&'w ()>,
 }
 
-impl Future for WorkRequest {
+impl<'w> Future for WorkRequest<'w> {
     type Output = ffi::ibv_wc;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         // NOTE(cjr): Do not use the slab.take because it may block.
@@ -1124,7 +1207,15 @@ impl Future for WorkRequest {
 // Data-verbs
 impl<T: ToQpType> QueuePair<T, RTS> {
     #[inline]
-    pub fn post_send(&self, mr: &MemoryRegion<T>, wr_id: u64) -> io::Result<WorkRequest> {
+    pub fn post_send<'q, 'm, 'w>(
+        &'q self,
+        mr: &'m MemoryRegion<T>,
+        wr_id: u64,
+    ) -> io::Result<WorkRequest<'w>>
+    where
+        'q: 'w,
+        'm: 'w,
+    {
         let inner = WorkRequestInner {
             wr_id,
             wc: OnceLock::new(),
@@ -1136,8 +1227,85 @@ impl<T: ToQpType> QueuePair<T, RTS> {
         let wr = WorkRequest {
             cq: self.inner.send_cq.clone(),
             wr_key,
-            _qp: Arc::clone(&self.inner),
-            _mr: Arc::clone(&mr.inner),
+            _marker: PhantomData,
+        };
+        Ok(wr)
+    }
+
+    #[inline]
+    pub fn post_send_gather<'q, 'm, 'w>(
+        &'q self,
+        ms: &'m [MemorySegment<RO>],
+        wr_id: u64,
+    ) -> io::Result<WorkRequest<'w>>
+    where
+        'q: 'w,
+        'm: 'w,
+    {
+        let inner = WorkRequestInner {
+            wr_id,
+            wc: OnceLock::new(),
+            waker: OnceLock::new(),
+        };
+        // Panics if too many items in the slab.
+        let wr_key = self.inner.send_cq.0.wr_slab.insert(inner).unwrap();
+        self.inner.qp.post_send_gather(ms, wr_key as u64)?;
+        let wr = WorkRequest {
+            cq: self.inner.send_cq.clone(),
+            wr_key,
+            _marker: PhantomData,
+        };
+        Ok(wr)
+    }
+
+    #[inline]
+    pub fn post_recv<'q, 'm, 'w>(
+        &'q self,
+        mr: &'m mut MemoryRegion<T>,
+        wr_id: u64,
+    ) -> io::Result<WorkRequest<'w>>
+    where
+        'q: 'w,
+        'm: 'w,
+    {
+        let inner = WorkRequestInner {
+            wr_id,
+            wc: OnceLock::new(),
+            waker: OnceLock::new(),
+        };
+        // Panics if too many items in the slab.
+        let wr_key = self.inner.recv_cq.0.wr_slab.insert(inner).unwrap();
+        self.inner.qp.post_recv(mr, wr_key as u64)?;
+        let wr = WorkRequest {
+            cq: self.inner.recv_cq.clone(),
+            wr_key,
+            _marker: PhantomData,
+        };
+        Ok(wr)
+    }
+
+    #[inline]
+    pub fn post_recv_scatter<'q, 'm, 'w>(
+        &'q self,
+        ms: &'m [MemorySegment<RW>],
+        wr_id: u64,
+    ) -> io::Result<WorkRequest<'w>>
+    where
+        'q: 'w,
+        'm: 'w,
+    {
+        let inner = WorkRequestInner {
+            wr_id,
+            wc: OnceLock::new(),
+            waker: OnceLock::new(),
+        };
+        // Panics if too many items in the slab.
+        let wr_key = self.inner.send_cq.0.wr_slab.insert(inner).unwrap();
+        self.inner.qp.post_recv_scatter(ms, wr_key as u64)?;
+        let wr = WorkRequest {
+            cq: self.inner.send_cq.clone(),
+            wr_key,
+            _marker: PhantomData,
         };
         Ok(wr)
     }
@@ -1146,6 +1314,7 @@ impl<T: ToQpType> QueuePair<T, RTS> {
 struct OwnedMemoryRegionOpaque {
     mr: *mut ffi::ibv_mr,
     data: Box<[u8]>,
+    intervals: Mutex<IntervalTree>,
 }
 
 unsafe impl Send for OwnedMemoryRegionOpaque {}
@@ -1196,48 +1365,197 @@ impl<T> DerefMut for MemoryRegion<T> {
     }
 }
 
-use core::ops::Range;
-
-pub struct MemorySegment {
+pub struct MemorySegment<P: 'static> {
     mr: Arc<OwnedMemoryRegionOpaque>,
     range: Range<usize>,
+    _permission: PhantomData<P>,
 }
 
-// impl<T> MemoryRegion<T> {
-//     /// Get the remote authentication key used to allow direct remote access to this memory region.
-//     pub fn rkey(&self) -> RemoteKey {
-//         RemoteKey {
-//             key: unsafe { &*self.inner.mr }.rkey,
-//         }
-//     }
-//
-//     pub fn get_readonly(&self) -> MemorySegment<RO> {
-//     }
-//     pub fn get_readwrite(self) -> MemorySegment<RW> {
-//     }
-// }
-//
+pub struct RW;
+pub struct RO;
+
+impl<P: 'static> Drop for MemorySegment<P> {
+    fn drop(&mut self) {
+        let mut intervals = self.mr.intervals.lock().unwrap();
+        intervals.remove::<P>(&self.range).unwrap()
+    }
+}
+
+// TODO: implement it with balance tree
+struct IntervalTree {
+    ro_intervals: Vec<Range<usize>>,
+    rw_intervals: Vec<Range<usize>>,
+}
+
+impl IntervalTree {
+    fn new() -> Self {
+        IntervalTree {
+            ro_intervals: Vec::new(),
+            rw_intervals: Vec::new(),
+        }
+    }
+
+    fn check_overlap(range: Range<usize>, intervals: &[Range<usize>]) -> bool {
+        for r in intervals {
+            if r.start < range.end && r.end > range.start {
+                return true;
+            }
+            if r.start >= range.end {
+                break;
+            }
+        }
+        false
+    }
+
+    fn insert(range: Range<usize>, intervals: &mut Vec<Range<usize>>) {
+        let pos = intervals
+            .iter()
+            .rposition(|r| range.start >= r.start)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        intervals.insert(pos, range);
+    }
+
+    fn try_insert_readonly(&mut self, range: Range<usize>) -> Result<(), ()> {
+        // returns Err if it conflicts with any rw_interval
+        // for all r, where r.start < range.end, find the maximal of r.end
+        if Self::check_overlap(range.clone(), &self.rw_intervals) {
+            return Err(());
+        }
+        Self::insert(range, &mut self.ro_intervals);
+        Ok(())
+    }
+
+    fn try_insert_readwrite(&mut self, range: Range<usize>) -> Result<(), ()> {
+        // returns Err if it conflicts with any interval
+        if Self::check_overlap(range.clone(), &self.rw_intervals) {
+            return Err(());
+        }
+        if Self::check_overlap(range.clone(), &self.ro_intervals) {
+            return Err(());
+        }
+        Self::insert(range, &mut self.rw_intervals);
+        Ok(())
+    }
+
+    fn _remove(range: &Range<usize>, intervals: &mut Vec<Range<usize>>) -> Result<(), ()> {
+        let pos = intervals.iter().position(|r| r == range).ok_or(())?;
+        intervals.remove(pos);
+        Ok(())
+    }
+
+    fn remove<R: 'static>(&mut self, range: &Range<usize>) -> Result<(), ()> {
+        if TypeId::of::<R>() == TypeId::of::<RO>() {
+            Self::_remove(range, &mut self.ro_intervals)
+        } else if TypeId::of::<R>() == TypeId::of::<RW>() {
+            Self::_remove(range, &mut self.rw_intervals)
+        } else {
+            unreachable!()
+        }
+    }
+}
+
+impl<T> MemoryRegion<T> {
+    /// Get the remote authentication key used to allow direct remote access to this memory region.
+    pub fn rkey(&self) -> RemoteKey {
+        RemoteKey {
+            key: unsafe { &*self.inner.mr }.rkey,
+        }
+    }
+
+    pub fn get_readonly(&self, range: Range<usize>) -> Option<MemorySegment<RO>> {
+        let mut intervals = self.inner.intervals.lock().unwrap();
+        intervals
+            .try_insert_readonly(range.clone())
+            .ok()
+            .map(|_| MemorySegment {
+                mr: Arc::clone(&self.inner),
+                range: Range {
+                    start: range.start * size_of::<T>(),
+                    end: range.end * size_of::<T>(),
+                },
+                _permission: PhantomData,
+            })
+    }
+
+    pub fn get_readwrite(&self, range: Range<usize>) -> Option<MemorySegment<RW>> {
+        let mut intervals = self.inner.intervals.lock().unwrap();
+        intervals
+            .try_insert_readwrite(range.clone())
+            .ok()
+            .map(|_| MemorySegment {
+                mr: Arc::clone(&self.inner),
+                range: Range {
+                    start: range.start * size_of::<T>(),
+                    end: range.end * size_of::<T>(),
+                },
+                _permission: PhantomData,
+            })
+    }
+}
+
 // impl MemorySegment<RO> {
-//     pub fn get_readonly(&self) -> MemorySegment<RO> {
-//     }
+//     pub fn get_readonly(&self, range: Range<usize>) -> MemorySegment<RO> {}
 // }
 
-// use std::sync::atomic::AtomicIsize;
-//
-// pub struct MemoryRegion<T> {
-//     mr: *mut ffi::ibv_mr,
-//     data: Box<[T]>,
-//     refcnt: AtomicIsize,
-// }
-//
-// unsafe impl<T> Send for MemoryRegion<T> {}
-// unsafe impl<T> Sync for MemoryRegion<T> {}
-//
-// impl<T> MemoryRegion<T> {
-//     fn get_readonly<R>(&self, range: R) -> Option<MemorySegment> {
-//         self.refcnt.fetch_update(Ordering::Acquire, Ordering::Relaxed, |c| );
-//     }
-//
-//     fn get_readwrite<R>(&mut self, range: R) -> Option<MemorySegment> {
-//     }
-// }
+impl<T> SliceIndex<MemoryRegion<T>> for Range<usize> {
+    type Output = MemorySegment<RO>;
+
+    #[inline]
+    unsafe fn get_unchecked(self, slice: &MemoryRegion<T>) -> &MemorySegment<RO> {
+        use std::slice::from_raw_parts;
+        from_raw_parts(slice.as_ptr().add(self.start), self.end - self.start)
+    }
+
+    #[inline]
+    fn index(self, slice: &MemoryRegion<T>) -> &MemorySegment<RO> {
+        if self.start > self.end {
+            slice_index_order_fail(self.start, self.end);
+        } else if self.end > slice.len() {
+            slice_index_len_fail(self.end, slice.len());
+        }
+        unsafe { self.get_unchecked(slice) }
+    }
+}
+
+impl<T> SliceIndex<[T]> for ops::RangeTo<usize> {
+    type Output = [T];
+
+    #[inline]
+    unsafe fn get_unchecked(self, slice: &[T]) -> &[T] {
+        (0..self.end).get_unchecked(slice)
+    }
+
+    #[inline]
+    fn index(self, slice: &[T]) -> &[T] {
+        (0..self.end).index(slice)
+    }
+}
+
+impl<T> SliceIndex<[T]> for ops::RangeFrom<usize> {
+    type Output = [T];
+
+    #[inline]
+    unsafe fn get_unchecked(self, slice: &[T]) -> &[T] {
+        (self.start..slice.len()).get_unchecked(slice)
+    }
+
+    #[inline]
+    fn index(self, slice: &[T]) -> &[T] {
+        (self.start..slice.len()).index(slice)
+    }
+}
+
+impl<T> SliceIndex<[T]> for ops::RangeFull {
+    type Output = [T];
+
+    #[inline]
+    unsafe fn get_unchecked(self, slice: &[T]) -> &[T] {
+        slice
+    }
+
+    #[inline]
+    fn index(self, slice: &[T]) -> &[T] {
+        slice
+    }
+}
