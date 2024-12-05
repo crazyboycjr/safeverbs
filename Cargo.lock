@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "ibverbs-sys"
-version = "0.2.1+52.0"
+version = "0.2.2+54.0"
 dependencies = [
  "bindgen",
  "cmake",

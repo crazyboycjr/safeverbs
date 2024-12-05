@@ -1,3 +1,4 @@
 [submodule "rust-ibverbs"]
 	path = rust-ibverbs
-	url = ./rust-ibverbs
+	url = https://github.com/crazyboycjr/rust-ibverbs.git
+	branch = safeverbs

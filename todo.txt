@@ -1,0 +1,9 @@
+-[ ] MemorySegment that does not bear the overhead of maintaining
+non-overlapping segments.
+-[ ] IntervalTree reimplement
+-[ ] thread-local version of everything, and a function localize to pin
+them to one thread (to convert to the thread-local version of the object).
+-[ ] derive(Debug) for all sort of resources
+-[ ] post_send_batch
+-[ ] doc for unsafe function
+-[ ] organize code into different modules
