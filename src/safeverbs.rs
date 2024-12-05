@@ -648,12 +648,14 @@ impl OwnedQueuePair {
             Ok(())
         }
     }
-    unsafe fn post_recv<T>(&self, ms: &MemorySegment<T, WO>, wr_id: u64) -> io::Result<()> {
+
+    unsafe fn post_recv<T>(&self, ms: &MemorySegment<T, RW>, wr_id: u64) -> io::Result<()> {
         self.post_recv_scatter(&[ms.get_opaque()], wr_id)
     }
+
     unsafe fn post_recv_scatter(
         &self,
-        ms: &[MemorySegmentOpaque<WO>],
+        ms: &[MemorySegmentOpaque<RW>],
         wr_id: u64,
     ) -> io::Result<()> {
         let mut sglist = Vec::with_capacity(ms.len());
@@ -1296,7 +1298,7 @@ impl<T: ToQpType> QueuePair<T, RTS> {
     #[inline]
     pub fn post_recv<'q, 'm, 'w, V>(
         &'q self,
-        ms: &'m MemorySegment<V, WO>,
+        ms: &'m MemorySegment<V, RW>,
         wr_id: u64,
     ) -> io::Result<WorkRequest<'w>>
     where
@@ -1324,7 +1326,7 @@ impl<T: ToQpType> QueuePair<T, RTS> {
     #[inline]
     pub fn post_recv_scatter<'q, 'm, 'w>(
         &'q self,
-        ms: &'m [MemorySegmentOpaque<WO>],
+        ms: &'m [MemorySegmentOpaque<RW>],
         wr_id: u64,
     ) -> io::Result<WorkRequest<'w>>
     where
@@ -1417,8 +1419,8 @@ impl OwnedMemoryRegionOpaque {
     ///
     /// # Safety
     ///
-    /// The user must ensure a write-only memory segment never overlaps with any other memory segemnt,
-    /// whether they are read-only or write-only.
+    /// The user must ensure a read-write memory segment never overlaps with any other memory segemnt,
+    /// whether they are read-only or read-write.
     ///
     /// The user must also ensure the memory region has proper alignment for T. Other than that, `byte_range`
     /// must also be within the memory region.
@@ -1444,9 +1446,9 @@ impl OwnedMemoryRegionOpaque {
     }
 
     #[inline]
-    fn try_insert_writeonly(&self, range: Range<usize>) -> Result<(), ()> {
+    fn try_insert_readwrite(&self, range: Range<usize>) -> Result<(), ()> {
         let mut intervals = self.intervals.lock().unwrap();
-        intervals.try_insert_writeonly(range)
+        intervals.try_insert_readwrite(range)
     }
 }
 
@@ -1455,7 +1457,7 @@ pub struct MemorySegment<T, P: 'static> {
     _marker: PhantomData<T>,
 }
 
-pub struct WO;
+pub struct RW;
 pub struct RO;
 
 mod sealed {
@@ -1464,9 +1466,9 @@ mod sealed {
 use sealed::Sealed;
 pub trait Permission: 'static + Sealed {}
 impl Sealed for RO {}
-impl Sealed for WO {}
+impl Sealed for RW {}
 impl Permission for RO {}
-impl Permission for WO {}
+impl Permission for RW {}
 
 impl<T, P: 'static> Drop for MemorySegment<T, P> {
     fn drop(&mut self) {
@@ -1478,6 +1480,12 @@ impl<T, P: 'static> Drop for MemorySegment<T, P> {
 impl<T, P> AsRef<MemorySegmentOpaque<P>> for MemorySegment<T, P> {
     fn as_ref(&self) -> &MemorySegmentOpaque<P> {
         &self.opaque
+    }
+}
+
+impl<T> AsRef<[T]> for MemorySegment<T, RO> {
+    fn as_ref(&self) -> &[T] {
+        self.deref().as_ref()
     }
 }
 
@@ -1496,36 +1504,20 @@ impl<T> Deref for MemorySegment<T, RO> {
     }
 }
 
-impl<T> MemorySegment<T, WO> {
+// MemorySegment<T, RW> only implements AsMut<[T]>.
+impl<T> AsMut<[T]> for MemorySegment<T, RW> {
     /// Creates a mutable slice from MemorySegment<T, O>.
-    ///
-    /// # Safety
-    ///
-    /// The mutable slice should only be used to write into. Any read out of the slide can
-    /// cause *undefined behavior*.
-    ///
-    /// TODO(cjr): I think it is okay to read as long as read also takes in a mutable reference.
-    unsafe fn get_uncheck_mut(&mut self) -> &mut [T] {
-        slice::from_raw_parts_mut(
-            Arc::get_mut(&mut self.opaque.mr)
-                .unwrap()
-                .data
-                .as_mut_ptr()
-                .cast(),
-            self.opaque.mr.data.len() / size_of::<T>(),
-        )
-    }
-}
-
-impl<T: Clone> MemorySegment<T, WO> {
-    pub fn clone_from_slice(&mut self, src: &[T]) {
-        unsafe { self.get_uncheck_mut() }.clone_from_slice(src);
-    }
-}
-
-impl<T: Copy> MemorySegment<T, WO> {
-    pub fn copy_from_slice(&mut self, src: &[T]) {
-        unsafe { self.get_uncheck_mut() }.copy_from_slice(src);
+    fn as_mut(&mut self) -> &mut [T] {
+        unsafe {
+            slice::from_raw_parts_mut(
+                Arc::get_mut(&mut self.opaque.mr)
+                    .unwrap()
+                    .data
+                    .as_mut_ptr()
+                    .cast(),
+                self.opaque.mr.data.len() / size_of::<T>(),
+            )
+        }
     }
 }
 
@@ -1607,8 +1599,8 @@ impl<T> MemorySegment<T, RO> {
     }
 }
 
-impl<T> MemorySegment<T, WO> {
-    /// Consume an write-only memory segment and make it read-only.
+impl<T> MemorySegment<T, RW> {
+    /// Consume an read-write memory segment and make it read-only.
     #[inline]
     pub fn freeze(self) -> MemorySegment<T, RO> {
         // SAFETY: This is okay because they have the same layout.
@@ -1658,8 +1650,8 @@ impl<T> MemoryRegion<T> {
     ///
     /// # Safety
     ///
-    /// The user must ensure a write-only memory segment never overlaps with any other memory segemnt,
-    /// whether they are read-only or write-only.
+    /// The user must ensure a read-write memory segment never overlaps with any other memory segemnt,
+    /// whether they are read-only or read-write.
     #[inline]
     pub unsafe fn get_unchecked<P: Permission>(&self, range: Range<usize>) -> MemorySegment<T, P> {
         Arc::clone(&self.inner).get_unchecked(Self::byte_range(range))
@@ -1675,13 +1667,13 @@ impl<T> MemoryRegion<T> {
         self.get_unchecked(range)
     }
 
-    /// Returns a write-only `MemorySegment` that may overlap with other `MemorySegment`s.
+    /// Returns a read-write `MemorySegment` that may overlap with other `MemorySegment`s.
     ///
     /// # Safety
     ///
     /// Refer to [`Self::get_unchecked`].
     #[inline]
-    pub unsafe fn get_writeonly_unchecked(&self, range: Range<usize>) -> MemorySegment<T, WO> {
+    pub unsafe fn get_readwrite_unchecked(&self, range: Range<usize>) -> MemorySegment<T, RW> {
         self.get_unchecked(range)
     }
 
@@ -1691,8 +1683,8 @@ impl<T> MemoryRegion<T> {
     }
 
     #[inline]
-    pub fn try_insert_writeonly(&self, range: Range<usize>) -> Result<(), ()> {
-        self.inner.try_insert_writeonly(range)
+    pub fn try_insert_readwrite(&self, range: Range<usize>) -> Result<(), ()> {
+        self.inner.try_insert_readwrite(range)
     }
 
     #[inline]
@@ -1705,12 +1697,12 @@ impl<T> MemoryRegion<T> {
     }
 
     #[inline]
-    pub fn get_writeonly<R: RangeBounds<usize>>(&self, range: R) -> Option<MemorySegment<T, WO>> {
+    pub fn get_readwrite<R: RangeBounds<usize>>(&self, range: R) -> Option<MemorySegment<T, RW>> {
         let range = self.convert_to_range(range);
         self.check_range(&range);
-        self.try_insert_writeonly(range.clone())
+        self.try_insert_readwrite(range.clone())
             .ok()
-            .map(|_| unsafe { self.get_writeonly_unchecked(range) })
+            .map(|_| unsafe { self.get_readwrite_unchecked(range) })
     }
 }
 
@@ -1740,14 +1732,14 @@ fn mr_index_len_fail(index: usize, len: usize) -> ! {
 // TODO: implement it with balance tree
 struct IntervalTree {
     ro_intervals: Vec<Range<usize>>,
-    wo_intervals: Vec<Range<usize>>,
+    rw_intervals: Vec<Range<usize>>,
 }
 
 impl IntervalTree {
     fn new() -> Self {
         IntervalTree {
             ro_intervals: Vec::new(),
-            wo_intervals: Vec::new(),
+            rw_intervals: Vec::new(),
         }
     }
 
@@ -1773,24 +1765,24 @@ impl IntervalTree {
     }
 
     fn try_insert_readonly(&mut self, range: Range<usize>) -> Result<(), ()> {
-        // returns Err if it conflicts with any wo_interval
+        // returns Err if it conflicts with any rw_interval
         // for all r, where r.start < range.end, find the maximal of r.end
-        if Self::check_overlap(range.clone(), &self.wo_intervals) {
+        if Self::check_overlap(range.clone(), &self.rw_intervals) {
             return Err(());
         }
         Self::insert(range, &mut self.ro_intervals);
         Ok(())
     }
 
-    fn try_insert_writeonly(&mut self, range: Range<usize>) -> Result<(), ()> {
+    fn try_insert_readwrite(&mut self, range: Range<usize>) -> Result<(), ()> {
         // returns Err if it conflicts with any interval
-        if Self::check_overlap(range.clone(), &self.wo_intervals) {
+        if Self::check_overlap(range.clone(), &self.rw_intervals) {
             return Err(());
         }
         if Self::check_overlap(range.clone(), &self.ro_intervals) {
             return Err(());
         }
-        Self::insert(range, &mut self.wo_intervals);
+        Self::insert(range, &mut self.rw_intervals);
         Ok(())
     }
 
@@ -1803,8 +1795,8 @@ impl IntervalTree {
     fn remove<P: 'static>(&mut self, range: &Range<usize>) -> Result<(), ()> {
         if TypeId::of::<P>() == TypeId::of::<RO>() {
             Self::_remove(range, &mut self.ro_intervals)
-        } else if TypeId::of::<P>() == TypeId::of::<WO>() {
-            Self::_remove(range, &mut self.wo_intervals)
+        } else if TypeId::of::<P>() == TypeId::of::<RW>() {
+            Self::_remove(range, &mut self.rw_intervals)
         } else {
             unreachable!()
         }
