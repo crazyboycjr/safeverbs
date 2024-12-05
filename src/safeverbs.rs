@@ -609,8 +609,7 @@ impl OwnedQueuePair {
         }
     }
 
-    unsafe fn post_send<T>(&self, mr: &MemoryRegion<T>, wr_id: u64) -> io::Result<()> {
-        let ms = mr.get_readonly(..).expect("Failed to get MemorySegment");
+    unsafe fn post_send<T>(&self, ms: &MemorySegment<T, RO>, wr_id: u64) -> io::Result<()> {
         self.post_send_gather(&[ms.get_opaque()], wr_id)
     }
 
@@ -626,7 +625,7 @@ impl OwnedQueuePair {
                 addr: slice.as_ptr() as u64,
                 length: mem::size_of_val(slice) as u32,
                 // SAFETY: mr is guarded by Arc, so it should be valid.
-                lkey: unsafe { *m.mr.mr }.lkey,
+                lkey: m.mr.lkey(),
             });
         }
         let mut wr = ffi::ibv_send_wr {
@@ -640,25 +639,49 @@ impl OwnedQueuePair {
         };
         let mut bad_wr = ptr::null_mut();
 
-        // SAFETY: qp is valid since it cannot be destoryed by other means.
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe { ops.post_send.as_mut().unwrap()(self.qp, &mut wr, &mut bad_wr) };
+        let ctx = (*self.qp).context;
+        let ops = &mut (*ctx).ops;
+        let errno = ops.post_send.as_mut().unwrap()(self.qp, &mut wr, &mut bad_wr);
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {
             Ok(())
         }
     }
-    unsafe fn post_recv<T>(&self, _mr: &mut MemoryRegion<T>, _wr_id: u64) -> io::Result<()> {
-        todo!()
+    unsafe fn post_recv<T>(&self, ms: &MemorySegment<T, WO>, wr_id: u64) -> io::Result<()> {
+        self.post_recv_scatter(&[ms.get_opaque()], wr_id)
     }
     unsafe fn post_recv_scatter(
         &self,
-        _mr: &[MemorySegmentOpaque<WO>],
-        _wr_id: u64,
+        ms: &[MemorySegmentOpaque<WO>],
+        wr_id: u64,
     ) -> io::Result<()> {
-        todo!()
+        let mut sglist = Vec::with_capacity(ms.len());
+        for m in ms {
+            let slice = &m.mr.data.as_ref()[m.range.start..m.range.end];
+            sglist.push(ffi::ibv_sge {
+                addr: slice.as_ptr() as u64,
+                length: mem::size_of_val(slice) as u32,
+                // SAFETY: mr is guarded by Arc, so it should be valid.
+                lkey: m.mr.lkey(),
+            });
+        }
+        let mut wr = ffi::ibv_recv_wr {
+            wr_id,
+            next: ptr::null_mut(),
+            sg_list: sglist.as_mut_ptr(),
+            num_sge: sglist.len() as i32,
+        };
+        let mut bad_wr = ptr::null_mut();
+
+        let ctx = (*self.qp).context;
+        let ops = &mut (*ctx).ops;
+        let errno = ops.post_recv.as_mut().unwrap()(self.qp, &mut wr, &mut bad_wr);
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
     }
     // fn post_send_batch<T>(&self, mr: &MemoryRegion<T>) -> io::Result<()> {
     //     todo!()
@@ -1215,9 +1238,9 @@ impl<'w> Future for WorkRequest<'w> {
 // Data-verbs
 impl<T: ToQpType> QueuePair<T, RTS> {
     #[inline]
-    pub fn post_send<'q, 'm, 'w>(
+    pub fn post_send<'q, 'm, 'w, V>(
         &'q self,
-        mr: &'m MemoryRegion<T>,
+        ms: &'m MemorySegment<V, RO>,
         wr_id: u64,
     ) -> io::Result<WorkRequest<'w>>
     where
@@ -1232,7 +1255,7 @@ impl<T: ToQpType> QueuePair<T, RTS> {
         // Panics if too many items in the slab.
         let wr_key = self.inner.send_cq.0.wr_slab.insert(inner).unwrap();
         unsafe {
-            self.inner.qp.post_send(mr, wr_key as u64)?;
+            self.inner.qp.post_send(ms, wr_key as u64)?;
         }
         let wr = WorkRequest {
             cq: self.inner.send_cq.clone(),
@@ -1271,9 +1294,9 @@ impl<T: ToQpType> QueuePair<T, RTS> {
     }
 
     #[inline]
-    pub fn post_recv<'q, 'm, 'w>(
+    pub fn post_recv<'q, 'm, 'w, V>(
         &'q self,
-        mr: &'m mut MemoryRegion<T>,
+        ms: &'m MemorySegment<V, WO>,
         wr_id: u64,
     ) -> io::Result<WorkRequest<'w>>
     where
@@ -1288,7 +1311,7 @@ impl<T: ToQpType> QueuePair<T, RTS> {
         // Panics if too many items in the slab.
         let wr_key = self.inner.recv_cq.0.wr_slab.insert(inner).unwrap();
         unsafe {
-            self.inner.qp.post_recv(mr, wr_key as u64)?;
+            self.inner.qp.post_recv(ms, wr_key as u64)?;
         }
         let wr = WorkRequest {
             cq: self.inner.recv_cq.clone(),
@@ -1351,8 +1374,18 @@ pub struct MemoryRegion<T> {
     _marker: PhantomData<T>,
 }
 
+impl<T> Clone for MemoryRegion<T> {
+    fn clone(&self) -> Self {
+        MemoryRegion {
+            inner: Arc::clone(&self.inner),
+            _marker: PhantomData,
+        }
+    }
+}
+
 pub struct MemorySegmentOpaque<P: 'static> {
     mr: Arc<OwnedMemoryRegionOpaque>,
+    // Range in bytes
     range: Range<usize>,
     _permission: PhantomData<P>,
 }
@@ -1364,6 +1397,56 @@ impl<P> Clone for MemorySegmentOpaque<P> {
             range: self.range.clone(),
             _permission: PhantomData,
         }
+    }
+}
+
+impl OwnedMemoryRegionOpaque {
+    /// Get the remote authentication key used to allow direct remote access to this memory region.
+    fn rkey(&self) -> RemoteKey {
+        RemoteKey {
+            key: unsafe { &*self.mr }.rkey,
+        }
+    }
+
+    /// Get the local key.
+    fn lkey(&self) -> u32 {
+        unsafe { &*self.mr }.lkey
+    }
+
+    /// Returns a `MemorySegment` that may overlap with other `MemorySegment`s.
+    ///
+    /// # Safety
+    ///
+    /// The user must ensure a write-only memory segment never overlaps with any other memory segemnt,
+    /// whether they are read-only or write-only.
+    ///
+    /// The user must also ensure the memory region has proper alignment for T. Other than that, `byte_range`
+    /// must also be within the memory region.
+    #[inline]
+    unsafe fn get_unchecked<T, P: Permission>(
+        self: Arc<Self>,
+        byte_range: Range<usize>,
+    ) -> MemorySegment<T, P> {
+        MemorySegment {
+            opaque: MemorySegmentOpaque {
+                mr: Arc::clone(&self),
+                range: byte_range,
+                _permission: PhantomData,
+            },
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn try_insert_readonly(&self, range: Range<usize>) -> Result<(), ()> {
+        let mut intervals = self.intervals.lock().unwrap();
+        intervals.try_insert_readonly(range)
+    }
+
+    #[inline]
+    fn try_insert_writeonly(&self, range: Range<usize>) -> Result<(), ()> {
+        let mut intervals = self.intervals.lock().unwrap();
+        intervals.try_insert_writeonly(range)
     }
 }
 
@@ -1446,11 +1529,81 @@ impl<T: Copy> MemorySegment<T, WO> {
     }
 }
 
-impl<T> MemorySegment<T, RO> {
-    // pub fn get_readonly(&self, range: Range<usize>) -> MemorySegment<RO> {}
+impl<T, P> MemorySegment<T, P> {
     #[inline]
-    pub fn get_opaque(&self) -> MemorySegmentOpaque<RO> {
+    pub fn get_opaque(&self) -> MemorySegmentOpaque<P> {
         self.opaque.clone()
+    }
+}
+
+impl<T> MemorySegment<T, RO> {
+    /// Get the remote authentication key used to allow direct remote access to this memory region.
+    #[inline]
+    pub fn rkey(&self) -> RemoteKey {
+        self.opaque.mr.rkey()
+    }
+
+    fn byte_range(range: Range<usize>) -> Range<usize> {
+        Range {
+            start: range.start * size_of::<T>(),
+            end: range.end * size_of::<T>(),
+        }
+    }
+
+    fn check_range(&self, range: &Range<usize>) {
+        if range.start > range.end {
+            mr_index_order_fail(range.start, range.end);
+        } else if range.end * mem::size_of::<T>() > self.opaque.range.end {
+            mr_index_len_fail(range.end, self.opaque.range.end / mem::size_of::<T>());
+        }
+    }
+
+    /// To use with [`get_readonly_unchecked`] and [`try_insert_readonly`].
+    #[inline]
+    pub fn convert_to_range<R: RangeBounds<usize>>(&self, range: R) -> Range<usize> {
+        use core::ops::Bound;
+        let start = match range.start_bound() {
+            Bound::Included(s) => *s,
+            Bound::Excluded(_) => unreachable!(),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(e) => *e + 1,
+            Bound::Excluded(e) => *e,
+            Bound::Unbounded => self.opaque.range.end / mem::size_of::<T>(),
+        };
+        Range { start, end }
+    }
+
+    /// Returns a read-only `MemorySegment` that may overlap with other `MemorySegment`s.
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`Self::get_unchecked`].
+    #[inline]
+    pub unsafe fn get_readonly_unchecked(&self, range: Range<usize>) -> MemorySegment<T, RO> {
+        let byte_range = Self::byte_range(range);
+        let range = Range {
+            start: self.opaque.range.start + byte_range.start,
+            end: self.opaque.range.start + byte_range.end,
+        };
+        Arc::clone(&self.opaque.mr).get_unchecked(range)
+    }
+
+    #[inline]
+    pub fn try_insert_readonly(&self, range: Range<usize>) -> Result<(), ()> {
+        self.opaque.mr.try_insert_readonly(range)
+    }
+
+    #[inline]
+    pub fn get_readonly<R: RangeBounds<usize>>(&self, range: R) -> Option<MemorySegment<T, RO>> {
+        let range = self.convert_to_range(range);
+        self.check_range(&range);
+        self.opaque
+            .mr
+            .try_insert_readonly(range.clone())
+            .ok()
+            .map(|_| unsafe { self.get_readonly_unchecked(range) })
     }
 }
 
@@ -1462,6 +1615,127 @@ impl<T> MemorySegment<T, WO> {
         unsafe { mem::transmute(self) }
     }
 }
+
+impl<T> MemoryRegion<T> {
+    /// Get the remote authentication key used to allow direct remote access to this memory region.
+    #[inline]
+    pub fn rkey(&self) -> RemoteKey {
+        self.inner.rkey()
+    }
+
+    fn byte_range(range: Range<usize>) -> Range<usize> {
+        Range {
+            start: range.start * size_of::<T>(),
+            end: range.end * size_of::<T>(),
+        }
+    }
+
+    fn check_range(&self, range: &Range<usize>) {
+        if range.start > range.end {
+            mr_index_order_fail(range.start, range.end);
+        } else if range.end * mem::size_of::<T>() > self.inner.data.len() {
+            mr_index_len_fail(range.end, self.inner.data.len() / mem::size_of::<T>());
+        }
+    }
+
+    #[inline]
+    pub fn convert_to_range<R: RangeBounds<usize>>(&self, range: R) -> Range<usize> {
+        use core::ops::Bound;
+        let start = match range.start_bound() {
+            Bound::Included(s) => *s,
+            Bound::Excluded(_) => unreachable!(),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(e) => *e + 1,
+            Bound::Excluded(e) => *e,
+            Bound::Unbounded => self.inner.data.len() / mem::size_of::<T>(),
+        };
+        Range { start, end }
+    }
+
+    /// Returns a `MemorySegment` that may overlap with other `MemorySegment`s.
+    ///
+    /// # Safety
+    ///
+    /// The user must ensure a write-only memory segment never overlaps with any other memory segemnt,
+    /// whether they are read-only or write-only.
+    #[inline]
+    pub unsafe fn get_unchecked<P: Permission>(&self, range: Range<usize>) -> MemorySegment<T, P> {
+        Arc::clone(&self.inner).get_unchecked(Self::byte_range(range))
+    }
+
+    /// Returns a read-only `MemorySegment` that may overlap with other `MemorySegment`s.
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`Self::get_unchecked`].
+    #[inline]
+    pub unsafe fn get_readonly_unchecked(&self, range: Range<usize>) -> MemorySegment<T, RO> {
+        self.get_unchecked(range)
+    }
+
+    /// Returns a write-only `MemorySegment` that may overlap with other `MemorySegment`s.
+    ///
+    /// # Safety
+    ///
+    /// Refer to [`Self::get_unchecked`].
+    #[inline]
+    pub unsafe fn get_writeonly_unchecked(&self, range: Range<usize>) -> MemorySegment<T, WO> {
+        self.get_unchecked(range)
+    }
+
+    #[inline]
+    pub fn try_insert_readonly(&self, range: Range<usize>) -> Result<(), ()> {
+        self.inner.try_insert_readonly(range)
+    }
+
+    #[inline]
+    pub fn try_insert_writeonly(&self, range: Range<usize>) -> Result<(), ()> {
+        self.inner.try_insert_writeonly(range)
+    }
+
+    #[inline]
+    pub fn get_readonly<R: RangeBounds<usize>>(&self, range: R) -> Option<MemorySegment<T, RO>> {
+        let range = self.convert_to_range(range);
+        self.check_range(&range);
+        self.try_insert_readonly(range.clone())
+            .ok()
+            .map(|_| unsafe { self.get_readonly_unchecked(range) })
+    }
+
+    #[inline]
+    pub fn get_writeonly<R: RangeBounds<usize>>(&self, range: R) -> Option<MemorySegment<T, WO>> {
+        let range = self.convert_to_range(range);
+        self.check_range(&range);
+        self.try_insert_writeonly(range.clone())
+            .ok()
+            .map(|_| unsafe { self.get_writeonly_unchecked(range) })
+    }
+}
+
+#[inline(never)]
+#[cold]
+fn mr_index_order_fail(index: usize, end: usize) -> ! {
+    panic!("MemoryRegion index starts at {} but ends at {}", index, end);
+}
+
+#[inline(never)]
+#[cold]
+fn mr_index_len_fail(index: usize, len: usize) -> ! {
+    panic!(
+        "index {} out of range for MemoryRegion of length {}",
+        index, len
+    );
+}
+
+// scatter gather DMA
+// -> Lifetime cannot satisfy out needs. That's why we have MemorySegment<P>
+// allow non-overlappped post_send and post_recv
+// allow overlapped post_recvs in unsafe
+// Disallow:
+//   Overlapping post_recv
+//   Concurrent post_recv and post_send for overlapped memory region
 
 // TODO: implement it with balance tree
 struct IntervalTree {
@@ -1536,144 +1810,3 @@ impl IntervalTree {
         }
     }
 }
-
-impl<T> MemoryRegion<T> {
-    /// Get the remote authentication key used to allow direct remote access to this memory region.
-    #[inline]
-    pub fn rkey(&self) -> RemoteKey {
-        RemoteKey {
-            key: unsafe { &*self.inner.mr }.rkey,
-        }
-    }
-
-    #[inline]
-    fn byte_range(range: Range<usize>) -> Range<usize> {
-        Range {
-            start: range.start * size_of::<T>(),
-            end: range.end * size_of::<T>(),
-        }
-    }
-
-    /// Returns a `MemorySegment` that may overlap with other `MemorySegment`s.
-    ///
-    /// # Safety
-    ///
-    /// The user must ensure a write-only memory segment never overlaps with any other memory segemnt,
-    /// whether they are read-only or write-only.
-    #[inline]
-    pub unsafe fn get_unchecked<P: Permission>(&self, range: Range<usize>) -> MemorySegment<T, P> {
-        MemorySegment {
-            opaque: MemorySegmentOpaque {
-                mr: Arc::clone(&self.inner),
-                range: Self::byte_range(range),
-                _permission: PhantomData,
-            },
-            _marker: PhantomData,
-        }
-    }
-
-    /// Returns a read-only `MemorySegment` that may overlap with other `MemorySegment`s.
-    ///
-    /// # Safety
-    ///
-    /// Refer to [`Self::get_unchecked`].
-    #[inline]
-    pub unsafe fn get_readonly_unchecked(&self, range: Range<usize>) -> MemorySegment<T, RO> {
-        self.get_unchecked(range)
-    }
-
-    /// Returns a write-only `MemorySegment` that may overlap with other `MemorySegment`s.
-    ///
-    /// # Safety
-    ///
-    /// Refer to [`Self::get_unchecked`].
-    #[inline]
-    pub unsafe fn get_writeonly_unchecked(&self, range: Range<usize>) -> MemorySegment<T, WO> {
-        self.get_unchecked(range)
-    }
-
-    #[inline]
-    pub fn try_insert_readonly(&self, range: Range<usize>) -> Result<(), ()> {
-        let mut intervals = self.inner.intervals.lock().unwrap();
-        intervals.try_insert_readonly(range)
-    }
-
-    #[inline]
-    pub fn try_insert_writeonly(&self, range: Range<usize>) -> Result<(), ()> {
-        let mut intervals = self.inner.intervals.lock().unwrap();
-        intervals.try_insert_writeonly(range)
-    }
-
-    fn check_range(&self, range: &Range<usize>) {
-        if range.start > range.end {
-            mr_index_order_fail(range.start, range.end);
-        } else if range.end > self.inner.data.len() {
-            mr_index_len_fail(range.end, self.inner.data.len());
-        }
-    }
-
-    #[inline]
-    fn _get_readonly(&self, range: Range<usize>) -> Option<MemorySegment<T, RO>> {
-        self.check_range(&range);
-        self.try_insert_readonly(range.clone())
-            .ok()
-            .map(|_| unsafe { self.get_readonly_unchecked(range) })
-    }
-
-    #[inline]
-    fn _get_writeonly(&self, range: Range<usize>) -> Option<MemorySegment<T, WO>> {
-        self.check_range(&range);
-        self.try_insert_writeonly(range.clone())
-            .ok()
-            .map(|_| unsafe { self.get_writeonly_unchecked(range) })
-    }
-
-    #[inline]
-    pub fn get_range<R: RangeBounds<usize>>(&self, range: R) -> Range<usize> {
-        use core::ops::Bound;
-        let start = match range.start_bound() {
-            Bound::Included(s) => *s,
-            Bound::Excluded(_) => unreachable!(),
-            Bound::Unbounded => 0,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(e) => *e + 1,
-            Bound::Excluded(e) => *e,
-            Bound::Unbounded => self.inner.data.len(),
-        };
-        Range { start, end }
-    }
-
-    #[inline]
-    pub fn get_readonly<R: RangeBounds<usize>>(&self, range: R) -> Option<MemorySegment<T, RO>> {
-        self._get_readonly(self.get_range(range))
-    }
-
-    #[inline]
-    pub fn get_writeonly<R: RangeBounds<usize>>(&self, range: R) -> Option<MemorySegment<T, WO>> {
-        self._get_writeonly(self.get_range(range))
-    }
-}
-
-#[inline(never)]
-#[cold]
-fn mr_index_order_fail(index: usize, end: usize) -> ! {
-    panic!("MemoryRegion index starts at {} but ends at {}", index, end);
-}
-
-#[inline(never)]
-#[cold]
-fn mr_index_len_fail(index: usize, len: usize) -> ! {
-    panic!(
-        "index {} out of range for MemoryRegion of length {}",
-        index, len
-    );
-}
-
-// scatter gather DMA
-// -> Lifetime cannot satisfy out needs. That's why we have MemorySegment<P>
-// allow non-overlappped post_send and post_recv
-// allow overlapped post_recvs in unsafe
-// Disallow:
-//   Overlapping post_recv
-//   Concurrent post_recv and post_send for overlapped memory region
