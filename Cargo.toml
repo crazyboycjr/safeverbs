@@ -1,3 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["examples/greeter"]
+default-members = ["examples/greeter"]
+
+[workspace.dependencies]
+safeverbs = { path = "." }
+ibverbs = { path = "rust-ibverbs/ibverbs" }
+ibverbs-sys = { path = "rust-ibverbs/ibverbs-sys" }
+serde = { version = "1.0.215", features = ["derive"] }
+sharded-slab = "0.1.7"
+slab = "0.4.9"
+zerocopy = { version = "0.8.10", features = ["derive"] }
+
 [package]
 name = "safeverbs"
 version = "0.1.0"
@@ -6,12 +20,12 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ibverbs = { path = "rust-ibverbs/ibverbs" }
-ibverbs-sys = { path = "rust-ibverbs/ibverbs-sys" }
-serde = { version = "1.0.215", features = ["derive"], optional = true }
-sharded-slab = "0.1.7"
-slab = "0.4.9"
-zerocopy = { version = "0.8.10", features = ["derive"] }
+ibverbs.workspace = true
+ibverbs-sys.workspace = true
+serde = { workspace = true, features = ["derive"], optional = true }
+sharded-slab.workspace = true
+slab.workspace = true
+zerocopy.workspace = true
 
 [features]
 serde = ["dep:serde"]

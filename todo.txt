@@ -1,5 +1,6 @@
--[ ] MemorySegment that does not bear the overhead of maintaining
+-[x] MemorySegment that does not bear the overhead of maintaining
 non-overlapping segments.
+-[ ] Testing code
 -[ ] IntervalTree reimplement
 -[ ] thread-local version of everything, and a function localize to pin
 them to one thread (to convert to the thread-local version of the object).

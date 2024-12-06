@@ -15,6 +15,9 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Poll, Waker};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 // Re-exports
 pub use ibv::{devices, Device, DeviceList, DeviceListIter, Gid, Guid, RemoteKey};
 
@@ -150,7 +153,7 @@ impl ProtectionDomain {
         Ok(QueuePair {
             inner: Arc::new(QueuePairInner {
                 qp,
-                _pd: self.clone(),
+                pd: self.clone(),
                 send_cq: qp_init_attr.send_cq.clone(),
                 recv_cq: qp_init_attr.recv_cq.clone(),
             }),
@@ -418,7 +421,7 @@ impl<T: ConnectionOrientedQpType> QueuePairBuilder<T> {
         let qp = self.pd.create_qp(&self.qp_init_attr)?;
         Ok(PreparedQueuePair {
             port_attr: self.pd.context().port_attr()?,
-            gid: self.pd.context().gid(0)?,
+            gid: self.pd.context().gid(1)?,
             qp,
             setting: self.setting.clone(),
         })
@@ -703,7 +706,7 @@ impl Drop for OwnedQueuePair {
 
 struct QueuePairInner {
     qp: OwnedQueuePair,
-    _pd: ProtectionDomain,
+    pd: ProtectionDomain,
     send_cq: CompletionQueue,
     recv_cq: CompletionQueue,
 }
@@ -720,6 +723,21 @@ pub type RcQueuePair<S> = QueuePair<RC, S>;
 pub type UdQueuePair<S> = QueuePair<UD, S>;
 
 impl<T: ToQpType, S: ToQpState> QueuePair<T, S> {
+    #[inline]
+    pub fn send_cq(&self) -> &CompletionQueue {
+        &self.inner.send_cq
+    }
+
+    #[inline]
+    pub fn recv_cq(&self) -> &CompletionQueue {
+        &self.inner.recv_cq
+    }
+
+    #[inline]
+    pub fn pd(&self) -> &ProtectionDomain {
+        &self.inner.pd
+    }
+
     /// Bioperlate code to `ibv_modify_qp`.
     unsafe fn modify<D: ToQpState>(
         self,
@@ -840,7 +858,7 @@ macro_rules! impl_modify_qp {
             $($field_name_alt_path: $field_type_alt_path,)?
         ) -> io::Result<QueuePair<T, $qp_state_end>> {
             let mut attr = ffi::ibv_qp_attr {
-                qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
+                qp_state: $qp_state_end::to_qp_state().0,
                 ..Default::default()
             };
             let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
@@ -1231,7 +1249,7 @@ impl<'w> Future for WorkRequest<'w> {
             Poll::Ready(*wc)
         } else {
             // The inner waker should only be set by one thread
-            inner.waker.set(cx.waker().clone()).unwrap();
+            inner.waker.get_or_init(|| cx.waker().clone());
             Poll::Pending
         }
     }
@@ -1431,7 +1449,7 @@ impl OwnedMemoryRegionOpaque {
     ) -> MemorySegment<T, P> {
         MemorySegment {
             opaque: MemorySegmentOpaque {
-                mr: Arc::clone(&self),
+                mr: self,
                 range: byte_range,
                 _permission: PhantomData,
             },
@@ -1497,8 +1515,13 @@ impl<T> Deref for MemorySegment<T, RO> {
         // by OwnedMemoryRegion<T>.
         unsafe {
             slice::from_raw_parts(
-                self.opaque.mr.data.as_ptr().cast(),
-                self.opaque.mr.data.len() / size_of::<T>(),
+                self.opaque
+                    .mr
+                    .data
+                    .as_ptr()
+                    .byte_offset(self.opaque.range.start as isize)
+                    .cast(),
+                (self.opaque.range.end - self.opaque.range.start) / mem::size_of::<T>(),
             )
         }
     }
@@ -1508,14 +1531,19 @@ impl<T> Deref for MemorySegment<T, RO> {
 impl<T> AsMut<[T]> for MemorySegment<T, RW> {
     /// Creates a mutable slice from MemorySegment<T, O>.
     fn as_mut(&mut self) -> &mut [T] {
+        // SAFETY: MemorySegment<T, RW> does not overlap with any other memory segment,
+        // so it should be okay to obtain a mutable pointer regardless of how many
+        // owners of self.opaque.mr.
         unsafe {
             slice::from_raw_parts_mut(
-                Arc::get_mut(&mut self.opaque.mr)
-                    .unwrap()
+                self.opaque
+                    .mr
                     .data
-                    .as_mut_ptr()
+                    .as_ptr()
+                    .cast_mut()
+                    .byte_offset(self.opaque.range.start as isize)
                     .cast(),
-                self.opaque.mr.data.len() / size_of::<T>(),
+                (self.opaque.range.end - self.opaque.range.start) / mem::size_of::<T>(),
             )
         }
     }
@@ -1603,6 +1631,12 @@ impl<T> MemorySegment<T, RW> {
     /// Consume an read-write memory segment and make it read-only.
     #[inline]
     pub fn freeze(self) -> MemorySegment<T, RO> {
+        // move rw_interval to ro_interval
+        let range = self.opaque.range.clone();
+        let mut intervals = self.opaque.mr.intervals.lock().unwrap();
+        intervals.remove::<RW>(&range).unwrap();
+        intervals.try_insert_readonly(range).unwrap();
+        drop(intervals);
         // SAFETY: This is okay because they have the same layout.
         unsafe { mem::transmute(self) }
     }
