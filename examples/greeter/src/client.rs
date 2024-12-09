@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 mod config;
+const MSG: &str = "Hello SafeVerbs";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = config::find_and_open_device()?;
@@ -36,11 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.read_exact(&mut buf)?;
 
     let mr: MemoryRegion<u8> = pd.allocate(
-        1024,
+        MSG.len(),
         safeverbs::ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE,
     )?;
-    let mut ms = mr.get_readwrite(.."Hello SafeVerbs".len()).unwrap();
-    ms.as_mut().copy_from_slice("Hello SafeVerbs".as_bytes());
+    let mut ms = mr.get_readwrite(..).unwrap();
+    ms.as_mut().copy_from_slice(MSG.as_bytes());
     let ms = ms.freeze();
     let wr = qp.post_send(&ms, 114)?;
 

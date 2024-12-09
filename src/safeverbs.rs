@@ -1495,11 +1495,11 @@ impl<T, P: 'static> Drop for MemorySegment<T, P> {
     }
 }
 
-impl<T, P> AsRef<MemorySegmentOpaque<P>> for MemorySegment<T, P> {
-    fn as_ref(&self) -> &MemorySegmentOpaque<P> {
-        &self.opaque
-    }
-}
+// impl<T, P> AsRef<MemorySegmentOpaque<P>> for MemorySegment<T, P> {
+//     fn as_ref(&self) -> &MemorySegmentOpaque<P> {
+//         &self.opaque
+//     }
+// }
 
 impl<T> AsRef<[T]> for MemorySegment<T, RO> {
     fn as_ref(&self) -> &[T] {

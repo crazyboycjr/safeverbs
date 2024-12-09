@@ -35,12 +35,12 @@ fn handle_new_client(
     let mut completions = Vec::with_capacity(32);
     unsafe { completions.set_len(completions.capacity()) };
     let mut wr = wr.fuse();
+    let mut wc_len = 0;
     loop {
         futures::select! {
             wc = wr => {
                 println!("{:?}", wc);
-                // ms.freeze();
-                // println!("{:?}", ms.deref());
+                wc_len = wc.len();
             }
             complete => break,
             default => {
@@ -48,6 +48,7 @@ fn handle_new_client(
             }
         };
     }
+    println!("{:?}", std::str::from_utf8(&ms.freeze()[..wc_len]).unwrap());
     Ok(())
 }
 
