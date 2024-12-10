@@ -5,6 +5,32 @@ use std::net::{TcpListener, TcpStream};
 
 mod config;
 
+pub fn yield_now() -> YieldNow {
+    YieldNow(false)
+}
+
+/// Future for the [`yield_now()`] function.
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct YieldNow(bool);
+
+impl std::future::Future for YieldNow {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if !self.0 {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    }
+}
+
 fn handle_new_client(
     mut stream: TcpStream,
     pd: ProtectionDomain,
@@ -36,6 +62,9 @@ fn handle_new_client(
     unsafe { completions.set_len(completions.capacity()) };
     let mut wr = wr.fuse();
     let mut wc_len = 0;
+
+    let start = std::time::Instant::now();
+
     loop {
         futures::select! {
             wc = wr => {
@@ -48,7 +77,26 @@ fn handle_new_client(
             }
         };
     }
-    println!("{:?}", std::str::from_utf8(&ms.freeze()[..wc_len]).unwrap());
+    println!("{}", std::str::from_utf8(&ms.freeze()[..wc_len])?);
+
+    // use futures::task::{LocalSpawnExt, SpawnExt};
+    // let mut pool = futures::executor::LocalPool::new();
+    // pool.spawner().spawn(async move {
+    //     loop {
+    //         qp.recv_cq().poll(&mut completions).unwrap();
+    //         yield_now().await;
+    //     }
+    // })?;
+    // let handle = pool.spawner().spawn_local_with_handle(async move {
+    //     let wc = wr.await;
+    //     println!(
+    //         "{:?}",
+    //         std::str::from_utf8(&ms.freeze()[..wc.len()]).unwrap()
+    //     );
+    // })?;
+    // pool.run_until(handle);
+
+    println!("Duration: {:?}", start.elapsed());
     Ok(())
 }
 

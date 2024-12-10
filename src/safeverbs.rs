@@ -612,10 +612,6 @@ impl OwnedQueuePair {
         }
     }
 
-    unsafe fn post_send<T>(&self, ms: &MemorySegment<T, RO>, wr_id: u64) -> io::Result<()> {
-        self.post_send_gather(&[ms.get_opaque()], wr_id)
-    }
-
     unsafe fn post_send_gather(
         &self,
         ms: &[MemorySegmentOpaque<RO>],
@@ -652,10 +648,6 @@ impl OwnedQueuePair {
         }
     }
 
-    unsafe fn post_recv<T>(&self, ms: &MemorySegment<T, RW>, wr_id: u64) -> io::Result<()> {
-        self.post_recv_scatter(&[ms.get_opaque()], wr_id)
-    }
-
     unsafe fn post_recv_scatter(
         &self,
         ms: &[MemorySegmentOpaque<RW>],
@@ -688,6 +680,7 @@ impl OwnedQueuePair {
             Ok(())
         }
     }
+
     // fn post_send_batch<T>(&self, mr: &MemoryRegion<T>) -> io::Result<()> {
     //     todo!()
     // }
@@ -1234,6 +1227,18 @@ pub struct WorkRequest<'w> {
     _marker: PhantomData<&'w ()>,
 }
 
+pub struct SendRequest {
+    qp: Arc<QueuePairInner>,
+    wr_key: usize,
+    _ms: Vec<MemorySegmentOpaque<RO>>,
+}
+
+pub struct RecvRequest {
+    qp: Arc<QueuePairInner>,
+    wr_key: usize,
+    _ms: Vec<MemorySegmentOpaque<RW>>,
+}
+
 impl<'w> Future for WorkRequest<'w> {
     type Output = ffi::ibv_wc;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
@@ -1255,46 +1260,62 @@ impl<'w> Future for WorkRequest<'w> {
     }
 }
 
+impl Future for SendRequest {
+    type Output = ffi::ibv_wc;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        // NOTE(cjr): Do not use the slab.take because it may block.
+        // Simply get and remove would be nicer here.
+
+        // `wr_key`` should exists otherwise something is wrong
+        let inner = self.qp.send_cq.0.wr_slab.get(self.wr_key).unwrap();
+        if let Some(wc) = inner.wc.get() {
+            // NOTE: Now wr_id must be the wr_key in the slab
+            let removed = self.qp.send_cq.0.wr_slab.remove(self.wr_key);
+            assert!(removed);
+            Poll::Ready(*wc)
+        } else {
+            // The inner waker should only be set by one thread
+            inner.waker.get_or_init(|| cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+impl Future for RecvRequest {
+    type Output = ffi::ibv_wc;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        // NOTE(cjr): Do not use the slab.take because it may block.
+        // Simply get and remove would be nicer here.
+
+        // `wr_key`` should exists otherwise something is wrong
+        let inner = self.qp.recv_cq.0.wr_slab.get(self.wr_key).unwrap();
+        if let Some(wc) = inner.wc.get() {
+            // NOTE: Now wr_id must be the wr_key in the slab
+            let removed = self.qp.recv_cq.0.wr_slab.remove(self.wr_key);
+            assert!(removed);
+            Poll::Ready(*wc)
+        } else {
+            // The inner waker should only be set by one thread
+            inner.waker.get_or_init(|| cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
 // Data-verbs
 impl<T: ToQpType> QueuePair<T, RTS> {
     #[inline]
-    pub fn post_send<'q, 'm, 'w, V>(
-        &'q self,
-        ms: &'m MemorySegment<V, RO>,
-        wr_id: u64,
-    ) -> io::Result<WorkRequest<'w>>
-    where
-        'q: 'w,
-        'm: 'w,
-    {
-        let inner = WorkRequestInner {
-            wr_id,
-            wc: OnceLock::new(),
-            waker: OnceLock::new(),
-        };
-        // Panics if too many items in the slab.
-        let wr_key = self.inner.send_cq.0.wr_slab.insert(inner).unwrap();
-        unsafe {
-            self.inner.qp.post_send(ms, wr_key as u64)?;
-        }
-        let wr = WorkRequest {
-            cq: self.inner.send_cq.clone(),
-            wr_key,
-            _marker: PhantomData,
-        };
-        Ok(wr)
+    pub fn post_send<V>(&self, ms: &MemorySegment<V, RO>, wr_id: u64) -> io::Result<SendRequest> {
+        let ms = vec![ms.get_opaque()];
+        self.post_send_gather(&ms, wr_id)
     }
 
     #[inline]
-    pub fn post_send_gather<'q, 'm, 'w>(
-        &'q self,
-        ms: &'m [MemorySegmentOpaque<RO>],
+    pub fn post_send_gather(
+        &self,
+        ms: &[MemorySegmentOpaque<RO>],
         wr_id: u64,
-    ) -> io::Result<WorkRequest<'w>>
-    where
-        'q: 'w,
-        'm: 'w,
-    {
+    ) -> io::Result<SendRequest> {
         let inner = WorkRequestInner {
             wr_id,
             wc: OnceLock::new(),
@@ -1305,52 +1326,26 @@ impl<T: ToQpType> QueuePair<T, RTS> {
         unsafe {
             self.inner.qp.post_send_gather(ms, wr_key as u64)?;
         }
-        let wr = WorkRequest {
-            cq: self.inner.send_cq.clone(),
+        let wr = SendRequest {
+            qp: Arc::clone(&self.inner),
             wr_key,
-            _marker: PhantomData,
+            _ms: ms.to_vec(),
         };
         Ok(wr)
     }
 
     #[inline]
-    pub fn post_recv<'q, 'm, 'w, V>(
-        &'q self,
-        ms: &'m MemorySegment<V, RW>,
-        wr_id: u64,
-    ) -> io::Result<WorkRequest<'w>>
-    where
-        'q: 'w,
-        'm: 'w,
-    {
-        let inner = WorkRequestInner {
-            wr_id,
-            wc: OnceLock::new(),
-            waker: OnceLock::new(),
-        };
-        // Panics if too many items in the slab.
-        let wr_key = self.inner.recv_cq.0.wr_slab.insert(inner).unwrap();
-        unsafe {
-            self.inner.qp.post_recv(ms, wr_key as u64)?;
-        }
-        let wr = WorkRequest {
-            cq: self.inner.recv_cq.clone(),
-            wr_key,
-            _marker: PhantomData,
-        };
-        Ok(wr)
+    pub fn post_recv<V>(&self, ms: &MemorySegment<V, RW>, wr_id: u64) -> io::Result<RecvRequest> {
+        let ms = vec![ms.get_opaque()];
+        self.post_recv_scatter(&ms, wr_id)
     }
 
     #[inline]
-    pub fn post_recv_scatter<'q, 'm, 'w>(
-        &'q self,
-        ms: &'m [MemorySegmentOpaque<RW>],
+    pub fn post_recv_scatter(
+        &self,
+        ms: &[MemorySegmentOpaque<RW>],
         wr_id: u64,
-    ) -> io::Result<WorkRequest<'w>>
-    where
-        'q: 'w,
-        'm: 'w,
-    {
+    ) -> io::Result<RecvRequest> {
         let inner = WorkRequestInner {
             wr_id,
             wc: OnceLock::new(),
@@ -1361,10 +1356,10 @@ impl<T: ToQpType> QueuePair<T, RTS> {
         unsafe {
             self.inner.qp.post_recv_scatter(ms, wr_key as u64)?;
         }
-        let wr = WorkRequest {
-            cq: self.inner.recv_cq.clone(),
+        let wr = RecvRequest {
+            qp: Arc::clone(&self.inner),
             wr_key,
-            _marker: PhantomData,
+            _ms: ms.to_vec(),
         };
         Ok(wr)
     }
@@ -1416,6 +1411,15 @@ impl<P> Clone for MemorySegmentOpaque<P> {
             mr: Arc::clone(&self.mr),
             range: self.range.clone(),
             _permission: PhantomData,
+        }
+    }
+}
+
+impl<P: 'static> Drop for MemorySegmentOpaque<P> {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.mr) == 1 {
+            let mut intervals = self.mr.intervals.lock().unwrap();
+            intervals.remove::<P>(&self.range).unwrap();
         }
     }
 }
@@ -1488,16 +1492,15 @@ impl Sealed for RW {}
 impl Permission for RO {}
 impl Permission for RW {}
 
-impl<T, P: 'static> Drop for MemorySegment<T, P> {
-    fn drop(&mut self) {
-        let mut intervals = self.opaque.mr.intervals.lock().unwrap();
-        intervals.remove::<P>(&self.opaque.range).unwrap();
-    }
-}
-
-// impl<T, P> AsRef<MemorySegmentOpaque<P>> for MemorySegment<T, P> {
-//     fn as_ref(&self) -> &MemorySegmentOpaque<P> {
-//         &self.opaque
+// COMMENT(cjr): Keep this in case I forget: when post_send/recv holds references,
+// it is okay to impl Drop for the high-level MmeorySegment<T, P> instead of impl Drop
+// for the underlying type MemorySegmentOpaque<P>; when post_send/recv does not hold references
+// but instead, it increments the reference counts to the input arguments, the impl Drop
+// should only be implemented to the underlying type.
+// impl<T, P: 'static> Drop for MemorySegment<T, P> {
+//     fn drop(&mut self) {
+//         let mut intervals = self.opaque.mr.intervals.lock().unwrap();
+//         intervals.remove::<P>(&self.opaque.range).unwrap();
 //     }
 // }
 
