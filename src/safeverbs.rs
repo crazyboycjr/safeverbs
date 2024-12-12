@@ -616,6 +616,7 @@ impl OwnedQueuePair {
         &self,
         ms: &[MemorySegmentOpaque<RO>],
         wr_id: u64,
+        flags: ffi::ibv_send_flags,
     ) -> io::Result<()> {
         let mut sglist = Vec::with_capacity(ms.len());
         for m in ms {
@@ -633,7 +634,51 @@ impl OwnedQueuePair {
             sg_list: sglist.as_mut_ptr(),
             num_sge: sglist.len() as i32,
             opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
-            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            send_flags: flags.0,
+            ..Default::default()
+        };
+        let mut bad_wr = ptr::null_mut();
+
+        let ctx = (*self.qp).context;
+        let ops = &mut (*ctx).ops;
+        let errno = ops.post_send.as_mut().unwrap()(self.qp, &mut wr, &mut bad_wr);
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
+
+    unsafe fn post_write_gather(
+        &self,
+        ms: &[MemorySegmentOpaque<RO>],
+        remote_memory: &RemoteMemory,
+        wr_id: u64,
+        flags: ffi::ibv_send_flags,
+    ) -> io::Result<()> {
+        let mut sglist = Vec::with_capacity(ms.len());
+        for m in ms {
+            let slice = &m.mr.data.as_ref()[m.range.start..m.range.end];
+            sglist.push(ffi::ibv_sge {
+                addr: slice.as_ptr() as u64,
+                length: mem::size_of_val(slice) as u32,
+                // SAFETY: mr is guarded by Arc, so it should be valid.
+                lkey: m.mr.lkey(),
+            });
+        }
+        let mut wr = ffi::ibv_send_wr {
+            wr_id,
+            next: ptr::null_mut(),
+            sg_list: sglist.as_mut_ptr(),
+            num_sge: sglist.len() as i32,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            send_flags: flags.0,
+            wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr: remote_memory.addr,
+                    rkey: remote_memory.rkey.key,
+                },
+            },
             ..Default::default()
         };
         let mut bad_wr = ptr::null_mut();
@@ -1221,12 +1266,6 @@ struct WorkRequestInner {
     waker: OnceLock<Waker>,
 }
 
-pub struct WorkRequest<'w> {
-    cq: CompletionQueue,
-    wr_key: usize,
-    _marker: PhantomData<&'w ()>,
-}
-
 pub struct SendRequest {
     qp: Arc<QueuePairInner>,
     wr_key: usize,
@@ -1237,27 +1276,6 @@ pub struct RecvRequest {
     qp: Arc<QueuePairInner>,
     wr_key: usize,
     _ms: Vec<MemorySegmentOpaque<RW>>,
-}
-
-impl<'w> Future for WorkRequest<'w> {
-    type Output = ffi::ibv_wc;
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        // NOTE(cjr): Do not use the slab.take because it may block.
-        // Simply get and remove would be nicer here.
-
-        // `wr_key`` should exists otherwise something is wrong
-        let inner = self.cq.0.wr_slab.get(self.wr_key).unwrap();
-        if let Some(wc) = inner.wc.get() {
-            // NOTE: Now wr_id must be the wr_key in the slab
-            let removed = self.cq.0.wr_slab.remove(self.wr_key);
-            assert!(removed);
-            Poll::Ready(*wc)
-        } else {
-            // The inner waker should only be set by one thread
-            inner.waker.get_or_init(|| cx.waker().clone());
-            Poll::Pending
-        }
-    }
 }
 
 impl Future for SendRequest {
@@ -1303,6 +1321,49 @@ impl Future for RecvRequest {
 }
 
 // Data-verbs
+macro_rules! impl_post_recv {
+    ($qp_state: ident) => {
+        impl<T: ToQpType> QueuePair<T, $qp_state> {
+            #[inline]
+            pub fn post_recv<V>(
+                &self,
+                ms: &MemorySegment<V, RW>,
+                wr_id: u64,
+            ) -> io::Result<RecvRequest> {
+                let ms = vec![ms.get_opaque()];
+                self.post_recv_scatter(&ms, wr_id)
+            }
+
+            #[inline]
+            pub fn post_recv_scatter(
+                &self,
+                ms: &[MemorySegmentOpaque<RW>],
+                wr_id: u64,
+            ) -> io::Result<RecvRequest> {
+                let inner = WorkRequestInner {
+                    wr_id,
+                    wc: OnceLock::new(),
+                    waker: OnceLock::new(),
+                };
+                // Panics if too many items in the slab.
+                let wr_key = self.inner.recv_cq.0.wr_slab.insert(inner).unwrap();
+                unsafe {
+                    self.inner.qp.post_recv_scatter(ms, wr_key as u64)?;
+                }
+                let wr = RecvRequest {
+                    qp: Arc::clone(&self.inner),
+                    wr_key,
+                    _ms: ms.to_vec(),
+                };
+                Ok(wr)
+            }
+        }
+    };
+}
+
+impl_post_recv!(RTR);
+impl_post_recv!(RTS);
+
 impl<T: ToQpType> QueuePair<T, RTS> {
     #[inline]
     pub fn post_send<V>(&self, ms: &MemorySegment<V, RO>, wr_id: u64) -> io::Result<SendRequest> {
@@ -1324,7 +1385,11 @@ impl<T: ToQpType> QueuePair<T, RTS> {
         // Panics if too many items in the slab.
         let wr_key = self.inner.send_cq.0.wr_slab.insert(inner).unwrap();
         unsafe {
-            self.inner.qp.post_send_gather(ms, wr_key as u64)?;
+            self.inner.qp.post_send_gather(
+                ms,
+                wr_key as u64,
+                ffi::ibv_send_flags::IBV_SEND_SIGNALED,
+            )?;
         }
         let wr = SendRequest {
             qp: Arc::clone(&self.inner),
@@ -1334,34 +1399,80 @@ impl<T: ToQpType> QueuePair<T, RTS> {
         Ok(wr)
     }
 
+    /// Post a send request without generating a completion.
+    ///
+    /// # Safety
+    ///
+    /// This API posts a send request to the NIC, without generating a completion, so there
+    /// is no direct way to know when the operation will be finished.
+    /// Therefore, the user must ensure the relevant QP, MemorySegment, and any other relevant
+    /// resources are not dropped before the completion of the operation.
     #[inline]
-    pub fn post_recv<V>(&self, ms: &MemorySegment<V, RW>, wr_id: u64) -> io::Result<RecvRequest> {
-        let ms = vec![ms.get_opaque()];
-        self.post_recv_scatter(&ms, wr_id)
-    }
-
-    #[inline]
-    pub fn post_recv_scatter(
+    pub unsafe fn post_send_gather_unsignaled(
         &self,
-        ms: &[MemorySegmentOpaque<RW>],
+        ms: &[MemorySegmentOpaque<RO>],
         wr_id: u64,
-    ) -> io::Result<RecvRequest> {
+    ) -> io::Result<()> {
+        self.inner
+            .qp
+            .post_send_gather(ms, wr_id, ffi::ibv_send_flags(0))?;
+        Ok(())
+    }
+}
+
+impl QueuePair<UC, RTS> {
+    #[inline]
+    pub fn post_write_gather(
+        &self,
+        ms: &[MemorySegmentOpaque<RO>],
+        remote_memory: &RemoteMemory,
+        wr_id: u64,
+    ) -> io::Result<SendRequest> {
         let inner = WorkRequestInner {
             wr_id,
             wc: OnceLock::new(),
             waker: OnceLock::new(),
         };
         // Panics if too many items in the slab.
-        let wr_key = self.inner.recv_cq.0.wr_slab.insert(inner).unwrap();
+        let wr_key = self.inner.send_cq.0.wr_slab.insert(inner).unwrap();
         unsafe {
-            self.inner.qp.post_recv_scatter(ms, wr_key as u64)?;
+            self.inner.qp.post_write_gather(
+                ms,
+                remote_memory,
+                wr_key as u64,
+                ffi::ibv_send_flags::IBV_SEND_SIGNALED,
+            )?;
         }
-        let wr = RecvRequest {
+        let wr = SendRequest {
             qp: Arc::clone(&self.inner),
             wr_key,
             _ms: ms.to_vec(),
         };
         Ok(wr)
+    }
+
+    /// Post a send request without generating a completion.
+    ///
+    /// # Safety
+    ///
+    /// This API posts a send request to the NIC, without generating a completion, so there
+    /// is no direct way to know when the operation will be finished.
+    /// Therefore, the user must ensure the relevant QP, MemorySegment, and any other relevant
+    /// resources are not dropped before the completion of the operation.
+    #[inline]
+    pub unsafe fn post_write_gather_unsignaled(
+        &self,
+        ms: &[MemorySegmentOpaque<RO>],
+        remote_memory: &RemoteMemory,
+        wr_id: u64,
+    ) -> io::Result<()> {
+        self.inner.qp.post_write_gather(
+            ms,
+            remote_memory,
+            wr_id,
+            ffi::ibv_send_flags(0),
+        )?;
+        Ok(())
     }
 }
 
@@ -1382,6 +1493,13 @@ impl Drop for OwnedMemoryRegionOpaque {
             panic!("{}", e);
         }
     }
+}
+
+#[cfg(feature = "serde")]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct RemoteMemory {
+    pub addr: u64,
+    pub rkey: RemoteKey,
 }
 
 pub struct MemoryRegion<T> {
@@ -1631,6 +1749,14 @@ impl<T> MemorySegment<T, RO> {
 }
 
 impl<T> MemorySegment<T, RW> {
+    #[inline]
+    pub fn remote_memory(&self) -> RemoteMemory {
+        RemoteMemory {
+            addr: self.opaque.mr.data.as_ptr() as u64,
+            rkey: self.opaque.mr.rkey(),
+        }
+    }
+
     /// Consume an read-write memory segment and make it read-only.
     #[inline]
     pub fn freeze(self) -> MemorySegment<T, RO> {

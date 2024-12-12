@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["examples/greeter"]
-default-members = ["examples/greeter"]
+members = ["examples/greeter", "examples/uchan"]
+default-members = ["examples/uchan"]
 
 [workspace.dependencies]
 safeverbs = { path = "." }
