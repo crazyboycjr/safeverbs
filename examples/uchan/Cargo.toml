@@ -11,4 +11,3 @@ futures = "0.3.31"
 minstant = "0.1.7"
 safeverbs = { workspace = true, features = ["serde"] }
 serde.workspace = true
-tokio = { version = "1.42.0", features = ["macros", "rt"] }

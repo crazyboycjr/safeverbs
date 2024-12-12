@@ -1,10 +1,13 @@
 -[x] MemorySegment that does not bear the overhead of maintaining
 non-overlapping segments.
--[ ] Testing code
+-[x] Testing code
+-[ ] README, how to run, and highlights in API design
+-[ ] demo, code snippets vs C API
+-[ ] derive(Debug) for all sort of resources
+-[ ] doc for unsafe function
 -[ ] IntervalTree reimplement
+-[ ] ring-allreduce
 -[ ] thread-local version of everything, and a function localize to pin
 them to one thread (to convert to the thread-local version of the object).
--[ ] derive(Debug) for all sort of resources
 -[ ] post_send_batch
--[ ] doc for unsafe function
 -[ ] organize code into different modules

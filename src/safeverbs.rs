@@ -1466,12 +1466,9 @@ impl QueuePair<UC, RTS> {
         remote_memory: &RemoteMemory,
         wr_id: u64,
     ) -> io::Result<()> {
-        self.inner.qp.post_write_gather(
-            ms,
-            remote_memory,
-            wr_id,
-            ffi::ibv_send_flags(0),
-        )?;
+        self.inner
+            .qp
+            .post_write_gather(ms, remote_memory, wr_id, ffi::ibv_send_flags(0))?;
         Ok(())
     }
 }
