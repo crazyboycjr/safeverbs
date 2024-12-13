@@ -1,7 +1,7 @@
 # SafeVerbs
 __SafeVerbs__ implements a memory-safe RDMA API in Rust. It leverages Rust’s type system to ensure safety properties at compile time, simplifying the development of high-performance RDMA applications.
 
-- 🛡️ __Memory Safety__: Prevents common RDMA programming pitfalls such as premature memory reuse, resource mismanagement, and invalid memory access.
+- 🛡️ __Memory-Safe__: Prevents common RDMA programming pitfalls such as premature memory reuse, resource mismanagement, and invalid memory access.
 - ✨ __User-Friendly__: Encapsulates complex RDMA operations into intuitive, high-level abstractions.
 - 🚀 __High Performance__: Provides zero-cost abstractions wherever possible and exposes unsafe APIs for advanced usage scenarios requiring maximum performance. Supports asynchronous programming for scalable applications.
 
@@ -83,7 +83,7 @@ RDMA programming with C libraries like `libibverbs` is powerful but prone to err
 __Data Path__
 - __Type-Safe Memory Regions__: Prevents data corruption by ensuring only valid types can be used in RDMA operations.
 - __Memory Segments__: Supports multiple readers and multiple __non-overlapping__ writers on the same memory region with memory safety guarantees. This design addresses a common issue in C, where `post_send` and `post_recv` operations on the same memory region can create data races. In SafeVerbs, such behavior is explicitly forbidden, as writable memory segments are guaranteed never to overlap with any other memory segments. While this safety enforcement cannot made with zero cost, unsafe unchecked versions are available for high-performance use cases where safety checks can be bypassed by the user.
-- __Asynchronous Operations__: `post_send` and `post_recv` are represented as [`Future`s](https://doc.rust-lang.org/stable/std/future/trait.Future.html), enabling seamless integration with Rust's async ecosystem.
+- __Asynchronous Operations__: `post_send` and `post_recv` are represented as [`Future`](https://doc.rust-lang.org/stable/std/future/trait.Future.html)s, enabling seamless integration with Rust's async ecosystem.
   - All resources are `Send + Sync`.
   - The `Future` representing an RDMA operation implements `Send + Sync + 'static`, making it compatible with async libraries.
   - Expose unsafe functions for send requests that do not require NIC to generate a completion notification.

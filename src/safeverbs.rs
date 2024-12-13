@@ -316,30 +316,30 @@ pub type UdQueuePairBuilder = QueuePairBuilder<UD>;
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-struct QueuePairSetting {
+pub struct QueuePairSetting {
     /// valid for RC and UC
-    access: ffi::ibv_access_flags,
+    pub access: ffi::ibv_access_flags,
     /// valid for RC and UC
-    path_mtu: u32,
+    pub path_mtu: u32,
     /// valid for RC and UC
-    rq_psn: u32,
+    pub rq_psn: u32,
     /// valid for RC and UC
-    sq_psn: u32,
+    pub sq_psn: u32,
     /// only valid for RC
-    timeout: Option<u8>,
+    pub timeout: Option<u8>,
     /// only valid for RC
-    retry_count: Option<u8>,
+    pub retry_count: Option<u8>,
     /// only valid for RC
-    rnr_retry: Option<u8>,
+    pub rnr_retry: Option<u8>,
     /// only valid for RC
-    min_rnr_timer: Option<u8>,
+    pub min_rnr_timer: Option<u8>,
     /// only valid for RC
-    max_rd_atomic: Option<u8>,
+    pub max_rd_atomic: Option<u8>,
     /// only valid for RC
-    max_dest_rd_atomic: Option<u8>,
+    pub max_dest_rd_atomic: Option<u8>,
     /// traffic class, the default value is 0.
     /// Note that the setting can be overwritten by a global system setting.
-    traffic_class: u8,
+    pub traffic_class: u8,
 }
 
 /// An unconfigured `QueuePair`.
@@ -774,6 +774,21 @@ impl<T: ToQpType, S: ToQpState> QueuePair<T, S> {
     #[inline]
     pub fn pd(&self) -> &ProtectionDomain {
         &self.inner.pd
+    }
+
+    pub fn endpoint(&self) -> io::Result<QueuePairEndpoint> {
+        let port_attr = self.inner.pd.context().port_attr()?;
+        let gid = self.inner.pd.context().gid(1)?;
+
+        // SAFETY: QP cannot be dropped when there's outstanding references,
+        // so it is safe to access qp_num field.
+        let num = unsafe { &*self.inner.qp.qp }.qp_num;
+
+        Ok(QueuePairEndpoint {
+            num,
+            lid: port_attr.lid,
+            gid: Some(gid),
+        })
     }
 
     /// Bioperlate code to `ibv_modify_qp`.
