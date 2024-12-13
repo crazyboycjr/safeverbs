@@ -1,7 +1,7 @@
 -[x] MemorySegment that does not bear the overhead of maintaining
 non-overlapping segments.
 -[x] Testing code
--[ ] README, how to run, and highlights in API design
+-[x] README, how to run, and highlights in API design
 -[ ] demo, code snippets vs C API
 -[ ] derive(Debug) for all sort of resources
 -[ ] doc for unsafe function
