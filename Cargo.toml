@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["examples/greeter", "examples/uchan"]
+members = ["examples/greeter", "examples/perftest", "examples/uchan"]
 
 [workspace.dependencies]
 safeverbs = { path = "." }
