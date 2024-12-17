@@ -3,6 +3,7 @@ void free_before_post_send_completion() {
   struct ibv_mr* mr = ibv_reg_mr(pd, addr, length, access);
 
   free(addr);
+	// void* new_addr = malloc(length);
 
 	struct ibv_sge list = {
 		.addr	= addr,

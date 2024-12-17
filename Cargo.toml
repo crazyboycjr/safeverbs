@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["examples/greeter", "examples/uchan"]
-default-members = ["examples/uchan"]
 
 [workspace.dependencies]
 safeverbs = { path = "." }
@@ -11,6 +10,7 @@ serde = { version = "1.0.215", features = ["derive"] }
 sharded-slab = "0.1.7"
 slab = "0.4.9"
 zerocopy = { version = "0.8.10", features = ["derive"] }
+rudac = "0.8.3"
 
 [package]
 name = "safeverbs"
@@ -26,6 +26,7 @@ serde = { workspace = true, features = ["derive"], optional = true }
 sharded-slab.workspace = true
 slab.workspace = true
 zerocopy.workspace = true
+rudac.workspace = true
 
 [features]
 serde = ["dep:serde"]

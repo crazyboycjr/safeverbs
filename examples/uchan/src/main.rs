@@ -157,9 +157,9 @@ fn run_sender(server_addr: &str) -> anyhow::Result<()> {
     let mut wr_set = FuturesUnordered::new();
     let tx_depth = args.tx_depth as usize;
 
-    loop {
+    while rcnt < args.num_iters + args.warmup {
         while scnt < rcnt + tx_depth && scnt < args.num_iters + args.warmup {
-            if (scnt + 1) % tx_depth == 0 {
+            if (scnt + 1) % tx_depth == 0 || scnt + 1 == args.num_iters + args.warmup {
                 let wr = qp.post_write_gather(&[ms.get_opaque()], &remote_memory, scnt as _)?;
                 wr_set.push(wr.fuse());
             } else {
@@ -174,7 +174,11 @@ fn run_sender(server_addr: &str) -> anyhow::Result<()> {
         futures::select! {
             wc = wr_set.next() => {
                 // println!("{:?}", wc);
-                let _wc = wc.unwrap_or_else(|| panic!("wc failed: {:?}", wc));
+                let wc = wc.expect("FuturesUnordered has been drained");
+                // it's not always tx_depth but it is okay because it will only affect the last iteration
+                if !wc.is_valid() {
+                    panic!("wc failed: {:?}", wc);
+                }
                 rcnt += tx_depth;
                 nbytes += ms.as_ref().len() * tx_depth;
             }
@@ -182,15 +186,12 @@ fn run_sender(server_addr: &str) -> anyhow::Result<()> {
             default => {
                 cq.poll(&mut completions)?;
 
-                if rcnt >= args.num_iters + args.warmup {
-                    break;
-                }
                 let last_dura = last_ts.elapsed();
                 if last_dura > std::time::Duration::from_secs(1) {
                     let rps = (rcnt - last_rcnt) as f64 / last_dura.as_secs_f64();
                     let bw_gbps = 8e-9 * (nbytes - last_nbytes) as f64 / last_dura.as_secs_f64();
                     if rcnt > args.warmup {
-                        println!("{} rps, {} Gb/s", rps, bw_gbps);
+                        println!("{:.2} rps, {:.2} Gb/s", rps, bw_gbps);
                     }
                     last_ts = Instant::now();
                     last_rcnt = rcnt;

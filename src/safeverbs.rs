@@ -3,6 +3,7 @@
 
 use crate::ffi;
 use crate::ibv;
+use crate::interval_tree::IntervalTree;
 use core::any::TypeId;
 use core::mem;
 use core::ops::Deref;
@@ -1507,8 +1508,8 @@ impl Drop for OwnedMemoryRegionOpaque {
     }
 }
 
-#[cfg(feature = "serde")]
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy)]
 pub struct RemoteMemory {
     pub addr: u64,
     pub rkey: RemoteKey,
@@ -1744,19 +1745,20 @@ impl<T> MemorySegment<T, RO> {
     }
 
     #[inline]
-    pub fn try_insert_readonly(&self, range: Range<usize>) -> Result<(), ()> {
-        self.opaque.mr.try_insert_readonly(range)
+    pub fn insert_readonly(&self, range: Range<usize>) {
+        self.opaque
+            .mr
+            .try_insert_readonly(range)
+            .expect("This operation should never fail");
     }
 
     #[inline]
-    pub fn get_readonly<R: RangeBounds<usize>>(&self, range: R) -> Option<MemorySegment<T, RO>> {
+    pub fn get_readonly<R: RangeBounds<usize>>(&self, range: R) -> MemorySegment<T, RO> {
         let range = self.convert_to_range(range);
         self.check_range(&range);
-        self.opaque
-            .mr
-            .try_insert_readonly(range.clone())
-            .ok()
-            .map(|_| unsafe { self.get_readonly_unchecked(range) })
+        self.insert_readonly(range.clone());
+        // SAFETY: This operation should never fail
+        unsafe { self.get_readonly_unchecked(range) }
     }
 }
 
@@ -1894,86 +1896,4 @@ fn mr_index_len_fail(index: usize, len: usize) -> ! {
         "index {} out of range for MemoryRegion of length {}",
         index, len
     );
-}
-
-// scatter gather DMA
-// -> Lifetime cannot satisfy out needs. That's why we have MemorySegment<P>
-// allow non-overlappped post_send and post_recv
-// allow overlapped post_recvs in unsafe
-// Disallow:
-//   Overlapping post_recv
-//   Concurrent post_recv and post_send for overlapped memory region
-
-// TODO: implement it with balance tree
-struct IntervalTree {
-    ro_intervals: Vec<Range<usize>>,
-    rw_intervals: Vec<Range<usize>>,
-}
-
-impl IntervalTree {
-    fn new() -> Self {
-        IntervalTree {
-            ro_intervals: Vec::new(),
-            rw_intervals: Vec::new(),
-        }
-    }
-
-    fn check_overlap(range: Range<usize>, intervals: &[Range<usize>]) -> bool {
-        for r in intervals {
-            if r.start < range.end && r.end > range.start {
-                return true;
-            }
-            if r.start >= range.end {
-                break;
-            }
-        }
-        false
-    }
-
-    fn insert(range: Range<usize>, intervals: &mut Vec<Range<usize>>) {
-        let pos = intervals
-            .iter()
-            .rposition(|r| range.start >= r.start)
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        intervals.insert(pos, range);
-    }
-
-    fn try_insert_readonly(&mut self, range: Range<usize>) -> Result<(), ()> {
-        // returns Err if it conflicts with any rw_interval
-        // for all r, where r.start < range.end, find the maximal of r.end
-        if Self::check_overlap(range.clone(), &self.rw_intervals) {
-            return Err(());
-        }
-        Self::insert(range, &mut self.ro_intervals);
-        Ok(())
-    }
-
-    fn try_insert_readwrite(&mut self, range: Range<usize>) -> Result<(), ()> {
-        // returns Err if it conflicts with any interval
-        if Self::check_overlap(range.clone(), &self.rw_intervals) {
-            return Err(());
-        }
-        if Self::check_overlap(range.clone(), &self.ro_intervals) {
-            return Err(());
-        }
-        Self::insert(range, &mut self.rw_intervals);
-        Ok(())
-    }
-
-    fn _remove(range: &Range<usize>, intervals: &mut Vec<Range<usize>>) -> Result<(), ()> {
-        let pos = intervals.iter().position(|r| r == range).ok_or(())?;
-        intervals.remove(pos);
-        Ok(())
-    }
-
-    fn remove<P: 'static>(&mut self, range: &Range<usize>) -> Result<(), ()> {
-        if TypeId::of::<P>() == TypeId::of::<RO>() {
-            Self::_remove(range, &mut self.ro_intervals)
-        } else if TypeId::of::<P>() == TypeId::of::<RW>() {
-            Self::_remove(range, &mut self.rw_intervals)
-        } else {
-            unreachable!()
-        }
-    }
 }
