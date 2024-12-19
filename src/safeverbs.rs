@@ -341,6 +341,9 @@ pub struct QueuePairSetting {
     /// traffic class, the default value is 0.
     /// Note that the setting can be overwritten by a global system setting.
     pub traffic_class: u8,
+    /// source gid_index. IB: None, ETH: default 0.
+    /// See `show_gids` for more information.
+    pub gid_index: Option<u8>,
 }
 
 /// An unconfigured `QueuePair`.
@@ -360,12 +363,13 @@ pub struct QueuePairBuilder<T: ConnectionOrientedQpType> {
 
 impl<T: ConnectionOrientedQpType> QueuePairBuilder<T> {
     pub fn new(pd: ProtectionDomain, qp_init_attr: QpInitAttr<T>) -> QueuePairBuilder<T> {
+        let port_attr = pd.context().port_attr().unwrap();
         QueuePairBuilder {
             pd: pd.clone(),
             qp_init_attr,
             setting: QueuePairSetting {
                 access: ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE,
-                path_mtu: pd.context().port_attr().unwrap().active_mtu,
+                path_mtu: port_attr.active_mtu,
                 rq_psn: 0,
                 sq_psn: 0,
                 min_rnr_timer: is::<T, RC>().then_some(16),
@@ -375,6 +379,8 @@ impl<T: ConnectionOrientedQpType> QueuePairBuilder<T> {
                 max_rd_atomic: is::<T, RC>().then_some(1),
                 max_dest_rd_atomic: is::<T, RC>().then_some(1),
                 traffic_class: 0,
+                gid_index: (port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET as u8)
+                    .then_some(0),
             },
         }
     }
@@ -418,11 +424,20 @@ impl<T: ConnectionOrientedQpType> QueuePairBuilder<T> {
         self
     }
 
+    pub fn set_gid_index(&mut self, gid_index: u8) -> &mut Self {
+        self.setting.gid_index = Some(gid_index);
+        self
+    }
+
     pub fn build(&self) -> io::Result<PreparedQueuePair<T>> {
         let qp = self.pd.create_qp(&self.qp_init_attr)?;
+        let gid = self.setting.gid_index
+            .map(|index| self.pd.context().gid(index as u32))
+            .transpose()?;
+        println!("build, gid: {:?}", gid);
         Ok(PreparedQueuePair {
             port_attr: self.pd.context().port_attr()?,
-            gid: self.pd.context().gid(1)?,
+            gid,
             qp,
             setting: self.setting.clone(),
         })
@@ -465,7 +480,7 @@ impl QueuePairBuilder<RC> {
 
 pub struct PreparedQueuePair<T: ConnectionOrientedQpType> {
     port_attr: ffi::ibv_port_attr,
-    gid: Gid,
+    gid: Option<Gid>,
     qp: QueuePair<T, RESET>,
 
     // carried along from builder
@@ -492,7 +507,7 @@ impl<T: ConnectionOrientedQpType> PreparedQueuePair<T> {
         QueuePairEndpoint {
             num,
             lid: self.port_attr.lid,
-            gid: Some(self.gid),
+            gid: self.gid,
         }
     }
 }
@@ -513,7 +528,7 @@ impl PreparedQueuePair<RC> {
             ah_attr.grh = ffi::ibv_global_route {
                 dgid: gid.into(),
                 flow_label: 0,
-                sgid_index: 0,
+                sgid_index: self.setting.gid_index.expect("expect GRH"),
                 hop_limit: 0xff,
                 traffic_class: self.setting.traffic_class,
             };
@@ -561,7 +576,7 @@ impl PreparedQueuePair<UC> {
             ah_attr.grh = ffi::ibv_global_route {
                 dgid: gid.into(),
                 flow_label: 0,
-                sgid_index: 0,
+                sgid_index: self.setting.gid_index.expect("expect GRH"),
                 hop_limit: 0xff,
                 traffic_class: self.setting.traffic_class,
             };
@@ -777,9 +792,13 @@ impl<T: ToQpType, S: ToQpState> QueuePair<T, S> {
         &self.inner.pd
     }
 
-    pub fn endpoint(&self) -> io::Result<QueuePairEndpoint> {
+    /// IB: no gid. ETH: required
+    pub fn endpoint(&self, gid_index: Option<u32>) -> io::Result<QueuePairEndpoint> {
         let port_attr = self.inner.pd.context().port_attr()?;
-        let gid = self.inner.pd.context().gid(1)?;
+        let gid = gid_index
+            .map(|index| self.inner.pd.context().gid(index))
+            .transpose()?;
+        println!("endpoint, gid: {:?}", gid);
 
         // SAFETY: QP cannot be dropped when there's outstanding references,
         // so it is safe to access qp_num field.
@@ -788,7 +807,7 @@ impl<T: ToQpType, S: ToQpState> QueuePair<T, S> {
         Ok(QueuePairEndpoint {
             num,
             lid: port_attr.lid,
-            gid: Some(gid),
+            gid,
         })
     }
 
@@ -1436,7 +1455,7 @@ impl<T: ToQpType> QueuePair<T, RTS> {
     }
 }
 
-impl QueuePair<UC, RTS> {
+impl<T: ConnectionOrientedQpType> QueuePair<T, RTS> {
     #[inline]
     pub fn post_write_gather(
         &self,

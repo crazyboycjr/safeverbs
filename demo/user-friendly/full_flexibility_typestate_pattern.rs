@@ -74,7 +74,8 @@ pub fn demo_typestate_pattern() -> Box<QueuePair<RC, RTS>, Box<dyn std::error::E
     let endpoint = qp.endpoint();
     let remote: QueuePairEndpoint = exchange_endpoint(&mut stream, endpoint);
 
-    let setting = qp_setting();
+    let gid_index = 0;
+    let setting = qp_setting(Some(gid_index));
     let init_qp = self.qp.modify_to_init(0, 1, setting.access)?;
     let mut ah_attr = ffi::ibv_ah_attr {
         dlid: remote.lid,
@@ -89,7 +90,7 @@ pub fn demo_typestate_pattern() -> Box<QueuePair<RC, RTS>, Box<dyn std::error::E
         ah_attr.grh = ffi::ibv_global_route {
             dgid: gid.into(),
             flow_label: 0,
-            sgid_index: 0,
+            sgid_index: gid_index,
             hop_limit: 0xff,
             traffic_class: setting.traffic_class,
         };

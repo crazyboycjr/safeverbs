@@ -1,20 +1,11 @@
 use clap::Parser;
-use futures::stream::{FuturesUnordered, StreamExt};
-use futures::FutureExt;
-use minstant::Instant;
-use safeverbs::{
-    Context, MemoryRegion, QpCapability, QpInitAttr, QueuePairBuilder, QueuePairEndpoint, UC,
-};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 
 #[derive(Parser, Debug)]
 #[command(about = "Perftest for SafeVerbs.")]
 pub struct Args {
-    /// The address to connect, can be an IP address or domain name.
+    /// The host address to connect, can be an IP address or domain name.
     /// If not specified, the binary runs as a server that listens on 0.0.0.0.
-    #[arg(short, long)]
-    pub connect: Option<String>,
+    pub host: Option<String>,
 
     /// The port number to use.
     #[arg(short, long, default_value = "5000")]
@@ -39,6 +30,18 @@ pub struct Args {
     /// Message size.
     #[arg(short, long, default_value = "65536")]
     pub size: usize,
+
+    /// Connection type, RC/UC.
+    #[arg(short, long, default_value = "RC")]
+    pub connection: String,
+
+    /// Uses GID with GID index. Equivalent to -x flags in perftest.
+    #[arg(short = 'x', long)]
+    pub gid_index: Option<u8>,
+
+    /// Traffic class if GRH is in use
+    #[arg(long, default_value = "0")]
+    pub traffic_class: u8,
     // /// Number of QPs in each thread.
     // #[arg(long, default_value = "1")]
     // pub num_qp: usize,
