@@ -431,10 +431,11 @@ impl<T: ConnectionOrientedQpType> QueuePairBuilder<T> {
 
     pub fn build(&self) -> io::Result<PreparedQueuePair<T>> {
         let qp = self.pd.create_qp(&self.qp_init_attr)?;
-        let gid = self.setting.gid_index
+        let gid = self
+            .setting
+            .gid_index
             .map(|index| self.pd.context().gid(index as u32))
             .transpose()?;
-        println!("build, gid: {:?}", gid);
         Ok(PreparedQueuePair {
             port_attr: self.pd.context().port_attr()?,
             gid,
@@ -653,16 +654,7 @@ impl OwnedQueuePair {
             send_flags: flags.0,
             ..Default::default()
         };
-        let mut bad_wr = ptr::null_mut();
-
-        let ctx = (*self.qp).context;
-        let ops = &mut (*ctx).ops;
-        let errno = ops.post_send.as_mut().unwrap()(self.qp, &mut wr, &mut bad_wr);
-        if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
-        } else {
-            Ok(())
-        }
+        self.post_send_batch(&mut wr)
     }
 
     unsafe fn post_write_gather(
@@ -697,16 +689,7 @@ impl OwnedQueuePair {
             },
             ..Default::default()
         };
-        let mut bad_wr = ptr::null_mut();
-
-        let ctx = (*self.qp).context;
-        let ops = &mut (*ctx).ops;
-        let errno = ops.post_send.as_mut().unwrap()(self.qp, &mut wr, &mut bad_wr);
-        if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
-        } else {
-            Ok(())
-        }
+        self.post_send_batch(&mut wr)
     }
 
     unsafe fn post_recv_scatter(
@@ -742,9 +725,18 @@ impl OwnedQueuePair {
         }
     }
 
-    // fn post_send_batch<T>(&self, mr: &MemoryRegion<T>) -> io::Result<()> {
-    //     todo!()
-    // }
+    unsafe fn post_send_batch(&self, wr_list: &mut ffi::ibv_send_wr) -> io::Result<()> {
+        let mut bad_wr = ptr::null_mut();
+
+        let ctx = (*self.qp).context;
+        let ops = &mut (*ctx).ops;
+        let errno = ops.post_send.as_mut().unwrap()(self.qp, wr_list, &mut bad_wr);
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for OwnedQueuePair {
@@ -798,8 +790,6 @@ impl<T: ToQpType, S: ToQpState> QueuePair<T, S> {
         let gid = gid_index
             .map(|index| self.inner.pd.context().gid(index))
             .transpose()?;
-        println!("endpoint, gid: {:?}", gid);
-
         // SAFETY: QP cannot be dropped when there's outstanding references,
         // so it is safe to access qp_num field.
         let num = unsafe { &*self.inner.qp.qp }.qp_num;
@@ -1452,6 +1442,170 @@ impl<T: ToQpType> QueuePair<T, RTS> {
             .qp
             .post_send_gather(ms, wr_id, ffi::ibv_send_flags(0))?;
         Ok(())
+    }
+
+    /// Post a batch of work request, only the last wr generating a completion.
+    ///
+    /// # Safety
+    ///
+    /// The user must ensure all the memory regions/segments, QPs, and relevant resources are
+    /// valid and remain unchanged before the completion of the last work request in the batch.
+    #[inline]
+    pub unsafe fn post_send_batch(&self, sr: &mut WorkRequestBatch) -> io::Result<SendRequest> {
+        assert!(sr.enclosed());
+        let inner = WorkRequestInner {
+            wr_id: sr.wr_id().expect("Empty wr_list"),
+            wc: OnceLock::new(),
+            waker: OnceLock::new(),
+        };
+        // Panics if too many items in the slab.
+        let wr_key = self.inner.send_cq.0.wr_slab.insert(inner).unwrap();
+        sr.set_wr_id(wr_key as u64);
+        unsafe {
+            self.inner.qp.post_send_batch(sr.to_ibv_send_wr())?;
+        }
+        let wr = SendRequest {
+            qp: Arc::clone(&self.inner),
+            wr_key,
+            _ms: vec![],
+        };
+        Ok(wr)
+    }
+}
+
+pub struct WorkRequestBatch {
+    wr_list: Vec<Box<ffi::ibv_send_wr>>,
+    sglists: Vec<Vec<ffi::ibv_sge>>,
+}
+
+unsafe impl Send for WorkRequestBatch {}
+unsafe impl Sync for WorkRequestBatch {}
+
+impl WorkRequestBatch {
+    #[inline]
+    pub const fn new() -> Self {
+        WorkRequestBatch {
+            wr_list: Vec::new(),
+            sglists: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        WorkRequestBatch {
+            wr_list: Vec::with_capacity(capacity),
+            sglists: Vec::with_capacity(capacity),
+        }
+    }
+
+    #[inline]
+    pub fn wr_id(&self) -> Option<u64> {
+        self.wr_list
+            .last()
+            .map(|last| last.wr_id)
+    }
+
+    fn set_wr_id(&mut self, wr_id: u64) {
+        if let Some(last) = self.wr_list.last_mut() {
+            last.wr_id = wr_id;
+        }
+    }
+
+    #[inline]
+    pub fn prepost_send(
+        &mut self,
+        ms: &[MemorySegmentOpaque<RO>],
+        wr_id: u64,
+        flags: ffi::ibv_send_flags,
+    ) {
+        let mut sglist = Vec::with_capacity(ms.len());
+        for m in ms {
+            let slice = &m.mr.data.as_ref()[m.range.start..m.range.end];
+            sglist.push(ffi::ibv_sge {
+                addr: slice.as_ptr() as u64,
+                length: mem::size_of_val(slice) as u32,
+                lkey: m.mr.lkey(),
+            });
+        }
+        let wr = Box::new(ffi::ibv_send_wr {
+            wr_id,
+            next: ptr::null_mut(),
+            sg_list: sglist.as_mut_ptr(),
+            num_sge: sglist.len() as i32,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
+            send_flags: flags.0,
+            ..Default::default()
+        });
+        self.push(wr, sglist);
+    }
+
+    #[inline]
+    pub fn prepost_write(
+        &mut self,
+        ms: &[MemorySegmentOpaque<RO>],
+        remote_memory: &RemoteMemory,
+        wr_id: u64,
+        flags: ffi::ibv_send_flags,
+    ) {
+        let mut sglist = Vec::with_capacity(ms.len());
+        for m in ms {
+            let slice = &m.mr.data.as_ref()[m.range.start..m.range.end];
+            sglist.push(ffi::ibv_sge {
+                addr: slice.as_ptr() as u64,
+                length: mem::size_of_val(slice) as u32,
+                lkey: m.mr.lkey(),
+            });
+        }
+        let wr = Box::new(ffi::ibv_send_wr {
+            wr_id,
+            next: ptr::null_mut(),
+            sg_list: sglist.as_mut_ptr(),
+            num_sge: sglist.len() as i32,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            send_flags: flags.0,
+            wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr: remote_memory.addr,
+                    rkey: remote_memory.rkey.key,
+                },
+            },
+            ..Default::default()
+        });
+        self.push(wr, sglist);
+    }
+
+    fn push(&mut self, mut wr: Box<ffi::ibv_send_wr>, sglist: Vec<ffi::ibv_sge>) {
+        if let Some(last) = self.wr_list.last_mut() {
+            last.send_flags &= !ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+            last.next = &raw mut *wr;
+        }
+
+        self.wr_list.push(wr);
+        self.sglists.push(sglist);
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.wr_list.clear();
+        self.sglists.clear();
+    }
+
+    #[inline]
+    pub fn enclose(&mut self) {
+        self.wr_list
+            .last_mut()
+            .expect("Empty wr_list")
+            .send_flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+    }
+
+    fn enclosed(&self) -> bool {
+        self.wr_list.last().expect("Empty wr_list").send_flags
+            & ffi::ibv_send_flags::IBV_SEND_SIGNALED.0
+            != 0
+    }
+
+    unsafe fn to_ibv_send_wr(&mut self) -> &mut ffi::ibv_send_wr {
+        &mut *self.wr_list.first_mut().expect("Empty wr_list")
     }
 }
 

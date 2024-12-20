@@ -3,7 +3,7 @@ use futures::FutureExt;
 use minstant::Instant;
 use perftest::cli::get_args;
 use perftest::{exchange_endpoint, find_and_open_device, qp_capability};
-use safeverbs::{MemoryRegion, QpInitAttr, QueuePairBuilder, RC, UC};
+use safeverbs::{MemoryRegion, QpInitAttr, QueuePairBuilder, WorkRequestBatch, RC, UC};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -67,19 +67,60 @@ macro_rules! impl_run_sender {
             let mut last_nbytes = 0;
             let mut wr_set = FuturesUnordered::new();
             let tx_depth = args.tx_depth as usize;
+            let mut batch = WorkRequestBatch::new();
+            let total_iters = args.num_iters + args.warmup;
 
-            while rcnt < args.num_iters + args.warmup {
-                while scnt < rcnt + tx_depth && scnt < args.num_iters + args.warmup {
-                    if (scnt + 1) % tx_depth == 0 || scnt + 1 == args.num_iters + args.warmup {
-                        let wr = qp.post_write_gather(&[ms.get_opaque()], &remote_memory, scnt as _)?;
-                        wr_set.push(wr.fuse());
-                    } else {
-                        // SAFETY: QP and MS are not dropped so it should be okay.
-                        unsafe {
-                            qp.post_write_gather_unsignaled(&[ms.get_opaque()], &remote_memory, scnt as _)?;
+            while scnt < rcnt + tx_depth && scnt < total_iters {
+                batch.prepost_write(&[ms.get_opaque()], &remote_memory, scnt as _, safeverbs::ffi::ibv_send_flags(0));
+                if (scnt + 1) % tx_depth == 0 || scnt + 1 == total_iters {
+                    batch.enclose();
+                    let wr = unsafe { qp.post_send_batch(&mut batch)? };
+                    wr_set.push(wr.fuse());
+                }
+                scnt += 1;
+            }
+
+            while rcnt < total_iters {
+                // while scnt < rcnt + tx_depth && scnt < total_iters {
+                    // This achieves ~5.5 million ops/s.
+                    // if (scnt + 1) % tx_depth == 0 || scnt + 1 == total_iters {
+                    //     let wr = qp.post_write_gather(&[ms.get_opaque()], &remote_memory, scnt as _)?;
+                    //     wr_set.push(wr.fuse());
+                    // } else {
+                    //     // SAFETY: QP and MS are not dropped so it should be okay.
+                    //     unsafe {
+                    //         qp.post_write_gather_unsignaled(&[ms.get_opaque()], &remote_memory, scnt as _)?;
+                    //     }
+                    // }
+                    // Post in batch achieves ~7 million ops/s.
+                    // batch.prepost_write(&[ms.get_opaque()], &remote_memory, scnt as _, safeverbs::ffi::ibv_send_flags(0));
+                    // if (scnt + 1) % tx_depth == 0 || scnt + 1 == total_iters {
+                    //     batch.enclose();
+                    //     let wr = unsafe { qp.post_send_batch(&mut batch)? };
+                    //     wr_set.push(wr.fuse());
+                    // }
+                    // scnt += 1;
+                // }
+
+                if scnt < rcnt + tx_depth && scnt < total_iters {
+                    if scnt + tx_depth > total_iters {
+                        batch.clear();
+                        while scnt < rcnt + tx_depth && scnt < total_iters {
+                            batch.prepost_write(&[ms.get_opaque()], &remote_memory, scnt as _, safeverbs::ffi::ibv_send_flags(0));
+                            if (scnt + 1) % tx_depth == 0 || scnt + 1 == total_iters {
+                                batch.enclose();
+                                let wr = unsafe { qp.post_send_batch(&mut batch)? };
+                                wr_set.push(wr.fuse());
+                            }
+                            scnt += 1;
                         }
+                    } else {
+                        // Avoid reconstruct the batch every time
+                        // THis achieves ~12 million ops/s
+                        let wr = unsafe { qp.post_send_batch(&mut batch)? };
+                        wr_set.push(wr.fuse());
+                        scnt += tx_depth;
                     }
-                    scnt += 1;
                 }
 
                 futures::select! {
