@@ -55,6 +55,22 @@ use crate::wc::Wc;
 
 verus! {
 
+/// A pure ghost interpretation of the ring's concrete resource value, with one direction
+/// per member. A future buffer-token proof must construct this interpretation honestly;
+/// these adapters prove that the ring preserves it rather than assuming a whole worker
+/// refinement. No runtime field, allocation or check is introduced.
+pub ghost struct Permissions<L> {
+    pub access: Map<int, Seq<Dir>>,
+    pub resources: spec_fn(L) -> Seq<Lease>,
+}
+
+impl<L> Permissions<L> {
+    pub open spec fn contains_key(self, s: int) -> bool { self.access.contains_key(s) }
+    pub open spec fn insert(self, s: int, dirs: Seq<Dir>) -> Self {
+        Permissions { access: self.access.insert(s, dirs), resources: self.resources }
+    }
+}
+
 /// What A sees of a ring: its requests and its staged requests, by sequence
 /// number.
 pub ghost struct View<L> {
@@ -103,28 +119,36 @@ pub open spec fn as_req<L>(r: ReqView<L>, q: QpId, dir: Seq<Dir>) -> Req {
     Req { qp: q, dirs: dir, phase: r.phase, waker: r.waker, detached: r.detached }
 }
 
+/// The abstract group is exactly the resource sequence represented by the concrete `L`.
+pub open spec fn resources_match<L>(v: View<L>, a: Abs::State, ids: Map<int, Id>, dirs: Permissions<L>, s: int) -> bool {
+    &&& (v.req)(s) is Some ==> a.groups[ids[s]].members == (dirs.resources)((v.req)(s)->0.leases)
+    &&& (v.staged)(s) is Some ==> a.groups[ids[s]].members == (dirs.resources)((v.staged)(s)->0.leases)
+    &&& (v.refused)(s) is Some ==> a.groups[ids[s]].members == (dirs.resources)((v.refused)(s)->0)
+}
+
 /// The ring's requests sit in `a`: every request A sees in the ring is the
 /// request group `ids[s]` of `a`, on queue pair `q`, with member directions
-/// `dirs[s]`, with the same phase, waker and owner; every staged request's
+/// `dirs.access[s]`, with the same phase, waker and owner; every staged request's
 /// leases are the program lease `ids[s]`, which may be posted in direction
-/// `dirs[s]`; every refused request's leases are the program lease
+/// `dirs.access[s]`; every refused request's leases are the program lease
 /// `ids[s]`; no two hold the same lease.
 pub open spec fn placed<L>(
     v: View<L>,
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> bool {
     &&& abs_inv(a)
     &&& wf(v)
     &&& a.qps.contains(q)
+    &&& forall|s: int| #[trigger] holds(v, s) ==> resources_match(v, a, ids, dirs, s)
     &&& forall|s: int| #[trigger] holds(v, s) ==> ids.contains_key(s) && dirs.contains_key(s)
     &&& forall|s: int|
         #[trigger] (v.req)(s) is Some ==> a.groups.contains_key(ids[s]) && a.groups[ids[s]].holder
-            == (Holder::Request { req: as_req((v.req)(s)->0, q, dirs[s]) })
+            == (Holder::Request { req: as_req((v.req)(s)->0, q, dirs.access[s]) })
     &&& forall|s: int|
-        #[trigger] (v.staged)(s) is Some ==> a.is_program(ids[s]) && a.groups[ids[s]].allows(dirs[s])
+        #[trigger] (v.staged)(s) is Some ==> a.is_program(ids[s]) && a.groups[ids[s]].allows(dirs.access[s])
     &&& forall|s: int| #[trigger] (v.refused)(s) is Some ==> a.is_program(ids[s])
     &&& forall|s: int, t: int|
         #![trigger ids[s], ids[t]]
@@ -165,13 +189,18 @@ pub open spec fn flushed() -> Outcome {
 // Single steps
 
 /// Placement carries over to a view that agrees.
-pub proof fn lemma_same<L>(v: View<L>, w: View<L>, a: Abs::State, q: QpId, ids: Map<int, Id>, dirs: Map<int, Seq<Dir>>)
+pub proof fn lemma_same<L>(v: View<L>, w: View<L>, a: Abs::State, q: QpId, ids: Map<int, Id>, dirs: Permissions<L>)
     requires
         placed(v, a, q, ids, dirs),
         same(v, w),
     ensures
         placed(w, a, q, ids, dirs),
 {
+    assert forall|s: int| #[trigger] holds(w, s) implies resources_match(w, a, ids, dirs, s) by {
+        assert(holds(v, s));
+        assert(resources_match(v, a, ids, dirs, s));
+        assert((v.req)(s) == (w.req)(s) && (v.staged)(s) == (w.staged)(s) && (v.refused)(s) == (w.refused)(s));
+    }
     assert forall|s: int| #[trigger] (w.req)(s) is Some implies req_wf((w.req)(s)->0) by {
         assert((v.req)(s) == (w.req)(s));
     }
@@ -197,10 +226,10 @@ pub proof fn lemma_same<L>(v: View<L>, w: View<L>, a: Abs::State, q: QpId, ids: 
         assert((v.refused)(s) == (w.refused)(s));
     }
     assert forall|s: int| #[trigger] (w.req)(s) is Some implies a.groups.contains_key(ids[s])
-        && a.groups[ids[s]].holder == (Holder::Request { req: as_req((w.req)(s)->0, q, dirs[s]) }) by {
+        && a.groups[ids[s]].holder == (Holder::Request { req: as_req((w.req)(s)->0, q, dirs.access[s]) }) by {
         assert((v.req)(s) == (w.req)(s));
     }
-    assert forall|s: int| #[trigger] (w.staged)(s) is Some implies a.is_program(ids[s]) && a.groups[ids[s]].allows(dirs[s]) by {
+    assert forall|s: int| #[trigger] (w.staged)(s) is Some implies a.is_program(ids[s]) && a.groups[ids[s]].allows(dirs.access[s]) by {
         assert((v.staged)(s) == (w.staged)(s));
     }
     assert forall|s: int, t: int|
@@ -256,7 +285,7 @@ pub proof fn lemma_complete_one<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
     o: Wc,
 )
@@ -280,16 +309,21 @@ pub proof fn lemma_complete_one<L>(
     safeverbs_spec::abs::lemma_abs_step_is_next(a, a2, Abs::Step::complete(r, o.outcome()));
     safeverbs_spec::refinement::lemma_abs_reaches_next(a, a2);
     safeverbs_spec::refinement::lemma_abs_reaches_invariant(a, a2);
+    assert forall|t: int| #[trigger] holds(w, t) implies resources_match(w, a2, ids, dirs, t) by {
+        assert(holds(v, t));
+        assert(resources_match(v, a, ids, dirs, t));
+        if t != s { assert(ids[t] != ids[s]); }
+    }
     assert forall|t: int| #[trigger] holds(w, t) implies ids.contains_key(t) && dirs.contains_key(t) by {
         assert(holds(v, t));
     }
     assert forall|t: int| #[trigger] (w.req)(t) is Some implies a2.groups.contains_key(ids[t])
-        && a2.groups[ids[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs[t]) }) by {
+        && a2.groups[ids[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs.access[t]) }) by {
         if t != s {
             assert(holds(v, t));
         }
     }
-    assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a2.is_program(ids[t]) && a2.groups[ids[t]].allows(dirs[t]) by {
+    assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a2.is_program(ids[t]) && a2.groups[ids[t]].allows(dirs.access[t]) by {
         assert(holds(v, t));
     }
     assert forall|t: int| #[trigger] (w.refused)(t) is Some implies a2.is_program(ids[t]) by {
@@ -328,7 +362,7 @@ pub proof fn lemma_complete<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     from: int,
     to: int,
     o: spec_fn(int) -> Wc,
@@ -424,7 +458,7 @@ proof fn lemma_step_one<L>(
     step: Abs::Step,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
 )
     requires
@@ -432,6 +466,7 @@ proof fn lemma_step_one<L>(
         abs_step(a, a2, step),
         wf(w),
         holds(v, s),
+        resources_match(w, a2, ids, dirs, s),
         forall|t: int| t != s ==> #[trigger] (w.req)(t) == (v.req)(t),
         forall|t: int| t != s ==> #[trigger] (w.staged)(t) == (v.staged)(t),
         forall|t: int| t != s ==> #[trigger] (w.refused)(t) == (v.refused)(t),
@@ -440,9 +475,9 @@ proof fn lemma_step_one<L>(
             && a2.groups[i] == a.groups[i],
         a2.qps == a.qps,
         (w.req)(s) is Some ==> a2.groups.contains_key(ids[s]) && a2.groups[ids[s]].holder == (Holder::Request {
-            req: as_req((w.req)(s)->0, q, dirs[s]),
+            req: as_req((w.req)(s)->0, q, dirs.access[s]),
         }),
-        (w.staged)(s) is Some ==> a2.is_program(ids[s]) && a2.groups[ids[s]].allows(dirs[s]),
+        (w.staged)(s) is Some ==> a2.is_program(ids[s]) && a2.groups[ids[s]].allows(dirs.access[s]),
         (w.refused)(s) is Some ==> a2.is_program(ids[s]),
     ensures
         safeverbs_spec::refinement::abs_reaches(a, a2),
@@ -464,7 +499,7 @@ proof fn lemma_placed_but<L>(
     a2: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
 )
     requires
@@ -472,6 +507,7 @@ proof fn lemma_placed_but<L>(
         abs_inv(a2),
         wf(w),
         holds(v, s),
+        resources_match(w, a2, ids, dirs, s),
         forall|t: int| t != s ==> #[trigger] (w.req)(t) == (v.req)(t),
         forall|t: int| t != s ==> #[trigger] (w.staged)(t) == (v.staged)(t),
         forall|t: int| t != s ==> #[trigger] (w.refused)(t) == (v.refused)(t),
@@ -479,25 +515,32 @@ proof fn lemma_placed_but<L>(
             && a2.groups[i] == a.groups[i],
         a2.qps == a.qps,
         (w.req)(s) is Some ==> a2.groups.contains_key(ids[s]) && a2.groups[ids[s]].holder == (Holder::Request {
-            req: as_req((w.req)(s)->0, q, dirs[s]),
+            req: as_req((w.req)(s)->0, q, dirs.access[s]),
         }),
-        (w.staged)(s) is Some ==> a2.is_program(ids[s]) && a2.groups[ids[s]].allows(dirs[s]),
+        (w.staged)(s) is Some ==> a2.is_program(ids[s]) && a2.groups[ids[s]].allows(dirs.access[s]),
         (w.refused)(s) is Some ==> a2.is_program(ids[s]),
     ensures
         placed(w, a2, q, ids, dirs),
 {
+    assert forall|t: int| #[trigger] holds(w, t) implies resources_match(w, a2, ids, dirs, t) by {
+        if t != s {
+            assert(holds(v, t) && ids[t] != ids[s]);
+            assert(resources_match(v, a, ids, dirs, t));
+            assert(a.groups.contains_key(ids[t]) && a2.groups[ids[t]] == a.groups[ids[t]]);
+        }
+    }
     assert forall|t: int| #[trigger] holds(w, t) implies ids.contains_key(t) && dirs.contains_key(t) by {
         if t != s {
             assert(holds(v, t));
         }
     }
     assert forall|t: int| #[trigger] (w.req)(t) is Some implies a2.groups.contains_key(ids[t])
-        && a2.groups[ids[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs[t]) }) by {
+        && a2.groups[ids[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs.access[t]) }) by {
         if t != s {
             assert(holds(v, t));
         }
     }
-    assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a2.is_program(ids[t]) && a2.groups[ids[t]].allows(dirs[t]) by {
+    assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a2.is_program(ids[t]) && a2.groups[ids[t]].allows(dirs.access[t]) by {
         if t != s {
             assert(holds(v, t));
             assert(ids[t] != ids[s]);
@@ -527,18 +570,19 @@ proof fn lemma_reshape<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
 )
     requires
         placed(v, a, q, ids, dirs),
         wf(w),
         holds(v, s),
+        resources_match(w, a, ids, dirs, s),
         forall|t: int| t != s ==> #[trigger] (w.req)(t) == (v.req)(t),
         forall|t: int| t != s ==> #[trigger] (w.staged)(t) == (v.staged)(t),
         forall|t: int| t != s ==> #[trigger] (w.refused)(t) == (v.refused)(t),
         (w.req)(s) is None,
-        (w.staged)(s) is Some ==> a.is_program(ids[s]) && a.groups[ids[s]].allows(dirs[s]),
+        (w.staged)(s) is Some ==> a.is_program(ids[s]) && a.groups[ids[s]].allows(dirs.access[s]),
         (w.refused)(s) is Some ==> a.is_program(ids[s]),
     ensures
         placed(w, a, q, ids, dirs),
@@ -554,7 +598,7 @@ pub proof fn lemma_post_one<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
 ) -> (r: (Abs::State, Map<int, Id>))
     requires
@@ -569,7 +613,7 @@ pub proof fn lemma_post_one<L>(
 {
     let st = (v.staged)(s)->0;
     let i = ids[s];
-    let dir = dirs[s];
+    let dir = dirs.access[s];
     let id = a.next_id;
     assert(holds(v, s));
     // post_request
@@ -599,6 +643,11 @@ pub proof fn lemma_post_one<L>(
     safeverbs_spec::refinement::lemma_abs_reaches_invariant(a, a2);
     let ids2 = ids.insert(s, id);
     let w = posted(v, s);
+    assert forall|t: int| #[trigger] holds(w, t) implies resources_match(w, a2, ids2, dirs, t) by {
+        assert(holds(v, t));
+        assert(resources_match(v, a, ids, dirs, t));
+        if t != s { assert(ids[t] != ids[s] && ids[t] < id); }
+    }
     // Every lease the ring holds is older than the fresh id.
     assert forall|t: int| #[trigger] holds(v, t) implies ids[t] < id by {
         assert(a.groups.contains_key(ids[t]));
@@ -608,10 +657,10 @@ pub proof fn lemma_post_one<L>(
         assert(holds(v, t));
     }
     assert forall|t: int| #[trigger] (w.req)(t) is Some implies a2.groups.contains_key(ids2[t])
-        && a2.groups[ids2[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs[t]) }) by {
+        && a2.groups[ids2[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs.access[t]) }) by {
         assert(holds(v, t));
     }
-    assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a2.is_program(ids2[t]) && a2.groups[ids2[t]].allows(dirs[t]) by {
+    assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a2.is_program(ids2[t]) && a2.groups[ids2[t]].allows(dirs.access[t]) by {
         assert(holds(v, t));
     }
     assert forall|t: int| #[trigger] (w.refused)(t) is Some implies a2.is_program(ids2[t]) by {
@@ -670,7 +719,7 @@ pub proof fn lemma_commit<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     from: int,
     to: int,
 ) -> (r: (Abs::State, Map<int, Id>))
@@ -729,7 +778,7 @@ pub proof fn lemma_abort<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     from: int,
     to: int,
     keep: int,
@@ -799,7 +848,7 @@ pub proof fn lemma_drop_staged<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     from: int,
     to: int,
 ) -> (a2: Abs::State)
@@ -866,7 +915,7 @@ pub proof fn lemma_take_refused<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
 )
     requires
@@ -886,7 +935,7 @@ pub proof fn lemma_drop_refused<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
 ) -> (a2: Abs::State)
     requires
@@ -912,7 +961,7 @@ pub proof fn lemma_take<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
     o: Wc,
     l: L,
@@ -975,7 +1024,7 @@ pub proof fn lemma_detach<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
 ) -> (a2: Abs::State)
     requires
@@ -1008,10 +1057,10 @@ pub proof fn lemma_detach<L>(
             assert(holds(v, t));
         }
         assert forall|t: int| #[trigger] (w.req)(t) is Some implies a.groups.contains_key(ids[t])
-            && a.groups[ids[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs[t]) }) by {
+            && a.groups[ids[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs.access[t]) }) by {
             assert(holds(v, t));
         }
-        assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a.is_program(ids[t]) && a.groups[ids[t]].allows(dirs[t]) by {
+        assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a.is_program(ids[t]) && a.groups[ids[t]].allows(dirs.access[t]) by {
             assert(holds(v, t));
         }
         assert forall|t: int| #[trigger] (w.refused)(t) is Some implies a.is_program(ids[t]) by {
@@ -1059,7 +1108,7 @@ pub proof fn lemma_register<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
     wk: WakerId,
 ) -> (a2: Abs::State)
@@ -1086,10 +1135,10 @@ pub proof fn lemma_register<L>(
             assert(holds(v, t));
         }
         assert forall|t: int| #[trigger] (w.req)(t) is Some implies a.groups.contains_key(ids[t])
-            && a.groups[ids[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs[t]) }) by {
+            && a.groups[ids[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs.access[t]) }) by {
             assert(holds(v, t));
         }
-        assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a.is_program(ids[t]) && a.groups[ids[t]].allows(dirs[t]) by {
+        assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a.is_program(ids[t]) && a.groups[ids[t]].allows(dirs.access[t]) by {
             assert(holds(v, t));
         }
         assert forall|t: int| #[trigger] (w.refused)(t) is Some implies a.is_program(ids[t]) by {
@@ -1125,7 +1174,7 @@ pub proof fn lemma_end<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
     i: Id,
     dir: Seq<Dir>,
@@ -1136,6 +1185,7 @@ pub proof fn lemma_end<L>(
         placed(v, a, q, ids, dirs),
         !holds(v, s),
         a.is_program(i),
+        a.groups[i].members == (dirs.resources)(l),
         a.groups[i].allows(dir),
         forall|t: int| #[trigger] holds(v, t) ==> ids[t] != i,
     ensures
@@ -1144,6 +1194,12 @@ pub proof fn lemma_end<L>(
     let w = staged_with(v, s, detached, l);
     let ids2 = ids.insert(s, i);
     let dirs2 = dirs.insert(s, dir);
+    assert forall|t: int| #[trigger] holds(w, t) implies resources_match(w, a, ids2, dirs2, t) by {
+        if t != s {
+            assert(holds(v, t));
+            assert(resources_match(v, a, ids, dirs, t));
+        }
+    }
     assert forall|t: int| #[trigger] (w.staged)(t) is Some implies staged_wf((w.staged)(t)->0) by {}
     assert forall|t: int| #[trigger] holds(w, t) implies ids2.contains_key(t) && dirs2.contains_key(t) by {
         if t != s {
@@ -1151,10 +1207,10 @@ pub proof fn lemma_end<L>(
         }
     }
     assert forall|t: int| #[trigger] (w.req)(t) is Some implies a.groups.contains_key(ids2[t])
-        && a.groups[ids2[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs2[t]) }) by {
+        && a.groups[ids2[t]].holder == (Holder::Request { req: as_req((w.req)(t)->0, q, dirs2.access[t]) }) by {
         assert(holds(v, t));
     }
-    assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a.is_program(ids2[t]) && a.groups[ids2[t]].allows(dirs2[t]) by {
+    assert forall|t: int| #[trigger] (w.staged)(t) is Some implies a.is_program(ids2[t]) && a.groups[ids2[t]].allows(dirs2.access[t]) by {
         if t != s {
             assert(holds(v, t));
         }
@@ -1182,7 +1238,7 @@ pub proof fn lemma_release_one<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     s: int,
 ) -> (a2: Abs::State)
     requires
@@ -1265,7 +1321,7 @@ pub proof fn lemma_release<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     from: int,
     to: int,
 ) -> (a2: Abs::State)
@@ -1319,7 +1375,7 @@ pub proof fn lemma_ring_stutter<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 )
     requires
         placed(pre.view(), a, q, ids, dirs),
@@ -1341,7 +1397,7 @@ pub proof fn lemma_ring_end<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
     i: Id,
     dir: Seq<Dir>,
 )
@@ -1349,6 +1405,7 @@ pub proof fn lemma_ring_end<L>(
         pre.inv(),
         placed(pre.view(), a, q, ids, dirs),
         a.is_program(i),
+        a.groups[i].members == (dirs.resources)(leases),
         a.groups[i].allows(dir),
         forall|t: int| #[trigger] holds(pre.view(), t) ==> ids[t] != i,
         forall|s: int| #[trigger] post.req(s) == pre.req(s),
@@ -1389,7 +1446,7 @@ pub proof fn lemma_ring_commit<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (r: (Abs::State, Map<int, Id>))
     requires
         pre.inv(),
@@ -1424,7 +1481,7 @@ pub proof fn lemma_ring_abort<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (a2: Abs::State)
     requires
         pre.inv(),
@@ -1464,7 +1521,7 @@ pub proof fn lemma_ring_complete<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (a2: Abs::State)
     requires
         pre.inv(),
@@ -1518,7 +1575,7 @@ pub proof fn lemma_ring_take<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (a2: Abs::State)
     requires
         placed(pre.view(), a, q, ids, dirs),
@@ -1560,7 +1617,7 @@ pub proof fn lemma_ring_take_refused<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 )
     requires
         placed(pre.view(), a, q, ids, dirs),
@@ -1589,7 +1646,7 @@ pub proof fn lemma_ring_detach<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (a2: Abs::State)
     requires
         placed(pre.view(), a, q, ids, dirs),
@@ -1634,7 +1691,7 @@ pub proof fn lemma_ring_register<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (a2: Abs::State)
     requires
         placed(pre.view(), a, q, ids, dirs),
@@ -1674,7 +1731,7 @@ pub proof fn lemma_ring_release_all<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (a2: Abs::State)
     requires
         pre.inv(),
@@ -1750,7 +1807,7 @@ pub proof fn lemma_side_move<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 )
     requires
         placed(with_side(pre.view(), side, refused), a, q, ids, dirs),
@@ -1792,7 +1849,7 @@ pub proof fn lemma_side_move_refused<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 )
     requires
         placed(with_side(pre.view(), side, refused), a, q, ids, dirs),
@@ -1830,7 +1887,7 @@ pub proof fn lemma_side_take<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (a2: Abs::State)
     requires
         placed(with_side(v, side, refused), a, q, ids, dirs),
@@ -1856,7 +1913,7 @@ pub proof fn lemma_side_take_refused<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 )
     requires
         placed(with_side(v, side, refused), a, q, ids, dirs),
@@ -1881,7 +1938,7 @@ pub proof fn lemma_side_detach<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (a2: Abs::State)
     requires
         placed(with_side(v, side, refused), a, q, ids, dirs),
@@ -1907,7 +1964,7 @@ pub proof fn lemma_side_detach_refused<L>(
     a: Abs::State,
     q: QpId,
     ids: Map<int, Id>,
-    dirs: Map<int, Seq<Dir>>,
+    dirs: Permissions<L>,
 ) -> (a2: Abs::State)
     requires
         placed(with_side(v, side, refused), a, q, ids, dirs),
