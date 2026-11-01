@@ -2,7 +2,7 @@
 //! unit of thread affinity, driven synchronously.
 //!
 //! Everything of a worker that the NIC model M sees (its CQ, its QPs'
-//! hardware queues and rings, its share of M) lives in [`crate::hw::Hw`],
+//! hardware queues and rings, its share of M) lives in the internal `Hw`,
 //! which is verified: every call into the NIC meets M's precondition, the
 //! rings stay coupled to M's queues, completions are routed to the WQEs they
 //! name, and QPs are destroyed only drained. This module is the unverified

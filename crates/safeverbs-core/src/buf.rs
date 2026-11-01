@@ -530,8 +530,8 @@ impl<T, N: Nic> fmt::Debug for Buf<T, N> {
 
 /// A buffer exposed to peers: they may RDMA WRITE, READ and run atomics on
 /// it with [`Exposed::remote`], so it is never readable as `[T]`; read it
-/// with volatile copies ([`Exposed::copy_to_slice`]) or [`Exposed::reclaim`]
-/// it, which revokes the peers' access first.
+/// only after [`Exposed::reclaim`] revokes the peers' access. The unsafe
+/// [`Exposed::copy_to_slice`] escape hatch requires caller-established quiescence.
 pub struct Exposed<T, N: Nic = Verbs> {
     /// The remote-access registration; dropped (deregistered) before `raw`.
     mr: N::Mr,
@@ -561,12 +561,27 @@ impl<T, N: Nic> Exposed<T, N> {
     }
 
     /// Copies its current contents into `out` (the first `out.len()`
-    /// elements) with volatile reads, since peers may be writing it.
+    /// elements) with volatile reads after the caller has synchronized peer access.
+    ///
+    /// # Safety
+    ///
+    /// No NIC, software backend or peer may write the source bytes during
+    /// this copy. The caller must establish completion and exclude concurrent
+    /// and future writes for its duration. Volatile reads do not synchronize
+    /// with DMA or other Rust threads. Prefer [`Self::reclaim`] to revoke
+    /// remote access before using ordinary safe reads.
+    ///
+    /// ```compile_fail
+    /// use safeverbs_core::Exposed;
+    /// fn unsynchronized_copy(buf: &Exposed<u8>, out: &mut [u8]) {
+    ///     buf.copy_to_slice(out);
+    /// }
+    /// ```
     ///
     /// # Panics
     ///
     /// If `out` is longer than it.
-    pub fn copy_to_slice(&self, out: &mut [T])
+    pub unsafe fn copy_to_slice(&self, out: &mut [T])
     where
         T: FromBytes + IntoBytes,
     {
@@ -580,8 +595,7 @@ impl<T, N: Nic> Exposed<T, N> {
         let src = self.raw.ptr();
         let mut i = 0;
         while i < dst.len() {
-            // SAFETY: inside the buffer; volatile because the NIC may write
-            // it behind the compiler's back.
+            // SAFETY: inside the buffer and quiescent by the caller's contract.
             dst[i] = unsafe { core::ptr::read_volatile(src.add(i)) };
             i += 1;
         }

@@ -318,7 +318,18 @@ pub struct ConnectAttr {
 /// dependency order: QPs before their CQs and PD, memory regions before
 /// their PD, everything before the device. The safe wrappers in this crate
 /// keep that order.
-pub trait Nic: Send + Sync + Sized + 'static {
+/// # Safety
+///
+/// Implementations and their associated resources must enforce the access ranges,
+/// protection domains and permissions of registered memory. Completions must truthfully
+/// identify retired work: reporting retirement permits the safe core to release its
+/// buffers immediately. An in-order completion must imply all earlier work on that queue
+/// has stopped accessing local memory. Deregistration and resource destruction must
+/// quiesce access before returning or releasing backing memory. Associated queue methods
+/// must honor their documented posting, cancellation and completion contracts, including
+/// rejecting invalid remote descriptors rather than accessing arbitrary process memory.
+/// A backend is part of the trusted boundary even when its implementation is software.
+pub unsafe trait Nic: Send + Sync + Sized + 'static {
     /// A protection domain.
     type Pd: Send + Sync + 'static;
     /// A registered memory region; deregistered when dropped.
@@ -420,10 +431,12 @@ pub trait NicQp: Send {
     /// # Safety
     ///
     /// Between [`NicQp::start`] and [`NicQp::complete`] or [`NicQp::abort`].
-    /// The memory of `sges`, and of the local or remote buffer `op` names,
-    /// must stay registered and valid until the WQE completes; memory the
+    /// The local memory of `sges` must stay registered and valid until the
+    /// WQE completes; memory the
     /// NIC writes must not be read or written by Rust code meanwhile. The
     /// queue must have room.
+    /// A remote descriptor may be stale or rejected by the peer; this must
+    /// produce an operation error, never a local memory-safety violation.
     unsafe fn post(&mut self, wr_id: u64, signaled: bool, op: &WrOp, sges: &[Sge]);
 
     /// Rings the doorbell for the WQEs written since [`NicQp::start`]

@@ -14,10 +14,10 @@
 //! - [`ring`]: the completion ring of a work queue, pure bookkeeping
 //!   without FFI or `unsafe`, verified with Verus; [`refine`] proves that
 //!   it refines the abstract machine of `safeverbs-spec`;
-//! - [`trusted`]: the verbs with their contracts from the NIC model;
+//! - the internal `trusted` module: verbs with contracts from the NIC model;
 //! - [`wr_id`]: the `wr_id` of a WQE and how a completion is routed back by
 //!   it, verified;
-//! - [`hw`]: the hardware side of a worker (its CQ, its QPs' queues and
+//! - the internal `hw` module: the hardware side of a worker (its CQ, its QPs' queues and
 //!   rings, its share of the NIC model), verified against the trusted verbs:
 //!   every verb meets the model's precondition, the rings stay coupled to the
 //!   model's queues, and QPs are destroyed only once drained;
@@ -46,14 +46,14 @@
 
 pub mod buf;
 pub mod error;
-pub mod hw;
+pub(crate) mod hw;
 pub mod model;
 pub mod nic;
 pub mod pd;
 pub mod refine;
 pub mod ring;
 pub mod transport;
-pub mod trusted;
+pub(crate) mod trusted;
 pub mod verbs;
 pub mod wc;
 pub mod worker;

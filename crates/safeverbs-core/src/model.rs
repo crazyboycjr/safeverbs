@@ -303,17 +303,19 @@ impl Fabric {
     /// Validates `sges` as local memory of `pd` (writable if `write`);
     /// returns the total length.
     fn check_local(&self, pd: u32, sges: &[Sge], write: bool) -> Option<usize> {
-        let mut total = 0;
+        let mut total: usize = 0;
         for sge in sges {
             let mr = self.mrs.get(&sge.lkey)?;
             if mr.pd != pd || (write && !mr.access.contains(Access::LOCAL_WRITE)) {
                 return None;
             }
-            let start = sge.addr as usize;
-            if start < mr.addr || start + sge.length as usize > mr.addr + mr.len {
+            let start = usize::try_from(sge.addr).ok()?;
+            let end = start.checked_add(sge.length as usize)?;
+            let region_end = mr.addr.checked_add(mr.len)?;
+            if start < mr.addr || end > region_end {
                 return None;
             }
-            total += sge.length as usize;
+            total = total.checked_add(sge.length as usize)?;
         }
         Some(total)
     }
@@ -323,11 +325,16 @@ impl Fabric {
     fn check_remote(&self, pd: u32, rkey: u32, addr: u64, len: usize, right: Access) -> bool {
         match self.mrs.get(&rkey) {
             Some(mr) => {
-                let start = addr as usize;
-                mr.pd == pd
-                    && mr.access.contains(right)
-                    && start >= mr.addr
-                    && start + len <= mr.addr + mr.len
+                let Ok(start) = usize::try_from(addr) else {
+                    return false;
+                };
+                let Some(end) = start.checked_add(len) else {
+                    return false;
+                };
+                let Some(region_end) = mr.addr.checked_add(mr.len) else {
+                    return false;
+                };
+                mr.pd == pd && mr.access.contains(right) && start >= mr.addr && end <= region_end
             }
             None => false,
         }
@@ -909,5 +916,41 @@ impl Nic for Model {
             num,
             staged: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn forged_ranges_never_wrap_into_registered_memory() {
+        let model = Model::new(1);
+        let mut fabric = model.lock();
+        fabric.mrs.insert(
+            7,
+            MrRec {
+                addr: 0x1000,
+                len: 4096,
+                access: Access::LOCAL_WRITE | Access::REMOTE_WRITE | Access::REMOTE_READ,
+                pd: 3,
+            },
+        );
+        assert!(fabric.check_remote(3, 7, 0x1000, 4096, Access::REMOTE_WRITE));
+        assert!(!fabric.check_remote(3, 7, (usize::MAX - 3) as u64, 8, Access::REMOTE_WRITE));
+        assert!(!fabric.check_remote(3, 7, 0x1fff, 2, Access::REMOTE_READ));
+        assert!(!fabric.check_remote(3, 7, 0x1000, usize::MAX, Access::REMOTE_READ));
+        let valid = Sge {
+            addr: 0x1000,
+            length: 4096,
+            lkey: 7,
+        };
+        assert_eq!(fabric.check_local(3, &[valid], true), Some(4096));
+        let forged = Sge {
+            addr: (usize::MAX - 3) as u64,
+            length: 8,
+            ..valid
+        };
+        assert_eq!(fabric.check_local(3, &[forged], true), None);
     }
 }
