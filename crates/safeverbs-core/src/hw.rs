@@ -662,6 +662,7 @@ impl<N: Device> Hw<N> {
     /// The sizes are checked against what the device supports, and the
     /// QP's depths must fit in what the CQ has not reserved yet: this is
     /// M's reservation, so the CQ cannot overrun.
+    #[verifier::spinoff_prover]
     pub fn create_qp(&mut self, qp_type: QpType, caps: QpCaps, max_batch: u32) -> (r: Result<usize>)
         requires
             old(self).inv(),
@@ -968,6 +969,7 @@ proof fn lemma_modified(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State
 impl<N: Device> Hw<N> {
     /// After a step that changed only entry `index`'s QP in M (and the
     /// entry), the invariant holds again.
+    #[verifier::spinoff_prover]
     proof fn lemma_touch_one(&self, start: &Self, t: NicToken, mid: Nic::State, n: Nic::State, index: int)
         requires
             start.inv_with(t, mid),
@@ -1042,6 +1044,7 @@ impl<N: Device> Hw<N> {
     /// Moves QP `index` to the error state: every request in flight
     /// completes with a flush error. Work posted from then on is flushed
     /// too.
+    #[verifier::spinoff_prover]
     pub fn to_error(&mut self, index: usize) -> (r: Result<()>)
         requires
             old(self).inv(),
@@ -1111,6 +1114,7 @@ impl<N: Device> Hw<N> {
 impl<N: Device> Hw<N> {
     /// After steps that frame the share but QP `q` of entry `index` (and a
     /// change of that entry), the invariant holds again.
+    #[verifier::spinoff_prover]
     proof fn lemma_but_one(&self, start: &Self, t: NicToken, m: Nic::State, n: Nic::State, index: int)
         requires
             start.inv_with(t, m),
@@ -1215,6 +1219,7 @@ impl<N: Device> Hw<N> {
     /// Connects QP `index` to `remote` (RESET to INIT, RTR and RTS). A QP
     /// connects once: from RESET, as created. If connecting fails part way,
     /// the QP takes no work until it is moved to the error state.
+    #[verifier::spinoff_prover]
     pub fn connect(&mut self, index: usize, attr: &ConnectAttr, remote: &Endpoint) -> (r: Result<()>)
         requires
             old(self).inv(),
@@ -1319,6 +1324,7 @@ impl<N: Device> Hw<N> {
     /// `detached` if nobody will take it back by its sequence number.
     /// Refused when the QP takes no work (`Error::NotConnected`), the part is
     /// of another protection domain or frozen, or the receive queue is full.
+    #[verifier::spinoff_prover]
     pub fn post_recv(&mut self, index: usize, part: Part<N>, detached: bool) -> (r: core::result::Result<RingSeq, BufError<Part<N>>>)
         requires
             old(self).inv(),
@@ -1571,6 +1577,7 @@ impl<N: Device> Hw<N> {
     /// Routes one completion, the one `before`'s `poll_cq` step reports, to
     /// its QP's ring: its `wr_id` names the QP's index, the queue and the
     /// WQE, which the ring retires (with every earlier request it ends).
+    #[verifier::spinoff_prover]
     fn dispatch(&mut self, wc: &Wc, Ghost(t): Ghost<NicToken>, Ghost(before): Ghost<Nic::State>, Ghost(after): Ghost<Nic::State>)
         requires
             old(self).inv_with(t, before),
@@ -1702,6 +1709,7 @@ impl<N: Device> Hw<N> {
     /// After a `poll_cq` step that changed only entry `index`'s QP and
     /// retired WQEs of it (and a change of that entry), the invariant holds
     /// again.
+    #[verifier::spinoff_prover]
     proof fn lemma_poll_one(&self, start: &Self, t: NicToken, mid: Nic::State, n: Nic::State, index: int)
         requires
             start.inv_with(t, mid),
@@ -1782,6 +1790,7 @@ impl<N: Device> Hw<N> {
     /// Polls the CQ once, retiring what completed in the rings of its QPs
     /// (and waking the wakers registered there); returns the number of
     /// completions.
+    #[verifier::spinoff_prover]
     pub fn progress(&mut self) -> (n: usize)
         requires
             old(self).inv(),
@@ -1859,6 +1868,7 @@ impl<N: Device> Hw<N> {
     /// is refused as a device would refuse it: `Error::NotConnected`), none
     /// of them is posted: each with an owner retires at once with a flush
     /// error, each without releases its leases.
+    #[verifier::spinoff_prover]
     pub fn commit(&mut self, index: usize, keep: Option<RingSeq>) -> (r: core::result::Result<(), (Error, Option<Leases<N>>)>)
         requires
             old(self).inv(),
@@ -1990,6 +2000,7 @@ impl<N: Device> Hw<N> {
     /// After a step that changed only entry `index`'s QP in M, the entry,
     /// and the token's writing of that QP (now done), the invariant holds
     /// again.
+    #[verifier::spinoff_prover]
     proof fn lemma_commit_frame(&self, start: &Self, t0: NicToken, t: NicToken, mid: Nic::State, n: Nic::State, index: int)
         requires
             start.inv_with(t0, mid),
@@ -2134,6 +2145,7 @@ impl<N: Device> Hw<N> {
     /// last WQE, signaled if `signal` or if the ring says so; `detached` if
     /// nobody will take it back. Returns its sequence number, `None` without
     /// an open request. It goes out at the next doorbell.
+    #[verifier::spinoff_prover]
     pub fn close(&mut self, index: usize, signal: bool, detached: bool) -> (r: Option<RingSeq>)
         requires
             old(self).inv(),
@@ -2312,6 +2324,7 @@ impl<N: Device> Hw<N> {
     /// until a slot and a WQE are free. Fails if every slot holds a result
     /// nobody took, or if the doorbell is refused.
     #[verifier::exec_allows_no_decreases_clause]
+    #[verifier::spinoff_prover]
     fn make_send_room(&mut self, index: usize) -> (r: Result<()>)
         requires
             old(self).inv(),
@@ -2363,6 +2376,7 @@ impl<N: Device> Hw<N> {
 
     /// Adds `part` to the scatter/gather list of the WQE being written on QP
     /// `index`; refused (the part handed back) past [`MAX_SGES`] parts.
+    #[verifier::spinoff_prover]
     pub fn gather(&mut self, index: usize, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
         requires
             old(self).inv(),
@@ -2427,6 +2441,7 @@ impl<N: Device> Hw<N> {
     /// full (waiting for room: this polls the CQ), writes the WQE held so far
     /// and holds this one. On error nothing is added; the part is handed
     /// back if there was one, else the parts are dropped.
+    #[verifier::spinoff_prover]
     pub fn push(&mut self, index: usize, op: WrOp) -> (r: core::result::Result<(), (Error, Option<Part<N>>)>)
         requires
             old(self).inv(),
@@ -2588,6 +2603,7 @@ impl<N: Device> Hw<N> {
 
     /// The new WQE of [`Hw::push`], checked, in a request with room for it:
     /// writes the WQE held so far, if any, and holds this one.
+    #[verifier::spinoff_prover]
     fn hold(&mut self, index: usize, op: WrOp, parts: Vec<Part<N>>, sges: [Sge; MAX_SGES], n: usize, total: u64)
         requires
             old(self).inv(),
@@ -2717,6 +2733,277 @@ impl<N: Device> Hw<N> {
             assert(self.entry_ok(index as int, t4, m3));
             self.lemma_commit_frame(&s3, t3, t4, m3, m3, index as int);
         }
+    }
+}
+
+// =============================================================================
+// The rings, for their owners and the event loop
+
+/// Which ring of a QP.
+#[derive(Clone, Copy)]
+pub enum Side {
+    /// The send queue's.
+    Send,
+    /// The receive queue's.
+    Recv,
+}
+
+impl<N: Device> Hw<N> {
+    /// Whether `index` names a QP of the worker (not one being removed).
+    pub fn is_qp(&self, index: usize) -> (b: bool)
+        requires
+            self.inv(),
+    {
+        if index >= self.qps.len() {
+            return false;
+        }
+        match &self.qps[index] {
+            Some(e) => !e.removed,
+            None => false,
+        }
+    }
+
+    /// QP `index`'s ring of `side`, if it is a QP of the worker.
+    pub fn ring(&self, index: usize, side: Side) -> Option<&Ring<Leases<N>>>
+        requires
+            self.inv(),
+    {
+        if index >= self.qps.len() {
+            return None;
+        }
+        match &self.qps[index] {
+            Some(e) => match side {
+                Side::Send => Some(&e.send),
+                Side::Recv => Some(&e.recv),
+            },
+            None => None,
+        }
+    }
+
+    /// QP `index`'s queue sizes.
+    pub fn qp_caps(&self, index: usize) -> Option<QpCaps>
+        requires
+            self.inv(),
+    {
+        if index >= self.qps.len() {
+            return None;
+        }
+        match &self.qps[index] {
+            Some(e) => Some(e.caps),
+            None => None,
+        }
+    }
+
+    /// QP `index`'s number on the device, and whether the driver takes no
+    /// locks for it.
+    pub fn qp_num(&self, index: usize) -> Option<(u32, bool)>
+        requires
+            self.inv(),
+    {
+        if index >= self.qps.len() {
+            return None;
+        }
+        match &self.qps[index] {
+            Some(e) => Some((qp_num_of(&e.hw), qp_lock_free(&e.hw))),
+            None => None,
+        }
+    }
+
+    /// Takes the outcome and leases of retired (or refused) request `seq`
+    /// of QP `index`'s ring of `side`.
+    #[verifier::spinoff_prover]
+    pub fn take(&mut self, index: usize, side: Side, seq: RingSeq) -> (r: Option<(Wc, Leases<N>)>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        if index >= self.qps.len() {
+            return None;
+        }
+        let ghost start = *self;
+        let ghost t = self.token@;
+        let ghost m = t.nic();
+        proof {
+            assert(start.entry_ok(index as int, t, m));
+        }
+        let r = match &mut self.qps[index] {
+            Some(e) => match side {
+                Side::Send => e.send.take(seq),
+                Side::Recv => e.recv.take(seq),
+            },
+            None => None,
+        };
+        proof {
+            if start.qps@[index as int] is Some {
+                assert(self.entry_ok(index as int, t, m));
+                self.lemma_touch_one(&start, t, m, m, index as int);
+            } else {
+                assert(self.qps@ =~= start.qps@);
+                self.lemma_inv_fields(&start, t, m);
+            }
+        }
+        r
+    }
+
+    /// Gives up request `seq` of QP `index`'s ring of `side`: its leases are
+    /// released when it retires (now, if it has).
+    #[verifier::spinoff_prover]
+    pub fn detach(&mut self, index: usize, side: Side, seq: RingSeq)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        if index >= self.qps.len() {
+            return;
+        }
+        let ghost start = *self;
+        let ghost t = self.token@;
+        let ghost m = t.nic();
+        proof {
+            assert(start.entry_ok(index as int, t, m));
+        }
+        match &mut self.qps[index] {
+            Some(e) => match side {
+                Side::Send => e.send.detach(seq),
+                Side::Recv => e.recv.detach(seq),
+            },
+            None => {},
+        }
+        proof {
+            if start.qps@[index as int] is Some {
+                assert(self.entry_ok(index as int, t, m));
+                self.lemma_touch_one(&start, t, m, m, index as int);
+            } else {
+                assert(self.qps@ =~= start.qps@);
+                self.lemma_inv_fields(&start, t, m);
+            }
+        }
+    }
+
+    /// Wakes `waker` when request `seq` of QP `index`'s ring of `side`
+    /// retires.
+    #[verifier::spinoff_prover]
+    pub fn set_waker(&mut self, index: usize, side: Side, seq: RingSeq, waker: &core::task::Waker)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        if index >= self.qps.len() {
+            return;
+        }
+        let ghost start = *self;
+        let ghost t = self.token@;
+        let ghost m = t.nic();
+        proof {
+            assert(start.entry_ok(index as int, t, m));
+        }
+        match &mut self.qps[index] {
+            Some(e) => match side {
+                Side::Send => e.send.set_waker(seq, waker),
+                Side::Recv => e.recv.set_waker(seq, waker),
+            },
+            None => {},
+        }
+        proof {
+            if start.qps@[index as int] is Some {
+                assert(self.entry_ok(index as int, t, m));
+                self.lemma_touch_one(&start, t, m, m, index as int);
+            } else {
+                assert(self.qps@ =~= start.qps@);
+                self.lemma_inv_fields(&start, t, m);
+            }
+        }
+    }
+
+    /// The first error completion of a send request without an owner on QP
+    /// `index`, once.
+    #[verifier::spinoff_prover]
+    pub fn take_send_error(&mut self, index: usize) -> (r: Option<Wc>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        if index >= self.qps.len() {
+            return None;
+        }
+        let ghost start = *self;
+        let ghost t = self.token@;
+        let ghost m = t.nic();
+        proof {
+            assert(start.entry_ok(index as int, t, m));
+        }
+        let r = match &mut self.qps[index] {
+            Some(e) => e.send.take_detached_error(),
+            None => None,
+        };
+        proof {
+            if start.qps@[index as int] is Some {
+                assert(self.entry_ok(index as int, t, m));
+                self.lemma_touch_one(&start, t, m, m, index as int);
+            } else {
+                assert(self.qps@ =~= start.qps@);
+                self.lemma_inv_fields(&start, t, m);
+            }
+        }
+        r
+    }
+
+    /// The next QP listed with requests for the event loop to hand out,
+    /// with whether a doorbell of it was refused since (both flags cleared):
+    /// `None` once the list is empty, `Some(None)` for a QP removed since.
+    #[verifier::spinoff_prover]
+    pub fn pop_dirty(&mut self) -> (r: Option<Option<(usize, bool)>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        let ghost start = *self;
+        let ghost t = self.token@;
+        let ghost m = t.nic();
+        let popped = self.dirty.pop();
+        proof {
+            self.lemma_inv_fields(&start, t, m);
+        }
+        let index = match popped {
+            Some(i) => i as usize,
+            None => return None,
+        };
+        if index >= self.qps.len() {
+            return Some(None);
+        }
+        let ghost s0 = *self;
+        proof {
+            assert(s0.entry_ok(index as int, t, m));
+        }
+        let r = match &mut self.qps[index] {
+            Some(e) => {
+                e.dirty = false;
+                let refused = e.refused;
+                e.refused = false;
+                Some((index, refused))
+            },
+            None => None,
+        };
+        proof {
+            if s0.qps@[index as int] is Some {
+                assert(self.entry_ok(index as int, t, m));
+                self.lemma_touch_one(&s0, t, m, m, index as int);
+            } else {
+                assert(self.qps@ =~= s0.qps@);
+                self.lemma_inv_fields(&s0, t, m);
+            }
+        }
+        Some(r)
     }
 }
 

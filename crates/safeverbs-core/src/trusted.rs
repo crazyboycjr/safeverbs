@@ -346,14 +346,14 @@ impl NicToken {
 
     /// `self` and `other` agree on the writing of every queue pair but `q`.
     pub open spec fn same_writing_but(&self, other: &NicToken, q: QpId) -> bool {
-        forall|p: QpId| p != q ==> #[trigger] self.started(p) == other.started(p) && self.written(p)
-            == other.written(p)
+        &&& forall|p: QpId| p != q ==> #[trigger] self.started(p) == other.started(p)
+        &&& forall|p: QpId| p != q ==> #[trigger] self.written(p) == other.written(p)
     }
 
     /// `self` and `other` agree on the writing of every queue pair.
     pub open spec fn same_writings(&self, other: &NicToken) -> bool {
-        forall|p: QpId| #[trigger] self.started(p) == other.started(p) && self.written(p)
-            == other.written(p)
+        &&& forall|p: QpId| #[trigger] self.started(p) == other.started(p)
+        &&& forall|p: QpId| #[trigger] self.written(p) == other.written(p)
     }
 }
 
