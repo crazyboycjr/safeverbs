@@ -189,7 +189,7 @@ fn batch_is_one_request() {
             "one request"
         );
         let copy = dst.reclaim();
-        for chunk in copy.chunks(64) {
+        for chunk in copy[..].chunks(64) {
             assert_eq!(chunk, &src[..]);
         }
         // The batch kept one lease of the buffer: it is free again.
@@ -212,7 +212,7 @@ fn batch_longer_than_max_batch_is_split() {
         .unwrap();
         a.flush().await.unwrap();
         let copy = dst.reclaim();
-        assert!(copy.chunks(8).all(|c| c == &src[..]));
+        assert!(copy[..].chunks(8).all(|c| c == &src[..]));
         assert!(src.try_thaw().is_ok());
     });
 }
