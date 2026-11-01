@@ -120,6 +120,25 @@ pub proof fn lemma_f1_taken_once(pre: Abs::State, post: Abs::State, r: Id)
 // =========================================================================================
 // R1: no leak, no early release.
 
+/// Every live member identity has exactly one position in exactly one group. Shared
+/// clones may overlap bytes, but cloning never duplicates a resource identity.
+pub proof fn lemma_member_owned_once(s: Abs::State, i: Id, j: Id, k: int, l: int)
+    requires
+        s.invariant(),
+        s.groups.contains_key(i), s.groups.contains_key(j),
+        0 <= k < s.groups[i].members.len(),
+        0 <= l < s.groups[j].members.len(),
+        s.groups[i].members[k].id == s.groups[j].members[l].id,
+    ensures
+        i == j && k == l,
+{
+    if i != j {
+        assert(s.groups[i].compatible(s.groups[j]));
+    } else if k != l {
+        assert(s.groups[i].wf());
+    }
+}
+
 /// **R1, never before the NIC is done.** A request in flight keeps its lease, unchanged,
 /// until the NIC produces its outcome: no client action (dropping the future included)
 /// releases it earlier. With S1 this means its memory is never reused while the NIC may
