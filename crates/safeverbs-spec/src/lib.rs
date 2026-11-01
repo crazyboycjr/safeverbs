@@ -6,3 +6,4 @@ pub mod guarantees;
 pub mod nic;
 pub mod nic_proofs;
 pub mod refinement;
+pub mod examples;
