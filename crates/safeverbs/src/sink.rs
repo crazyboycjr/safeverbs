@@ -51,13 +51,13 @@ impl<U, N: Nic> WriteOp<U, N> {
 /// Errors: the first error completion among the QP's requests without an
 /// owner (this sink's among them) is reported by the next call. Dropping
 /// the sink flushes it.
-pub struct WriteSink<'q, Q: QueueAccess, U> {
+pub struct WriteSink<'q, Q: QueueAccess, U: IntoBytes + Immutable> {
     q: &'q Q,
     held: Option<WriteOp<U, Q::N>>,
     last: Option<Seq>,
 }
 
-impl<'q, Q: QueueAccess, U> WriteSink<'q, Q, U> {
+impl<'q, Q: QueueAccess, U: IntoBytes + Immutable> WriteSink<'q, Q, U> {
     pub(crate) fn new(q: &'q Q) -> Self {
         WriteSink {
             q,
@@ -99,7 +99,7 @@ impl<'q, Q: QueueAccess, U> WriteSink<'q, Q, U> {
     }
 }
 
-impl<Q: QueueAccess, U> Unpin for WriteSink<'_, Q, U> {}
+impl<Q: QueueAccess, U: IntoBytes + Immutable> Unpin for WriteSink<'_, Q, U> {}
 
 impl<Q: QueueAccess, U: IntoBytes + Immutable> Sink<WriteOp<U, Q::N>> for WriteSink<'_, Q, U> {
     type Error = Error;
@@ -163,7 +163,7 @@ impl<Q: QueueAccess, U: IntoBytes + Immutable> Sink<WriteOp<U, Q::N>> for WriteS
     }
 }
 
-impl<Q: QueueAccess, U> Drop for WriteSink<'_, Q, U> {
+impl<Q: QueueAccess, U: IntoBytes + Immutable> Drop for WriteSink<'_, Q, U> {
     fn drop(&mut self) {
         let _ = self.flush_now();
     }

@@ -276,7 +276,20 @@ impl<T, N: Nic> BufMut<T, N> {
     }
 
     /// Freezes it into a shared, read-only [`Buf`].
-    pub fn freeze(self) -> Buf<T, N> {
+    ///
+    /// Interior mutation would race with a NIC reading a shared frozen buffer.
+    ///
+    /// ```compile_fail
+    /// use core::cell::Cell;
+    /// use safeverbs_core::BufMut;
+    /// fn cannot_freeze_cells(buf: BufMut<Cell<u8>>) {
+    ///     let _ = buf.freeze();
+    /// }
+    /// ```
+    pub fn freeze(self) -> Buf<T, N>
+    where
+        T: Immutable,
+    {
         let len = self.len();
         Buf {
             frozen: Arc::new(Frozen { raw: self.raw }),
@@ -289,7 +302,10 @@ impl<T, N: Nic> BufMut<T, N> {
     /// Exposes it to peers for RDMA WRITE, READ and atomics: registers it
     /// again with remote access and hands out its address and remote key
     /// ([`Exposed::remote`]). Until reclaimed it cannot be read as `[T]`.
-    pub fn expose(self) -> Result<Exposed<T, N>, BufError<BufMut<T, N>>> {
+    pub fn expose(self) -> Result<Exposed<T, N>, BufError<BufMut<T, N>>>
+    where
+        T: IntoBytes,
+    {
         let access = Access::LOCAL_WRITE
             | Access::REMOTE_WRITE
             | Access::REMOTE_READ
@@ -316,7 +332,20 @@ impl<T, N: Nic> BufMut<T, N> {
 
     /// Lends it to the NIC as one scatter/gather element (for receives and
     /// READs into it).
-    pub fn into_part(self) -> Part<N> {
+    ///
+    /// A part may also be used as an outbound source by the synchronous API,
+    /// so every byte must be initialized, including after Rust writes a value.
+    ///
+    /// ```compile_fail
+    /// use safeverbs_core::BufMut;
+    /// fn cannot_lend_padding<T: zerocopy::FromBytes>(buf: BufMut<T>) {
+    ///     let _ = buf.into_part();
+    /// }
+    /// ```
+    pub fn into_part(self) -> Part<N>
+    where
+        T: IntoBytes,
+    {
         Part {
             sge: self.raw.sge(),
             pd: self.raw.pd().id(),
@@ -467,7 +496,10 @@ impl<T, N: Nic> Buf<T, N> {
 
     /// Lends it to the NIC as one scatter/gather element (for sends and
     /// WRITEs from it).
-    pub fn into_part(self) -> Part<N> {
+    pub fn into_part(self) -> Part<N>
+    where
+        T: IntoBytes + Immutable,
+    {
         let sge = Sge {
             addr: self.frozen.raw.ptr() as u64 + self.offset as u64,
             length: (self.len * size_of::<T>()) as u32,
