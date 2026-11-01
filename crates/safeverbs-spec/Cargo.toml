@@ -1,0 +1,27 @@
+[package]
+name = "safeverbs-spec"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Formal model of an RDMA NIC (M), the abstract SafeVerbs machine (A) and the guarantees, in Verus"
+publish = false
+
+# Its own workspace for now: vstd needs a newer Rust than the repository's pinned toolchain.
+# Everything here is ghost code: a plain `cargo build` compiles it to (almost) nothing.
+[workspace]
+
+[dependencies]
+vstd = { version = "=0.0.0-2026-10-25-0158", default-features = false }
+verus_state_machines_macros = "=0.0.0-2026-10-25-0158"
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(verus_only)',
+  'cfg(verus_keep_ghost)',
+  'cfg(verus_keep_ghost_body)',
+] }
+# `state_machine!` generates modules named after the machine (`Nic`, `Abs`).
+non_snake_case = "allow"
