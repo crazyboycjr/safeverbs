@@ -1121,4 +1121,79 @@ pub proof fn lemma_touches_registered(s: Nic::State, a: int)
     }
 }
 
+/// The proof of `lemma_nic_steps_keep_verbs_enabled`: a NIC step changes no region, no
+/// reservation, no queue length and no protection domain, and only moves a queue pair to
+/// `Err` from `Rtr` or `Rts`.
+pub proof fn lemma_keeps_enabled(pre: Nic::State, post: Nic::State, step: Nic::Step, verb: Nic::Step)
+    requires
+        nic_inv(pre),
+        is_nic_step(step),
+        nic_step(pre, post, step),
+        is_verb(verb),
+        nic_enabled(pre, verb),
+    ensures
+        nic_enabled(post, verb),
+{
+    // The CQ has room, so the step's updates are known.
+    match step {
+        Nic::Step::execute_send(q, o) => lemma_room_for_send_cqe(pre, q),
+        Nic::Step::execute_recv(q, o) => lemma_room_for_recv_cqe(pre, q),
+        _ => {},
+    }
+    // What every NIC step keeps.
+    assert(post.caps == pre.caps && post.pds == pre.pds && post.mrs == pre.mrs);
+    assert(post.retired == pre.retired);
+    assert(post.qps.dom() =~= pre.qps.dom());
+    assert(post.cqs.dom() =~= pre.cqs.dom());
+    assert forall|q: QpId| #[trigger] post.qps.contains_key(q) implies {
+        let a = pre.qps[q];
+        let b = post.qps[q];
+        &&& b.attr == a.attr
+        &&& b.sq.len() == a.sq.len() && b.rq.len() == a.rq.len()
+        &&& forall|k: int| 0 <= k < a.sq.len() ==> (#[trigger] b.sq[k]).wr == a.sq[k].wr
+        &&& forall|k: int| 0 <= k < a.rq.len() ==> (#[trigger] b.rq[k]).wr == a.rq[k].wr
+        &&& b.state == a.state || (b.state is Err && (a.state is Rtr || a.state is Rts || a.state is Err))
+    } by {}
+    assert forall|c: CqId| #[trigger] post.cqs.contains_key(c) implies {
+        &&& post.cqs[c].cap == pre.cqs[c].cap
+        &&& post.cqs[c].reserved == pre.cqs[c].reserved
+        &&& post.cqs[c].entries.len() >= pre.cqs[c].entries.len()
+    } by {}
+    match verb {
+        Nic::Step::post_send(q, wrs) => {
+            assert forall|i: int| 0 <= i < wrs.len() implies post.send_wr_ok(post.qps[q].attr, #[trigger] wrs[i]) by {
+                assert(pre.send_wr_ok(pre.qps[q].attr, wrs[i]));
+            }
+        },
+        Nic::Step::post_recv(q, wrs) => {
+            assert forall|i: int| 0 <= i < wrs.len() implies post.recv_wr_ok(post.qps[q].attr, #[trigger] wrs[i]) by {
+                assert(pre.recv_wr_ok(pre.qps[q].attr, wrs[i]));
+            }
+        },
+        Nic::Step::dereg_mr(key) => {
+            if post.mr_in_use(key) {
+                if exists|q: QpId, k: int| #![trigger post.qps[q].sq[k]] post.qps.contains_key(q)
+                    && 0 <= k < post.qps[q].sq.len() && !post.qps[q].sq[k].wr.inline
+                    && names_key(post.qps[q].sq[k].wr.sges, key) {
+                    let (q, k) = choose|q: QpId, k: int| #![trigger post.qps[q].sq[k]] post.qps.contains_key(q)
+                        && 0 <= k < post.qps[q].sq.len() && !post.qps[q].sq[k].wr.inline
+                        && names_key(post.qps[q].sq[k].wr.sges, key);
+                    assert(pre.qps[q].sq[k].wr == post.qps[q].sq[k].wr);
+                } else {
+                    let (q, k) = choose|q: QpId, k: int| #![trigger post.qps[q].rq[k]] post.qps.contains_key(q)
+                        && 0 <= k < post.qps[q].rq.len() && names_key(post.qps[q].rq[k].wr.sges, key);
+                    assert(pre.qps[q].rq[k].wr == post.qps[q].rq[k].wr);
+                }
+            }
+        },
+        Nic::Step::destroy_cq(c) => {
+            assert forall|q: QpId| #[trigger] post.qps.contains_key(q)
+                implies post.qps[q].attr.send_cq != c && post.qps[q].attr.recv_cq != c by {
+                assert(pre.qps.contains_key(q));
+            }
+        },
+        _ => {},
+    }
+}
+
 } // verus!

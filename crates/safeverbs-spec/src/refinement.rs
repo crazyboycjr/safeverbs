@@ -52,6 +52,20 @@ pub open spec fn nic_reaches(m: Nic::State, n: Nic::State) -> bool {
     exists|run: Seq<Nic::State>| run.len() > 0 && run[0] == m && run.last() == n && nic_run(run)
 }
 
+/// `m` reaches `n` by the NIC's own steps only (executions and faults, no verb): what may
+/// happen between two calls of the library.
+pub open spec fn nic_env_reaches(m: Nic::State, n: Nic::State) -> bool {
+    exists|run: Seq<Nic::State>, steps: Seq<Nic::Step>| nic_env_run(run, steps) && run[0] == m && run.last() == n
+}
+
+/// `run` is an execution of M by the NIC steps `steps`.
+pub open spec fn nic_env_run(run: Seq<Nic::State>, steps: Seq<Nic::Step>) -> bool {
+    &&& run.len() > 0
+    &&& steps.len() == run.len() - 1
+    &&& forall|i: int| 0 <= i < steps.len()
+        ==> is_nic_step(#[trigger] steps[i]) && nic_step(run[i], run[i + 1], steps[i])
+}
+
 // =========================================================================================
 // How A and M fit together
 
@@ -273,6 +287,55 @@ pub proof fn lemma_nic_reaches_next(a: Nic::State, b: Nic::State)
     let run = seq![a, b];
     assert(run.last() == b);
     assert(nic_run(run));
+}
+
+/// What the NIC does by itself between two calls keeps M's invariants and every verb's
+/// precondition. This is what makes the trusted wrappers' contracts consistent: a wrapper
+/// requires the precondition in the state the library last saw and ensures the verb
+/// happened after whatever NIC steps came first.
+pub proof fn lemma_nic_env_keeps_enabled(m: Nic::State, n: Nic::State, verb: Nic::Step)
+    requires
+        nic_inv(m),
+        nic_env_reaches(m, n),
+        is_verb(verb),
+        nic_enabled(m, verb),
+    ensures
+        nic_inv(n),
+        nic_enabled(n, verb),
+        nic_reaches(m, n),
+{
+    let (run, steps) = choose|run: Seq<Nic::State>, steps: Seq<Nic::Step>|
+        nic_env_run(run, steps) && run[0] == m && run.last() == n;
+    lemma_nic_env_run(run, steps, verb);
+    assert forall|i: int| 0 <= i < run.len() - 1 implies Nic::State::next(#[trigger] run[i], run[i + 1]) by {
+        crate::nic::lemma_nic_step_is_next(run[i], run[i + 1], steps[i]);
+    }
+}
+
+proof fn lemma_nic_env_run(run: Seq<Nic::State>, steps: Seq<Nic::Step>, verb: Nic::Step)
+    requires
+        nic_env_run(run, steps),
+        nic_inv(run[0]),
+        is_verb(verb),
+        nic_enabled(run[0], verb),
+    ensures
+        nic_inv(run.last()),
+        nic_enabled(run.last(), verb),
+    decreases run.len(),
+{
+    if run.len() > 1 {
+        let (pr, ps) = (run.drop_last(), steps.drop_last());
+        assert forall|i: int| 0 <= i < ps.len() implies is_nic_step(#[trigger] ps[i]) && nic_step(pr[i], pr[i + 1], ps[i]) by {
+            assert(ps[i] == steps[i] && pr[i] == run[i] && pr[i + 1] == run[i + 1]);
+        }
+        lemma_nic_env_run(pr, ps, verb);
+        let k = steps.len() - 1;
+        assert(pr.last() == run[k]);
+        assert(nic_step(run[k], run[k + 1], steps[k]));
+        crate::nic::lemma_nic_steps_keep_verbs_enabled(run[k], run[k + 1], steps[k], verb);
+        crate::nic::lemma_nic_step_is_next(run[k], run[k + 1], steps[k]);
+        crate::nic::lemma_step_keeps_invariant(run[k], run[k + 1]);
+    }
 }
 
 pub proof fn lemma_abs_init_invariant(a: Abs::State)

@@ -878,6 +878,16 @@ pub open spec fn nic_enabled(pre: Nic::State, step: Nic::Step) -> bool {
     }
 }
 
+/// The NIC's own steps (they happen by themselves); every other step is a verb.
+pub open spec fn is_nic_step(step: Nic::Step) -> bool {
+    step is execute_send || step is execute_recv || step is fault
+}
+
+/// A verb: a call the library makes.
+pub open spec fn is_verb(step: Nic::Step) -> bool {
+    !is_nic_step(step) && !(step is dummy_to_use_type_params)
+}
+
 /// A step by `step` is a step of Nic.
 pub proof fn lemma_nic_step_is_next(pre: Nic::State, post: Nic::State, step: Nic::Step)
     requires
@@ -940,6 +950,22 @@ pub proof fn lemma_poll(pre: Nic::State, post: Nic::State, c: CqId)
         }),
 {
     crate::nic_proofs::lemma_poll_reports(pre, post, c);
+}
+
+/// The NIC's own steps never invalidate a verb's precondition. So the library may check a
+/// precondition against the state it last observed: whatever the NIC did since (executing
+/// work requests, moving a queue pair to `Err`), the call is still within M.
+pub proof fn lemma_nic_steps_keep_verbs_enabled(pre: Nic::State, post: Nic::State, step: Nic::Step, verb: Nic::Step)
+    requires
+        nic_inv(pre),
+        is_nic_step(step),
+        nic_step(pre, post, step),
+        is_verb(verb),
+        nic_enabled(pre, verb),
+    ensures
+        nic_enabled(post, verb),
+{
+    crate::nic_proofs::lemma_keeps_enabled(pre, post, step, verb);
 }
 
 /// The NIC only touches registered memory: whatever it may read or write lies in a region
