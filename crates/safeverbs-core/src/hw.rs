@@ -346,6 +346,29 @@ impl<N: Device> Hw<N> {
             )
     }
 
+    /// `self` has the same QPs as `other` at the same indices.
+    pub closed spec fn same_table(&self, other: &Self) -> bool {
+        &&& self.caps == other.caps
+        &&& self.pd == other.pd
+        &&& self.qps@.len() == other.qps@.len()
+        &&& forall|i: int|
+            0 <= i < self.qps@.len() ==> (#[trigger] self.qps@[i] is Some) == (other.qps@[i] is Some)
+        &&& forall|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some ==> {
+                let (a, b) = (self.qps@[i]->0, other.qps@[i]->0);
+                &&& a.id@ == b.id@
+                &&& a.qp_type == b.qp_type
+                &&& a.atomics == b.atomics
+                &&& a.caps == b.caps
+                &&& a.pd_id == b.pd_id
+            }
+    }
+
+    /// QP `index` is in the table.
+    pub closed spec fn has_qp(&self, index: int) -> bool {
+        0 <= index < self.qps@.len() && self.qps@[index] is Some
+    }
+
     /// The invariant: the worker's state is coupled to M (see the module
     /// documentation).
     pub closed spec fn inv(&self) -> bool {
@@ -1024,6 +1047,7 @@ impl<N: Device> Hw<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -1196,6 +1220,7 @@ impl<N: Device> Hw<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -1299,6 +1324,7 @@ impl<N: Device> Hw<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -1554,6 +1580,7 @@ impl<N: Device> Hw<N> {
             final(self).inv_with(t, after),
             final(self).token == old(self).token,
             final(self).qps@.len() == old(self).qps@.len(),
+            final(self).same_table(old(self)),
     {
         let ghost sh = t.share();
         let ghost c = sh.cq;
@@ -1760,6 +1787,7 @@ impl<N: Device> Hw<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            final(self).same_table(old(self)),
     {
         let mut wcs = [EMPTY_WC; POLL_BATCH];
         let ghost t0 = self.token@;
@@ -1788,6 +1816,7 @@ impl<N: Device> Hw<N> {
                 t.same_worker(&t0),
                 t.same_writings(&t0),
                 self.qps@.len() == start.qps@.len(),
+                self.same_table(&start),
                 self.inv_with(t0, if i == 0 { m0 } else { afters[i - 1] }),
             decreases n - i,
         {
@@ -1835,6 +1864,7 @@ impl<N: Device> Hw<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -2109,6 +2139,7 @@ impl<N: Device> Hw<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             return None;
@@ -2210,6 +2241,482 @@ impl<N: Device> Hw<N> {
             self.lemma_commit_frame(&mid1, t1, t, m1, m1, index as int);
         }
         r
+    }
+}
+
+/// The bytes of the first `i` elements, one more element at a time.
+proof fn lemma_sges_len_step(s: Seq<Sge>, i: int)
+    requires
+        0 <= i < s.len(),
+    ensures
+        sges_len(s.take(i + 1)) == sges_len(s.take(i)) + s[i].length,
+{
+    let f = |sge: Sge| sge_model(sge);
+    let a = s.take(i + 1).map_values(f);
+    assert(a.drop_last() =~= s.take(i).map_values(f));
+    assert(a.last() == sge_model(s[i]));
+}
+
+/// `same_table` is transitive.
+proof fn lemma_same_table_trans<N: Device>(a: &Hw<N>, b: &Hw<N>, c: &Hw<N>)
+    requires
+        a.same_table(b),
+        b.same_table(c),
+    ensures
+        a.same_table(c),
+{
+    assert(a.caps == c.caps && a.pd == c.pd);
+    assert forall|i: int| 0 <= i < a.qps@.len() implies (#[trigger] a.qps@[i] is Some) == (c.qps@[i] is Some) by {
+        assert(b.qps@[i] is Some == c.qps@[i] is Some);
+    }
+    assert forall|i: int| 0 <= i < a.qps@.len() && #[trigger] a.qps@[i] is Some implies {
+        let (x, z) = (a.qps@[i]->0, c.qps@[i]->0);
+        &&& x.id@ == z.id@
+        &&& x.qp_type == z.qp_type
+        &&& x.atomics == z.atomics
+        &&& x.caps == z.caps
+        &&& x.pd_id == z.pd_id
+    } by {
+        assert(b.qps@[i] is Some);
+    }
+}
+
+impl<N: Device> Hw<N> {
+    /// Whether QP `index`'s send ring could take a request of one WQE now.
+    closed spec fn room(&self, index: int) -> bool {
+        let r = self.qps@[index]->0.send;
+        &&& !r.spec_is_open()
+        &&& r.spec_has_free_slot()
+        &&& r.spec_wqe_posted() - r.spec_wqe_retired() < r.spec_depth()
+    }
+
+    /// QP `index`'s send ring can take one more WQE: a new request (no
+    /// request open, a free slot, room for a WQE) or the open one has room.
+    closed spec fn can_hold(&self, index: int) -> bool {
+        let r = self.qps@[index]->0.send;
+        ||| self.room(index)
+        ||| r.spec_has_wqe_room()
+    }
+
+    /// A WQE doing `op` on `n` parts is one QP `index` may take: within its
+    /// scatter/gather limit, an operation its transport allows.
+    closed spec fn wqe_fits(&self, index: int, op: WrOp, n: usize) -> bool {
+        let e = self.qps@[index]->0;
+        let attr = qp_attr(0, e.qp_type, 0, e.caps);
+        &&& n <= attr.max_sge
+        &&& opcode_model(op).allowed_on(attr.transport)
+    }
+
+    /// Waits until a new send request of at least one WQE fits on QP
+    /// `index`: rings its doorbell for what is written and polls the CQ
+    /// until a slot and a WQE are free. Fails if every slot holds a result
+    /// nobody took, or if the doorbell is refused.
+    #[verifier::exec_allows_no_decreases_clause]
+    fn make_send_room(&mut self, index: usize) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+            old(self).has_qp(index as int),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+            r is Ok ==> final(self).room(index as int),
+    {
+        let ghost start = *self;
+        loop
+            invariant
+                self.inv(),
+                self.same_table(&start),
+                start.has_qp(index as int),
+                start == *old(self),
+        {
+            proof {
+                assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+            }
+            let (can, clogged) = match &self.qps[index] {
+                Some(e) => (e.send.can_post(), e.send.is_clogged()),
+                None => (false, false),
+            };
+            if can {
+                return Ok(());
+            }
+            if clogged {
+                return Err(Error::Clogged);
+            }
+            let ghost s0 = *self;
+            match self.commit(index, None) {
+                Ok(()) => {},
+                Err((e, _)) => {
+                    proof {
+                        lemma_same_table_trans(self, &s0, &start);
+                    }
+                    return Err(e);
+                },
+            }
+            let ghost s1 = *self;
+            self.progress();
+            proof {
+                lemma_same_table_trans(&s1, &s0, &start);
+                lemma_same_table_trans(self, &s1, &start);
+            }
+        }
+    }
+
+    /// Adds `part` to the scatter/gather list of the WQE being written on QP
+    /// `index`; refused (the part handed back) past [`MAX_SGES`] parts.
+    pub fn gather(&mut self, index: usize, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        if index >= self.qps.len() {
+            no_qp(index);
+            return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
+        }
+        let ghost start = *self;
+        let ghost t = self.token@;
+        let ghost m = t.nic();
+        proof {
+            assert(start.entry_ok(index as int, t, m));
+        }
+        let r = match &mut self.qps[index] {
+            Some(e) => {
+                if e.building.len() >= MAX_SGES {
+                    let max = e.caps.max_send_sge as usize;
+                    Err(BufError { error: Error::TooManySges { got: MAX_SGES + 1, max }, buf: part })
+                } else {
+                    e.building.push(part);
+                    Ok(())
+                }
+            },
+            None => {
+                no_qp(index);
+                Err(BufError { error: Error::Invalid("no such QP"), buf: part })
+            },
+        };
+        proof {
+            assert(self.entry_ok(index as int, t, m));
+            self.lemma_touch_one(&start, t, m, m, index as int);
+        }
+        r
+    }
+
+    /// Drops the parts gathered on QP `index` but one, which it hands back if
+    /// it was the only one.
+    fn give_back(parts: &mut Vec<Part<N>>) -> (r: Option<Part<N>>)
+        ensures
+            final(parts)@.len() == 0,
+    {
+        let r = if parts.len() == 1 {
+            parts.pop()
+        } else {
+            None
+        };
+        while parts.len() > 0
+            decreases parts@.len(),
+        {
+            parts.pop();
+        }
+        r
+    }
+
+    /// Finishes the WQE gathered on QP `index` with operation `op`: checks
+    /// it (what the QP may do, the parts' domain and uniqueness, the
+    /// lengths), opens a request for it or splits the open one when it is
+    /// full (waiting for room: this polls the CQ), writes the WQE held so far
+    /// and holds this one. On error nothing is added; the part is handed
+    /// back if there was one, else the parts are dropped.
+    pub fn push(&mut self, index: usize, op: WrOp) -> (r: core::result::Result<(), (Error, Option<Part<N>>)>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        if index >= self.qps.len() {
+            no_qp(index);
+            return Err((Error::Invalid("no such QP"), None));
+        }
+        let pd_id = pd_id_of(&self.pd);
+        let max_msg = self.caps.max_msg;
+        let ghost start = *self;
+        let ghost t = self.token@;
+        let ghost m = t.nic();
+        proof {
+            assert(start.entry_ok(index as int, t, m));
+        }
+        // The parts, out of the entry.
+        let mut parts: Vec<Part<N>> = Vec::new();
+        let (rc, atomics, max_sge) = match &mut self.qps[index] {
+            Some(e) => {
+                core::mem::swap(&mut parts, &mut e.building);
+                let max_sge = if e.caps.max_send_sge <= e.caps.max_recv_sge {
+                    e.caps.max_send_sge
+                } else {
+                    e.caps.max_recv_sge
+                };
+                (matches!(e.qp_type, QpType::Rc), e.atomics, max_sge)
+            },
+            None => {
+                no_qp(index);
+                (false, false, 0)
+            },
+        };
+        proof {
+            assert(self.entry_ok(index as int, t, m));
+            self.lemma_touch_one(&start, t, m, m, index as int);
+        }
+        // What the QP may do: READ and atomics on reliable connections only,
+        // atomics where the device has them.
+        let n = parts.len();
+        let check = if n == 0 || n > max_sge as usize {
+            Err(Error::TooManySges { got: n, max: max_sge as usize })
+        } else if matches!(op, WrOp::Read(_)) && !rc {
+            Err(Error::Unsupported("RDMA READ on this QP"))
+        } else if (matches!(op, WrOp::FetchAdd { .. }) || matches!(op, WrOp::CompareSwap { .. })) && !atomics {
+            Err(Error::Unsupported("atomics on this QP"))
+        } else {
+            Ok(())
+        };
+        if let Err(error) = check {
+            let back = Self::give_back(&mut parts);
+            return Err((error, back));
+        }
+        let writes_local = matches!(op, WrOp::Read(_)) || matches!(op, WrOp::FetchAdd { .. })
+            || matches!(op, WrOp::CompareSwap { .. });
+        let limit: u64 = if max_msg < 0x7fff_ffff {
+            max_msg as u64
+        } else {
+            0x7fff_ffff
+        };
+        // The scatter/gather list, its owners and its length.
+        let mut sges = [Sge { addr: 0, length: 0, lkey: 0 }; MAX_SGES];
+        let mut total: u64 = 0;
+        let mut i = 0;
+        let mut bad: Option<Error> = None;
+        while i < n
+            invariant_except_break
+                bad is None,
+            invariant
+                n == parts@.len(),
+                1 <= n <= MAX_SGES,
+                0 <= i <= n,
+                bad is None ==> total == sges_len(sges@.take(i as int)) && total <= limit,
+                bad is None ==> forall|j: int|
+                    0 <= j < i ==> sges@[j] == part_sge(#[trigger] parts@[j]) && part_pd(parts@[j]) == pd_id
+                        && (writes_local ==> part_writable(parts@[j])),
+                limit <= 0x7fff_ffff,
+            ensures
+                bad is None ==> i == n,
+            decreases n - i,
+        {
+            let sge = part_sge_of(&parts[i]);
+            if part_pd_of(&parts[i]) != pd_id {
+                bad = Some(Error::PdMismatch);
+                break;
+            }
+            if writes_local && !part_writable_of(&parts[i]) {
+                bad = Some(Error::Invalid("the NIC would write a frozen buffer"));
+                break;
+            }
+            let ghost before = sges@;
+            sges[i] = sge;
+            proof {
+                assert(sges@.take(i as int) =~= before.take(i as int));
+                lemma_sges_len_step(sges@, i as int);
+            }
+            total = total + sge.length as u64;
+            if total > limit {
+                bad = Some(Error::TooLong { len: total, max: limit });
+                break;
+            }
+            i += 1;
+        }
+        if let Some(error) = bad {
+            let back = Self::give_back(&mut parts);
+            return Err((error, back));
+        }
+        proof {
+            assert(i == n);
+            assert(total == sges_len(sges@.take(n as int)));
+        }
+        let remote = match op {
+            WrOp::Write(r) | WrOp::WriteImm(r, _) | WrOp::Read(r) => if total > r.len {
+                Err(Error::TooLong { len: total, max: r.len })
+            } else {
+                Ok(())
+            },
+            WrOp::FetchAdd { remote, .. } | WrOp::CompareSwap { remote, .. } => if total != 8 || n != 1 {
+                Err(Error::Invalid("an atomic needs one local buffer of 8 bytes"))
+            } else if remote.len < 8 || remote.addr % 8 != 0 {
+                Err(Error::Invalid("an atomic needs 8 aligned remote bytes"))
+            } else {
+                Ok(())
+            },
+            WrOp::Send | WrOp::SendImm(_) => Ok(()),
+        };
+        if let Err(error) = remote {
+            let back = Self::give_back(&mut parts);
+            return Err((error, back));
+        }
+        // A request with room for the WQE: a new one, or the open one.
+        proof {
+            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+        }
+        let (open, wqe_room) = match &self.qps[index] {
+            Some(e) => (e.send.is_open(), e.send.wqe_room()),
+            None => (false, 0),
+        };
+        if !open || wqe_room == 0 {
+            if open {
+                self.close(index, true, true);
+            }
+            if let Err(error) = self.make_send_room(index) {
+                let back = Self::give_back(&mut parts);
+                return Err((error, back));
+            }
+        }
+        proof {
+            let e = self.qps@[index as int]->0;
+            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+            lemma_same_table_trans(self, &start, &start);
+        }
+        self.hold(index, op, parts, sges, n, total);
+        Ok(())
+    }
+
+    /// The new WQE of [`Hw::push`], checked, in a request with room for it:
+    /// writes the WQE held so far, if any, and holds this one.
+    fn hold(&mut self, index: usize, op: WrOp, parts: Vec<Part<N>>, sges: [Sge; MAX_SGES], n: usize, total: u64)
+        requires
+            old(self).inv(),
+            old(self).has_qp(index as int),
+            old(self).can_hold(index as int),
+            parts@.len() == n,
+            1 <= n <= MAX_SGES,
+            forall|j: int|
+                0 <= j < n ==> sges@[j] == part_sge(#[trigger] parts@[j]) && part_pd(parts@[j]) == pd_id(old(self).pd)
+                    && (opcode_model(op).writes_local() ==> part_writable(parts@[j])),
+            total == sges_len(sges@.take(n as int)),
+            total <= old(self).caps.max_msg,
+            old(self).wqe_fits(index as int, op, n),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        let mut parts = parts;
+        // The WQE held so far (if any) is written now: its regions are
+        // registered (its parts' leases say so).
+        proof {
+            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+        }
+        let ghost s2 = *self;
+        let ghost t2 = self.token@;
+        let ghost m2 = t2.nic();
+        let has_held = match &self.qps[index] {
+            Some(e) => e.held.is_some(),
+            None => false,
+        };
+        if has_held {
+            match &self.qps[index] {
+                Some(e) => registered_all(&e.held_parts, &self.pd, Tracked(self.token.borrow_mut())),
+                None => {},
+            }
+        }
+        let ghost t3 = self.token@;
+        let ghost m3 = t3.nic();
+        proof {
+            if has_held {
+                s2.lemma_rely(t2, m2, m3);
+                s2.lemma_same_token(t2, t3, m3);
+                self.lemma_inv_fields(&s2, t3, m3);
+            }
+            assert(self.entry_ok(index as int, t3, m3));
+        }
+        let ghost s3 = *self;
+        match &mut self.qps[index] {
+            Some(e) => {
+                let ghost q = e.id@;
+                let ghost e3 = *e;
+                proof {
+                    e3.send.lemma_wqes();
+                }
+                if !e.send.is_open() {
+                    match e.send.begin() {
+                        Some(_) => {},
+                        None => {
+                            proof { assert(false); }
+                        },
+                    }
+                }
+                proof {
+                    e.send.lemma_wqes();
+                }
+                let wqe = match e.send.push_wqe() {
+                    Some(wqe) => wqe,
+                    None => {
+                        proof { assert(false); }
+                        0
+                    },
+                };
+                match e.held {
+                    Some(h) => {
+                        if !e.started {
+                            crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                            e.started = true;
+                        }
+                        let held_sges = vstd::slice::slice_subrange(h.sges.as_slice(), 0, h.n);
+                        post(&mut e.hw, h.wr_id, false, &h.op, held_sges, Ghost(q), Tracked(self.token.borrow_mut()));
+                        proof {
+                            assert(held_sges@ == h.sges@.take(h.n as int));
+                            lemma_held_wr_ok(h, e3.held_parts@, index as u16, e3.send.spec_wqe_committed() + t3.written(q).len(), m3, m3.qps[q].attr, e3.pd_id@, false);
+                        }
+                        while e.held_parts.len() > 0
+                            decreases e.held_parts@.len(),
+                        {
+                            match e.held_parts.pop() {
+                                Some(part) => keep_lease(&mut e.open_leases, part),
+                                None => {},
+                            }
+                        }
+                    },
+                    None => {},
+                }
+                e.held = Some(Held { wr_id: wr_id(index as u16, false, wqe), op, sges, n });
+                core::mem::swap(&mut e.held_parts, &mut parts);
+                core::mem::swap(&mut e.building, &mut parts);
+                e.open_bytes = if e.open_bytes <= u64::MAX - total {
+                    e.open_bytes + total
+                } else {
+                    u64::MAX
+                };
+            },
+            None => {},
+        }
+        proof {
+            let t4 = self.token@;
+            let e3 = s3.qps@[index as int]->0;
+            let e = self.qps@[index as int]->0;
+            let q = e3.id();
+            let attr = m3.qps[q].attr;
+            let written = t4.written(q);
+            assert(s3.entry_ok(index as int, t3, m3));
+            assert forall|j: int| 0 <= j < written.len() implies m3.send_wr_ok(attr, #[trigger] written[j]) by {
+                if j < t3.written(q).len() {
+                    assert(written[j] == t3.written(q)[j]);
+                }
+            }
+            assert(writing_ok(e.send, index as u16, m3, attr, t4.started(q), written, true));
+            assert(opcode_model(op).allowed_on(attr.transport));
+            assert(e.held->0.sges == sges && e.held->0.n == n);
+            assert(total == sges_len(sges@.take(n as int)));
+            assert(caps_model(m3.caps, self.caps));
+            assert(total <= m3.caps.max_msg);
+            assert(held_ok(e.held->0, e.held_parts@, index as u16, e.send.spec_wqe_committed() + written.len(), attr, e.pd_id@, m3.caps.max_msg));
+            assert(self.entry_ok(index as int, t4, m3));
+            self.lemma_commit_frame(&s3, t3, t4, m3, m3, index as int);
+        }
     }
 }
 
