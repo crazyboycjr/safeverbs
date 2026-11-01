@@ -297,6 +297,9 @@ pub proof fn lemma_singleton(m: Nic::State, w: WqeRef)
             assert(s == w.seq);
         }
     }
+    if range.all_retired(m.retired) {
+        assert(m.retired.contains_key(range.at(w.seq)));
+    }
     if posted(m, w) && !m.retired.contains_key(w) {
         assert(range.pending_at(m, w.seq));
     }
@@ -322,6 +325,65 @@ pub proof fn lemma_pending_last(range: WqeRange, m: Nic::State)
 {
     let cut = choose|cut: nat| range.pending_at(m, cut);
     assert(cut <= (range.end - 1) as nat < range.end);
+}
+
+/// Polling a CQE inside a proper prefix advances the retirement cut without completing
+/// the batch. This follows from M's existing poll rule, for either queue, without changing M.
+pub proof fn lemma_poll_prefix_pending(
+    pre: Nic::State,
+    post: Nic::State,
+    c: CqId,
+    range: WqeRange,
+    cut: nat,
+)
+    requires
+        range.pending_at(pre, cut),
+        Nic::State::poll_cq(pre, post, c),
+        pre.cqs[c].entries[0].qp == range.qp,
+        pre.cqs[c].entries[0].queue == range.queue,
+        cut <= pre.cqs[c].entries[0].seq < range.end - 1,
+    ensures
+        range.pending_at(post, pre.cqs[c].entries[0].seq + 1),
+        !range.all_retired(post.retired),
+{
+    let e = pre.cqs[c].entries[0];
+    let qp = pre.qps[range.qp];
+    let next = e.seq + 1;
+    assert(posted(pre, range.at(cut)));
+    assert(posted(pre, range.last()));
+    reveal(retires);
+    match range.queue {
+        Queue::Send => {
+            assert(qp.sq_head <= cut <= e.seq < qp.sq_head + qp.sq.len());
+            assert(post.qps[range.qp].sq_head == next);
+            assert(post.qps[range.qp].sq.len() == qp.sq.len() - (next - qp.sq_head));
+        }
+        Queue::Recv => {
+            assert(qp.rq_head <= cut <= e.seq < qp.rq_head + qp.rq.len());
+            assert(post.qps[range.qp].rq_head == next);
+            assert(post.qps[range.qp].rq.len() == qp.rq.len() - (next - qp.rq_head));
+        }
+    }
+    assert forall|s: nat| range.first <= s < next implies {
+        let w = #[trigger] range.at(s);
+        post.retired.contains_key(w) && !posted(post, w)
+    } by {
+        if s < cut {
+            assert(pre.retired.contains_key(range.at(s)));
+        } else {
+            assert(retires(qp, e).contains_key(range.at(s)));
+        }
+    }
+    assert forall|s: nat| next <= s < range.end implies {
+        let w = #[trigger] range.at(s);
+        posted(post, w) && !post.retired.contains_key(w)
+    } by {
+        assert(posted(pre, range.at(s)));
+        assert(!pre.retired.contains_key(range.at(s)));
+        assert(!retires(qp, e).contains_key(range.at(s)));
+    }
+    assert(range.pending_at(post, next));
+    lemma_pending_last(range, post);
 }
 
 /// The coupling between A and M that the core's invariant must imply.
@@ -576,6 +638,156 @@ pub proof fn corollary_inflight(
         a.leases[r].mem == a.posted[r],
 {
     lemma_pending_last(ranges[r], m);
+}
+
+// =========================================================================================
+// Concrete batch executions (no premises)
+
+/// M can produce two different errors for one batch. Polling the first leaves its last
+/// WQE outstanding; polling the last permits completion, retaining RemoteErr over FlushErr.
+/// The states start at M's open transition and use its existing verbs and execution rules.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(30)]
+pub proof fn example_batch_first_error() {
+    broadcast use vstd::multiset::group_multiset_axioms;
+    reveal_with_fuel(total_len, 2);
+    let caps = Caps { max_qp_wr: 16, max_sge: 4, max_inline: 64, max_cqe: 64, max_msg: 1024 };
+    let remote = Outcome { status: Status::RemoteErr, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    let flush = Outcome { status: Status::FlushErr, ..remote };
+    let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 2 };
+
+    let m0 = Nic::State {
+        caps,
+        pds: Set::empty(),
+        mrs: Map::empty(),
+        cqs: Map::empty(),
+        qps: Map::empty(),
+        retired: IMap::empty(),
+    };
+    assert(Nic::State::open(m0, caps));
+    reveal(Nic::State::init);
+    reveal(Nic::State::init_by);
+    assert(Nic::State::init_by(m0, Nic::Config::open(caps)));
+    lemma_nic_init_invariant(m0);
+
+    let m1 = Nic::State { pds: m0.pds.insert(1), ..m0 };
+    assert(Nic::State::alloc_pd(m0, m1, 1));
+    crate::nic_proofs::lemma_alloc_pd(m0, m1, 1);
+    let mr = Mr { pd: 1, span: Span { start: 0, len: 128 }, local_write: true, remote_read: false, remote_write: false };
+    let m2 = Nic::State { mrs: m1.mrs.insert(5, mr), ..m1 };
+    assert(Nic::State::reg_mr(m1, m2, 5, mr));
+    crate::nic_proofs::lemma_reg_mr(m1, m2, 5, mr);
+    let cq = Cq {
+        cap: 4, entries: Seq::empty(),
+        reserved: vstd::multiset::Multiset::empty(), used: vstd::multiset::Multiset::empty(),
+    };
+    let m3 = Nic::State { cqs: m2.cqs.insert(3, cq), ..m2 };
+    assert(Nic::State::create_cq(m2, m3, 3, 4));
+    crate::nic_proofs::lemma_create_cq(m2, m3, 3, 4);
+    let attr = QpAttr { pd: 1, transport: Transport::Rc, send_cq: 3, recv_cq: 3, sq_depth: 2, rq_depth: 0, max_sge: 1, max_inline: 0 };
+    let cqs1 = m3.cqs.insert(3, m3.cqs[3].reserve(7, 2));
+    let cqs2 = cqs1.insert(3, cqs1[3].reserve(7, 0));
+    crate::nic_proofs::lemma_copies(7, 2);
+    assert(cqs2[3].reserved.len() == 2);
+    let qp0 = Qp { attr, state: QpState::Reset, sq: Seq::empty(), sq_head: 0, sq_done: 0, rq: Seq::empty(), rq_head: 0, rq_done: 0 };
+    let m4 = Nic::State { cqs: cqs2, qps: m3.qps.insert(7, qp0), ..m3 };
+    assert(Nic::State::create_qp(m3, m4, 7, attr));
+    crate::nic_proofs::lemma_create_qp(m3, m4, 7, attr);
+    let m5 = Nic::State { qps: m4.qps.insert(7, qp0.with_state(QpState::Init)), ..m4 };
+    assert(Nic::State::modify_qp(m4, m5, 7, QpState::Init));
+    crate::nic_proofs::lemma_modify_qp(m4, m5, 7, QpState::Init);
+    let m6 = Nic::State { qps: m5.qps.insert(7, qp0.with_state(QpState::Rtr)), ..m5 };
+    assert(Nic::State::modify_qp(m5, m6, 7, QpState::Rtr));
+    crate::nic_proofs::lemma_modify_qp(m5, m6, 7, QpState::Rtr);
+    let qp1 = qp0.with_state(QpState::Rts);
+    let m7 = Nic::State { qps: m6.qps.insert(7, qp1), ..m6 };
+    assert(Nic::State::modify_qp(m6, m7, 7, QpState::Rts));
+    crate::nic_proofs::lemma_modify_qp(m6, m7, 7, QpState::Rts);
+
+    let w1 = SendWr { wr_id: 1, opcode: Opcode::Write, sges: seq![Sge { addr: 0, len: 64, lkey: 5 }], signaled: false, inline: false };
+    let w2 = SendWr { wr_id: 2, opcode: Opcode::Write, sges: seq![Sge { addr: 64, len: 64, lkey: 5 }], signaled: true, inline: false };
+    let wrs = seq![w1, w2];
+    let qp2 = Qp { sq: qp1.sq + wrs.map_values(|wr: SendWr| SendSlot { wr, outcome: None }), ..qp1 };
+    let m8 = Nic::State { qps: m7.qps.insert(7, qp2), ..m7 };
+    assert(Nic::State::post_send(m7, m8, 7, wrs));
+    crate::nic_proofs::lemma_post_send(m7, m8, 7, wrs);
+    assert(range.pending_at(m8, 0));
+
+    // Even an unsignaled WQE emits a CQE on error; M moves the QP into Err.
+    let qp3 = Qp { sq: qp2.sq.update(0, SendSlot { wr: w1, outcome: Some(remote) }), sq_done: 1, state: QpState::Err, ..qp2 };
+    let e1 = Cqe { qp: 7, queue: Queue::Send, wr_id: 1, outcome: remote, seq: 0 };
+    let m9 = Nic::State { qps: m8.qps.insert(7, qp3), cqs: m8.cqs.insert(3, m8.cqs[3].push(e1)), ..m8 };
+    assert(Nic::State::execute_send(m8, m9, 7, remote));
+    crate::nic_proofs::lemma_execute_send(m8, m9, 7, remote);
+    assert(range.pending_at(m9, 0));
+
+    let qp4 = Qp { sq: qp3.sq.skip(1), sq_head: 1, sq_done: 0, ..qp3 };
+    let m10 = Nic::State {
+        qps: m9.qps.insert(7, qp4), cqs: m9.cqs.insert(3, m9.cqs[3].pop()),
+        retired: m9.retired.union_prefer_right(retires(qp3, e1)), ..m9
+    };
+    assert(Nic::State::poll_cq(m9, m10, 3));
+    lemma_poll_prefix_pending(m9, m10, 3, range, 0);
+    crate::nic::lemma_poll(m9, m10, 3);
+    crate::nic_proofs::lemma_poll_cq(m9, m10, 3);
+    assert(m10.retired[range.at(0)] == remote);
+    assert(range.pending_at(m10, 1));
+    assert(!range.all_retired(m10.retired));
+
+    // The final WQE flushes. Only after polling it is the whole interval retired.
+    let qp5 = Qp { sq: qp4.sq.update(0, SendSlot { wr: w2, outcome: Some(flush) }), sq_done: 1, ..qp4 };
+    let e2 = Cqe { qp: 7, queue: Queue::Send, wr_id: 2, outcome: flush, seq: 1 };
+    let m11 = Nic::State { qps: m10.qps.insert(7, qp5), cqs: m10.cqs.insert(3, m10.cqs[3].push(e2)), ..m10 };
+    assert(Nic::State::execute_send(m10, m11, 7, flush));
+    crate::nic_proofs::lemma_execute_send(m10, m11, 7, flush);
+    assert(range.pending_at(m11, 1));
+    let qp6 = Qp { sq: qp5.sq.skip(1), sq_head: 2, sq_done: 0, ..qp5 };
+    let m12 = Nic::State {
+        qps: m11.qps.insert(7, qp6), cqs: m11.cqs.insert(3, m11.cqs[3].pop()),
+        retired: m11.retired.union_prefer_right(retires(qp5, e2)), ..m11
+    };
+    assert(Nic::State::poll_cq(m11, m12, 3));
+    crate::nic::lemma_poll(m11, m12, 3);
+    crate::nic_proofs::lemma_poll_cq(m11, m12, 3);
+    reveal(retires);
+    assert(m12.retired[range.at(0)] == remote);
+    assert(m12.retired[range.at(1)] == flush);
+    assert forall|s: nat| range.first <= s < range.end
+        implies m12.retired.contains_key(#[trigger] range.at(s)) by {
+        assert(s == 0 || s == 1);
+    }
+    assert(range.first_error(m12.retired, 0));
+    lemma_aggregate_first_error(range, m12.retired, 0);
+    assert(range.aggregate(m12.retired) == remote);
+    assert(range.aggregate(m12.retired) != m12.retired[range.last()]);
+    if range.pending(m12) {
+        lemma_pending_last(range, m12);
+        assert(!posted(m12, range.last()));
+    }
+    assert(!range.pending(m12));
+}
+
+/// Success keeps the last outcome's metadata, and ownership is by QP, queue and interval.
+pub proof fn example_batch_success_and_ownership() {
+    let range = WqeRange { qp: 7, queue: Queue::Send, first: 4, end: 6 };
+    let ack = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    let read = Outcome { status: Status::Success, kind: CompletionKind::Read, byte_len: 64, imm: None };
+    let retired = IMap::empty().insert(range.at(4), ack).insert(range.at(5), read);
+    assert forall|s: nat| range.first <= s < range.end
+        implies retired.contains_key(#[trigger] range.at(s)) by {
+        assert(s == 4 || s == 5);
+    }
+    assert forall|s: nat| range.first <= s < range.end
+        implies (#[trigger] retired[range.at(s)]).status is Success by {
+        assert(s == 4 || s == 5);
+    }
+    lemma_aggregate_success(range, retired);
+    assert(range.aggregate(retired) == read);
+    assert(!WqeRange { end: 4, ..range }.wf());
+    assert(range.disjoint(WqeRange { first: 6, end: 8, ..range }));
+    assert(!range.disjoint(WqeRange { first: 5, end: 8, ..range }));
+    assert(range.disjoint(WqeRange { qp: 8, ..range }));
+    assert(range.disjoint(WqeRange { queue: Queue::Recv, ..range }));
 }
 
 // =========================================================================================
