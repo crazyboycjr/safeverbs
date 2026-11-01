@@ -1820,4 +1820,237 @@ impl<N: Device> Hw<N> {
     }
 }
 
+// =============================================================================
+// Doorbells
+
+impl<N: Device> Hw<N> {
+    /// Rings QP `index`'s doorbell for every request written since the last
+    /// one; with `keep`, hands back the leases of that staged request if the
+    /// device refuses. If the device refuses (or the QP takes no work, which
+    /// is refused as a device would refuse it: `Error::NotConnected`), none
+    /// of them is posted: each with an owner retires at once with a flush
+    /// error, each without releases its leases.
+    pub fn commit(&mut self, index: usize, keep: Option<RingSeq>) -> (r: core::result::Result<(), (Error, Option<Leases<N>>)>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        if index >= self.qps.len() {
+            no_qp(index);
+            return Ok(());
+        }
+        proof {
+            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+        }
+        let (started, open, ready) = match &self.qps[index] {
+            Some(e) => (e.started, e.send.is_open(), matches!(e.phase, Phase::Ready)),
+            None => {
+                no_qp(index);
+                (false, false, false)
+            },
+        };
+        // An open request is the caller's to finish first: the borrow of a
+        // request rules this out.
+        if !started || open {
+            return Ok(());
+        }
+        let ghost start = *self;
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        let ghost sh = t0.share();
+        let r = match &mut self.qps[index] {
+            Some(e) => {
+                if e.removed {
+                    no_qp(index);
+                }
+                let ghost q = e.id@;
+                let ghost e0 = *e;
+                e.started = false;
+                let r = if ready {
+                    proof {
+                        let qp = m0.qps[q];
+                        e0.send.lemma_wqes();
+                        assert(nic_enabled(m0, Nic::Step::post_send(q, t0.written(q))));
+                    }
+                    match doorbell(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut())) {
+                        Ok(()) => {
+                            e.send.commit();
+                            Ok(())
+                        },
+                        Err(err) => {
+                            let kept = match keep {
+                                Some(seq) => e.send.abort_keeping(seq),
+                                None => {
+                                    e.send.abort();
+                                    None
+                                },
+                            };
+                            Err((err, kept))
+                        },
+                    }
+                } else {
+                    abort(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                    let kept = match keep {
+                        Some(seq) => e.send.abort_keeping(seq),
+                        None => {
+                            e.send.abort();
+                            None
+                        },
+                    };
+                    Err((Error::NotConnected, kept))
+                };
+                if r.is_err() {
+                    e.refused = true;
+                    if !e.dirty {
+                        e.dirty = true;
+                        self.dirty.push(index as u16);
+                    }
+                }
+                r
+            },
+            None => {
+                no_qp(index);
+                Ok(())
+            },
+        };
+        proof {
+            let t = self.token@;
+            let n = t.nic();
+            let e0 = start.qps@[index as int]->0;
+            let q = e0.id();
+            let e = self.qps@[index as int]->0;
+            assert(start.entry_ok(index as int, t0, m0));
+            if ready && r is Ok {
+                let wrs = t0.written(q);
+                let mid = choose|mid: Nic::State| rely_reaches(sh, pinned(t0), m0, mid) && nic_step(mid, n, Nic::Step::post_send(q, wrs));
+                start.lemma_rely(t0, m0, mid);
+                lemma_nic_step_is_next(mid, n, Nic::Step::post_send(q, wrs));
+                lemma_step_keeps_invariant(mid, n);
+                lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::post_send(q, wrs));
+                assert(start.entry_ok(index as int, t0, mid));
+                let (a, b) = (mid.qps[q], n.qps[q]);
+                assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
+                    index as u16,
+                    false,
+                    (b.sq_head + k) as u64,
+                ) by {
+                    if k < a.sq.len() {
+                        assert(b.sq[k] == a.sq[k]);
+                    } else {
+                        assert(b.sq[k].wr == wrs[k - a.sq.len()]);
+                    }
+                }
+                assert(sq_linked(e.send, index as u16, b));
+                assert(self.entry_ok(index as int, t, n));
+                self.lemma_commit_frame(&start, t0, t, mid, n, index as int);
+            } else {
+                start.lemma_rely(t0, m0, n);
+                assert(start.entry_ok(index as int, t0, n));
+                assert(sq_linked(e.send, index as u16, n.qps[q]));
+                assert(self.entry_ok(index as int, t, n));
+                self.lemma_commit_frame(&start, t0, t, n, n, index as int);
+            }
+        }
+        r
+    }
+}
+
+impl<N: Device> Hw<N> {
+    /// After a step that changed only entry `index`'s QP in M, the entry,
+    /// and the token's writing of that QP (now done), the invariant holds
+    /// again.
+    proof fn lemma_commit_frame(&self, start: &Self, t0: NicToken, t: NicToken, mid: Nic::State, n: Nic::State, index: int)
+        requires
+            start.inv_with(t0, mid),
+            nic_inv(n),
+            share_wf(n, t.share()),
+            0 <= index < start.qps@.len(),
+            start.qps@[index] is Some,
+            t.same_worker(&t0),
+            t.same_writing_but(&t0, start.qps@[index]->0.id()),
+            !t.started(start.qps@[index]->0.id()),
+            t.written(start.qps@[index]->0.id()).len() == 0,
+            self.qps@.len() == start.qps@.len(),
+            forall|i: int| 0 <= i < self.qps@.len() && i != index ==> #[trigger] self.qps@[i] == start.qps@[i],
+            self.qps@[index] is Some,
+            self.qps@[index]->0.id() == start.qps@[index]->0.id(),
+            self.entry_ok(index, t, n),
+            cq_of(self.cq) == cq_of(start.cq),
+            self.pd == start.pd,
+            self.caps == start.caps,
+            self.cq_size == start.cq_size,
+            self.reserved == start.reserved,
+            self.next_name == start.next_name,
+            n.qps.dom() =~= mid.qps.dom(),
+            forall|p: QpId| #[trigger] mid.qps.contains_key(p) && p != start.qps@[index]->0.id() ==> n.qps[p] == mid.qps[p],
+            n.caps == mid.caps,
+            n.mrs == mid.mrs,
+            n.pds == mid.pds,
+            n.retired == mid.retired,
+            n.cqs[t.share().cq].cap == mid.cqs[t.share().cq].cap,
+            n.cqs[t.share().cq].reserved == mid.cqs[t.share().cq].reserved,
+        ensures
+            self.inv_with(t, n),
+    {
+        let q = start.qps@[index]->0.id();
+        assert forall|i: int| 0 <= i < self.qps@.len() implies #[trigger] self.entry_ok(i, t, n) by {
+            if i != index {
+                assert(start.entry_ok(i, t0, mid));
+                if let Some(e) = self.qps@[i] {
+                    assert(e.id() != q);
+                    assert(t.started(e.id()) == t0.started(e.id()));
+                    assert(t.written(e.id()) == t0.written(e.id()));
+                    lemma_ok_same(e, i as u16, mid, n, t.share(), t.pd(), t.started(e.id()), t.written(e.id()));
+                }
+            }
+        }
+        assert forall|i: int, j: int|
+            #![trigger self.qps@[i], self.qps@[j]]
+            0 <= i < self.qps@.len() && 0 <= j < self.qps@.len() && i != j && self.qps@[i] is Some
+                && self.qps@[j] is Some implies self.qps@[i]->0.id() != self.qps@[j]->0.id() by {
+            if i != index && j != index {
+                assert(self.qps@[i] == start.qps@[i] && self.qps@[j] == start.qps@[j]);
+            } else if i == index {
+                assert(self.qps@[j] == start.qps@[j]);
+            } else {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|p: QpId| #[trigger] n.qps.contains_key(p) && t.share().owns.contains(p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            assert(mid.qps.contains_key(p));
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            if i != index {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|p: QpId| #[trigger] writes(t, p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            assert(p != q);
+            assert(t.started(p) == t0.started(p));
+            assert(t.written(p) == t0.written(p));
+            assert(writes(t0, p));
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            if i != index {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|a: nat| #[trigger] t.share().owns.contains(t.name(a)) by {
+            assert(t.name(a) == t0.name(a));
+        }
+        assert forall|a: nat, b: nat| #[trigger] t.name(a) == #[trigger] t.name(b) implies a == b by {
+            assert(t.name(a) == t0.name(a) && t.name(b) == t0.name(b));
+        }
+        assert forall|k: nat| k >= self.next_name@ implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
+            assert(t.name(k) == t0.name(k));
+            assert(!mid.qps.contains_key(t0.name(k)));
+        }
+        assert forall|k: nat, w: WqeRef| k >= self.next_name@ && #[trigger] n.retired.contains_key(w)
+            implies w.qp != #[trigger] t.name(k) by {
+            assert(t.name(k) == t0.name(k));
+        }
+    }
+}
+
 } // verus!
