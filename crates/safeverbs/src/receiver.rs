@@ -8,6 +8,7 @@ use futures_core::Stream;
 use safeverbs_core::{BufError, BufMut, Error, Seq, Wc};
 use zerocopy::{FromBytes, IntoBytes};
 
+use crate::op::Side;
 use crate::qp::QueueAccess;
 
 /// A [`Stream`] of receives on a QP, from
@@ -52,7 +53,9 @@ impl<'q, Q: QueueAccess, U: FromBytes + IntoBytes> Receiver<'q, Q, U> {
     /// another protection domain.
     pub fn repost(&mut self, buf: BufMut<U, Q::N>) -> Result<(), BufError<BufMut<U, Q::N>>> {
         let q = self.q;
-        q.with_qp(|qp| {
+        q.with_state(|s| {
+            s.unclog();
+            let qp = s.qp();
             if qp.recv_ring().failed() {
                 return Err(BufError {
                     error: Error::QpFailed,
@@ -89,7 +92,9 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let q = this.q;
-        let next = q.with_qp(|qp| {
+        let next = q.with_state(|s| {
+            s.unclog();
+            let qp = s.qp();
             while !this.spare.is_empty() && qp.recv_ring().can_post() && !qp.recv_ring().failed() {
                 let buf = this.spare.pop().expect("a spare buffer");
                 match qp.post_recv(buf.into_part(), false) {
@@ -102,19 +107,20 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
                 }
             }
             qp.poll_recv();
+            let failed = qp.recv_ring().failed();
             match this.posted.front() {
-                Some(&seq) => match qp.take_recv(seq) {
+                Some(&seq) => match s.take_request(Side::Recv, seq) {
                     Some((wc, leases)) => {
                         this.posted.pop_front();
                         let buf = leases.into_buf_mut().expect("a receive holds its buffer");
                         Poll::Ready(Some((wc, buf)))
                     }
                     None => {
-                        qp.set_recv_waker(seq, cx.waker());
+                        s.qp().set_recv_waker(seq, cx.waker());
                         Poll::Pending
                     }
                 },
-                None if this.spare.is_empty() || qp.recv_ring().failed() => Poll::Ready(None),
+                None if this.spare.is_empty() || failed => Poll::Ready(None),
                 None => Poll::Pending,
             }
         });
@@ -128,9 +134,9 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
 impl<Q: QueueAccess, U> Drop for Receiver<'_, Q, U> {
     fn drop(&mut self) {
         let posted = &self.posted;
-        self.q.with_qp(|qp| {
+        self.q.with_state(|s| {
             for &seq in posted {
-                qp.detach_recv(seq);
+                s.detach(Side::Recv, seq);
             }
         });
     }

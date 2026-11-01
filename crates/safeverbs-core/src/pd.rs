@@ -9,7 +9,7 @@ use crate::nic::{GidEntry, Nic, PortInfo};
 use crate::verbs::Verbs;
 
 /// An open RDMA device. Cheap to clone.
-pub struct Context<N: Nic> {
+pub struct Context<N: Nic = Verbs> {
     nic: Arc<N>,
 }
 
@@ -94,7 +94,7 @@ impl<N: Nic> Context<N> {
 
 /// A protection domain: memory registered in it can only be used by QPs of
 /// the same domain. Cheap to clone.
-pub struct Pd<N: Nic> {
+pub struct Pd<N: Nic = Verbs> {
     inner: Arc<PdInner<N>>,
 }
 

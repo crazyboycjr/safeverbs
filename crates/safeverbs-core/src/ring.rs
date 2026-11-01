@@ -244,6 +244,12 @@ impl<L> Ring<L> {
         self.max_wqes as u32
     }
 
+    /// The oldest request whose slot is not free (retired and not taken,
+    /// or not retired); equal to [`Ring::posted`] when the ring is empty.
+    pub fn head(&self) -> Seq {
+        self.head
+    }
+
     /// The next request's sequence number.
     pub fn posted(&self) -> Seq {
         self.posted

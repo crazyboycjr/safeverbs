@@ -192,7 +192,7 @@ fn poll_request<T: safeverbs_core::Transport, N: Nic>(
 ) -> Option<Result<(Wc, Leases<N>), (Error, Leases<N>)>> {
     s.drain();
     if let State::Queued(ticket) = *state {
-        match s.take(side, ticket) {
+        match s.take_ticket(side, ticket) {
             Some(Ok(seq)) => *state = State::Posted(seq),
             Some(Err(failed)) => return Some(Err(failed)),
             None => return None,
@@ -201,25 +201,18 @@ fn poll_request<T: safeverbs_core::Transport, N: Nic>(
     let State::Posted(seq) = *state else {
         unreachable!("polled in a final state")
     };
-    let qp = s.qp();
     match side {
-        Side::Send => {
-            qp.poll_send();
-            let taken = qp.take_send(seq);
-            if taken.is_none() {
-                qp.set_send_waker(seq, cx.waker());
-            }
-            taken.map(Ok)
-        }
-        Side::Recv => {
-            qp.poll_recv();
-            let taken = qp.take_recv(seq);
-            if taken.is_none() {
-                qp.set_recv_waker(seq, cx.waker());
-            }
-            taken.map(Ok)
+        Side::Send => s.qp().poll_send(),
+        Side::Recv => s.qp().poll_recv(),
+    };
+    let taken = s.take_request(side, seq);
+    if taken.is_none() {
+        match side {
+            Side::Send => s.qp().set_send_waker(seq, cx.waker()),
+            Side::Recv => s.qp().set_recv_waker(seq, cx.waker()),
         }
     }
+    taken.map(Ok)
 }
 
 impl<Q: QueueAccess, K: Outcome<Q::N>> Future for Op<'_, Q, K> {

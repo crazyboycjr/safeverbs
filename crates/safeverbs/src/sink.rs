@@ -111,10 +111,7 @@ impl<Q: QueueAccess, U: IntoBytes + Immutable> Sink<WriteOp<U, Q::N>> for WriteS
             let qp = s.qp();
             qp.poll_send();
             if idle && qp.send_ring().can_post() {
-                return Ok(true);
-            }
-            if qp.send_ring().is_clogged() {
-                return Err(Error::Clogged);
+                return Ok::<bool, Error>(true);
             }
             // What is written needs the doorbell to ever complete.
             qp.commit()?;

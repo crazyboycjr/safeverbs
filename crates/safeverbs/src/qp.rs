@@ -4,6 +4,7 @@
 use core::cell::RefCell;
 use std::sync::Mutex;
 
+use safeverbs_core::Wc;
 use safeverbs_core::qp::{MAX_SGES, QueuePair};
 use safeverbs_core::{
     Buf, BufMut, Endpoint, Error, Leases, Nic, Part, Pd, Reliable, RemoteBuf, Result, Seq,
@@ -28,6 +29,11 @@ pub struct QpState<T: Transport, N: Nic> {
     qp: QueuePair<T, N>,
     sends: Backlog<N>,
     recvs: Backlog<N>,
+    /// Results moved out of the send ring to free their slots (see
+    /// [`QpState::unclog`]).
+    sends_done: Vec<(Seq, Wc, Leases<N>)>,
+    /// Results moved out of the receive ring.
+    recvs_done: Vec<(Seq, Wc, Leases<N>)>,
 }
 
 impl<T: Transport, N: Nic> QpState<T, N> {
@@ -36,6 +42,8 @@ impl<T: Transport, N: Nic> QpState<T, N> {
             qp,
             sends: Backlog::new(),
             recvs: Backlog::new(),
+            sends_done: Vec::new(),
+            recvs_done: Vec::new(),
         }
     }
 
@@ -48,6 +56,7 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     /// Posts waiting work while it fits (polling the CQs first, and ringing
     /// the doorbell for what is written, so that room can appear).
     pub(crate) fn drain(&mut self) {
+        self.unclog();
         if !self.sends.is_idle() {
             let _ = self.qp.commit();
             self.qp.poll_send();
@@ -59,6 +68,42 @@ impl<T: Transport, N: Nic> QpState<T, N> {
         }
     }
 
+    /// Frees slots held by results nobody has taken yet when no slot is
+    /// free otherwise: the oldest such results move to a side list, where
+    /// their futures find them. So a ring never clogs, whatever order the
+    /// futures are awaited in.
+    pub(crate) fn unclog(&mut self) {
+        while self.qp.send_ring().is_clogged() {
+            let seq = self.qp.send_ring().head();
+            match self.qp.take_send(seq) {
+                Some((wc, leases)) => self.sends_done.push((seq, wc, leases)),
+                None => break,
+            }
+        }
+        while self.qp.recv_ring().is_clogged() {
+            let seq = self.qp.recv_ring().head();
+            match self.qp.take_recv(seq) {
+                Some((wc, leases)) => self.recvs_done.push((seq, wc, leases)),
+                None => break,
+            }
+        }
+    }
+
+    /// Takes the outcome and buffers of retired request `seq`, from its
+    /// slot or the side list.
+    pub(crate) fn take_request(&mut self, side: Side, seq: Seq) -> Option<(Wc, Leases<N>)> {
+        let (taken, done) = match side {
+            Side::Send => (self.qp.take_send(seq), &mut self.sends_done),
+            Side::Recv => (self.qp.take_recv(seq), &mut self.recvs_done),
+        };
+        if taken.is_some() {
+            return taken;
+        }
+        let i = done.iter().position(|d| d.0 == seq)?;
+        let (_, wc, leases) = done.swap_remove(i);
+        Some((wc, leases))
+    }
+
     /// Whether no send-queue work waits for room.
     pub(crate) fn sends_idle(&self) -> bool {
         self.sends.is_idle()
@@ -67,6 +112,7 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     /// Posts `work` now if nothing waits before it and it fits; else queues
     /// it and returns its ticket.
     pub(crate) fn submit(&mut self, side: Side, work: Work<N>) -> Result<Posted<N>, u64> {
+        self.unclog();
         let backlog = match side {
             Side::Send => &mut self.sends,
             Side::Recv => &mut self.recvs,
@@ -79,7 +125,7 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     }
 
     /// The posting result of queued work, once posted.
-    pub(crate) fn take(&mut self, side: Side, ticket: u64) -> Option<Posted<N>> {
+    pub(crate) fn take_ticket(&mut self, side: Side, ticket: u64) -> Option<Posted<N>> {
         match side {
             Side::Send => self.sends.take(ticket),
             Side::Recv => self.recvs.take(ticket),
@@ -98,6 +144,14 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     /// Gives up a posted request (its buffers are released when it
     /// retires).
     pub(crate) fn detach(&mut self, side: Side, seq: Seq) {
+        let done = match side {
+            Side::Send => &mut self.sends_done,
+            Side::Recv => &mut self.recvs_done,
+        };
+        if let Some(i) = done.iter().position(|d| d.0 == seq) {
+            done.swap_remove(i);
+            return;
+        }
         match side {
             Side::Send => self.qp.detach_send(seq),
             Side::Recv => self.qp.detach_recv(seq),

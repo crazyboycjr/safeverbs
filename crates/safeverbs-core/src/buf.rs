@@ -259,6 +259,8 @@ impl<T, N: Nic> BufMut<T, N> {
     }
 
     /// Splits into buffers of `n` elements (the last may be shorter).
+    /// (This shadows `[T]::chunks`; `buf[..].chunks(n)` gives borrowed
+    /// views instead.)
     ///
     /// # Panics
     ///

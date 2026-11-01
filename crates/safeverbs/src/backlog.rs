@@ -132,18 +132,19 @@ impl<N: Nic> Backlog<N> {
     }
 }
 
-/// Whether `work` can be posted now without waiting.
+/// Whether `work` can be posted now without waiting. Work waits both for
+/// room in the queue and for a free slot: when every slot holds a result
+/// that its future has not taken yet, it waits for those futures to be
+/// polled.
 pub(crate) fn fits<T: Transport, N: Nic>(qp: &QueuePair<T, N>, work: &Work<N>) -> bool {
     match work {
-        Work::One(..) | Work::Gather(..) => {
-            qp.send_ring().can_post() || qp.send_ring().is_clogged()
-        }
+        Work::One(..) | Work::Gather(..) => qp.send_ring().can_post(),
         Work::Batch(ops) => {
             let ring = qp.send_ring();
             let want = ops.len().min(ring.max_wqes() as usize) as u32;
-            (ring.can_post() && ring.depth() - ring.in_flight_wqes() >= want) || ring.is_clogged()
+            ring.can_post() && ring.depth() - ring.in_flight_wqes() >= want
         }
-        Work::Recv(_) => qp.recv_ring().can_post() || qp.recv_ring().is_clogged(),
+        Work::Recv(_) => qp.recv_ring().can_post(),
     }
 }
 
