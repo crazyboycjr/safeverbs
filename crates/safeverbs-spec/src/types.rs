@@ -95,7 +95,6 @@ impl Outcome {
         &&& self.status.is_err() ==> self.kind is StatusOnly
         &&& self.kind is StatusOnly ==> self.byte_len == 0 && self.imm is None
         &&& self.kind is Read ==> self.imm is None
-        &&& self.kind is WriteNotification ==> self.imm is Some
     }
 }
 

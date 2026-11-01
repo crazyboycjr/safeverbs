@@ -1,6 +1,8 @@
 # Verification
 
-SafeVerbs' guarantee is a theorem checked by [Verus](https://github.com/verus-lang/verus).
+SafeVerbs is being verified with [Verus](https://github.com/verus-lang/verus).
+The complete library refinement theorem is still an obligation; the checked components
+and trusted boundaries below describe the current result.
 This document tells users what is proved, what is only stated so far, and what is assumed;
 it tells contributors how to run the proofs and how code written inside `verus!` is built
 with plain `cargo`. The design behind it is in [`design.md`](design.md).
@@ -189,14 +191,13 @@ a token over a fresh share. These are trusted, not proved.
     not split from one global token: `create_cq` makes each). The control path (allocating
     PDs, registering and deregistering regions in `buf.rs` and `pd.rs`) is not verified; rely
     assumes it deregisters no region a worker's written WR names, which leases ensure.
-  - **One gap in the coupling of outcomes.** M lets the NIC choose any outcome for a successful
-    send (status, length), and records it when a later completion retires the WR; the ring
-    gives an unsignaled request the outcome it implied at posting (success with the posted
-    length). Their statuses agree (M proves an unsignaled retired WR succeeded) but their
-    lengths need not, so the F1 coupling `outcomes[r] == retired[wqe[r]]` cannot hold for
-    unsignaled requests as stated. Either M fixes a successful send's reported length to its
-    WR's total length (a change to the trusted model) or the coupling compares statuses for
-    unsignaled requests; this is left open.
+  - **Operation-specific outcomes.** The earlier SEND/WRITE `byte_len` mismatch is
+    resolved by projecting undefined fields away: `CompletionKind::StatusOnly` carries
+    only status. `lemma_ack_outcome_unique` proves the observed and implied successes
+    agree. READ outcomes carry read length; receive payloads are bounded by receive
+    SGEs; WRITE_WITH_IMM notifications are not. This resolves that particular obstruction,
+    but does not construct the missing worker-to-A map or discharge `impl Refines`.
+
 
   Until then Theorem 1 holds for any implementation that discharges the obligations; the core
   discharges M's side for the worker and A's side for the ring.

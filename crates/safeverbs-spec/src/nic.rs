@@ -151,7 +151,7 @@ impl RecvWr {
         &&& o.canonical()
         &&& o.status is Success ==> (
             (o.kind is Receive && o.byte_len <= total_len(self.sges))
-            || (o.kind is WriteNotification && !(t is Ud))
+            || (o.kind is WriteNotification && o.imm is Some && !(t is Ud))
         )
     }
 }

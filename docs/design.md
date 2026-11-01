@@ -115,7 +115,7 @@ allowed in `Rts` *or* `Err`. M also proves that no step the NIC takes on its own
 a precondition the library checked earlier (`lemma_nic_steps_keep_verbs_enabled`).
 
 **F1, completion correspondence.** Each request gets exactly one outcome, the one M produced
-for its WR (status, byte length, immediate data), and it is returned together with the
+for its WR (status and only operation-defined metadata), and it is returned together with the
 request's own buffers. For an unsignaled WR the outcome is "success": M's in-order rule
 implies that a WR retired by a later CQE executed without error, and M proves it
 (`lemma_poll`). In A: an outcome, once produced, never changes (`lemma_f1_outcome_fixed`);
@@ -125,8 +125,11 @@ Against M: the outcome is the one M recorded when it retired the request's own W
 other request shares that WR (`corollary_f1`).
 
 **R1, no leak by the library.** Every buffer handed to the library is returned or dropped
-exactly once, never before the NIC is done with it, and at the latest when its queue pair is
-dropped. Queue pairs are destroyed only after their WRs are retired, which happens before
+at most once, never before the NIC is done with it. Return or release is eventual only
+when the device quiesces and the driver makes progress. If teardown cannot establish that
+DMA has stopped, the implementation retains the QP and its dependencies; `NotFlushed`
+reports this condition. Unconditional leak freedom against a permanently stuck device is
+not a claim. Queue pairs are destroyed only after their WRs are retired, which happens before
 their buffers are freed. In A: an in-flight request keeps its lease, unchanged, until its
 outcome exists (`lemma_r1_kept_while_in_flight`); every request lives on a queue pair that
 exists (`lemma_r1_requests_on_live_qps`); a released lease never comes back
@@ -276,6 +279,44 @@ ring's head advances past completed slots; they get no unsignaled API, since not
 ever retire an unsignaled WR. A shared receive queue needs a free list instead of a ring.
 M today models the in-order transports (RC, UC, UD); out-of-order completion is a planned
 extension of M. A does not change: it never mentions order.
+
+### Operation-specific contracts
+
+The runtime and M distinguish SEND, SEND_WITH_IMM, WRITE, WRITE_WITH_IMM and READ.
+They share queue accounting but differ in memory access and completion semantics:
+
+| Operation | Local NIC access | Peer action | Successful local completion |
+| --- | --- | --- | --- |
+| SEND | Reads source | Consumes receive WQE; payload goes to its SGEs | Status; no reported length or immediate |
+| SEND_WITH_IMM | Reads source | As SEND; peer receives immediate | Status; immediate belongs to the peer |
+| WRITE | Reads source | Writes rkey-authorized region; no receive WQE consumed | Status; no reported length |
+| WRITE_WITH_IMM | Reads source | Writes rkey region and consumes receive WQE for notification | Status; peer gets write notification and immediate |
+| READ | Writes destination | Reads rkey-authorized region; no receive WQE consumed | Read transfer length; no immediate |
+
+A WRITE_WITH_IMM notification length describes the remote write. It is independent of
+receive SGE capacity and never a length to use when slicing the returned receive buffer.
+The safe completion API exposes `received_len()` only for an ordinary receive payload;
+`byte_len()` also describes READ and write notifications. Both return `None` for
+SEND/WRITE acknowledgements and all errors. `opcode()` and `imm()` likewise hide fields
+that are undefined for errors. A zero-length receive payload is `Some(0)`, distinct from
+an undefined length.
+
+M's `Outcome` contains a `CompletionKind`. Status-only outcomes canonically carry zero
+length and no immediate; zero there is bookkeeping, not a hardware-reported byte count.
+`lemma_ack_outcome_unique` proves that a successful SEND/WRITE inferred from a later CQE
+is exactly the same observable outcome as its own successful CQE. READ retains its
+transfer semantics. This repairs F1's earlier comparison of undefined send lengths
+without assuming that those hardware fields equal the posted length.
+
+Local completion permits local source reuse; it does not promise that a remote
+application has processed the data. UC success also does not promise remote delivery.
+Atomics remain outside M's functional semantics; their current local-buffer abstraction
+as READ must not be presented as a proof of atomicity or remote ordering.
+
+Sources: rdma-core's `ibv_poll_cq(3)` documents error-field validity; the
+[NVIDIA RDMA programming guide](https://networking-docs.nvidia.com/doca/archive/3-5-0/rdma-aware-networks-programming-guide)
+describes the operations and WRITE_WITH_IMM notifications. Provider CQE values are
+projected onto their defined observable fields before entering M or A.
 
 ## 9. Buffers
 
