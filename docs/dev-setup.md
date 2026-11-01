@@ -34,9 +34,6 @@ rdma-core is a submodule of `crates/safeverbs-sys`, pinned to a release tag:
 git submodule update --init crates/safeverbs-sys/vendor/rdma-core
 ```
 
-Until the old crate is removed, the workspace also needs the `rust-ibverbs`
-submodule to load: `git submodule update --init rust-ibverbs`.
-
 ## Building
 
 ```sh
@@ -73,14 +70,22 @@ once the program loads that libibverbs rather than the system's. The
 build script gives this crate's own tests and examples a run path to
 `build/lib` (`-Wl,-rpath`).
 
-Cargo passes such linker arguments only to the package that prints them. A
-crate depending on `safeverbs-sys` gets the directory as
-`DEP_RDMA_CORE_LIB_DIR` (the crate's `links` key is `rdma-core`) and gives
-its own binaries the same run path in its `build.rs`:
+Cargo passes such linker arguments only to the package that prints them,
+and passes build-script metadata only to direct dependents. So the
+directory travels down the crates, each giving its own tests a run path
+and handing it on (each has a `links` key for this, though only
+`safeverbs-sys` links a library):
+
+- `safeverbs-sys` prints it as `DEP_RDMA_CORE_LIB_DIR`;
+- `safeverbs-core` reads that and prints `DEP_SAFEVERBS_CORE_LIB_DIR`;
+- `safeverbs` reads that and prints `DEP_SAFEVERBS_LIB_DIR`.
+
+A crate depending on `safeverbs` (the examples, the demos, an
+application) gives its binaries the run path in its `build.rs`:
 
 ```rust
 fn main() {
-    if let Ok(dir) = std::env::var("DEP_RDMA_CORE_LIB_DIR") {
+    if let Ok(dir) = std::env::var("DEP_SAFEVERBS_LIB_DIR") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
     }
 }
@@ -144,8 +149,46 @@ the tests use.
 
 ```sh
 scripts/rxe.sh up
-cargo test -p safeverbs-sys -- --nocapture
+cargo test --workspace
 ```
+
+- `safeverbs-sys` (`crates/safeverbs-sys/tests/loopback.rs`): smoke tests
+  over the raw FFI, below.
+- `safeverbs-core`: unit tests of the completion ring (`ring.rs`), among
+  them random sequences of posts, commits, aborts, in-order completions
+  with errors and flushes, takes and detaches, checking the invariant after
+  every step and that every lease is released exactly once.
+- `safeverbs` (`crates/safeverbs/tests/model.rs`): the public API on the
+  simulated NIC (`Model`), which needs no device: every operation, the sink
+  and the stream, dropped futures, errors and flushes, and random
+  operation sequences with injected errors after which every buffer is
+  back or released once and nothing stays registered.
+- `safeverbs` (`crates/safeverbs/tests/rxe.rs`): one test per feature on a
+  real device, two QPs of it connected to each other.
+- The crate documentation of `safeverbs` runs its example on the model
+  and has `compile_fail` tests for what the types rule out.
+
+The tests on a device, the raw ones included, pass without doing anything
+on a host without RDMA devices. They pick an rxe device if there is one,
+else the first device; `SAFEVERBS_TEST_DEVICE` names one. On a RoCE port
+they use the first RoCE v2 GID that holds an IPv4 address;
+`SAFEVERBS_TEST_GID_INDEX` picks another. On an InfiniBand port they
+address by LID. Every wait has a deadline, so a test fails rather than
+hangs.
+
+The examples (`examples/`) and demos (`demo/`) run on Soft-RoCE as they
+are, client and server on the same device, for example:
+
+```sh
+cargo run -p greeter --bin greeter_server &
+cargo run -p greeter --bin greeter_client
+cargo run -p perftest --bin safeverbs_write_bw &
+cargo run -p perftest --bin safeverbs_write_bw -- 127.0.0.1
+cargo run -p demo --bin datapath            # on the simulated NIC
+SAFEVERBS_DEVICE=svrxe0 cargo run -p demo --bin datapath
+```
+
+### The raw smoke tests
 
 `crates/safeverbs-sys/tests/loopback.rs` has two tests over the raw FFI:
 
@@ -153,15 +196,10 @@ cargo test -p safeverbs-sys -- --nocapture
   each other; a 4 KiB SEND into a posted RECV, then a 4 KiB RDMA WRITE, each
   payload compared.
 - `probe_extended_verbs`: tries the extended verbs and prints which work
-  (table below), then posts a SEND and an RDMA WRITE in one `ibv_wr_start`
-  ... `ibv_wr_complete` batch and polls them with `ibv_start_poll`,
-  `ibv_next_poll` and `ibv_end_poll`.
-
-Both pass without doing anything on a host without RDMA devices. They pick
-an rxe device if there is one, else the first device; `SAFEVERBS_TEST_DEVICE`
-names one. On a RoCE port they use the first RoCE v2 GID that holds an IPv4
-address; `SAFEVERBS_TEST_GID_INDEX` picks another. On an InfiniBand port
-they address by LID.
+  (table below, `cargo test -p safeverbs-sys -- --nocapture`), then posts a
+  SEND and an RDMA WRITE in one `ibv_wr_start` ... `ibv_wr_complete` batch
+  and polls them with `ibv_start_poll`, `ibv_next_poll` and
+  `ibv_end_poll`.
 
 ### What rxe supports
 

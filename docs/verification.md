@@ -137,7 +137,7 @@ built and tested with plain `cargo test` on stable Rust. What we found:
   (Rust 1.82, which the repository pinned before, cannot build them). We built with stable
   1.98.1 and with 1.99.1, which Verus uses and the repository now pins.
 - **Workspace.** `safeverbs-spec` is its own workspace, so that it verifies on a plain clone:
-  the main workspace needs the `rust-ibverbs` and rdma-core submodules even for
+  the main workspace needs the rdma-core submodule even for
   `cargo metadata`. `safeverbs-core` can be a member of the main workspace and depend on it
   by path.
 - **Verification through cargo.** `cargo verus verify` builds with `RUSTC_WRAPPER=verus`
