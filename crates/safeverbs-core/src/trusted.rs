@@ -2,9 +2,11 @@
 //! contract taken from the NIC model M (`safeverbs_spec::nic`).
 //!
 //! A verb's precondition is M's (`nic_enabled`): Verus checks it at every
-//! call site, which is S2. Its postcondition says that the NIC took steps of
-//! its own (`nic_env_reaches`: executions, faults) and then the verb's step
-//! (`nic_step`), or, when the device refuses, only steps of its own. The
+//! call site, which is S2. Its postcondition says that M moved by steps that
+//! do not touch the caller's share (`rely_reaches`: the NIC's own steps,
+//! executions and faults, and the verbs of other workers on their own CQs
+//! and QPs) and then by the verb's step (`nic_step`), or, when the device
+//! refuses, only by such steps. The
 //! bodies are the calls of [`NicQp`] and [`NicCq`] and are not verified:
 //! together with M they are the assumption. Every item of this module that
 //! Verus trusts is listed in `scripts/trusted.txt`, and the trusted computing
@@ -16,10 +18,17 @@
 //! the start, and the doorbell posts that list.
 //!
 //! The NIC's state is a ghost token, [`NicToken`], that only these wrappers
-//! change and that nothing else can make. The worker and its queue pairs
-//! are not verified yet, so nothing calls them so far: they are the
-//! interface those will be verified against (see `docs/verification.md`,
-//! "Stated, not yet proved").
+//! change and that nothing else can make. A token is one worker's: it holds
+//! M's state as that worker last saw it and the worker's share of M
+//! (`safeverbs_spec::share`: its CQ and the names of its QPs). Each verb is
+//! on the token's own share (`mine`), so it is within what the other
+//! workers rely on, and its precondition, checked in the state the worker
+//! last saw, still holds when the verb happens
+//! (`safeverbs_spec::share::lemma_rely_keeps_enabled`): that is why the
+//! contracts below are consistent. The worker and its queue pairs are not
+//! verified yet, so nothing calls them so far: they are the interface those
+//! will be verified against (see `docs/verification.md`, "Stated, not yet
+//! proved").
 //
 // The imports are used by ghost code too.
 #![allow(unused_imports)]
@@ -28,7 +37,8 @@
 // named in a `use` (the explicit imports below shadow the model's `Sge`).
 use safeverbs_spec::nic::*;
 use safeverbs_spec::refinement::*;
-use safeverbs_spec::types::{CqId, QpId};
+use safeverbs_spec::share::*;
+use safeverbs_spec::types::{CqId, Key, QpId};
 use vstd::prelude::*;
 
 use crate::error::{Error, Result};
@@ -125,21 +135,33 @@ pub open spec fn reports(wc: Wc, e: Cqe) -> bool {
 // =============================================================================
 // The token
 
-/// What the library knows of the NIC: M's state, and for each queue pair the
-/// send WRs written since its last start. Only the trusted wrappers make or
-/// change one: its fields are private, so no other code can forge one.
+/// What one worker knows of the NIC: M's state as it last saw it, its share
+/// of M, and for each of its queue pairs the send WRs written since its last
+/// start. Only the trusted wrappers make or change one: its fields are
+/// private, so no other code can forge one.
 // The fields are ghost: only the proofs read them.
 #[allow(dead_code)]
 pub tracked struct NicToken {
     ghost nic: Nic::State,
+    ghost share: Share,
     ghost started: Set<QpId>,
     ghost written: Map<QpId, Seq<SendWr>>,
 }
 
 impl NicToken {
-    /// The NIC's state in M.
+    /// The NIC's state in M, as the worker last saw it.
     pub closed spec fn nic(&self) -> Nic::State {
         self.nic
+    }
+
+    /// The worker's share of M: its CQ and the names of its QPs.
+    pub closed spec fn share(&self) -> Share {
+        self.share
+    }
+
+    /// `self` is `other` after calls of the same worker: the same share.
+    pub open spec fn same_share(&self, other: &NicToken) -> bool {
+        self.share() == other.share()
     }
 
     /// Queue pair `q` is writing send WRs (between start and the doorbell).
@@ -169,21 +191,27 @@ impl NicToken {
     }
 }
 
-/// `polled(m, m2, c, wcs)`: polling CQ `c` took M from `m` to `m2` and gave
-/// `wcs`: one `poll_cq` step for each, in order, each reporting the CQE it
-/// popped, with steps of the NIC's own around them.
-pub open spec fn polled(m: Nic::State, m2: Nic::State, c: CqId, wcs: Seq<Wc>) -> bool
+/// No region pinned: what the others may do between two calls that name no
+/// memory.
+pub open spec fn no_pins() -> ISet<Key> {
+    ISet::empty()
+}
+
+/// `polled(sh, m, m2, wcs)`: polling the CQ of share `sh` took M from `m` to
+/// `m2` and gave `wcs`: one `poll_cq` step for each, in order, each reporting
+/// the CQE it popped, with steps that do not touch the share around them.
+pub open spec fn polled(sh: Share, m: Nic::State, m2: Nic::State, wcs: Seq<Wc>) -> bool
     decreases wcs.len(),
 {
     if wcs.len() == 0 {
-        nic_env_reaches(m, m2)
+        rely_reaches(sh, no_pins(), m, m2)
     } else {
         exists|mid: Nic::State, before: Nic::State|
             {
-                &&& polled(m, mid, c, wcs.drop_last())
-                &&& nic_env_reaches(mid, before)
-                &&& nic_step(before, m2, Nic::Step::poll_cq(c))
-                &&& reports(wcs.last(), before.cqs[c].entries[0])
+                &&& polled(sh, m, mid, wcs.drop_last())
+                &&& rely_reaches(sh, no_pins(), mid, before)
+                &&& nic_step(before, m2, Nic::Step::poll_cq(sh.cq))
+                &&& reports(wcs.last(), before.cqs[sh.cq].entries[0])
             }
     }
 }
@@ -198,6 +226,7 @@ pub fn start<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
         !old(token).started(q),
     ensures
         final(token).nic() == old(token).nic(),
+        final(token).same_share(old(token)),
         final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
@@ -221,6 +250,7 @@ pub fn post<Q: NicQp>(
         old(token).started(q),
     ensures
         final(token).nic() == old(token).nic(),
+        final(token).same_share(old(token)),
         final(token).started(q),
         final(token).written(q) == old(token).written(q).push(send_wr(wr_id, signaled, *op, sges@)),
         final(token).same_writing_but(old(token), q),
@@ -242,18 +272,31 @@ pub fn doorbell<Q: NicQp>(
     requires
         old(token).started(q),
         nic_inv(old(token).nic()),
+        share_wf(old(token).nic(), old(token).share()),
+        mine(
+            old(token).share(),
+            send_keys(old(token).written(q)),
+            Nic::Step::post_send(q, old(token).written(q)),
+        ),
         nic_enabled(old(token).nic(), Nic::Step::post_send(q, old(token).written(q))),
     ensures
+        final(token).same_share(old(token)),
         !final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
         r is Ok ==> exists|mid: Nic::State|
-            nic_env_reaches(old(token).nic(), mid) && nic_step(
+            rely_reaches(old(token).share(), send_keys(old(token).written(q)), old(token).nic(), mid)
+                && nic_step(
                 mid,
                 final(token).nic(),
                 Nic::Step::post_send(q, old(token).written(q)),
             ),
-        r is Err ==> nic_env_reaches(old(token).nic(), final(token).nic()),
+        r is Err ==> rely_reaches(
+            old(token).share(),
+            send_keys(old(token).written(q)),
+            old(token).nic(),
+            final(token).nic(),
+        ),
 {
     // SAFETY: started (the precondition).
     unsafe { qp.complete() }
@@ -265,10 +308,11 @@ pub fn abort<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
     requires
         old(token).started(q),
     ensures
+        final(token).same_share(old(token)),
         !final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
-        nic_env_reaches(old(token).nic(), final(token).nic()),
+        rely_reaches(old(token).share(), no_pins(), old(token).nic(), final(token).nic()),
 {
     // SAFETY: started (the precondition).
     unsafe { qp.abort() }
@@ -286,17 +330,34 @@ pub fn post_recv<Q: NicQp>(
 ) -> (r: Result<()>)
     requires
         nic_inv(old(token).nic()),
+        share_wf(old(token).nic(), old(token).share()),
+        mine(
+            old(token).share(),
+            recv_keys(seq![recv_wr(wr_id, sges@)]),
+            Nic::Step::post_recv(q, seq![recv_wr(wr_id, sges@)]),
+        ),
         nic_enabled(old(token).nic(), Nic::Step::post_recv(q, seq![recv_wr(wr_id, sges@)])),
     ensures
+        final(token).same_share(old(token)),
         forall|p: QpId| #[trigger] final(token).started(p) == old(token).started(p),
         forall|p: QpId| #[trigger] final(token).written(p) == old(token).written(p),
         r is Ok ==> exists|mid: Nic::State|
-            nic_env_reaches(old(token).nic(), mid) && nic_step(
+            rely_reaches(
+                old(token).share(),
+                recv_keys(seq![recv_wr(wr_id, sges@)]),
+                old(token).nic(),
+                mid,
+            ) && nic_step(
                 mid,
                 final(token).nic(),
                 Nic::Step::post_recv(q, seq![recv_wr(wr_id, sges@)]),
             ),
-        r is Err ==> nic_env_reaches(old(token).nic(), final(token).nic()),
+        r is Err ==> rely_reaches(
+            old(token).share(),
+            recv_keys(seq![recv_wr(wr_id, sges@)]),
+            old(token).nic(),
+            final(token).nic(),
+        ),
 {
     // SAFETY: the memory stays valid until the receive completes: the
     // precondition says it is registered, and the ring keeps its lease until
@@ -304,19 +365,16 @@ pub fn post_recv<Q: NicQp>(
     unsafe { qp.post_recv(wr_id, sges) }
 }
 
-/// `ibv_poll_cq` on CQ `c`: up to `out.len()` CQEs, each popped by M's
-/// `poll_cq` and reported in `out`, in order.
+/// `ibv_poll_cq` on the CQ of the token's share: up to `out.len()` CQEs,
+/// each popped by M's `poll_cq` and reported in `out`, in order.
 #[verifier::external_body]
-pub fn poll<C: NicCq>(
-    cq: &mut C,
-    out: &mut [Wc],
-    Ghost(c): Ghost<CqId>,
-    Tracked(token): Tracked<&mut NicToken>,
-) -> (n: usize)
+pub fn poll<C: NicCq>(cq: &mut C, out: &mut [Wc], Tracked(token): Tracked<&mut NicToken>) -> (n:
+    usize)
     ensures
         n <= old(out)@.len(),
         final(out)@.len() == old(out)@.len(),
-        polled(old(token).nic(), final(token).nic(), c, final(out)@.take(n as int)),
+        final(token).same_share(old(token)),
+        polled(old(token).share(), old(token).nic(), final(token).nic(), final(out)@.take(n as int)),
         forall|q: QpId| #[trigger] final(token).started(q) == old(token).started(q),
         forall|q: QpId| #[trigger] final(token).written(q) == old(token).written(q),
 {

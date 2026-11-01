@@ -15,7 +15,9 @@
 //!    precondition is what **S2** (no local misuse) promises the library meets.
 //! 4. [`refinement`]: **Theorem 1**, as the interface the core must prove, and how A and M
 //!    fit together.
-//! 5. [`examples`]: concrete executions of A and M.
+//! 5. [`share`]: each worker's share of M, and what the threads of one device rely on and
+//!    guarantee each other.
+//! 6. [`examples`]: concrete executions of A and M.
 //!
 //! [`types`] holds what A and M share; [`nic_proofs`] holds the proofs about M.
 //!
@@ -32,4 +34,5 @@ pub mod guarantees;
 pub mod nic;
 pub mod nic_proofs;
 pub mod refinement;
+pub mod share;
 pub mod types;
