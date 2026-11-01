@@ -1223,4 +1223,167 @@ impl<N: Device> Hw<N> {
     }
 }
 
+impl<N: Device> Hw<N> {
+    /// Posts a receive into `part`, a unique buffer, on QP `index`;
+    /// `detached` if nobody will take it back by its sequence number.
+    /// Refused when the QP takes no work (`Error::NotConnected`), the part is
+    /// of another protection domain or frozen, or the receive queue is full.
+    pub fn post_recv(&mut self, index: usize, part: Part<N>, detached: bool) -> (r: core::result::Result<RingSeq, BufError<Part<N>>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        if index >= self.qps.len() {
+            no_qp(index);
+            return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
+        }
+        proof {
+            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+        }
+        let (ready, room, clogged) = match &self.qps[index] {
+            Some(e) => (matches!(e.phase, Phase::Ready), e.recv.can_post(), e.recv.is_clogged()),
+            None => {
+                no_qp(index);
+                (false, false, false)
+            },
+        };
+        if !ready {
+            return Err(BufError { error: Error::NotConnected, buf: part });
+        }
+        if part_pd_of(&part) != pd_id_of(&self.pd) {
+            return Err(BufError { error: Error::PdMismatch, buf: part });
+        }
+        if !part_writable_of(&part) {
+            return Err(BufError { error: Error::Invalid("receive into a frozen buffer"), buf: part });
+        }
+        if !room {
+            let error = if clogged {
+                Error::Clogged
+            } else {
+                Error::QueueFull
+            };
+            return Err(BufError { error, buf: part });
+        }
+        let ghost start = *self;
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        let ghost sh = t0.share();
+        // The buffer's region is registered (its lease says so).
+        registered(&part, &self.pd, Tracked(self.token.borrow_mut()));
+        let ghost t1 = self.token@;
+        let ghost m1 = t1.nic();
+        proof {
+            start.lemma_rely(t0, m0, m1);
+            start.lemma_same_token(t0, t1, m1);
+            self.lemma_inv_fields(&start, t1, m1);
+            assert(self.entry_ok(index as int, t1, m1));
+        }
+        let ghost mid1 = *self;
+        let sge = part_sge_of(&part);
+        let r = match &mut self.qps[index] {
+            Some(e) => {
+                if e.removed {
+                    no_qp(index);
+                }
+                let ghost q = e.id@;
+                let ghost e1 = *e;
+                proof {
+                    e1.recv.lemma_wqes();
+                }
+                let seq = match e.recv.begin() {
+                    Some(seq) => seq,
+                    None => {
+                        proof { assert(false); }
+                        0
+                    },
+                };
+                proof {
+                    e.recv.lemma_wqes();
+                }
+                let wqe = match e.recv.push_wqe() {
+                    Some(wqe) => wqe,
+                    None => {
+                        proof { assert(false); }
+                        0
+                    },
+                };
+                let id = wr_id(index as u16, true, wqe);
+                let sges = [sge];
+                proof {
+                    let qp = m1.qps[q];
+                    e1.recv.lemma_wqes();
+                    assert(sges@ =~= seq![sge]);
+                    let wr = recv_wr(id, sges@);
+                    assert(wr.sges[0] == sge_model(sge));
+                    assert(m1.recv_wr_ok(qp.attr, wr));
+                    assert(nic_enabled(m1, Nic::Step::post_recv(q, seq![wr])));
+                }
+                match post_recv(&mut e.hw, id, &sges, Ghost(q), Tracked(self.token.borrow_mut())) {
+                    Ok(()) => {
+                        let implied = Wc::success(Opcode::RECV, sge.length);
+                        let mut leases = no_leases();
+                        keep_lease(&mut leases, part);
+                        e.recv.end(true, detached, implied, leases);
+                        e.recv.commit();
+                        Ok(seq)
+                    },
+                    Err(error) => {
+                        e.recv.abort();
+                        Err(BufError { error, buf: part })
+                    },
+                }
+            },
+            None => {
+                no_qp(index);
+                Err(BufError { error: Error::Invalid("no such QP"), buf: part })
+            },
+        };
+        proof {
+            let t = self.token@;
+            let n = t.nic();
+            let q = mid1.qps@[index as int]->0.id();
+            let e1 = mid1.qps@[index as int]->0;
+            let e = self.qps@[index as int]->0;
+            let wr = recv_wr(spec_wr_id(index as u16, true, e1.recv.spec_wqe_posted()), seq![sge]);
+            let pins = pinned(t1).union(recv_keys(seq![wr]));
+            if r is Ok {
+                let mid = choose|mid: Nic::State| rely_reaches(sh, pins, m1, mid) && nic_step(mid, n, Nic::Step::post_recv(q, seq![wr]));
+                lemma_rely_fewer_pins(sh, pins, pinned(t1), m1, mid);
+                mid1.lemma_rely(t1, m1, mid);
+                lemma_nic_step_is_next(mid, n, Nic::Step::post_recv(q, seq![wr]));
+                lemma_step_keeps_invariant(mid, n);
+                lemma_mine_keeps_share_wf(sh, pins, mid, n, Nic::Step::post_recv(q, seq![wr]));
+                assert(mid1.entry_ok(index as int, t1, mid));
+                let (a, b) = (mid.qps[q], n.qps[q]);
+                assert forall|k: int| 0 <= k < b.rq.len() implies (#[trigger] b.rq[k]).wr.wr_id == spec_wr_id(
+                    index as u16,
+                    true,
+                    (b.rq_head + k) as u64,
+                ) by {
+                    if k < a.rq.len() {
+                        assert(b.rq[k] == a.rq[k]);
+                    }
+                }
+                assert(rq_linked(e.recv, index as u16, b));
+                let written = t1.written(q);
+                assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(b.attr, #[trigger] written[j]) by {
+                    assert(mid.send_wr_ok(a.attr, written[j]));
+                }
+                assert(self.entry_ok(index as int, t1, n));
+                self.lemma_touch_one(&mid1, t1, mid, n, index as int);
+                self.lemma_same_token(t1, t, n);
+            } else {
+                mid1.lemma_rely(t1, m1, n);
+                assert(mid1.entry_ok(index as int, t1, n));
+                assert(rq_linked(e.recv, index as u16, n.qps[q]));
+                assert(self.entry_ok(index as int, t1, n));
+                self.lemma_touch_one(&mid1, t1, n, n, index as int);
+                self.lemma_same_token(t1, t, n);
+            }
+        }
+        r
+    }
+}
+
 } // verus!

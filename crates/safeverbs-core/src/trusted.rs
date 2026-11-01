@@ -42,7 +42,7 @@ use safeverbs_spec::share::*;
 use safeverbs_spec::types::{CqId, Key, PdId, QpId};
 use vstd::prelude::*;
 
-use crate::buf::{Leases, Part};
+use crate::buf::{BufError, Leases, Part};
 use crate::error::{Error, Result};
 // The device trait as `Device`: `Nic` names M's state machine here.
 use crate::nic::{
@@ -91,6 +91,12 @@ pub struct ExQpType(QpType);
 #[cfg(verus_keep_ghost)]
 #[verifier::external_type_specification]
 pub struct ExError(Error);
+
+/// [`BufError`], as defined.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+#[verifier::reject_recursive_types(B)]
+pub struct ExBufError<B>(BufError<B>);
 
 /// [`ConnectAttr`], opaque (only the device reads it).
 #[cfg(verus_keep_ghost)]

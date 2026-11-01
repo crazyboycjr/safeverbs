@@ -1018,6 +1018,11 @@ impl<L> Ring<L> {
         self.depth
     }
 
+    /// [`Ring::max_wqes`], as a specification.
+    pub closed spec fn spec_max_wqes(&self) -> u64 {
+        self.max_wqes
+    }
+
     /// `self` and `other` agree on the WQE accounting: what the hardware
     /// queue holds is the same.
     pub open spec fn same_wqes(&self, other: &Self) -> bool {
@@ -1041,6 +1046,10 @@ impl<L> Ring<L> {
                 < self.spec_depth(),
             self.spec_open_wqes() as int <= self.spec_wqe_posted() - self.spec_wqe_committed(),
             !self.spec_is_open() ==> self.spec_open_wqes() == 0,
+            1 <= self.spec_max_wqes() <= self.spec_depth(),
+            self.spec_has_wqe_room() <==> (self.spec_is_open() && self.spec_wqe_posted()
+                - self.spec_wqe_retired() < self.spec_depth() && (self.spec_open_wqes() as int)
+                < self.spec_max_wqes()),
     {
     }
 
@@ -1481,6 +1490,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_committed() == old(self).spec_wqe_posted(),
             final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
             final(self).spec_depth() == old(self).spec_depth(),
+            !final(self).spec_is_open(),
     {
         assert!(!self.open, "commit with an open request");
         let ghost pre = *self;
