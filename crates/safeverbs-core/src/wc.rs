@@ -3,6 +3,10 @@
 
 use core::fmt;
 
+use vstd::prelude::*;
+
+verus! {
+
 /// The status of a work completion (`enum ibv_wc_status`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Status(pub u32);
@@ -45,10 +49,17 @@ impl Status {
     pub const GENERAL_ERR: Status = Status(21);
 
     /// Whether the work request completed without error.
-    pub const fn is_ok(self) -> bool {
+    pub const fn is_ok(self) -> (ok: bool)
+        ensures
+            ok == (self.0 == 0),
+    {
         self.0 == 0
     }
+}
 
+} // verus!
+
+impl Status {
     /// The status's name, as `ibv_wc_status_str` would give it.
     pub const fn name(self) -> &'static str {
         match self.0 {
@@ -90,6 +101,8 @@ impl fmt::Display for Status {
         f.write_str(self.name())
     }
 }
+
+verus! {
 
 /// What a completed work request did (`enum ibv_wc_opcode`).
 ///
@@ -154,7 +167,17 @@ impl Wc {
     }
 
     /// Whether the work request succeeded.
-    pub const fn is_ok(&self) -> bool {
+    pub const fn is_ok(&self) -> (ok: bool)
+        ensures
+            ok == self.spec_ok(),
+    {
         self.status.is_ok()
     }
+
+    /// Whether the work request succeeded (for proofs).
+    pub open spec fn spec_ok(&self) -> bool {
+        self.status.0 == 0
+    }
 }
+
+} // verus!

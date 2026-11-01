@@ -2,8 +2,10 @@
 //! they hold, and when they retire.
 //!
 //! This module is bookkeeping only: no FFI, no `unsafe`, no closures or
-//! iterator chains, so that it can be moved into `verus!` and proved. The
-//! queue pair (`crate::qp`) drives it next to the hardware queue.
+//! iterator chains. It is written inside `verus!` and proved: Verus checks
+//! that every operation keeps the invariants below, never panics and never
+//! overflows (`scripts/verify.sh`; a plain `cargo build` erases the proofs).
+//! The queue pair (`crate::qp`) drives it next to the hardware queue.
 //!
 //! # Requests, WQEs and sequence numbers
 //!
@@ -61,7 +63,9 @@
 //!
 //! # Invariants
 //!
-//! Checked by [`Ring::invariant`] after every operation in debug builds:
+//! Proved, not checked: [`Ring::new`] establishes `Ring::inv` (the
+//! specification of the list below) and every operation requires and keeps
+//! it. [`Ring::invariant`] checks the same list at run time, for tests.
 //!
 //! 1. `head <= retired <= committed <= posted` and `posted - head <= slots`:
 //!    the occupied slots form the window `[head, posted)`, with the retired
@@ -86,13 +90,55 @@
 //!    (it is freed instead).
 //! 8. Outside an open request, the WQEs posted after the last signaled
 //!    request (and not retired) number at most `depth - max_wqes`.
+//!
+//! No counter overflows: every request has a WQE, so request numbers stay
+//! below WQE numbers, and [`Ring::has_free_slot`] refuses a new request once
+//! the WQE numbers could not hold `max_wqes` more (after 2^64 WQEs, which
+//! no NIC reaches). The proofs also rely on a few facts about wakers that
+//! Verus takes on trust: [`core::task::Waker`] is opaque to them, and waking,
+//! comparing and cloning one are the standard library's (see the TCB in
+//! `docs/verification.md`).
 
 use core::task::Waker;
 
+use vstd::prelude::*;
+
 use crate::wc::Wc;
+
+verus! {
 
 /// A request's sequence number in its queue.
 pub type Seq = u64;
+
+// =============================================================================
+// Wakers (trusted: these are the standard library's)
+
+/// `Waker` is opaque to the proofs.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExWaker(Waker);
+
+/// Wakes the task `waker` belongs to.
+#[verifier::external_body]
+fn wake(waker: Waker) {
+    waker.wake();
+}
+
+/// Whether `a` and `b` would wake the same task.
+#[verifier::external_body]
+fn will_wake(a: &Waker, b: &Waker) -> bool {
+    a.will_wake(b)
+}
+
+/// Another handle to the task `waker` belongs to.
+#[verifier::external_body]
+fn clone_waker(waker: &Waker) -> Waker {
+    waker.clone()
+}
+
+// =============================================================================
+// Slots
 
 /// Where a slot is in its life (see the module documentation).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -117,8 +163,6 @@ struct Slot<L> {
     first_wqe: u64,
     /// One past the WQE sequence number of its last WQE.
     end_wqe: u64,
-    /// Whether its last WQE asks for a completion.
-    signaled: bool,
     /// No owner: release the leases at retirement.
     detached: bool,
     /// The outcome if a later completion retires it without an error of
@@ -133,13 +177,33 @@ struct Slot<L> {
 }
 
 impl<L> Slot<L> {
-    fn free() -> Slot<L> {
+    /// Holds nothing: no outcome, no leases, no waker.
+    spec fn is_empty(&self) -> bool {
+        &&& self.state == State::Free
+        &&& self.outcome is None
+        &&& self.leases is None
+        &&& self.waker is None
+    }
+
+    /// The slot with `state`.
+    spec fn with_state(self, state: State) -> Slot<L> {
+        Slot { state, ..self }
+    }
+
+    /// The slot freed of everything it holds.
+    spec fn emptied(self) -> Slot<L> {
+        Slot { state: State::Free, outcome: None, leases: None, waker: None, ..self }
+    }
+
+    fn free() -> (slot: Slot<L>)
+        ensures
+            slot.is_empty(),
+    {
         Slot {
             state: State::Free,
             seq: 0,
             first_wqe: 0,
             end_wqe: 0,
-            signaled: false,
             detached: false,
             implied: Wc::success(crate::wc::Opcode(0), 0),
             outcome: None,
@@ -148,6 +212,9 @@ impl<L> Slot<L> {
         }
     }
 }
+
+// =============================================================================
+// The ring
 
 /// The ring of slots of one work queue.
 ///
@@ -189,22 +256,324 @@ pub struct Ring<L> {
     detached_error: Option<Wc>,
 }
 
+/// Requests less than `n` apart live in different slots of a ring of `n`.
+proof fn lemma_distinct(n: int, a: int, b: int)
+    requires
+        1 <= n,
+        0 <= a < b < a + n,
+    ensures
+        a % n != b % n,
+{
+    vstd::arithmetic::div_mod::lemma_fundamental_div_mod(a, n);
+    vstd::arithmetic::div_mod::lemma_fundamental_div_mod(b, n);
+    if a % n == b % n {
+        let k = b / n - a / n;
+        assert(b - a == n * k) by (nonlinear_arith)
+            requires
+                a == n * (a / n) + a % n,
+                b == n * (b / n) + b % n,
+                a % n == b % n,
+                k == b / n - a / n,
+        ;
+        if k >= 1 {
+            assert(n * k >= n) by (nonlinear_arith)
+                requires
+                    k >= 1,
+                    n >= 1,
+            ;
+        } else {
+            assert(n * k <= 0) by (nonlinear_arith)
+                requires
+                    k <= 0,
+                    n >= 1,
+            ;
+        }
+    }
+}
+
+/// Two different requests less than `n` apart live in different slots.
+proof fn lemma_other(n: int, a: int, b: int)
+    requires
+        1 <= n,
+        0 <= a,
+        0 <= b,
+        a != b,
+        a < b + n,
+        b < a + n,
+    ensures
+        a % n != b % n,
+{
+    if a < b {
+        lemma_distinct(n, a, b);
+    } else {
+        lemma_distinct(n, b, a);
+    }
+}
+
 impl<L> Ring<L> {
+    // -------------------------------------------------------------------------
+    // The invariants, as specifications
+
+    /// The number of slots.
+    closed spec fn n(&self) -> int {
+        self.slots@.len() as int
+    }
+
+    /// The slot request `seq` lives in.
+    closed spec fn slot(&self, seq: int) -> Slot<L> {
+        self.slots@[seq % self.n()]
+    }
+
+    /// One past the last WQE of the closed requests: every WQE handed out
+    /// but the open request's.
+    closed spec fn closed_end(&self) -> int {
+        self.wqe_posted - self.open_wqes
+    }
+
+    /// Where the unsignaled tail starts, for the last signaled request
+    /// ending at `sig_end`: after it, or after the last retired WQE.
+    closed spec fn tail_start(&self, sig_end: u64) -> int {
+        if sig_end > self.wqe_retired {
+            sig_end as int
+        } else {
+            self.wqe_retired as int
+        }
+    }
+
+    /// 1 and 2: the windows of requests and WQEs, and the bounds that keep
+    /// the counters from overflowing.
+    closed spec fn inv_counters(&self) -> bool {
+        &&& self.n() >= 1
+        &&& 1 <= self.max_wqes <= self.depth <= u32::MAX
+        &&& self.head <= self.retired <= self.committed <= self.posted
+        &&& self.posted - self.head <= self.n()
+        // The open request has a slot waiting for it.
+        &&& self.open ==> self.posted - self.head < self.n()
+        &&& self.wqe_retired <= self.wqe_committed <= self.closed_end()
+        &&& self.wqe_posted - self.wqe_retired <= self.depth
+        &&& self.open_wqes <= self.max_wqes
+        &&& !self.open ==> self.open_wqes == 0
+        // Every request has a WQE, so request numbers stay below WQE numbers,
+        &&& self.committed <= self.wqe_committed
+        &&& self.posted + self.open_wqes <= self.wqe_posted
+        // and the open request can take `max_wqes` WQEs without overflow.
+        &&& self.open ==> self.closed_end() + self.max_wqes <= u64::MAX
+    }
+
+    /// 5, 6 and 7 for a request in `[head, retired)`: its slot is free, or
+    /// retired with an owner, its outcome and its leases, and no waker.
+    closed spec fn done_ok(&self, s: int) -> bool {
+        let slot = self.slot(s);
+        slot.is_empty() || {
+            &&& slot.state == State::Retired
+            &&& slot.seq == s
+            &&& !slot.detached
+            &&& slot.outcome is Some
+            &&& slot.leases is Some
+            &&& slot.waker is None
+        }
+    }
+
+    /// 3, 5 and 7 for a request in `[retired, posted)`: in flight (if
+    /// committed) or staged, holding its leases, over the WQEs
+    /// `[first_wqe, end_wqe)`.
+    closed spec fn live_ok(&self, s: int) -> bool {
+        let slot = self.slot(s);
+        &&& slot.seq == s
+        &&& if s < self.committed {
+            slot.state == State::InFlight
+        } else {
+            slot.state == State::Staged && slot.outcome is None
+        }
+        &&& slot.leases is Some
+        &&& slot.detached ==> slot.waker is None
+        &&& self.wqe_retired <= slot.first_wqe < slot.end_wqe <= self.closed_end()
+        &&& slot.end_wqe - slot.first_wqe <= self.max_wqes
+        &&& if s < self.committed {
+            slot.end_wqe <= self.wqe_committed
+        } else {
+            self.wqe_committed <= slot.first_wqe
+        }
+    }
+
+    /// 1 and 5 for a slot outside the window `[head, posted)`: it holds
+    /// nothing.
+    closed spec fn free_ok(&self, s: int) -> bool {
+        self.slot(s).is_empty()
+    }
+
+    /// Every slot, by where its request is.
+    #[verifier::opaque]
+    closed spec fn inv_slots(&self) -> bool {
+        &&& forall|s: int| self.head <= s < self.retired ==> #[trigger] self.done_ok(s)
+        &&& forall|s: int| self.retired <= s < self.posted ==> #[trigger] self.live_ok(s)
+        &&& forall|s: int| self.posted <= s < self.head + self.n() ==> #[trigger] self.free_ok(s)
+    }
+
+    /// 3: the requests not retired cover consecutive WQE ranges from
+    /// `wqe_retired`, the committed ones up to `wqe_committed`, all up to
+    /// the open request's.
+    #[verifier::opaque]
+    closed spec fn inv_wqes(&self) -> bool {
+        &&& self.retired < self.posted ==> self.slot(self.retired as int).first_wqe
+            == self.wqe_retired
+        &&& forall|s: int|
+            self.retired < s < self.posted ==> #[trigger] self.slot(s).first_wqe == self.slot(
+                s - 1,
+            ).end_wqe
+        &&& if self.retired < self.committed {
+            self.slot(self.committed - 1).end_wqe == self.wqe_committed
+        } else {
+            self.wqe_committed == self.wqe_retired
+        }
+        &&& if self.committed < self.posted {
+            self.slot(self.posted - 1).end_wqe == self.closed_end()
+        } else {
+            self.wqe_committed == self.closed_end()
+        }
+    }
+
+    /// 8: the WQEs posted after the last signaled request and not retired
+    /// number at most `depth - max_wqes`, and so they do after an abort.
+    closed spec fn inv_signal(&self) -> bool {
+        &&& self.sig_end <= self.closed_end()
+        &&& self.committed_sig_end <= self.wqe_committed
+        &&& self.closed_end() - self.tail_start(self.sig_end) <= self.depth - self.max_wqes
+        &&& self.wqe_committed - self.tail_start(self.committed_sig_end) <= self.depth
+            - self.max_wqes
+    }
+
+    /// The head is advanced past the free slots at the front of the window.
+    closed spec fn head_ok(&self) -> bool {
+        self.head < self.retired ==> self.slot(self.head as int).state != State::Free
+    }
+
+    /// Everything but [`Ring::head_ok`].
+    closed spec fn inv_body(&self) -> bool {
+        &&& self.inv_counters()
+        &&& self.inv_slots()
+        &&& self.inv_wqes()
+        &&& self.inv_signal()
+    }
+
+    /// The invariants of the module documentation.
+    pub closed spec fn inv(&self) -> bool {
+        self.inv_body() && self.head_ok()
+    }
+
+    /// The state of request `seq`'s slot, as [`Ring::state`] reports it.
+    pub closed spec fn state_of(&self, seq: int) -> State {
+        if seq < self.head || seq >= self.posted || self.slot(seq).seq != seq {
+            State::Free
+        } else {
+            self.slot(seq).state
+        }
+    }
+
+    /// `self` and `other` agree on everything but the slots.
+    closed spec fn same_counters(&self, other: &Self) -> bool {
+        &&& self.head == other.head
+        &&& self.retired == other.retired
+        &&& self.committed == other.committed
+        &&& self.posted == other.posted
+        &&& self.depth == other.depth
+        &&& self.max_wqes == other.max_wqes
+        &&& self.wqe_retired == other.wqe_retired
+        &&& self.wqe_committed == other.wqe_committed
+        &&& self.wqe_posted == other.wqe_posted
+        &&& self.sig_end == other.sig_end
+        &&& self.committed_sig_end == other.committed_sig_end
+        &&& self.open == other.open
+        &&& self.open_wqes == other.open_wqes
+        &&& self.failed == other.failed
+        &&& self.detached_error == other.detached_error
+    }
+
+    /// The slot invariants depend on the slots and the window counters only.
+    proof fn lemma_frame(pre: &Self, post: &Self)
+        requires
+            pre.inv_slots(),
+            pre.inv_wqes(),
+            post.slots@ == pre.slots@,
+            post.head == pre.head,
+            post.retired == pre.retired,
+            post.committed == pre.committed,
+            post.posted == pre.posted,
+            post.max_wqes == pre.max_wqes,
+            post.wqe_retired == pre.wqe_retired,
+            post.wqe_committed == pre.wqe_committed,
+            post.closed_end() == pre.closed_end(),
+        ensures
+            post.inv_slots(),
+            post.inv_wqes(),
+            pre.head_ok() ==> post.head_ok(),
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        assert forall|s: int| post.head <= s < post.retired implies #[trigger] post.done_ok(s) by {
+            assert(pre.done_ok(s));
+        }
+        assert forall|s: int| post.retired <= s < post.posted implies #[trigger] post.live_ok(s) by {
+            assert(pre.live_ok(s));
+        }
+        assert forall|s: int| post.posted <= s < post.head + post.n() implies #[trigger] post.free_ok(
+            s,
+        ) by {
+            assert(pre.free_ok(s));
+        }
+        assert forall|s: int| post.retired < s < post.posted implies #[trigger] post.slot(s).first_wqe
+            == post.slot(s - 1).end_wqe by {
+            assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+        }
+    }
+
+    /// The WQE ranges of the requests not retired are in order: a later
+    /// request's WQEs come after an earlier one's.
+    proof fn lemma_ordered(&self, s: int, t: int)
+        requires
+            self.inv_body(),
+            self.retired <= s < t < self.posted,
+        ensures
+            self.slot(s).end_wqe <= self.slot(t).first_wqe,
+        decreases t - s,
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        assert(self.slot(t).first_wqe == self.slot(t - 1).end_wqe);
+        if s < t - 1 {
+            self.lemma_ordered(s, t - 1);
+            assert(self.live_ok(t - 1));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Construction and observers
+
     /// A ring of `slots` slots for a queue of `depth` WQEs, whose requests
     /// have at most `max_wqes` WQEs.
     ///
     /// # Panics
     ///
-    /// Unless `slots >= 1` and `1 <= max_wqes <= depth`.
-    pub fn new(slots: usize, depth: u32, max_wqes: u32) -> Ring<L> {
+    /// Unless `slots >= 1` and `1 <= max_wqes <= depth` (checked at run
+    /// time too, for callers outside the proofs).
+    pub fn new(slots: usize, depth: u32, max_wqes: u32) -> (ring: Ring<L>)
+        requires
+            slots >= 1,
+            1 <= max_wqes <= depth,
+        ensures
+            ring.inv(),
+    {
         assert!(slots >= 1, "a ring needs a slot");
-        assert!(
-            max_wqes >= 1 && max_wqes <= depth,
-            "a request needs 1..=depth WQEs"
-        );
-        let mut v = Vec::with_capacity(slots);
+        assert!(max_wqes >= 1 && max_wqes <= depth, "a request needs 1..=depth WQEs");
+        let mut v: Vec<Slot<L>> = Vec::with_capacity(slots);
         let mut i = 0;
-        while i < slots {
+        while i < slots
+            invariant
+                i <= slots,
+                v@.len() == i,
+                forall|j: int| 0 <= j < i ==> (#[trigger] v@[j]).is_empty(),
+            decreases slots - i,
+        {
             v.push(Slot::free());
             i += 1;
         }
@@ -226,47 +595,106 @@ impl<L> Ring<L> {
             failed: false,
             detached_error: None,
         };
-        debug_assert!(ring.invariant());
+        proof {
+            reveal(Ring::inv_slots);
+            reveal(Ring::inv_wqes);
+            assert forall|s: int| ring.posted <= s < ring.head + ring.n() implies #[trigger] ring.free_ok(
+                s,
+            ) by {
+                vstd::arithmetic::div_mod::lemma_mod_bound(s, ring.n());
+            }
+        }
         ring
     }
 
-    fn index(&self, seq: Seq) -> usize {
+    fn index(&self, seq: Seq) -> (i: usize)
+        requires
+            self.slots@.len() >= 1,
+        ensures
+            i == seq as int % self.n(),
+            i < self.slots@.len(),
+    {
         (seq % self.slots.len() as u64) as usize
     }
 
     /// The queue's depth in WQEs.
-    pub fn depth(&self) -> u32 {
+    pub fn depth(&self) -> u32
+        requires
+            self.inv(),
+    {
         self.depth as u32
     }
 
     /// The most WQEs of one request.
-    pub fn max_wqes(&self) -> u32 {
+    pub fn max_wqes(&self) -> u32
+        requires
+            self.inv(),
+    {
         self.max_wqes as u32
     }
 
     /// The oldest request whose slot is not free (retired and not taken,
     /// or not retired); equal to [`Ring::posted`] when the ring is empty.
-    pub fn head(&self) -> Seq {
+    #[verifier::when_used_as_spec(spec_head)]
+    pub fn head(&self) -> (seq: Seq)
+        ensures
+            seq == self.spec_head(),
+    {
+        self.head
+    }
+
+    /// [`Ring::head`], as a specification.
+    pub closed spec fn spec_head(&self) -> Seq {
         self.head
     }
 
     /// The next request's sequence number.
-    pub fn posted(&self) -> Seq {
+    #[verifier::when_used_as_spec(spec_posted)]
+    pub fn posted(&self) -> (seq: Seq)
+        ensures
+            seq == self.spec_posted(),
+    {
+        self.posted
+    }
+
+    /// [`Ring::posted`], as a specification.
+    pub closed spec fn spec_posted(&self) -> Seq {
         self.posted
     }
 
     /// The oldest request not retired: every request before it has retired.
-    pub fn retired(&self) -> Seq {
+    #[verifier::when_used_as_spec(spec_retired)]
+    pub fn retired(&self) -> (seq: Seq)
+        ensures
+            seq == self.spec_retired(),
+    {
+        self.retired
+    }
+
+    /// [`Ring::retired`], as a specification.
+    pub closed spec fn spec_retired(&self) -> Seq {
         self.retired
     }
 
     /// The oldest staged request: every request before it is committed.
-    pub fn committed(&self) -> Seq {
+    #[verifier::when_used_as_spec(spec_committed)]
+    pub fn committed(&self) -> (seq: Seq)
+        ensures
+            seq == self.spec_committed(),
+    {
+        self.committed
+    }
+
+    /// [`Ring::committed`], as a specification.
+    pub closed spec fn spec_committed(&self) -> Seq {
         self.committed
     }
 
     /// WQEs posted and not retired.
-    pub fn in_flight_wqes(&self) -> u32 {
+    pub fn in_flight_wqes(&self) -> u32
+        requires
+            self.inv(),
+    {
         (self.wqe_posted - self.wqe_retired) as u32
     }
 
@@ -277,24 +705,54 @@ impl<L> Ring<L> {
 
     /// Whether a request is open (between [`Ring::begin`] and
     /// [`Ring::end`]).
-    pub fn is_open(&self) -> bool {
+    #[verifier::when_used_as_spec(spec_is_open)]
+    pub fn is_open(&self) -> (open: bool)
+        ensures
+            open == self.spec_is_open(),
+    {
+        self.open
+    }
+
+    /// [`Ring::is_open`], as a specification.
+    pub closed spec fn spec_is_open(&self) -> bool {
         self.open
     }
 
     /// Whether a slot is free for the next request.
-    pub fn has_free_slot(&self) -> bool {
-        self.posted - self.head < self.slots.len() as u64
+    ///
+    /// It also refuses once the WQE sequence numbers are nearly exhausted
+    /// (after 2^64 - `max_wqes` WQEs, centuries at any rate a NIC can
+    /// reach), so that no counter can overflow.
+    pub fn has_free_slot(&self) -> (free: bool)
+        requires
+            self.inv(),
+        ensures
+            free == self.spec_has_free_slot(),
+    {
+        self.posted - self.head < self.slots.len() as u64 && self.wqe_posted <= u64::MAX
+            - self.max_wqes
+    }
+
+    /// [`Ring::has_free_slot`], as a specification.
+    pub closed spec fn spec_has_free_slot(&self) -> bool {
+        self.posted - self.head < self.n() && self.wqe_posted + self.max_wqes <= u64::MAX
     }
 
     /// Whether a new request of one WQE could be posted now: a free slot and
     /// room for a WQE.
-    pub fn can_post(&self) -> bool {
+    pub fn can_post(&self) -> bool
+        requires
+            self.inv(),
+    {
         !self.open && self.has_free_slot() && self.wqe_posted - self.wqe_retired < self.depth
     }
 
     /// Whether every slot is taken by a retired request whose owner has not
     /// taken it: waiting for completions would not free one.
-    pub fn is_clogged(&self) -> bool {
+    pub fn is_clogged(&self) -> bool
+        requires
+            self.inv(),
+    {
         !self.has_free_slot() && self.head < self.retired
     }
 
@@ -304,13 +762,27 @@ impl<L> Ring<L> {
     }
 
     /// The first error completion of a detached request, once.
-    pub fn take_detached_error(&mut self) -> Option<Wc> {
-        self.detached_error.take()
+    pub fn take_detached_error(&mut self) -> (error: Option<Wc>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        let error = self.detached_error.take();
+        proof {
+            Self::lemma_frame(old(self), final(self));
+        }
+        error
     }
 
     /// The state of request `seq`'s slot: `Free` once it was taken, freed or
     /// never posted.
-    pub fn state(&self, seq: Seq) -> State {
+    pub fn state(&self, seq: Seq) -> (state: State)
+        requires
+            self.inv(),
+        ensures
+            state == self.state_of(seq as int),
+    {
         if seq < self.head || seq >= self.posted {
             return State::Free;
         }
@@ -321,21 +793,36 @@ impl<L> Ring<L> {
         slot.state
     }
 
+    // -------------------------------------------------------------------------
+    // Writing requests
+
     /// Opens a request; returns its sequence number, or `None` without a
     /// free slot or while another request is open.
-    pub fn begin(&mut self) -> Option<Seq> {
+    pub fn begin(&mut self) -> (seq: Option<Seq>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
         if self.open || !self.has_free_slot() {
             return None;
         }
         self.open = true;
         self.open_wqes = 0;
-        debug_assert!(self.invariant());
+        proof {
+            Self::lemma_frame(old(self), final(self));
+        }
         Some(self.posted)
     }
 
     /// How many more WQEs the open request may take now: limited by the
     /// queue's room and by `max_wqes`.
-    pub fn wqe_room(&self) -> u32 {
+    pub fn wqe_room(&self) -> (room: u32)
+        requires
+            self.inv(),
+        ensures
+            room == 0 <==> !self.spec_has_wqe_room(),
+    {
         if !self.open {
             return 0;
         }
@@ -348,33 +835,67 @@ impl<L> Ring<L> {
         }
     }
 
+    /// Whether the open request may take another WQE now.
+    pub closed spec fn spec_has_wqe_room(&self) -> bool {
+        self.open && self.wqe_posted - self.wqe_retired < self.depth && self.open_wqes
+            < self.max_wqes
+    }
+
     /// WQEs handed out to the open request.
-    pub fn open_wqes(&self) -> u32 {
+    #[verifier::when_used_as_spec(spec_open_wqes)]
+    pub fn open_wqes(&self) -> (n: u32)
+        requires
+            self.inv(),
+        ensures
+            n == self.spec_open_wqes(),
+    {
+        self.open_wqes as u32
+    }
+
+    /// [`Ring::open_wqes`], as a specification.
+    pub closed spec fn spec_open_wqes(&self) -> u32 {
         self.open_wqes as u32
     }
 
     /// Hands out the next WQE sequence number (the `wr_id`) to the open
     /// request, or `None` without room.
-    pub fn push_wqe(&mut self) -> Option<u64> {
+    pub fn push_wqe(&mut self) -> (id: Option<u64>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
         if self.wqe_room() == 0 {
             return None;
         }
         let id = self.wqe_posted;
-        self.wqe_posted += 1;
+        self.wqe_posted = id + 1;
         self.open_wqes += 1;
-        debug_assert!(self.invariant());
+        proof {
+            Self::lemma_frame(old(self), final(self));
+        }
         Some(id)
     }
 
     /// Whether the open request must be signaled: with its WQEs, the
     /// unsignaled tail would exceed `depth - max_wqes`.
-    pub fn must_signal(&self) -> bool {
+    pub fn must_signal(&self) -> (must: bool)
+        requires
+            self.inv(),
+        ensures
+            must == self.spec_must_signal(),
+    {
         let base = if self.sig_end > self.wqe_retired {
             self.sig_end
         } else {
             self.wqe_retired
         };
         self.wqe_posted - base > self.depth - self.max_wqes
+    }
+
+    /// [`Ring::must_signal`], as a specification.
+    pub closed spec fn spec_must_signal(&self) -> bool {
+        self.wqe_posted - self.tail_start(self.sig_end) > self.depth - self.max_wqes
     }
 
     /// Closes the open request and stages it in its slot with `leases`.
@@ -386,101 +907,385 @@ impl<L> Ring<L> {
     ///
     /// # Panics
     ///
-    /// Without an open request of at least one WQE.
-    pub fn end(
-        &mut self,
-        want_signal: bool,
-        detached: bool,
-        implied: Wc,
-        leases: L,
-    ) -> (Seq, bool) {
-        assert!(
-            self.open && self.open_wqes >= 1,
-            "no open request with a WQE"
-        );
+    /// Without an open request of at least one WQE (checked at run time
+    /// too, for callers outside the proofs).
+    pub fn end(&mut self, want_signal: bool, detached: bool, implied: Wc, leases: L) -> (r: (
+        Seq,
+        bool,
+    ))
+        requires
+            old(self).inv(),
+            old(self).is_open(),
+            old(self).open_wqes() >= 1,
+        ensures
+            final(self).inv(),
+    {
+        assert!(self.open && self.open_wqes >= 1, "no open request with a WQE");
         let signaled = want_signal || self.must_signal();
         let seq = self.posted;
         let i = self.index(seq);
-        let slot = &mut self.slots[i];
-        slot.state = State::Staged;
-        slot.seq = seq;
-        slot.first_wqe = self.wqe_posted - self.open_wqes;
-        slot.end_wqe = self.wqe_posted;
-        slot.signaled = signaled;
-        slot.detached = detached;
-        slot.implied = implied;
-        slot.outcome = None;
-        slot.leases = Some(leases);
-        slot.waker = None;
-        self.posted += 1;
+        let first_wqe = self.wqe_posted - self.open_wqes;
+        let ghost pre = *self;
+        self.slots[i] = Slot {
+            state: State::Staged,
+            seq,
+            first_wqe,
+            end_wqe: self.wqe_posted,
+            detached,
+            implied,
+            outcome: None,
+            leases: Some(leases),
+            waker: None,
+        };
+        self.posted = seq + 1;
         if signaled {
             self.sig_end = self.wqe_posted;
         }
         self.open = false;
         self.open_wqes = 0;
-        debug_assert!(self.invariant());
+        proof {
+            self.lemma_end(&pre, seq as int);
+        }
         (seq, signaled)
     }
+
+    proof fn lemma_end(&self, pre: &Self, p: int)
+        requires
+            pre.inv(),
+            pre.open,
+            pre.open_wqes >= 1,
+            p == pre.posted,
+            self.slots@ == pre.slots@.update(p % pre.n(), self.slot(p)),
+            self.slot(p).state == State::Staged,
+            self.slot(p).seq == p,
+            self.slot(p).first_wqe == pre.closed_end(),
+            self.slot(p).end_wqe == pre.wqe_posted,
+            self.slot(p).outcome is None,
+            self.slot(p).leases is Some,
+            self.slot(p).waker is None,
+            self.head == pre.head,
+            self.retired == pre.retired,
+            self.committed == pre.committed,
+            self.posted == p + 1,
+            self.depth == pre.depth,
+            self.max_wqes == pre.max_wqes,
+            self.wqe_retired == pre.wqe_retired,
+            self.wqe_committed == pre.wqe_committed,
+            self.wqe_posted == pre.wqe_posted,
+            self.sig_end == pre.sig_end || (self.sig_end == pre.wqe_posted),
+            self.sig_end == pre.sig_end ==> pre.wqe_posted - pre.tail_start(pre.sig_end)
+                <= pre.depth - pre.max_wqes,
+            self.committed_sig_end == pre.committed_sig_end,
+            !self.open,
+            self.open_wqes == 0,
+        ensures
+            self.inv(),
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        let n = pre.n();
+        assert forall|s: int| pre.head <= s < pre.head + n && s != p implies self.slot(s) == pre.slot(
+            s,
+        ) by {
+            lemma_other(n, p, s);
+        }
+        assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
+            assert(pre.done_ok(s));
+        }
+        assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
+            if s != p {
+                assert(pre.live_ok(s));
+            }
+        }
+        assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
+            s,
+        ) by {
+            assert(pre.free_ok(s));
+        }
+        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
+            == self.slot(s - 1).end_wqe by {
+            if s != p {
+                assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+            } else if pre.committed < pre.posted {
+            } else {
+                assert(pre.live_ok(s - 1));
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Committing and aborting
 
     /// The doorbell rang: every staged request is in flight.
     ///
     /// # Panics
     ///
-    /// While a request is open.
-    pub fn commit(&mut self) {
+    /// While a request is open (checked at run time too, for callers outside
+    /// the proofs).
+    pub fn commit(&mut self)
+        requires
+            old(self).inv(),
+            !old(self).is_open(),
+        ensures
+            final(self).inv(),
+    {
         assert!(!self.open, "commit with an open request");
+        let ghost pre = *self;
         let mut seq = self.committed;
-        while seq < self.posted {
+        while seq < self.posted
+            invariant
+                pre.inv(),
+                !pre.open,
+                self.same_counters(&pre),
+                self.slots@.len() == pre.slots@.len(),
+                pre.committed <= seq <= pre.posted,
+                forall|s: int|
+                    pre.head <= s < pre.head + pre.n() ==> #[trigger] self.slot(s) == if pre.committed
+                        <= s < seq {
+                        pre.slot(s).with_state(State::InFlight)
+                    } else {
+                        pre.slot(s)
+                    },
+            decreases pre.posted - seq,
+        {
             let i = self.index(seq);
+            let ghost before = *self;
             self.slots[i].state = State::InFlight;
+            proof {
+                assert forall|s: int| pre.head <= s < pre.head + pre.n() implies #[trigger] self.slot(s)
+                    == if s == seq {
+                    before.slot(s).with_state(State::InFlight)
+                } else {
+                    before.slot(s)
+                } by {
+                    if s != seq {
+                        lemma_other(pre.n(), seq as int, s);
+                    }
+                }
+            }
             seq += 1;
         }
+        let ghost looped = *self;
         self.committed = self.posted;
         self.wqe_committed = self.wqe_posted;
         self.committed_sig_end = self.sig_end;
-        debug_assert!(self.invariant());
+        proof {
+            assert forall|s: int| pre.head <= s < pre.head + pre.n() implies #[trigger] self.slot(s)
+                == looped.slot(s) by {}
+            self.lemma_commit(&pre);
+        }
+    }
+
+    proof fn lemma_commit(&self, pre: &Self)
+        requires
+            pre.inv(),
+            !pre.open,
+            self.slots@.len() == pre.slots@.len(),
+            forall|s: int|
+                pre.head <= s < pre.head + pre.n() ==> #[trigger] self.slot(s) == if pre.committed
+                    <= s < pre.posted {
+                    pre.slot(s).with_state(State::InFlight)
+                } else {
+                    pre.slot(s)
+                },
+            self.head == pre.head,
+            self.retired == pre.retired,
+            self.committed == pre.posted,
+            self.posted == pre.posted,
+            self.depth == pre.depth,
+            self.max_wqes == pre.max_wqes,
+            self.wqe_retired == pre.wqe_retired,
+            self.wqe_committed == pre.wqe_posted,
+            self.wqe_posted == pre.wqe_posted,
+            self.sig_end == pre.sig_end,
+            self.committed_sig_end == pre.sig_end,
+            self.open == pre.open,
+            self.open_wqes == pre.open_wqes,
+        ensures
+            self.inv(),
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
+            assert(pre.done_ok(s));
+        }
+        assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
+            assert(pre.live_ok(s));
+        }
+        assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
+            s,
+        ) by {
+            assert(pre.free_ok(s));
+        }
+        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
+            == self.slot(s - 1).end_wqe by {
+            assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+        }
+        if self.retired < self.posted {
+            assert(pre.slot(self.retired as int) == self.slot(self.retired as int).with_state(
+                pre.slot(self.retired as int).state,
+            ));
+            assert(pre.slot(self.posted - 1).end_wqe == self.slot(self.posted - 1).end_wqe);
+        }
+        if self.head < self.retired {
+            assert(pre.slot(self.head as int) == self.slot(self.head as int));
+        }
     }
 
     /// The hardware discarded everything since the last commit: drops the
     /// open request (if any) and every staged request, releasing their
     /// leases. Returns how many staged requests were dropped.
-    pub fn abort(&mut self) -> u64 {
+    pub fn abort(&mut self) -> (dropped: u64)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
         let dropped = self.posted - self.committed;
         // No request is staged at `posted`: every lease is released.
-        let kept = self.abort_keeping(self.posted);
-        debug_assert!(kept.is_none());
-        drop(kept);
+        let _kept = self.abort_keeping(self.posted);
+        proof {
+            assert(_kept is None);
+        }
         dropped
     }
 
     /// Like [`Ring::abort`], but hands back the leases of staged request
     /// `keep` instead of releasing them (`None` if it is not staged).
-    pub fn abort_keeping(&mut self, keep: Seq) -> Option<L> {
+    pub fn abort_keeping(&mut self, keep: Seq) -> (kept: Option<L>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            kept is Some <==> old(self).committed() <= keep < old(self).posted(),
+    {
+        let ghost pre = *self;
         let mut kept = None;
-        if self.state(keep) == State::Staged {
-            let i = self.index(keep);
-            kept = self.slots[i].leases.take();
-            self.slots[i].state = State::Free;
-            self.slots[i].waker = None;
-        }
         let mut seq = self.committed;
-        while seq < self.posted {
+        while seq < self.posted
+            invariant
+                pre.inv(),
+                self.same_counters(&pre),
+                self.slots@.len() == pre.slots@.len(),
+                pre.committed <= seq <= pre.posted,
+                forall|s: int|
+                    pre.head <= s < pre.head + pre.n() ==> #[trigger] self.slot(s) == if pre.committed
+                        <= s < seq {
+                        pre.slot(s).emptied()
+                    } else {
+                        pre.slot(s)
+                    },
+                kept is Some <==> pre.committed <= keep < seq,
+            decreases pre.posted - seq,
+        {
             let i = self.index(seq);
+            let ghost before = *self;
+            proof {
+                reveal(Ring::inv_slots);
+                assert(pre.live_ok(seq as int));
+                assert(before.slot(seq as int) == pre.slot(seq as int));
+            }
             let slot = &mut self.slots[i];
             slot.state = State::Free;
             slot.outcome = None;
             slot.waker = None;
-            let leases = slot.leases.take();
-            drop(leases);
+            if seq == keep {
+                kept = slot.leases.take();
+            } else {
+                // Releases the leases.
+                slot.leases = None;
+            }
+            proof {
+                assert forall|s: int| pre.head <= s < pre.head + pre.n() implies #[trigger] self.slot(s)
+                    == if s == seq {
+                    before.slot(s).emptied()
+                } else {
+                    before.slot(s)
+                } by {
+                    if s != seq {
+                        lemma_other(pre.n(), seq as int, s);
+                    }
+                }
+            }
             seq += 1;
         }
+        let ghost looped = *self;
         self.posted = self.committed;
         self.wqe_posted = self.wqe_committed;
         self.sig_end = self.committed_sig_end;
         self.open = false;
         self.open_wqes = 0;
-        debug_assert!(self.invariant());
+        proof {
+            assert forall|s: int| pre.head <= s < pre.head + pre.n() implies #[trigger] self.slot(s)
+                == looped.slot(s) by {}
+            self.lemma_abort(&pre);
+        }
         kept
+    }
+
+    proof fn lemma_abort(&self, pre: &Self)
+        requires
+            pre.inv(),
+            self.slots@.len() == pre.slots@.len(),
+            forall|s: int|
+                pre.head <= s < pre.head + pre.n() ==> #[trigger] self.slot(s) == if pre.committed
+                    <= s < pre.posted {
+                    pre.slot(s).emptied()
+                } else {
+                    pre.slot(s)
+                },
+            self.head == pre.head,
+            self.retired == pre.retired,
+            self.committed == pre.committed,
+            self.posted == pre.committed,
+            self.depth == pre.depth,
+            self.max_wqes == pre.max_wqes,
+            self.wqe_retired == pre.wqe_retired,
+            self.wqe_committed == pre.wqe_committed,
+            self.wqe_posted == pre.wqe_committed,
+            self.sig_end == pre.committed_sig_end,
+            self.committed_sig_end == pre.committed_sig_end,
+            !self.open,
+            self.open_wqes == 0,
+        ensures
+            self.inv(),
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
+            assert(pre.done_ok(s));
+        }
+        assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
+            assert(pre.live_ok(s));
+        }
+        assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
+            s,
+        ) by {
+            if s >= pre.posted {
+                assert(pre.free_ok(s));
+            }
+        }
+        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
+            == self.slot(s - 1).end_wqe by {
+            assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+        }
+        if self.retired < self.posted {
+            assert(pre.slot(self.retired as int) == self.slot(self.retired as int));
+        }
+        if self.retired < self.committed {
+            assert(pre.slot(self.committed - 1) == self.slot(self.committed - 1));
+        }
+        if self.head < self.retired {
+            assert(pre.slot(self.head as int) == self.slot(self.head as int));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Completions
+
+    /// One past the last committed WQE.
+    pub closed spec fn spec_wqe_committed(&self) -> u64 {
+        self.wqe_committed
     }
 
     /// Records the completion of WQE `wqe` (its `wr_id`): retires every
@@ -492,14 +1297,29 @@ impl<L> Ring<L> {
     /// recorded on it. A completion for an already retired WQE is ignored.
     /// Returns `false`, and changes nothing, for a WQE that was never
     /// committed.
-    pub fn complete(&mut self, wqe: u64, wc: Wc) -> bool {
+    pub fn complete(&mut self, wqe: u64, wc: Wc) -> (known: bool)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            known == (wqe < old(self).spec_wqe_committed()),
+    {
         if wqe >= self.wqe_committed {
             return false;
         }
         if wqe < self.wqe_retired {
             return true;
         }
-        while self.retired < self.committed {
+        let ghost committed = self.committed;
+        let ghost wqe_committed = self.wqe_committed;
+        while self.retired < self.committed
+            invariant
+                self.inv_body(),
+                self.committed == committed,
+                self.wqe_committed == wqe_committed,
+                wqe < self.wqe_committed,
+            decreases self.committed - self.retired,
+        {
             let i = self.index(self.retired);
             let end = self.slots[i].end_wqe;
             if end <= wqe + 1 {
@@ -511,25 +1331,78 @@ impl<L> Ring<L> {
                         } else {
                             self.slots[i].implied
                         }
-                    }
+                    },
                 };
                 self.retire(i, outcome);
             } else {
                 if !wc.is_ok() && self.slots[i].outcome.is_none() {
+                    let ghost pre = *self;
                     self.slots[i].outcome = Some(wc);
+                    proof {
+                        self.lemma_record(&pre);
+                    }
                 }
                 break;
             }
         }
         self.advance_head();
-        debug_assert!(self.invariant());
         true
     }
 
+    /// Recording an error on the oldest request in flight keeps the
+    /// invariants.
+    proof fn lemma_record(&self, pre: &Self)
+        requires
+            pre.inv_body(),
+            pre.retired < pre.committed,
+            self.same_counters(pre),
+            self.slots@ == pre.slots@.update(
+                (pre.retired as int) % pre.n(),
+                Slot { outcome: self.slot(pre.retired as int).outcome, ..pre.slot(pre.retired as int) },
+            ),
+        ensures
+            self.inv_body(),
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        let r = pre.retired as int;
+        let n = pre.n();
+        assert forall|s: int| pre.head <= s < pre.head + n && s != r implies self.slot(s) == pre.slot(
+            s,
+        ) by {
+            lemma_other(n, r, s);
+        }
+        assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
+            assert(pre.done_ok(s));
+        }
+        assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
+            assert(pre.live_ok(s));
+        }
+        assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
+            s,
+        ) by {
+            assert(pre.free_ok(s));
+        }
+        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
+            == self.slot(s - 1).end_wqe by {
+            assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+        }
+    }
+
     /// Retires the oldest in-flight request, in slot `i`, with `outcome`.
-    fn retire(&mut self, i: usize, outcome: Wc) {
-        debug_assert!(self.slots[i].state == State::InFlight);
-        debug_assert!(self.slots[i].seq == self.retired);
+    fn retire(&mut self, i: usize, outcome: Wc)
+        requires
+            old(self).inv_body(),
+            old(self).retired < old(self).committed,
+            i == old(self).retired as int % old(self).n(),
+        ensures
+            final(self).inv_body(),
+            final(self).retired == old(self).retired + 1,
+            final(self).head == old(self).head,
+            final(self).committed == old(self).committed,
+            final(self).wqe_committed == old(self).wqe_committed,
+    {
+        let ghost pre = *self;
         if !outcome.is_ok() {
             self.failed = true;
         }
@@ -543,103 +1416,458 @@ impl<L> Ring<L> {
             let slot = &mut self.slots[i];
             slot.state = State::Free;
             slot.outcome = None;
-            let leases = slot.leases.take();
-            drop(leases);
+            // Releases the leases.
+            slot.leases = None;
         } else {
             let slot = &mut self.slots[i];
             slot.state = State::Retired;
             slot.outcome = Some(outcome);
         }
+        proof {
+            let r = pre.retired as int;
+            assert(self.slots@ =~= pre.slots@.update(r % pre.n(), self.slot(r)));
+            self.lemma_retire(&pre);
+        }
         if let Some(waker) = waker {
-            waker.wake();
+            wake(waker);
+        }
+    }
+
+    proof fn lemma_retire(&self, pre: &Self)
+        requires
+            pre.inv_body(),
+            pre.retired < pre.committed,
+            self.slots@.len() == pre.slots@.len(),
+            ({
+                let r = pre.retired as int;
+                let old_slot = pre.slot(r);
+                let new_slot = self.slot(r);
+                &&& self.slots@ == pre.slots@.update(r % pre.n(), new_slot)
+                &&& new_slot.waker is None
+                &&& if old_slot.detached {
+                    new_slot.is_empty()
+                } else {
+                    &&& new_slot.state == State::Retired
+                    &&& new_slot.outcome is Some
+                    &&& new_slot.leases == old_slot.leases
+                    &&& new_slot.seq == old_slot.seq
+                    &&& new_slot.detached == old_slot.detached
+                }
+            }),
+            self.head == pre.head,
+            self.retired == pre.retired + 1,
+            self.committed == pre.committed,
+            self.posted == pre.posted,
+            self.depth == pre.depth,
+            self.max_wqes == pre.max_wqes,
+            self.wqe_retired == pre.slot(pre.retired as int).end_wqe,
+            self.wqe_committed == pre.wqe_committed,
+            self.wqe_posted == pre.wqe_posted,
+            self.sig_end == pre.sig_end,
+            self.committed_sig_end == pre.committed_sig_end,
+            self.open == pre.open,
+            self.open_wqes == pre.open_wqes,
+        ensures
+            self.inv_body(),
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        let r = pre.retired as int;
+        let n = pre.n();
+        assert(pre.live_ok(r));
+        assert forall|s: int| pre.head <= s < pre.head + n && s != r implies self.slot(s) == pre.slot(
+            s,
+        ) by {
+            lemma_other(n, r, s);
+        }
+        assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
+            if s != r {
+                assert(pre.done_ok(s));
+            }
+        }
+        assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
+            assert(pre.live_ok(s));
+            pre.lemma_ordered(r, s);
+        }
+        assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
+            s,
+        ) by {
+            assert(pre.free_ok(s));
+        }
+        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
+            == self.slot(s - 1).end_wqe by {
+            assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+        }
+        if self.retired < self.posted {
+            assert(pre.slot(r + 1).first_wqe == pre.slot(r).end_wqe);
+        }
+        if self.retired < self.committed {
+            assert(pre.slot(self.committed - 1) == self.slot(self.committed - 1));
+        }
+        if self.committed < self.posted {
+            assert(pre.slot(self.posted - 1) == self.slot(self.posted - 1));
         }
     }
 
     /// Moves `head` past the free slots at the front of the window.
-    fn advance_head(&mut self) {
-        while self.head < self.retired {
-            let i = self.index(self.head);
-            if self.slots[i].state != State::Free {
-                break;
-            }
+    fn advance_head(&mut self)
+        requires
+            old(self).inv_body(),
+        ensures
+            final(self).inv(),
+            final(self).slots@ == old(self).slots@,
+            final(self).head >= old(self).head,
+            final(self).retired == old(self).retired,
+            final(self).committed == old(self).committed,
+            final(self).posted == old(self).posted,
+            final(self).wqe_retired == old(self).wqe_retired,
+            final(self).wqe_committed == old(self).wqe_committed,
+            final(self).wqe_posted == old(self).wqe_posted,
+    {
+        let ghost pre = *self;
+        while self.head < self.retired && matches!(self.slots[self.index(self.head)].state, State::Free)
+            invariant
+                self.inv_body(),
+                self.slots@ == pre.slots@,
+                self.head >= pre.head,
+                self.retired == pre.retired,
+                self.committed == pre.committed,
+                self.posted == pre.posted,
+                self.wqe_retired == pre.wqe_retired,
+                self.wqe_committed == pre.wqe_committed,
+                self.wqe_posted == pre.wqe_posted,
+            decreases self.retired - self.head,
+        {
+            let ghost before = *self;
             self.head += 1;
+            proof {
+                self.lemma_head(&before);
+            }
         }
     }
 
+    proof fn lemma_head(&self, pre: &Self)
+        requires
+            pre.inv_body(),
+            pre.head < pre.retired,
+            pre.slot(pre.head as int).state == State::Free,
+            self.slots@ == pre.slots@,
+            self.head == pre.head + 1,
+            self.retired == pre.retired,
+            self.committed == pre.committed,
+            self.posted == pre.posted,
+            self.depth == pre.depth,
+            self.max_wqes == pre.max_wqes,
+            self.wqe_retired == pre.wqe_retired,
+            self.wqe_committed == pre.wqe_committed,
+            self.wqe_posted == pre.wqe_posted,
+            self.sig_end == pre.sig_end,
+            self.committed_sig_end == pre.committed_sig_end,
+            self.open == pre.open,
+            self.open_wqes == pre.open_wqes,
+        ensures
+            self.inv_body(),
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        let n = pre.n();
+        let h = pre.head as int;
+        assert(pre.done_ok(h));
+        assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
+            assert(pre.done_ok(s));
+        }
+        assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
+            assert(pre.live_ok(s));
+        }
+        assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
+            s,
+        ) by {
+            if s < h + n {
+                assert(pre.free_ok(s));
+            } else {
+                assert((h + n) % n == h % n) by {
+                    vstd::arithmetic::div_mod::lemma_mod_add_multiples_vanish(h, n);
+                }
+            }
+        }
+        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
+            == self.slot(s - 1).end_wqe by {
+            assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Owners
+
     /// Takes the outcome and leases of retired request `seq`, freeing its
     /// slot; `None` unless it is retired and not taken yet.
-    pub fn take(&mut self, seq: Seq) -> Option<(Wc, L)> {
-        if self.state(seq) != State::Retired {
+    pub fn take(&mut self, seq: Seq) -> (taken: Option<(Wc, L)>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            taken is Some <==> old(self).state_of(seq as int) == State::Retired,
+    {
+        if !matches!(self.state(seq), State::Retired) {
             return None;
+        }
+        let ghost pre = *self;
+        proof {
+            self.lemma_retired_slot(seq as int);
         }
         let i = self.index(seq);
         let slot = &mut self.slots[i];
         let outcome = slot.outcome.take();
         let leases = slot.leases.take();
         slot.state = State::Free;
+        proof {
+            self.lemma_free(&pre, seq as int);
+        }
         self.advance_head();
-        debug_assert!(self.invariant());
         match (outcome, leases) {
             (Some(outcome), Some(leases)) => Some((outcome, leases)),
             _ => None,
         }
     }
 
+    /// A request reported `Retired` is retired, with its outcome and leases.
+    proof fn lemma_retired_slot(&self, seq: int)
+        requires
+            self.inv(),
+            self.state_of(seq) == State::Retired,
+        ensures
+            self.head <= seq < self.retired,
+            self.slot(seq).outcome is Some,
+            self.slot(seq).leases is Some,
+            self.slot(seq).waker is None,
+            !self.slot(seq).detached,
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        if seq >= self.retired {
+            assert(self.live_ok(seq));
+        }
+        assert(self.done_ok(seq));
+    }
+
+    /// Emptying the slot of a retired request keeps the invariants but the
+    /// head's.
+    proof fn lemma_free(&self, pre: &Self, seq: int)
+        requires
+            pre.inv(),
+            pre.head <= seq < pre.retired,
+            self.same_counters(pre),
+            self.slots@ == pre.slots@.update(seq % pre.n(), self.slot(seq)),
+            self.slot(seq).is_empty(),
+        ensures
+            self.inv_body(),
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        let n = pre.n();
+        assert forall|s: int| pre.head <= s < pre.head + n && s != seq implies self.slot(s)
+            == pre.slot(s) by {
+            lemma_other(n, seq, s);
+        }
+        assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
+            assert(pre.done_ok(s));
+        }
+        assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
+            assert(pre.live_ok(s));
+        }
+        assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
+            s,
+        ) by {
+            assert(pre.free_ok(s));
+        }
+        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
+            == self.slot(s - 1).end_wqe by {
+            assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+        }
+        if self.retired < self.posted {
+            assert(pre.slot(self.retired as int) == self.slot(self.retired as int));
+        }
+        if self.retired < self.committed {
+            assert(pre.slot(self.committed - 1) == self.slot(self.committed - 1));
+        }
+        if self.committed < self.posted {
+            assert(pre.slot(self.posted - 1) == self.slot(self.posted - 1));
+        }
+    }
+
     /// Gives up ownership of request `seq`: a retired request is freed and
     /// its leases released now, a staged or in-flight one when it retires.
-    pub fn detach(&mut self, seq: Seq) {
+    pub fn detach(&mut self, seq: Seq)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
         let state = self.state(seq);
         let i = self.index(seq);
-        if state == State::Retired {
+        if matches!(state, State::Retired) {
+            let ghost pre = *self;
+            proof {
+                self.lemma_retired_slot(seq as int);
+            }
             let slot = &mut self.slots[i];
             slot.state = State::Free;
             slot.outcome = None;
-            let leases = slot.leases.take();
-            drop(leases);
+            // Releases the leases.
+            slot.leases = None;
+            proof {
+                self.lemma_free(&pre, seq as int);
+            }
             self.advance_head();
-        } else if state == State::Staged || state == State::InFlight {
+        } else if matches!(state, State::Staged) || matches!(state, State::InFlight) {
+            let ghost pre = *self;
+            proof {
+                self.lemma_live_slot(seq as int);
+            }
             let slot = &mut self.slots[i];
             slot.detached = true;
             slot.waker = None;
+            proof {
+                self.lemma_live_update(&pre, seq as int);
+            }
         }
-        debug_assert!(self.invariant());
+    }
+
+    /// A request reported `Staged` or `InFlight` is not retired.
+    proof fn lemma_live_slot(&self, seq: int)
+        requires
+            self.inv(),
+            self.state_of(seq) == State::Staged || self.state_of(seq) == State::InFlight,
+        ensures
+            self.retired <= seq < self.posted,
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        if seq < self.retired {
+            assert(self.done_ok(seq));
+        }
+    }
+
+    /// Changing the owner or waker of a request not retired keeps the
+    /// invariants, as long as a detached request has no waker.
+    proof fn lemma_live_update(&self, pre: &Self, seq: int)
+        requires
+            pre.inv(),
+            pre.retired <= seq < pre.posted,
+            self.same_counters(pre),
+            ({
+                let old_slot = pre.slot(seq);
+                let new_slot = self.slot(seq);
+                &&& self.slots@ == pre.slots@.update(seq % pre.n(), new_slot)
+                &&& new_slot == Slot {
+                    detached: new_slot.detached,
+                    waker: new_slot.waker,
+                    ..old_slot
+                }
+                &&& new_slot.detached ==> new_slot.waker is None
+            }),
+        ensures
+            self.inv(),
+    {
+        reveal(Ring::inv_slots);
+        reveal(Ring::inv_wqes);
+        let n = pre.n();
+        assert forall|s: int| pre.head <= s < pre.head + n && s != seq implies self.slot(s)
+            == pre.slot(s) by {
+            lemma_other(n, seq, s);
+        }
+        assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
+            assert(pre.done_ok(s));
+        }
+        assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
+            assert(pre.live_ok(s));
+        }
+        assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
+            s,
+        ) by {
+            assert(pre.free_ok(s));
+        }
+        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
+            == self.slot(s - 1).end_wqe by {
+            assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+        }
+        if self.retired < self.posted {
+            assert(pre.slot(self.retired as int).first_wqe == self.slot(
+                self.retired as int,
+            ).first_wqe);
+        }
+        if self.retired < self.committed {
+            assert(pre.slot(self.committed - 1).end_wqe == self.slot(self.committed - 1).end_wqe);
+        }
+        if self.committed < self.posted {
+            assert(pre.slot(self.posted - 1).end_wqe == self.slot(self.posted - 1).end_wqe);
+        }
+        if self.head < self.retired {
+            assert(pre.slot(self.head as int) == self.slot(self.head as int));
+        }
     }
 
     /// Registers `waker` to be woken when request `seq` retires (a staged or
     /// in-flight request with an owner); replaces the one before unless it
     /// would wake the same task.
-    pub fn set_waker(&mut self, seq: Seq, waker: &Waker) {
+    pub fn set_waker(&mut self, seq: Seq, waker: &Waker)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
         let state = self.state(seq);
-        if state != State::Staged && state != State::InFlight {
+        if !matches!(state, State::Staged) && !matches!(state, State::InFlight) {
             return;
+        }
+        proof {
+            self.lemma_live_slot(seq as int);
         }
         let i = self.index(seq);
-        let slot = &mut self.slots[i];
-        if slot.detached {
+        if self.slots[i].detached {
             return;
         }
-        let same = match &slot.waker {
-            Some(old) => old.will_wake(waker),
+        let same = match &self.slots[i].waker {
+            Some(old) => will_wake(old, waker),
             None => false,
         };
         if !same {
-            slot.waker = Some(waker.clone());
+            let ghost pre = *self;
+            self.slots[i].waker = Some(clone_waker(waker));
+            proof {
+                self.lemma_live_update(&pre, seq as int);
+            }
         }
-        debug_assert!(self.invariant());
     }
+
+    // -------------------------------------------------------------------------
+    // Destruction
 
     /// The QP is destroyed: the NIC will not touch any memory again, so
     /// every slot releases its leases and the ring is empty. Wakers are
     /// dropped (nobody can wait on a destroyed QP).
-    pub fn release_all(&mut self) {
+    pub fn release_all(&mut self)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        let ghost pre = *self;
         let mut i = 0;
-        while i < self.slots.len() {
+        while i < self.slots.len()
+            invariant
+                pre.inv(),
+                self.same_counters(&pre),
+                self.slots@.len() == pre.slots@.len(),
+                forall|j: int| 0 <= j < i ==> (#[trigger] self.slots@[j]).is_empty(),
+            decreases self.slots@.len() - i,
+        {
             let slot = &mut self.slots[i];
             slot.state = State::Free;
             slot.outcome = None;
             slot.waker = None;
-            let leases = slot.leases.take();
-            drop(leases);
+            // Releases the leases.
+            slot.leases = None;
             i += 1;
         }
         self.head = self.posted;
@@ -651,10 +1879,26 @@ impl<L> Ring<L> {
         self.committed_sig_end = self.wqe_posted;
         self.open = false;
         self.open_wqes = 0;
-        debug_assert!(self.invariant());
+        proof {
+            reveal(Ring::inv_slots);
+            reveal(Ring::inv_wqes);
+            assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
+                s,
+            ) by {
+                vstd::arithmetic::div_mod::lemma_mod_bound(s, self.n());
+            }
+        }
     }
+}
 
-    /// Checks the invariants of the module documentation.
+} // verus!
+
+// The checks of the invariants at run time, outside the proofs: tests use them to
+// cross-check the proved invariants on random sequences.
+impl<L> Ring<L> {
+    /// Checks the invariants of the module documentation at run time. They
+    /// are proved (`Ring::inv`), so this always returns `true`; tests call it
+    /// to cross-check the proofs against random executions.
     pub fn invariant(&self) -> bool {
         let n = self.slots.len() as u64;
         // 1. The windows.

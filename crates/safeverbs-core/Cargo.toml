@@ -14,9 +14,22 @@ links = "safeverbs-core"
 [dependencies]
 safeverbs-sys = { version = "0.1.0", path = "../safeverbs-sys" }
 serde = { version = "1.0.229", features = ["derive"], optional = true }
+vstd = { version = "=0.0.0-2026-10-25-0158", default-features = false, features = ["alloc"] }
 zerocopy = "0.8.63"
 
 [features]
 ## Serialize the values peers exchange (endpoints, remote buffers).
 serde = ["dep:serde"]
 
+
+# `cargo verus verify` checks the code written inside `verus!` (the ring, see
+# docs/verification.md); a plain `cargo build` erases its ghost code.
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(verus_only)',
+  'cfg(verus_keep_ghost)',
+  'cfg(verus_keep_ghost_body)',
+] }
