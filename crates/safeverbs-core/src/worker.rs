@@ -1126,6 +1126,62 @@ mod tests {
         assert!(wqe_of(wr_id(0, false, 5), 6) > 6 + (1 << 46));
     }
 
+    /// What routing a completion costs: the `wr_id` decoding the worker
+    /// does, against finding the QP by its number (a linear scan, as a
+    /// worker of a few QPs would, and a hash map). Run with `cargo test
+    /// --release -p safeverbs-core -- --ignored --nocapture demux_cost`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn demux_cost() {
+        use core::hint::black_box;
+        use std::collections::HashMap;
+        use std::time::Instant;
+        const N: usize = 1 << 24;
+        for qps in [1usize, 4, 16, 64, 256] {
+            // Completions of random QPs and queues, with their QP numbers.
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            let wcs: Vec<(u64, u32)> = (0..4096)
+                .map(|i| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let q = (x as usize) % qps;
+                    (wr_id(q, x & 1 == 0, i), 0x100 + 7 * q as u32)
+                })
+                .collect();
+            let nums: Vec<u32> = (0..qps).map(|q| 0x100 + 7 * q as u32).collect();
+            let map: HashMap<u32, usize> = nums.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+            let time = |f: &dyn Fn(u64, u32) -> u64| {
+                let start = Instant::now();
+                let mut sum = 0u64;
+                for i in 0..N {
+                    let (id, num) = wcs[i % wcs.len()];
+                    sum = sum.wrapping_add(f(black_box(id), black_box(num)));
+                }
+                black_box(sum);
+                start.elapsed().as_nanos() as f64 / N as f64
+            };
+            let by_wr_id = time(&|id, _| {
+                let index = id >> INDEX_SHIFT;
+                let recv = id & RECV_BIT != 0;
+                index * 2 + recv as u64 + wqe_of(id, 0)
+            });
+            let by_scan = time(&|id, num| {
+                let index = nums.iter().position(|&n| n == num).unwrap_or(0) as u64;
+                let recv = id & RECV_BIT != 0;
+                index * 2 + recv as u64 + wqe_of(id, 0)
+            });
+            let by_map = time(&|id, num| {
+                let index = map.get(&num).copied().unwrap_or(0) as u64;
+                let recv = id & RECV_BIT != 0;
+                index * 2 + recv as u64 + wqe_of(id, 0)
+            });
+            println!(
+                "{qps:4} QPs: wr_id {by_wr_id:.2} ns, qp_num scan {by_scan:.2} ns, qp_num hash map {by_map:.2} ns per completion"
+            );
+        }
+    }
+
     /// The CQ's capacity is reserved per QP; a QP that does not fit is
     /// refused, and removing one frees its share.
     #[test]

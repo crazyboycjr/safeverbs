@@ -1,0 +1,10 @@
+[package]
+name = "event_loop"
+description = "One worker per thread: the loop that polls the CQ, dispatches completions and posts work"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+safeverbs = { version = "0.1.0", path = "../../crates/safeverbs" }

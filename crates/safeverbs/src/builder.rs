@@ -8,7 +8,7 @@
 use core::marker::PhantomData;
 
 use safeverbs_core::{
-    Access, ConnectAttr, Endpoint, Error, Nic, Pd, QpCaps, RC, Result, Transport, UC,
+    Access, ConnectAttr, Endpoint, Error, Nic, Pd, QpCaps, QpKey, RC, Result, Transport, UC, Worker,
 };
 
 use crate::qp::QpGuard;
@@ -173,20 +173,42 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
     /// [`Error::PdMismatch`](crate::Error::PdMismatch) if the worker is of
     /// another protection domain.
     pub fn build_on(&self, worker: &LocalWorker<N>) -> Result<PreparedQp<T, N>> {
+        let state = worker.state();
+        let mut st = state.borrow_mut();
+        let (key, endpoint, attr) = self.build_in(&mut st.worker)?;
+        st.adopt(key);
+        drop(st);
+        Ok(PreparedQp {
+            guard: QpGuard::new(state.clone(), key),
+            attr,
+            endpoint,
+        })
+    }
+
+    /// Creates the QP on a synchronous worker (the event loop's), with the
+    /// queues' sizes checked against the device; returns its key, how the
+    /// peer reaches it, and the attributes to connect it with
+    /// ([`Worker::connect`]) once the peer's endpoint is known. Fails as
+    /// [`QueuePairBuilder::build_on`] does.
+    pub fn build_in(&self, w: &mut Worker<N>) -> Result<(QpKey<T>, Endpoint, ConnectAttr)> {
         let ctx = self.pd.context();
         let port = ctx.port(self.port)?;
         let gid_index = match self.gid_index {
             Some(g) => g,
             None => ctx.default_gid_index(self.port)?,
         };
-        let max_batch = self.max_batch.unwrap_or((self.caps.max_send_wr / 2).max(1));
-        let state = worker.state();
-        if state.borrow().worker.pd().id() != self.pd.id() {
+        if w.pd().id() != self.pd.id() {
             return Err(Error::PdMismatch);
         }
-        let key = state.borrow_mut().add_qp::<T>(self.caps, max_batch)?;
-        let guard = QpGuard::new(state.clone(), key);
-        let endpoint = state.borrow().worker.endpoint(key, self.port, gid_index)?;
+        let max_batch = self.max_batch.unwrap_or((self.caps.max_send_wr / 2).max(1));
+        let key = w.create_qp::<T>(self.caps, max_batch)?;
+        let endpoint = match w.endpoint(key, self.port, gid_index) {
+            Ok(e) => e,
+            Err(e) => {
+                w.remove_qp(key);
+                return Err(e);
+            }
+        };
         let rd = ctx.nic().caps().max_qp_rd_atom.clamp(1, 16) as u8;
         let attr = ConnectAttr {
             port: self.port,
@@ -203,11 +225,7 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
             max_rd_atomic: self.max_rd_atomic.unwrap_or(rd),
             max_dest_rd_atomic: self.max_dest_rd_atomic.unwrap_or(rd),
         };
-        Ok(PreparedQp {
-            guard,
-            attr,
-            endpoint,
-        })
+        Ok((key, endpoint, attr))
     }
 }
 

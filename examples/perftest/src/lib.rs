@@ -16,11 +16,13 @@ pub fn open_device() -> anyhow::Result<Context> {
     Ok(Context::open(get_args().device.as_deref())?)
 }
 
-/// A QP builder configured from the arguments.
+/// A QP builder configured from the arguments: send queues of `tx_depth`
+/// WQEs, receive queues of one (WRITEs need none).
 pub fn builder<T: Transport, N: Nic>(pd: &safeverbs::Pd<N>) -> QueuePairBuilder<T, N> {
     let args = get_args();
     let mut b = QueuePairBuilder::new(pd);
     b.set_send_depth(args.tx_depth)
+        .set_recv_depth(1)
         .set_traffic_class(args.traffic_class);
     if let Some(i) = args.gid_index {
         b.set_gid_index(i);

@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use safeverbs_core::Wc;
 use safeverbs_core::worker::MAX_SGES;
 use safeverbs_core::{
-    Buf, BufMut, Endpoint, Error, Leases, Nic, Part, Pd, QpCaps, QpKey, Reliable, RemoteBuf,
-    Result, Seq, Transport, Worker, WrOp,
+    Buf, BufMut, Endpoint, Error, Leases, Nic, Part, Pd, QpKey, Reliable, RemoteBuf, Result, Seq,
+    Transport, Worker, WrOp,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -52,13 +52,9 @@ impl<N: Nic> State<N> {
         }
     }
 
-    /// Creates a QP on the worker.
-    pub(crate) fn add_qp<T: Transport>(
-        &mut self,
-        caps: QpCaps,
-        max_batch: u32,
-    ) -> Result<QpKey<T>> {
-        let key = self.worker.create_qp::<T>(caps, max_batch)?;
+    /// Gives the futures their share of QP `key`, just created on the
+    /// worker.
+    pub(crate) fn adopt<T: Transport>(&mut self, key: QpKey<T>) {
         let i = key.index();
         if self.queues.len() <= i {
             self.queues.resize_with(i + 1, || None);
@@ -69,7 +65,6 @@ impl<N: Nic> State<N> {
             sends_done: Vec::new(),
             recvs_done: Vec::new(),
         });
-        Ok(key)
     }
 
     /// Destroys a QP of the worker, then drops the work and results the

@@ -4,6 +4,7 @@ members = [
     "crates/safeverbs-sys",
     "crates/safeverbs-core",
     "crates/safeverbs",
+    "examples/event_loop",
     "examples/greeter",
     "examples/perftest",
     "examples/uchan",
