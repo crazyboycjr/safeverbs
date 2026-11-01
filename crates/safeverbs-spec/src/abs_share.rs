@@ -440,4 +440,186 @@ pub proof fn lemma_transfer(
     }
 }
 
+// =========================================================================================
+// Concrete interleavings, without premises
+
+/// Start A, clone one frozen buffer, and post the two IDs on different workers' QPs.
+/// Foreign allocation, waker registration, completion and take preserve the local request.
+/// After a local completion, more foreign work preserves its outcome and appends wakes.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(20)]
+pub proof fn example_two_workers() {
+    let mem = Span { start: 0, len: 64 }.bytes();
+    let fresh = Span { start: 128, len: 64 }.bytes();
+    let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    let a0 = Abs::State {
+        qps: Set::empty(), leases: Map::empty(), next_id: 0,
+        outcomes: Map::empty(), posted: Map::empty(), wakes: Seq::empty(),
+    };
+    assert(Abs::State::start(a0));
+    Abs::State::start_inductive(a0);
+    let a1 = Abs::State { qps: a0.qps.insert(7), ..a0 };
+    assert(Abs::State::create_qp(a0, a1, 7));
+    Abs::State::create_qp_inductive(a0, a1, 7);
+    let a2 = Abs::State { qps: a1.qps.insert(8), ..a1 };
+    assert(Abs::State::create_qp(a1, a2, 8));
+    Abs::State::create_qp_inductive(a1, a2, 8);
+    let unique = Lease { mem, unique: true, any_bytes: true, holder: Holder::Program };
+    let a3 = Abs::State { leases: a2.leases.insert(0, unique), next_id: 1, ..a2 };
+    assert(Abs::State::alloc(a2, a3, mem, true));
+    Abs::State::alloc_inductive(a2, a3, mem, true);
+    let frozen = Lease { unique: false, ..unique };
+    let a4 = Abs::State { leases: a3.leases.insert(0, frozen), ..a3 };
+    assert(Abs::State::freeze(a3, a4, 0));
+    Abs::State::freeze_inductive(a3, a4, 0);
+    let a5 = Abs::State { leases: a4.leases.insert(1, frozen), next_id: 2, ..a4 };
+    assert(Abs::State::share(a4, a5, 0, mem));
+    Abs::State::share_inductive(a4, a5, 0, mem);
+    let local_req = Req { qp: 7, dir: Dir::Out, phase: Phase::InFlight, waker: None, detached: false };
+    let other_req = Req { qp: 8, ..local_req };
+    let a6 = Abs::State {
+        leases: a5.leases.remove(0).insert(2, frozen.with_req(local_req)),
+        posted: a5.posted.insert(2, mem), next_id: 3, ..a5
+    };
+    assert(Abs::State::post_request(a5, a6, 0, 7, Dir::Out));
+    Abs::State::post_request_inductive(a5, a6, 0, 7, Dir::Out);
+    let a7 = Abs::State {
+        leases: a6.leases.remove(1).insert(3, frozen.with_req(other_req)),
+        posted: a6.posted.insert(3, mem), next_id: 4, ..a6
+    };
+    assert(Abs::State::post_request(a6, a7, 1, 8, Dir::Out));
+    Abs::State::post_request_inductive(a6, a7, 1, 8, Dir::Out);
+    let a8 = Abs::State { leases: a7.leases.insert(2, frozen.with_req(local_req.with_waker(9))), ..a7 };
+    assert(Abs::State::register(a7, a8, 2, 9));
+    Abs::State::register_inductive(a7, a8, 2, 9);
+    let a9 = Abs::State { leases: a8.leases.insert(3, frozen.with_req(other_req.with_waker(11))), ..a8 };
+    assert(Abs::State::register(a8, a9, 3, 11));
+    Abs::State::register_inductive(a8, a9, 3, 11);
+    let local = Share { qps: ISet::empty().insert(7), ids: ISet::empty().insert(2) };
+    let other = Share { qps: ISet::empty().insert(8), ids: ISet::empty().insert(3) };
+    assert(local.disjoint(other));
+    assert(share_wf(a9, local) && share_wf(a9, other));
+    assert(a9.leases[2].mem.contains(0) && a9.leases[3].mem.contains(0));
+
+    let b1 = Abs::State {
+        leases: a9.leases.insert(4, Lease { mem: fresh, ..unique }), next_id: 5, ..a9
+    };
+    assert(abs_step(a9, b1, Abs::Step::alloc(fresh, true)));
+    lemma_foreign_step(local, a9, b1, Abs::Step::alloc(fresh, true));
+    // Acquisition of the freshly allocated ID is explicit in the other worker's share.
+    let other1 = other.with_ids(other.ids.insert(4));
+    assert(share_wf(b1, other1) && local.disjoint(other1));
+    let b2 = Abs::State { leases: b1.leases.insert(3, frozen.with_req(other_req.with_waker(12))), ..b1 };
+    assert(abs_step(b1, b2, Abs::Step::register(3, 12)));
+    lemma_mine_is_foreign(other1, local, Abs::Step::register(3, 12));
+    lemma_foreign_step(local, b1, b2, Abs::Step::register(3, 12));
+    let b3 = Abs::State {
+        leases: b2.leases.insert(3, frozen.with_req(other_req.completed(ok))),
+        outcomes: b2.outcomes.insert(3, ok), wakes: b2.wakes.push(12), ..b2
+    };
+    assert(abs_step(b2, b3, Abs::Step::complete(3, ok)));
+    lemma_foreign_step(local, b2, b3, Abs::Step::complete(3, ok));
+    let b4 = Abs::State { leases: b3.leases.remove(3).insert(5, frozen), next_id: 6, ..b3 };
+    assert(abs_step(b3, b4, Abs::Step::take(3, ok)));
+    lemma_foreign_step(local, b3, b4, Abs::Step::take(3, ok));
+    let other2 = other1.with_ids(other1.ids.insert(5));
+    assert(share_wf(b4, other2) && local.disjoint(other2));
+
+    let run = seq![a9, b1, b2, b3, b4];
+    let steps = seq![Abs::Step::alloc(fresh, true), Abs::Step::register(3, 12),
+        Abs::Step::complete(3, ok), Abs::Step::take(3, ok)];
+    assert forall|i: int| 0 <= i < steps.len() implies
+        foreign(local, #[trigger] steps[i]) && abs_step(run[i], run[i + 1], steps[i]) by {
+        if i == 0 {} else if i == 1 {} else if i == 2 {} else { assert(i == 3); }
+    }
+    assert(rely_run(local, run, steps));
+    assert(rely_reaches(local, a9, b4));
+    lemma_rely_inflight(local, a9, b4, 2);
+    assert(b4.req(2).waker == Some(9));
+    assert(!b4.outcomes.contains_key(2));
+    assert(b4.leases[2].mem == mem);
+    assert(b4.next_id == 6 && b4.wakes == seq![12nat]);
+
+    // The local worker completes its own request. Foreign work may append more wakes,
+    // but cannot replace the completed local lease or its historical outcome.
+    let c0 = Abs::State {
+        leases: b4.leases.insert(2, frozen.with_req(local_req.completed(ok))),
+        outcomes: b4.outcomes.insert(2, ok), wakes: b4.wakes.push(9), ..b4
+    };
+    assert(Abs::State::complete(b4, c0, 2, ok));
+    Abs::State::complete_inductive(b4, c0, 2, ok);
+    assert(share_wf(c0, local));
+    let c1 = Abs::State {
+        leases: c0.leases.remove(5).insert(6, frozen.with_req(other_req)),
+        posted: c0.posted.insert(6, mem), next_id: 7, ..c0
+    };
+    assert(abs_step(c0, c1, Abs::Step::post_request(5, 8, Dir::Out)));
+    lemma_foreign_step(local, c0, c1, Abs::Step::post_request(5, 8, Dir::Out));
+    let other3 = other2.with_ids(other2.ids.insert(6));
+    assert(share_wf(c1, other3) && local.disjoint(other3));
+    let c2 = Abs::State { leases: c1.leases.insert(6, frozen.with_req(other_req.with_waker(13))), ..c1 };
+    assert(abs_step(c1, c2, Abs::Step::register(6, 13)));
+    lemma_foreign_step(local, c1, c2, Abs::Step::register(6, 13));
+    let c3 = Abs::State {
+        leases: c2.leases.insert(6, frozen.with_req(other_req.completed(ok))),
+        outcomes: c2.outcomes.insert(6, ok), wakes: c2.wakes.push(13), ..c2
+    };
+    assert(abs_step(c2, c3, Abs::Step::complete(6, ok)));
+    lemma_foreign_step(local, c2, c3, Abs::Step::complete(6, ok));
+    lemma_framed_trans(local, c0, c1, c2);
+    lemma_framed_trans(local, c0, c2, c3);
+    assert(c3.leases[2] == c0.leases[2]);
+    assert(c3.outcomes[2] == ok && c3.req(2).waker is None);
+    assert(c3.wakes == seq![12nat, 9nat, 13nat]);
+}
+
+/// A frozen clone gets a separate fresh ID, then that ID is explicitly transferred to
+/// another worker. Its bytes overlap the source; the source's ID and lease remain local.
+#[verifier::spinoff_prover]
+pub proof fn example_clone_transfer() {
+    let mem = Span { start: 0, len: 64 }.bytes();
+    let frozen = Lease { mem, unique: false, any_bytes: true, holder: Holder::Program };
+    let a0 = Abs::State {
+        qps: Set::empty().insert(7).insert(8), leases: Map::empty().insert(0, frozen),
+        next_id: 1, outcomes: Map::empty(), posted: Map::empty(), wakes: Seq::empty(),
+    };
+    assert(abs_inv(a0));
+    let left = Share { qps: ISet::empty().insert(7), ids: ISet::empty().insert(0) };
+    let right = Share { qps: ISet::empty().insert(8), ids: ISet::empty() };
+    assert(share_wf(a0, left) && share_wf(a0, right) && left.disjoint(right));
+    let a1 = Abs::State { leases: a0.leases.insert(1, frozen), next_id: 2, ..a0 };
+    assert(abs_step(a0, a1, Abs::Step::share(0, mem)));
+    // Cloning is nonmutating interference even when the source ID is locally owned.
+    lemma_foreign_step(left, a0, a1, Abs::Step::share(0, mem));
+    lemma_foreign_step(right, a0, a1, Abs::Step::share(0, mem));
+    let acquired = left.with_ids(left.ids.insert(1));
+    assert(share_wf(a1, acquired) && acquired.disjoint(right));
+    let moved = ISet::empty().insert(1);
+    let left_after = acquired.with_ids(acquired.ids.difference(moved));
+    let right_after = right.with_ids(right.ids.union(moved));
+    assert(transfer(a1, acquired, right, moved, left_after, right_after));
+    lemma_transfer(a1, acquired, right, moved, left_after, right_after);
+    assert(left_after.ids.contains(0) && !left_after.ids.contains(1));
+    assert(right_after.ids.contains(1) && !right_after.ids.contains(0));
+    assert(a1.leases[0].mem.contains(0) && a1.leases[1].mem.contains(0));
+    assert(!a1.leases[0].mem.disjoint(a1.leases[1].mem));
+    assert(a1.leases[0] == a0.leases[0]);
+    let req = Req { qp: 8, dir: Dir::Out, phase: Phase::InFlight, waker: None, detached: false };
+    let a2 = Abs::State {
+        leases: a1.leases.remove(1).insert(2, frozen.with_req(req)),
+        posted: a1.posted.insert(2, mem), next_id: 3, ..a1
+    };
+    let step = Abs::Step::post_request(1, 8, Dir::Out);
+    assert(mine(right_after, step));
+    assert(abs_step(a1, a2, step));
+    lemma_mine_is_foreign(right_after, left_after, step);
+    lemma_foreign_step(left_after, a1, a2, step);
+    // The request's fresh ID is acquired separately from the transferred clone's ID.
+    let right_posted = right_after.with_ids(right_after.ids.insert(2));
+    assert(share_wf(a2, right_posted) && left_after.disjoint(right_posted));
+    assert(a2.leases[0] == a0.leases[0] && a2.in_flight(2));
+    assert(a2.leases[0].mem.contains(0) && a2.leases[2].mem.contains(0));
+    assert(!foreign(left_after, Abs::Step::drop(0)));
+}
+
 } // verus!
