@@ -1901,9 +1901,6 @@ impl<N: Device> Hw<N> {
         let ghost sh = t0.share();
         let r = match &mut self.qps[index] {
             Some(e) => {
-                if e.removed {
-                    no_qp(index);
-                }
                 let ghost q = e.id@;
                 let ghost e0 = *e;
                 e.started = false;
@@ -3048,24 +3045,25 @@ impl<N: Device> Hw<N> {
             // that refuses it is left to the timeout: the QP is then kept.
             if self.to_error(index).is_ok() {
                 let ghost s2 = *self;
-                self.set_flags(index, true, false);
+                self.set_flags(index, Some(true), false);
                 proof {
                     lemma_same_table_trans(self, &s2, &s1);
                 }
             }
         }
         let ghost s3 = *self;
-        self.set_flags(index, false, true);
+        self.set_flags(index, None, true);
         proof {
             lemma_same_table_trans(&s3, &s1, &start);
             lemma_same_table_trans(self, &s3, &start);
         }
     }
 
-    /// Marks QP `index` as waiting to post its drain WQE (if `drain`: when
-    /// its send queue has WQEs in flight), or as removed (if `removed`).
+    /// Marks QP `index` as waiting to post its drain WQE (`Some(true)`: if
+    /// its send queue has WQEs in flight) or not (`Some(false)`), and as
+    /// removed (if `removed`).
     #[verifier::spinoff_prover]
-    fn set_flags(&mut self, index: usize, drain: bool, removed: bool)
+    fn set_flags(&mut self, index: usize, drain: Option<bool>, removed: bool)
         requires
             old(self).inv(),
             old(self).has_qp(index as int),
@@ -3081,8 +3079,10 @@ impl<N: Device> Hw<N> {
         }
         match &mut self.qps[index] {
             Some(e) => {
-                if drain {
-                    e.drain_pending = e.send.in_flight_wqes() > 0;
+                match drain {
+                    Some(true) => e.drain_pending = e.send.in_flight_wqes() > 0,
+                    Some(false) => e.drain_pending = false,
+                    None => {},
                 }
                 if removed {
                     e.removed = true;
@@ -3204,6 +3204,307 @@ impl<N: Device> Hw<N> {
                 || e.recv.in_flight_wqes() > 0),
             None => false,
         }
+    }
+}
+
+impl<N: Device> Hw<N> {
+    /// Writes QP `index`'s drain WQE, if it waits for one and has room: a
+    /// signaled SEND of nothing, without an owner. Whether it was written
+    /// (it goes out at the next doorbell).
+    #[verifier::spinoff_prover]
+    fn stage_drain(&mut self, index: usize) -> (written: bool)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+            written ==> final(self).has_qp(index as int),
+    {
+        if index >= self.qps.len() {
+            return false;
+        }
+        let ghost start = *self;
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        proof {
+            assert(start.entry_ok(index as int, t0, m0));
+        }
+        let ready = match &self.qps[index] {
+            Some(e) => e.removed && e.drain_pending && matches!(e.phase, Phase::Ready) && e.send.can_post(),
+            None => false,
+        };
+        if !ready {
+            return false;
+        }
+        match &mut self.qps[index] {
+            Some(e) => {
+                let ghost q = e.id@;
+                let ghost e0 = *e;
+                proof {
+                    e0.send.lemma_wqes();
+                }
+                match e.send.begin() {
+                    Some(_) => {},
+                    None => {
+                        proof { assert(false); }
+                    },
+                }
+                proof {
+                    e.send.lemma_wqes();
+                }
+                let wqe = match e.send.push_wqe() {
+                    Some(wqe) => wqe,
+                    None => {
+                        proof { assert(false); }
+                        0
+                    },
+                };
+                let implied = Wc::success(Opcode::SEND, 0);
+                let (_, signaled) = e.send.end(true, true, implied, no_leases());
+                if !e.started {
+                    crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                    e.started = true;
+                }
+                let nothing: [Sge; 0] = [];
+                let none = nothing.as_slice();
+                post(&mut e.hw, wr_id(index as u16, false, wqe), signaled, &WrOp::Send, none, Ghost(q), Tracked(self.token.borrow_mut()));
+                proof {
+                    assert(none@ =~= Seq::<Sge>::empty());
+                    let wr = send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@);
+                    assert(wr.sges =~= Seq::<safeverbs_spec::nic::Sge>::empty());
+                    assert(m0.send_wr_ok(m0.qps[q].attr, wr));
+                }
+            },
+            None => {},
+        }
+        proof {
+            let t = self.token@;
+            let e0 = start.qps@[index as int]->0;
+            let q = e0.id();
+            let e = self.qps@[index as int]->0;
+            let attr = m0.qps[q].attr;
+            let written = t.written(q);
+            assert forall|j: int| 0 <= j < written.len() implies m0.send_wr_ok(attr, #[trigger] written[j]) by {
+                if j < t0.written(q).len() {
+                    assert(written[j] == t0.written(q)[j]);
+                }
+            }
+            assert(self.entry_ok(index as int, t, m0));
+            self.lemma_commit_frame(&start, t0, t, m0, m0, index as int);
+        }
+        true
+    }
+
+    /// Posts QP `index`'s drain WQE if it waits for one and has room (see
+    /// `crate::worker`, "Removing QPs"): it completes after every WQE before
+    /// it, with a flush error, and polling that completion retires them all,
+    /// including unsignaled ones that succeeded before the error. A refused
+    /// doorbell is tried again later.
+    pub fn post_drain(&mut self, index: usize)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        let ghost start = *self;
+        if self.stage_drain(index) {
+            let ghost s1 = *self;
+            if self.commit(index, None).is_ok() {
+                let ghost s2 = *self;
+                self.set_flags(index, Some(false), false);
+                proof {
+                    lemma_same_table_trans(self, &s2, &s1);
+                }
+            }
+            proof {
+                lemma_same_table_trans(self, &s1, &start);
+            }
+        }
+    }
+
+    /// After removing entry `index`'s QP from M (and the entry from the
+    /// table, its share of the CQ from the count), the invariant holds
+    /// again.
+    #[verifier::spinoff_prover]
+    proof fn lemma_remove_one(&self, start: &Self, t: NicToken, mid: Nic::State, n: Nic::State, index: int)
+        requires
+            start.inv_with(t, mid),
+            nic_inv(n),
+            share_wf(n, t.share()),
+            0 <= index < start.qps@.len(),
+            start.qps@[index] is Some,
+            !writes(t, start.qps@[index]->0.id()),
+            self.qps@.len() == start.qps@.len(),
+            forall|i: int| 0 <= i < self.qps@.len() && i != index ==> #[trigger] self.qps@[i] == start.qps@[i],
+            self.qps@[index] is None,
+            cq_of(self.cq) == cq_of(start.cq),
+            self.pd == start.pd,
+            self.caps == start.caps,
+            self.cq_size == start.cq_size,
+            self.next_name == start.next_name,
+            n.qps == mid.qps.remove(start.qps@[index]->0.id()),
+            n.caps == mid.caps,
+            n.mrs == mid.mrs,
+            n.pds == mid.pds,
+            n.retired == mid.retired,
+            n.cqs[t.share().cq].cap == mid.cqs[t.share().cq].cap,
+            n.cqs[t.share().cq].reserved.len() == self.reserved,
+            self.reserved <= self.cq_size,
+        ensures
+            self.inv_with(t, n),
+    {
+        let q = start.qps@[index]->0.id();
+        assert forall|i: int| 0 <= i < self.qps@.len() implies #[trigger] self.entry_ok(i, t, n) by {
+            if i != index {
+                assert(start.entry_ok(i, t, mid));
+                if let Some(e) = self.qps@[i] {
+                    assert(e.id() != q);
+                    lemma_ok_same(e, i as u16, mid, n, t.share(), t.pd(), t.started(e.id()), t.written(e.id()));
+                }
+            }
+        }
+        assert forall|i: int, j: int|
+            #![trigger self.qps@[i], self.qps@[j]]
+            0 <= i < self.qps@.len() && 0 <= j < self.qps@.len() && i != j && self.qps@[i] is Some
+                && self.qps@[j] is Some implies self.qps@[i]->0.id() != self.qps@[j]->0.id() by {
+            assert(self.qps@[i] == start.qps@[i] && self.qps@[j] == start.qps@[j]);
+        }
+        assert forall|p: QpId| #[trigger] n.qps.contains_key(p) && t.share().owns.contains(p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            assert(mid.qps.contains_key(p) && p != q);
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            assert(i != index);
+            assert(self.qps@[i] == start.qps@[i]);
+        }
+        assert forall|p: QpId| #[trigger] writes(t, p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            assert(i != index);
+            assert(self.qps@[i] == start.qps@[i]);
+        }
+        assert forall|k: nat| k >= self.next_name@ implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
+            assert(!mid.qps.contains_key(t.name(k)));
+        }
+    }
+
+    /// Destroys QP `index`, being removed, if neither of its rings has a WQE
+    /// in flight, which is M's `destroy_qp` precondition (empty queues): the
+    /// hardware QP first, then the rings, which release its buffers, then
+    /// its share of the CQ. Whether it was destroyed.
+    #[verifier::spinoff_prover]
+    pub fn destroy(&mut self, index: usize) -> (destroyed: bool)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        if index >= self.qps.len() {
+            return false;
+        }
+        let ghost start = *self;
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        let ghost sh = t0.share();
+        proof {
+            assert(start.entry_ok(index as int, t0, m0));
+        }
+        let idle = match &self.qps[index] {
+            Some(e) => e.removed && !e.started && !e.send.is_open() && e.send.in_flight_wqes() == 0
+                && e.recv.in_flight_wqes() == 0,
+            None => false,
+        };
+        if !idle {
+            return false;
+        }
+        let mut slot: Option<HwQp<N>> = None;
+        core::mem::swap(&mut slot, &mut self.qps[index]);
+        let entry = match slot {
+            Some(entry) => entry,
+            None => {
+                proof { assert(false); }
+                return false;
+            },
+        };
+        let ghost q = entry.id@;
+        let ghost need = entry.caps.max_send_wr + entry.caps.max_recv_wr;
+        proof {
+            let qp = m0.qps[q];
+            entry.send.lemma_wqes();
+            entry.recv.lemma_wqes();
+            assert(nic_enabled(m0, Nic::Step::destroy_qp(q)));
+            assert(m0.cq_wf(sh.cq));
+            assert(m0.cqs[sh.cq].reserved.count(q) == m0.reserved_by(sh.cq, q));
+            broadcast use vstd::multiset::group_multiset_axioms;
+            assert(need <= self.reserved);
+        }
+        let need = entry.caps.max_send_wr + entry.caps.max_recv_wr;
+        // The hardware QP first; the rest of the entry, the rings with the
+        // buffers, goes when this returns, once the NIC holds none of them.
+        destroy_qp(entry.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+        self.reserved = self.reserved - need;
+        proof {
+            let t = self.token@;
+            let n = t.nic();
+            let mid = choose|mid: Nic::State| rely_reaches(sh, pinned(t0), m0, mid) && nic_step(mid, n, Nic::Step::destroy_qp(q));
+            start.lemma_rely(t0, m0, mid);
+            start.lemma_same_token(t0, t, mid);
+            lemma_nic_step_is_next(mid, n, Nic::Step::destroy_qp(q));
+            lemma_step_keeps_invariant(mid, n);
+            lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::destroy_qp(q));
+            assert(start.entry_ok(index as int, t, mid));
+            let qp = mid.qps[q];
+            let cq = mid.cqs[sh.cq];
+            safeverbs_spec::nic_proofs::lemma_copies(q, qp.attr.sq_depth);
+            safeverbs_spec::nic_proofs::lemma_copies(q, qp.attr.rq_depth);
+            broadcast use vstd::multiset::group_multiset_axioms;
+            assert(mid.cq_wf(sh.cq));
+            assert(cq.reserved.count(q) == mid.reserved_by(sh.cq, q));
+            let c1 = cq.unreserve(q, qp.attr.sq_depth);
+            assert(copies(q, qp.attr.sq_depth).subset_of(cq.reserved));
+            assert(copies(q, qp.attr.rq_depth).subset_of(c1.reserved));
+            assert(n.cqs[sh.cq].reserved.len() == cq.reserved.len() - qp.attr.sq_depth - qp.attr.rq_depth);
+            assert(!writes(t, q));
+            self.lemma_remove_one(&start, t, mid, n, index as int);
+        }
+        true
+    }
+
+    /// Ends the worker: destroys its CQ if no QP is left (each destroyed
+    /// before: M's `destroy_cq` needs none attached). Otherwise hands the
+    /// worker back: a QP the device never flushed keeps it, and the caller
+    /// leaks it all (no memory the NIC may use is ever freed).
+    pub fn finish(self) -> (r: core::result::Result<(), Self>)
+        requires
+            self.inv(),
+    {
+        let mut i = 0;
+        while i < self.qps.len()
+            invariant
+                self.inv(),
+                0 <= i <= self.qps@.len(),
+                forall|j: int| 0 <= j < i ==> (#[trigger] self.qps@[j]) is None,
+            decreases self.qps@.len() - i,
+        {
+            if self.qps[i].is_some() {
+                return Err(self);
+            }
+            i += 1;
+        }
+        proof {
+            let t = self.token@;
+            let m = t.nic();
+            let sh = t.share();
+            assert forall|q: QpId| #[trigger] m.qps.contains_key(q) implies m.qps[q].attr.send_cq != sh.cq
+                && m.qps[q].attr.recv_cq != sh.cq by {
+                if m.qps[q].attr.send_cq == sh.cq || m.qps[q].attr.recv_cq == sh.cq {
+                    assert(sh.owns.contains(q));
+                }
+            }
+        }
+        let Hw { cq, token, .. } = self;
+        destroy_cq(cq, token);
+        Ok(())
     }
 }
 
