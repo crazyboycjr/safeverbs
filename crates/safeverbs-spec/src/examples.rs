@@ -17,6 +17,7 @@ verus! {
 
 /// A: allocate a buffer, freeze it, send it, poll once (`Pending`, registering a waker), let
 /// the NIC complete it (the waker runs), take the outcome and the buffer back.
+#[verifier::spinoff_prover]
 pub proof fn example_send_in_a() {
     let mem = Span { start: 0, len: 64 }.bytes();
     let ok = Outcome { status: Status::Success, byte_len: 64, imm: None };
@@ -113,6 +114,9 @@ pub proof fn example_dropped_receive_in_a() {
 
 /// M: post an unsignaled RDMA write and a signaled one with one doorbell; the NIC executes
 /// both, only the second produces a CQE, and polling it retires both, the first as a success.
+/// (Concrete states make big terms: this example gets its own resource limit.)
+#[verifier::spinoff_prover]
+#[verifier::rlimit(30)]
 pub proof fn example_unsignaled_in_m() {
     broadcast use vstd::multiset::group_multiset_axioms;
     reveal_with_fuel(total_len, 2);
