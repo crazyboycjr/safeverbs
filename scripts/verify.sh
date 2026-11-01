@@ -26,7 +26,7 @@ if grep -rnE '\b(assume|admit)\(|verifier::external|external_body|assume_specifi
     exit 1
 fi
 
-# The repository pins an older toolchain; Verus runs cargo with its own.
+# Verus runs cargo with its own toolchain, whatever rust-toolchain.toml pins.
 toolchain="$(verus --version 2>/dev/null | sed -n 's/^ *Toolchain: \([^ ]*\).*/\1/p')"
 if [ -z "$toolchain" ]; then
     echo "verify.sh: cannot read the toolchain from 'verus --version'" >&2

@@ -92,9 +92,8 @@ $ scripts/verify.sh
 safeverbs-spec: verification results:: 115 verified, 0 errors
 ```
 
-The script runs `cargo verus verify` on the crate with Verus's toolchain (the repository's
-`rust-toolchain.toml` pins an older one), always re-verifies the crate while vstd stays
-cached, runs under a memory cap when `systemd-run` is available (`VERIFY_MEMORY_MAX`, default
+The script runs `cargo verus verify` on the crate with the toolchain Verus names (whatever
+`rust-toolchain.toml` pins), always re-verifies the crate while vstd stays cached, runs under a memory cap when `systemd-run` is available (`VERIFY_MEMORY_MAX`, default
 `6G`), and exits non-zero on any failure. The first run also verifies vstd itself (about
 1900 items); after that a run takes a few seconds. Extra arguments go to Verus, for example
 `scripts/verify.sh --rlimit 2`, which still passes: the proofs are not at the edge of the
@@ -130,10 +129,13 @@ built and tested with plain `cargo test` on stable Rust. What we found:
   parameter after erasure (of a zero-sized type), so code outside Verus has to pass one
   (`Tracked::assume_new()`). The core's public API should therefore keep its tokens inside
   its structs and take no ghost parameters.
-- **Toolchain.** vstd's macro dependencies use edition 2024 and need Cargo 1.85 or newer;
-  the repository currently pins 1.82, so `safeverbs-spec` is its own workspace for now. We
-  built with stable 1.98.1 and with Verus's 1.99.1. Before `safeverbs-core` joins the main
-  workspace the pinned toolchain has to move to at least 1.85.
+- **Toolchain.** vstd's macro dependencies use edition 2024 and need Cargo 1.85 or newer
+  (Rust 1.82, which the repository pinned before, cannot build them). We built with stable
+  1.98.1 and with 1.99.1, which Verus uses and the repository now pins.
+- **Workspace.** `safeverbs-spec` is its own workspace, so that it verifies on a plain clone:
+  the main workspace needs the `rust-ibverbs` and rdma-core submodules even for
+  `cargo metadata`. `safeverbs-core` can be a member of the main workspace and depend on it
+  by path.
 - **Verification through cargo.** `cargo verus verify` builds with `RUSTC_WRAPPER=verus`
   and verifies every crate whose `Cargo.toml` has `[package.metadata.verus] verify = true`,
   importing what each verified dependency exports. It runs `cargo metadata` with the

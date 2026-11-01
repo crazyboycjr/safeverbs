@@ -6,7 +6,7 @@ license = "BSD-3-Clause"
 description = "Formal model of an RDMA NIC (M), the abstract SafeVerbs machine (A) and the guarantees, in Verus"
 publish = false
 
-# Its own workspace for now: vstd needs a newer Rust than the repository's pinned toolchain.
+# Its own workspace, so that it verifies without the main workspace's submodules.
 # Everything here is ghost code: a plain `cargo build` compiles it to (almost) nothing.
 [workspace]
 
