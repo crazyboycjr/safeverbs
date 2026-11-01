@@ -24,7 +24,7 @@
 //! and of receive queues: work requests execute in posting order, an unsignaled one that
 //! succeeds produces no completion, and a polled completion retires its work request and
 //! every earlier one. An error moves the queue pair to `Err`; from then on every work
-//! request completes with `FlushErr`, in order, signaled or not.
+//! request completes with an error (normally `FlushErr`), in order, signaled or not.
 #![allow(unused_imports)]
 
 use crate::types::*;

@@ -97,7 +97,7 @@ The script runs `cargo verus verify` on the crate with Verus's toolchain (the re
 cached, runs under a memory cap when `systemd-run` is available (`VERIFY_MEMORY_MAX`, default
 `6G`), and exits non-zero on any failure. The first run also verifies vstd itself (about
 1900 items); after that a run takes a few seconds. Extra arguments go to Verus, for example
-`scripts/verify.sh --rlimit 3`, which still passes: the proofs are not at the edge of the
+`scripts/verify.sh --rlimit 2`, which still passes: the proofs are not at the edge of the
 solver's resource limit.
 
 For quick iteration, the crate can also be checked without cargo:

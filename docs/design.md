@@ -166,13 +166,13 @@ The trusted computing base is:
   readable state machine, not a comment. In particular we assume that send queues of RC,
   UC, UD (and MRC) and all receive queues complete in posting order; that an unsignaled WR
   that succeeds produces no CQE; that a failed WR produces a CQE even if unsignaled and moves
-  the queue pair to the error state, after which every remaining WR completes with a flush
-  error in order; that a CQE carries the `wr_id` of its WR; that once a CQE is polled the NIC
-  no longer touches the buffers of the WRs it retires; that inline data is copied when it is
-  posted; that the NIC never accesses memory outside the scatter/gather lists of posted WRs
-  and the regions exposed for remote access; that after `ibv_dereg_mr` returns, the region's
-  rkey stops working and the NIC no longer accesses it; and that a CQ with enough reserved
-  capacity never overflows.
+  the queue pair to the error state, after which every remaining WR completes with an error
+  (normally a flush error), in order; that a CQE carries the `wr_id` of its WR; that once a
+  CQE is polled the NIC no longer touches the buffers of the WRs it retires; that inline data
+  is copied when it is posted; that the NIC never accesses memory outside the scatter/gather
+  lists of posted WRs and the regions exposed for remote access; that after `ibv_dereg_mr`
+  returns, the region's rkey stops working and the NIC no longer accesses it; and that a CQ
+  with enough reserved capacity never overflows.
 - **The trusted wrappers' bodies.** Each verb is called through a small wrapper whose
   contract is M (it requires the verb's precondition and ensures the matching M step); its
   body is the FFI call and is not verified.
@@ -267,8 +267,8 @@ or a send, never by polling memory. On an in-order queue, a signaled completion 
 `j` retires every earlier slot: those WRs executed without a CQE, which M shows means they
 were unsignaled and succeeded. Unsignaled WRs and batches are therefore safe: their buffers
 stay in their slots until a later CQE retires them. When the queue pair enters the error
-state, the remaining WRs complete with `FLUSH_ERR`, in order, signaled or not, and each
-releases its slot.
+state, the remaining WRs complete with an error (normally `FLUSH_ERR`), in order, signaled
+or not, and each releases its slot.
 
 A transport trait carries `IN_ORDER_COMPLETION`. Out-of-order transports (SRD on EFA, UEC's
 RUD) use a bitmap ring, in which a slot is freed when its own completion arrives and the
