@@ -107,6 +107,74 @@
 //! # Ok(()) }
 //! ```
 
+//! # What does not compile
+//!
+//! The rules above are checked by the compiler. A frozen buffer is read
+//! only:
+//!
+//! ```compile_fail,E0594
+//! # fn f(pd: safeverbs::Pd) -> safeverbs::Result<()> {
+//! let buf = pd.alloc::<u8>(64)?.freeze();
+//! buf[0] = 1;
+//! # Ok(()) }
+//! ```
+//!
+//! A buffer posted for a receive belongs to the request until it comes
+//! back:
+//!
+//! ```compile_fail,E0382
+//! # fn f(pd: safeverbs::Pd, qp: safeverbs::LocalQp<safeverbs::RC>) -> safeverbs::Result<()> {
+//! let mut buf = pd.alloc::<u8>(64)?;
+//! let recv = qp.recv(buf);
+//! buf[0] = 1;
+//! # Ok(()) }
+//! ```
+//!
+//! Memory a peer may write cannot be read as Rust values:
+//!
+//! ```compile_fail,E0608
+//! # fn f(pd: safeverbs::Pd) -> Result<(), Box<dyn std::error::Error>> {
+//! let exposed = pd.alloc::<u8>(64)?.expose()?;
+//! let first = exposed[0];
+//! # Ok(()) }
+//! ```
+//!
+//! The NIC only writes types that accept every bit pattern:
+//!
+//! ```compile_fail,E0277
+//! # fn f(pd: safeverbs::Pd) -> safeverbs::Result<()> {
+//! let flags = pd.alloc::<bool>(64)?;
+//! # Ok(()) }
+//! ```
+//!
+//! A QP posts only once connected, and UC has no RDMA READ:
+//!
+//! ```compile_fail,E0599
+//! # use safeverbs::{Pd, QueuePairBuilder, RC};
+//! # fn f(pd: Pd) -> safeverbs::Result<()> {
+//! let prepared = QueuePairBuilder::<RC>::new(&pd).build()?;
+//! let send = prepared.send(pd.alloc::<u8>(64)?.freeze());
+//! # Ok(()) }
+//! ```
+//!
+//! ```compile_fail,E0599
+//! # use safeverbs::{LocalQp, Pd, RemoteBuf, UC};
+//! # fn f(pd: Pd, qp: LocalQp<UC>, src: RemoteBuf) -> safeverbs::Result<()> {
+//! let read = qp.read(pd.alloc::<u8>(64)?, src);
+//! # Ok(()) }
+//! ```
+//!
+//! A `LocalQp` belongs to one thread at a time (use a [`SharedQp`] to
+//! share one):
+//!
+//! ```compile_fail,E0277
+//! # fn f(qp: safeverbs::LocalQp<safeverbs::RC>) {
+//! std::thread::scope(|s| {
+//!     s.spawn(|| qp.qp_num());
+//! });
+//! # }
+//! ```
+
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

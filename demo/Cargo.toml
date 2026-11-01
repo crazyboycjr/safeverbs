@@ -1,0 +1,27 @@
+[package]
+name = "demo"
+description = "Side-by-side snippets: libibverbs in C and the same thing with SafeVerbs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+futures = "0.3.34"
+safeverbs = { version = "0.1.0", path = "../crates/safeverbs" }
+
+[[bin]]
+name = "showcase1"
+path = "memory-safe/showcase1.rs"
+
+[[bin]]
+name = "builder_pattern"
+path = "user-friendly/builder_pattern.rs"
+
+[[bin]]
+name = "typestate_pattern"
+path = "user-friendly/full_flexibility_typestate_pattern.rs"
+
+[[bin]]
+name = "datapath"
+path = "user-friendly/datapath.rs"
