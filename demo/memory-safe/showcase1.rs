@@ -43,7 +43,9 @@ impl common::Demo for Showcase {
         let (wc, got) = block_on(recv)?;
         println!(
             "received {:?}",
-            std::str::from_utf8(&got[..wc.byte_len as usize])?
+            std::str::from_utf8(
+                &got[..wc.received_len().expect("a successful SEND receive") as usize]
+            )?
         );
         assert_eq!(&got[..MSG.len()], MSG);
         Ok(())

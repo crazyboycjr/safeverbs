@@ -144,25 +144,63 @@ impl Opcode {
     pub const RECV: Opcode = Opcode(128);
     /// A receive that an RDMA WRITE with immediate data consumed.
     pub const RECV_RDMA_WITH_IMM: Opcode = Opcode(129);
+
+    /// Whether a successful completion defines a transferred byte count.
+    pub(crate) const fn has_byte_len(self) -> (has: bool)
+        ensures
+            has == (self.0 == 2 || self.0 == 3 || self.0 == 4 || self.0 == 128 || self.0 == 129),
+    {
+        self.0 == 2 || self.0 == 3 || self.0 == 4 || self.0 == 128 || self.0 == 129
+    }
+
+    /// Whether a successful completion can carry received immediate data.
+    pub(crate) const fn is_receive(self) -> (recv: bool)
+        ensures
+            recv == (self.0 == 128 || self.0 == 129),
+    {
+        self.0 == 128 || self.0 == 129
+    }
 }
 
 /// A work completion: the outcome of one work request.
 ///
 /// Requests posted without a completion of their own (unsignaled) and
 /// retired by a later one get a completion made up from what was posted:
-/// success, the request's opcode and its length.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// success and the request's opcode, with the same metadata as a signaled
+/// completion. SEND and WRITE report status only. Metadata getters return
+/// `None` wherever the NIC leaves a field undefined, including on errors.
+/// Raw metadata cannot be accessed directly:
+///
+/// ```compile_fail
+/// use safeverbs_core::{Opcode, Wc};
+/// let wc = Wc::success(Opcode::SEND, 64);
+/// let _ = wc.byte_len;
+/// ```
+///
+/// ```compile_fail
+/// use safeverbs_core::{Opcode, Wc};
+/// let wc = Wc::success(Opcode::SEND, 64);
+/// let _ = wc.opcode;
+/// ```
+///
+/// ```compile_fail
+/// use safeverbs_core::{Opcode, Wc};
+/// let wc = Wc::success(Opcode::RECV, 64);
+/// let _ = wc.imm;
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Wc {
     /// The work request's id: its WQE sequence number in its queue.
     pub wr_id: u64,
     /// Whether it succeeded, and if not why.
     pub status: Status,
     /// What it did (successful completions only).
-    pub opcode: Opcode,
-    /// Bytes transferred: received for a receive, else what was posted.
-    pub byte_len: u32,
+    pub(crate) opcode: Opcode,
+    /// The NIC's byte count, meaningful only for successful receives,
+    /// RDMA READs and atomics.
+    pub(crate) byte_len: u32,
     /// The immediate data of a SEND or WRITE with immediate, on the receiver.
-    pub imm: Option<u32>,
+    pub(crate) imm: Option<u32>,
     /// The vendor's error code (error completions only).
     pub vendor_err: u32,
     /// The QP the work request was posted on.
@@ -170,18 +208,28 @@ pub struct Wc {
 }
 
 impl Wc {
-    /// A successful completion of `opcode` with `byte_len` bytes, for work
-    /// requests that complete without a completion of their own.
-    pub const fn success(opcode: Opcode, byte_len: u32) -> Wc {
-        Wc {
+    /// A successful completion of `opcode`, for work requests that retire
+    /// without a completion of their own. SEND and WRITE ignore `byte_len`.
+    pub const fn success(opcode: Opcode, byte_len: u32) -> (wc: Wc)
+        ensures
+            wc.spec_ok(),
+            wc.spec_opcode() == Some(opcode),
+            wc.spec_byte_len() == if opcode.0 == 2 || opcode.0 == 3 || opcode.0 == 4
+                || opcode.0 == 128 || opcode.0 == 129 { Some(byte_len) } else { None },
+            wc.outcome().imm is None,
+            wc.outcome().canonical(),
+    {
+        let wc = Wc {
             wr_id: 0,
             status: Status::SUCCESS,
             opcode,
-            byte_len,
+            byte_len: if opcode.has_byte_len() { byte_len } else { 0 },
             imm: None,
             vendor_err: 0,
             qp_num: 0,
-        }
+        };
+        proof { wc.lemma_outcome_canonical(); }
+        wc
     }
 
     /// Whether the work request succeeded.
@@ -192,19 +240,271 @@ impl Wc {
         self.status.is_ok()
     }
 
+    /// What the work request did, only when it succeeded.
+    pub const fn opcode(&self) -> (opcode: Option<Opcode>)
+        ensures
+            opcode == self.spec_opcode(),
+            (opcode is Some) == self.spec_ok(),
+            self.outcome().canonical(),
+    {
+        proof { self.lemma_outcome_canonical(); }
+        if self.status.is_ok() { Some(self.opcode) } else { None }
+    }
+
+    /// Bytes transferred by a successful receive, RDMA READ or atomic.
+    ///
+    /// For [`Opcode::RECV_RDMA_WITH_IMM`], this counts the remote WRITE,
+    /// whose data went to the remote address, not the posted receive
+    /// buffer. Use [`Self::received_len`] when slicing a receive buffer.
+    /// SEND and WRITE completions have no defined byte count.
+    pub const fn byte_len(&self) -> (len: Option<u32>)
+        ensures
+            len == self.spec_byte_len(),
+            len is Some ==> self.spec_ok(),
+            len is Some ==> self.outcome().byte_len == len->Some_0 as nat,
+            len is None ==> self.outcome().byte_len == 0,
+            self.outcome().canonical(),
+    {
+        proof { self.lemma_outcome_canonical(); }
+        if self.status.is_ok() && self.opcode.has_byte_len() {
+            Some(self.byte_len)
+        } else {
+            None
+        }
+    }
+
+    /// Bytes placed in the posted receive buffer by a successful SEND.
+    ///
+    /// A WRITE_WITH_IMM notification consumes a receive without writing
+    /// its buffer, so it returns `None` even if the remote WRITE has data.
+    pub const fn received_len(&self) -> (len: Option<u32>)
+        ensures
+            len == self.spec_received_len(),
+            (len is Some) == (self.spec_ok() && self.outcome().kind is Receive),
+            len is Some ==> self.outcome().byte_len == len->Some_0 as nat,
+            self.outcome().canonical(),
+    {
+        proof { self.lemma_outcome_canonical(); }
+        if self.status.is_ok() && self.opcode.0 == 128 {
+            Some(self.byte_len)
+        } else {
+            None
+        }
+    }
+
+    /// Received immediate data, only on a successful receive carrying it.
+    pub const fn imm(&self) -> (imm: Option<u32>)
+        ensures
+            imm == self.spec_imm(),
+            imm == self.outcome().imm,
+            imm is Some ==> self.spec_ok(),
+            self.outcome().canonical(),
+    {
+        proof { self.lemma_outcome_canonical(); }
+        if self.status.is_ok() && self.opcode.is_receive() {
+            self.imm
+        } else {
+            None
+        }
+    }
+
     /// Whether the work request succeeded (for proofs).
     pub open spec fn spec_ok(&self) -> bool {
         self.status.0 == 0
     }
 
+    /// The defined opcode, for accessor contracts.
+    pub closed spec fn spec_opcode(&self) -> Option<Opcode> {
+        if self.spec_ok() { Some(self.opcode) } else { None }
+    }
+
+    /// The defined transfer length, for accessor contracts.
+    pub closed spec fn spec_byte_len(&self) -> Option<u32> {
+        if self.spec_ok() && (self.opcode.0 == 2 || self.opcode.0 == 3
+            || self.opcode.0 == 4 || self.opcode.0 == 128 || self.opcode.0 == 129) {
+            Some(self.byte_len)
+        } else {
+            None
+        }
+    }
+
+    /// The defined posted-buffer length, for accessor contracts.
+    pub closed spec fn spec_received_len(&self) -> Option<u32> {
+        if self.spec_ok() && self.opcode.0 == 128 { Some(self.byte_len) } else { None }
+    }
+
+    /// The defined immediate data, for accessor contracts.
+    pub closed spec fn spec_imm(&self) -> Option<u32> {
+        if self.spec_ok() && (self.opcode.0 == 128 || self.opcode.0 == 129) {
+            self.imm
+        } else {
+            None
+        }
+    }
+
     /// The outcome as the formal model sees it (`safeverbs_spec::types::Outcome`).
-    pub open spec fn outcome(&self) -> safeverbs_spec::types::Outcome {
+    pub closed spec fn outcome(&self) -> safeverbs_spec::types::Outcome {
+        let kind = if !self.spec_ok() {
+            safeverbs_spec::types::CompletionKind::StatusOnly
+        } else if self.opcode.0 == 128 {
+            safeverbs_spec::types::CompletionKind::Receive
+        } else if self.opcode.0 == 129 {
+            safeverbs_spec::types::CompletionKind::WriteNotification
+        } else if self.opcode.0 == 2 || self.opcode.0 == 3 || self.opcode.0 == 4 {
+            safeverbs_spec::types::CompletionKind::Read
+        } else {
+            safeverbs_spec::types::CompletionKind::StatusOnly
+        };
         safeverbs_spec::types::Outcome {
             status: self.status.model(),
-            byte_len: self.byte_len as nat,
-            imm: self.imm,
+            kind,
+            byte_len: if kind is StatusOnly { 0 } else { self.byte_len as nat },
+            imm: if kind is Receive || kind is WriteNotification { self.imm } else { None },
+        }
+    }
+
+    /// Discarding undefined metadata always gives a canonical outcome.
+    pub proof fn lemma_outcome_canonical(&self)
+        ensures
+            self.outcome().canonical(),
+    {
+        if !self.spec_ok() {
+            assert(self.outcome().kind is StatusOnly);
+        } else if self.opcode.0 == 128 {
+            assert(self.outcome().kind is Receive);
+        } else if self.opcode.0 == 129 {
+            assert(self.outcome().kind is WriteNotification);
+        } else if self.opcode.0 == 2 || self.opcode.0 == 3 || self.opcode.0 == 4 {
+            assert(self.outcome().kind is Read);
+        } else {
+            assert(self.outcome().kind is StatusOnly);
         }
     }
 }
 
 } // verus!
+
+impl fmt::Debug for Wc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Wc")
+            .field("wr_id", &self.wr_id)
+            .field("status", &self.status)
+            .field("opcode", &self.opcode())
+            .field("byte_len", &self.byte_len())
+            .field("imm", &self.imm())
+            .field("vendor_err", &self.vendor_err)
+            .field("qp_num", &self.qp_num)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OPCODES: [Opcode; 8] = [
+        Opcode::SEND,
+        Opcode::RDMA_WRITE,
+        Opcode::RDMA_READ,
+        Opcode::COMP_SWAP,
+        Opcode::FETCH_ADD,
+        Opcode::RECV,
+        Opcode::RECV_RDMA_WITH_IMM,
+        Opcode(u32::MAX),
+    ];
+
+    /// Deliberately populates fields the provider may leave undefined.
+    fn raw(opcode: Opcode, status: Status) -> Wc {
+        Wc {
+            wr_id: 42,
+            status,
+            opcode,
+            byte_len: 4096,
+            imm: Some(0xdead_beef),
+            vendor_err: 7,
+            qp_num: 9,
+        }
+    }
+
+    #[test]
+    fn successful_metadata_depends_on_operation() {
+        for opcode in OPCODES {
+            let wc = raw(opcode, Status::SUCCESS);
+            assert_eq!(wc.opcode(), Some(opcode));
+            let len = match opcode {
+                Opcode::RDMA_READ
+                | Opcode::COMP_SWAP
+                | Opcode::FETCH_ADD
+                | Opcode::RECV
+                | Opcode::RECV_RDMA_WITH_IMM => Some(4096),
+                _ => None,
+            };
+            assert_eq!(wc.byte_len(), len, "{opcode:?}");
+            assert_eq!(
+                wc.received_len(),
+                if opcode == Opcode::RECV {
+                    Some(4096)
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                wc.imm(),
+                match opcode {
+                    Opcode::RECV | Opcode::RECV_RDMA_WITH_IMM => Some(0xdead_beef),
+                    _ => None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn errors_hide_all_undefined_metadata() {
+        for opcode in OPCODES {
+            for status in (1..=21).map(Status).chain([Status(u32::MAX)]) {
+                let wc = raw(opcode, status);
+                assert!(!wc.is_ok());
+                assert_eq!(wc.opcode(), None);
+                assert_eq!(wc.byte_len(), None);
+                assert_eq!(wc.received_len(), None);
+                assert_eq!(wc.imm(), None);
+                assert_eq!(
+                    (wc.wr_id, wc.status, wc.vendor_err, wc.qp_num),
+                    (42, status, 7, 9)
+                );
+                let debug = format!("{wc:?}");
+                assert!(debug.contains("opcode: None, byte_len: None, imm: None"));
+            }
+        }
+    }
+
+    #[test]
+    fn inferred_success_matches_signaled_metadata() {
+        for opcode in OPCODES {
+            let inferred = Wc::success(opcode, 4096);
+            let signaled = Wc {
+                imm: None,
+                ..raw(opcode, Status::SUCCESS)
+            };
+            assert!(inferred.is_ok());
+            assert_eq!(inferred.opcode(), signaled.opcode());
+            assert_eq!(inferred.byte_len(), signaled.byte_len());
+            assert_eq!(inferred.received_len(), signaled.received_len());
+            assert_eq!(inferred.imm(), signaled.imm());
+            if matches!(opcode, Opcode::SEND | Opcode::RDMA_WRITE) {
+                assert_eq!(inferred.byte_len, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_length_receive_is_distinct_from_write_notification() {
+        let recv = Wc::success(Opcode::RECV, 0);
+        assert_eq!(recv.byte_len(), Some(0));
+        assert_eq!(recv.received_len(), Some(0));
+        let notification = raw(Opcode::RECV_RDMA_WITH_IMM, Status::SUCCESS);
+        assert_eq!(notification.byte_len(), Some(4096));
+        assert_eq!(notification.received_len(), None);
+        assert_eq!(notification.imm(), Some(0xdead_beef));
+    }
+}

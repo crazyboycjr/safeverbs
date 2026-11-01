@@ -80,7 +80,7 @@ fn worker(pd: &Pd<Model>, pairs: usize, depth: u32) -> (Worker<Model>, Vec<QpKey
 #[derive(Debug)]
 struct Expect {
     opcode: Opcode,
-    /// Its bytes (a receive's are the sender's).
+    /// Its defined byte count, when known (SEND and WRITE have none).
     len: Option<u32>,
     /// The address of the unique buffer it holds, which must come back.
     buf: Option<usize>,
@@ -138,7 +138,7 @@ fn event_loop_on_several_qps() {
                             (i, Queue::Send, seq),
                             Expect {
                                 opcode,
-                                len: Some(len),
+                                len: None,
                                 buf: None,
                             },
                         );
@@ -169,7 +169,7 @@ fn event_loop_on_several_qps() {
                                 (i, Queue::Send, seq),
                                 Expect {
                                     opcode: Opcode::RDMA_WRITE,
-                                    // A batch's completion reports its last WQE's length.
+                                    // WRITE completions have no defined byte count.
                                     len: None,
                                     buf: None,
                                 },
@@ -276,14 +276,24 @@ fn event_loop_on_several_qps() {
                         delivered += 1;
                         if !c.wc.is_ok() {
                             failed += 1;
+                            assert_eq!(c.wc.opcode(), None);
+                            assert_eq!(c.wc.byte_len(), None);
+                            assert_eq!(c.wc.received_len(), None);
+                            assert_eq!(c.wc.imm(), None);
                         }
                         if c.wc.is_ok() {
-                            assert_eq!(c.wc.opcode, e.opcode, "seed {seed}: {e:?}");
+                            assert_eq!(c.wc.opcode(), Some(e.opcode), "seed {seed}: {e:?}");
+                            if matches!(e.opcode, Opcode::SEND | Opcode::RDMA_WRITE) {
+                                assert_eq!(c.wc.byte_len(), None);
+                            }
                             if let Some(len) = e.len {
                                 assert_eq!(
-                                    c.wc.byte_len, len,
+                                    c.wc.byte_len(),
+                                    Some(len),
                                     "seed {seed} step {step}: {e:?} {:?} qp {} seq {}",
-                                    c.wc, c.qp, c.seq
+                                    c.wc,
+                                    c.qp,
+                                    c.seq
                                 );
                             }
                         }

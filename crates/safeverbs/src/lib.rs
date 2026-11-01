@@ -66,11 +66,10 @@
 //!     qp.send(buf.slice(..64)).await?;
 //!
 //!     let (wc, got) = rx.next().await.expect("a receive");
-//!     assert_eq!(wc.byte_len, 64);
+//!     assert_eq!(wc.received_len(), Some(64));
 //!     assert!(got.iter().all(|&b| b == 42));
 //!     rx.repost(got)?;
-//!     let mut copy = vec![0; 4096];
-//!     dst.copy_to_slice(&mut copy); // volatile: the peer may still write
+//!     let copy = dst.reclaim(); // the completed WRITE is the only remote writer
 //!     assert!(copy.iter().all(|&b| b == 42));
 //!
 //!     // Nothing holds the frozen buffer any more: write into it again.
@@ -105,7 +104,9 @@
 //! tx.send_all(&mut ops).await?;
 //! let mut rx = qp.receiver(bufs);
 //! while let Some((wc, buf)) = rx.next().await {
-//!     println!("received {} bytes", wc.byte_len);
+//!     if let Some(len) = wc.received_len() {
+//!         println!("received {len} bytes");
+//!     }
 //!     rx.repost(buf)?;
 //! }
 //! # Ok(()) }

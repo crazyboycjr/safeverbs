@@ -167,7 +167,7 @@ fn run_receiver(args: &Args) -> anyhow::Result<()> {
                     if !wc.is_ok() {
                         anyhow::bail!("receive failed: {wc:?}");
                     }
-                    if let Some(seq) = wc.imm {
+                    if let Some(seq) = wc.imm() {
                         println!("{seq}");
                         received += 1;
                     }

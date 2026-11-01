@@ -227,10 +227,15 @@ impl NicCq for VerbsCq {
                 };
                 if status.is_ok() {
                     wc.opcode = Opcode(((*cq).read_opcode.unwrap_unchecked())(cq));
-                    wc.byte_len = ((*cq).read_byte_len.unwrap_unchecked())(cq);
-                    let flags = ((*cq).read_wc_flags.unwrap_unchecked())(cq);
-                    if flags & ffi::ibv_wc_flags::IBV_WC_WITH_IMM.0 != 0 {
-                        wc.imm = Some(u32::from_be(((*cq).read_imm_data.unwrap_unchecked())(cq)));
+                    if wc.opcode.has_byte_len() {
+                        wc.byte_len = ((*cq).read_byte_len.unwrap_unchecked())(cq);
+                    }
+                    if wc.opcode.is_receive() {
+                        let flags = ((*cq).read_wc_flags.unwrap_unchecked())(cq);
+                        if flags & ffi::ibv_wc_flags::IBV_WC_WITH_IMM.0 != 0 {
+                            wc.imm =
+                                Some(u32::from_be(((*cq).read_imm_data.unwrap_unchecked())(cq)));
+                        }
                     }
                 } else {
                     wc.vendor_err = ((*cq).read_vendor_err.unwrap_unchecked())(cq);
@@ -468,7 +473,10 @@ const _: () = {
     assert!(core::mem::offset_of!(Sge, lkey) == core::mem::offset_of!(ffi::ibv_sge, lkey));
 };
 
-impl Nic for Verbs {
+// SAFETY: the provider owns its verbs resources, reports the hardware's
+// completions, and quiesces QPs before the caller releases their memory.
+// The data-path methods preserve the provider's WQE and CQ ordering.
+unsafe impl Nic for Verbs {
     type Pd = VerbsPd;
     type Mr = VerbsMr;
     type Cq = VerbsCq;
@@ -670,6 +678,161 @@ impl Nic for Verbs {
                 lock_free,
                 qp_type,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::ManuallyDrop;
+
+    use super::*;
+
+    const OPCODE: u32 = 1;
+    const LENGTH: u32 = 2;
+    const FLAGS: u32 = 4;
+    const IMMEDIATE: u32 = 8;
+    const VENDOR: u32 = 16;
+    const QP: u32 = 32;
+    const END: u32 = 64;
+
+    /// A provider whose read callbacks record every field accessed.
+    #[repr(C)]
+    struct TestCq {
+        cq: ffi::ibv_cq_ex,
+        opcode: Opcode,
+        flags: u32,
+        reads: u32,
+    }
+
+    impl TestCq {
+        fn new(opcode: Opcode, status: Status, flags: u32) -> Self {
+            TestCq {
+                cq: ffi::ibv_cq_ex {
+                    status: status.0,
+                    wr_id: 42,
+                    start_poll: Some(start),
+                    next_poll: Some(next),
+                    end_poll: Some(end),
+                    read_opcode: Some(read_opcode),
+                    read_byte_len: Some(read_length),
+                    read_wc_flags: Some(read_flags),
+                    read_imm_data: Some(read_immediate),
+                    read_vendor_err: Some(read_vendor),
+                    read_qp_num: Some(read_qp),
+                    ..Default::default()
+                },
+                opcode,
+                flags,
+                reads: 0,
+            }
+        }
+
+        fn poll(&mut self) -> Wc {
+            // This is a Rust-owned test provider, not an allocated verbs
+            // resource: its CQ must not call ibv_destroy_cq on drop.
+            let mut cq = ManuallyDrop::new(VerbsCq { cq: &mut self.cq });
+            let mut out = [Wc::success(Opcode::SEND, 0); 2];
+            assert_eq!(cq.poll(&mut out), 1);
+            out[0]
+        }
+    }
+
+    unsafe extern "C" fn start(_: *mut ffi::ibv_cq_ex, _: *mut ffi::ibv_poll_cq_attr) -> i32 {
+        0
+    }
+
+    unsafe extern "C" fn next(_: *mut ffi::ibv_cq_ex) -> i32 {
+        ENOENT
+    }
+
+    unsafe extern "C" fn end(cq: *mut ffi::ibv_cq_ex) {
+        // SAFETY: repr(C) puts cq first in the live TestCq passed to poll.
+        unsafe { (*cq.cast::<TestCq>()).reads |= END };
+    }
+
+    unsafe extern "C" fn read_opcode(cq: *mut ffi::ibv_cq_ex) -> u32 {
+        // SAFETY: repr(C) puts cq first in the live TestCq passed to poll.
+        let test = unsafe { &mut *cq.cast::<TestCq>() };
+        test.reads |= OPCODE;
+        test.opcode.0
+    }
+
+    unsafe extern "C" fn read_length(cq: *mut ffi::ibv_cq_ex) -> u32 {
+        // SAFETY: repr(C) puts cq first in the live TestCq passed to poll.
+        unsafe { (*cq.cast::<TestCq>()).reads |= LENGTH };
+        4096
+    }
+
+    unsafe extern "C" fn read_flags(cq: *mut ffi::ibv_cq_ex) -> u32 {
+        // SAFETY: repr(C) puts cq first in the live TestCq passed to poll.
+        let test = unsafe { &mut *cq.cast::<TestCq>() };
+        test.reads |= FLAGS;
+        test.flags
+    }
+
+    unsafe extern "C" fn read_immediate(cq: *mut ffi::ibv_cq_ex) -> u32 {
+        // SAFETY: repr(C) puts cq first in the live TestCq passed to poll.
+        unsafe { (*cq.cast::<TestCq>()).reads |= IMMEDIATE };
+        0x1234_5678u32.to_be()
+    }
+
+    unsafe extern "C" fn read_vendor(cq: *mut ffi::ibv_cq_ex) -> u32 {
+        // SAFETY: repr(C) puts cq first in the live TestCq passed to poll.
+        unsafe { (*cq.cast::<TestCq>()).reads |= VENDOR };
+        7
+    }
+
+    unsafe extern "C" fn read_qp(cq: *mut ffi::ibv_cq_ex) -> u32 {
+        // SAFETY: repr(C) puts cq first in the live TestCq passed to poll.
+        unsafe { (*cq.cast::<TestCq>()).reads |= QP };
+        9
+    }
+
+    #[test]
+    fn poll_reads_only_defined_success_fields() {
+        let with_imm = ffi::ibv_wc_flags::IBV_WC_WITH_IMM.0;
+        for (opcode, has_len, recv) in [
+            (Opcode::SEND, false, false),
+            (Opcode::RDMA_WRITE, false, false),
+            (Opcode::RDMA_READ, true, false),
+            (Opcode::COMP_SWAP, true, false),
+            (Opcode::FETCH_ADD, true, false),
+            (Opcode::RECV, true, true),
+            (Opcode::RECV_RDMA_WITH_IMM, true, true),
+            (Opcode(u32::MAX), false, false),
+        ] {
+            for flags in [0, with_imm] {
+                let mut provider = TestCq::new(opcode, Status::SUCCESS, flags);
+                let wc = provider.poll();
+                assert_eq!(wc.opcode(), Some(opcode));
+                assert_eq!(wc.byte_len(), has_len.then_some(4096));
+                assert_eq!(wc.received_len(), (opcode == Opcode::RECV).then_some(4096));
+                assert_eq!(wc.imm(), (recv && flags != 0).then_some(0x1234_5678));
+                assert_eq!((wc.wr_id, wc.qp_num, wc.vendor_err), (42, 9, 0));
+                let expected = OPCODE
+                    | QP
+                    | END
+                    | if has_len { LENGTH } else { 0 }
+                    | if recv { FLAGS } else { 0 }
+                    | if recv && flags != 0 { IMMEDIATE } else { 0 };
+                assert_eq!(provider.reads, expected, "{opcode:?} flags {flags}");
+            }
+        }
+    }
+
+    #[test]
+    fn poll_errors_never_read_opcode_length_flags_or_immediate() {
+        for status in (1..=21).map(Status).chain([Status(u32::MAX)]) {
+            let mut provider = TestCq::new(Opcode::RECV, status, u32::MAX);
+            let wc = provider.poll();
+            assert_eq!(wc.status, status);
+            assert_eq!((wc.wr_id, wc.qp_num, wc.vendor_err), (42, 9, 7));
+            assert_eq!(wc.opcode(), None);
+            assert_eq!(wc.byte_len(), None);
+            assert_eq!(wc.received_len(), None);
+            assert_eq!(wc.imm(), None);
+            assert_eq!(provider.reads, QP | VENDOR | END);
         }
     }
 }

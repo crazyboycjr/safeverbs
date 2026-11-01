@@ -30,7 +30,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let (wc, buf) = block_on(recv)?;
     println!("{wc:?}");
-    println!("{}", std::str::from_utf8(&buf[..wc.byte_len as usize])?);
+    println!(
+        "{}",
+        std::str::from_utf8(
+            &buf[..wc.received_len().expect("a successful SEND receive") as usize]
+        )?
+    );
     println!("Duration: {:?}", start.elapsed());
     Ok(())
 }

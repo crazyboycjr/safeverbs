@@ -37,7 +37,10 @@ async fn side<N: Nic>(
         let recv = qp.recv(inbox);
         qp.send(frozen.clone()).await?;
         let (wc, got) = recv.await?;
-        assert_eq!(wc.byte_len as usize, SIZE);
+        assert_eq!(
+            wc.received_len().expect("a successful SEND receive") as usize,
+            SIZE
+        );
         assert_eq!(&got[..4], &round.to_le_bytes());
         assert!(got[4..].iter().all(|&b| b != me), "the peer's message");
         inbox = got;

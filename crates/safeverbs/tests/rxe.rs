@@ -87,10 +87,13 @@ fn send_recv<T: Transport>() {
     wait(a.send(src.clone())).unwrap();
     wait(a.send_imm(src.slice(..100), 0x1234_5678)).unwrap();
     let (wc, got) = wait(r1).unwrap();
-    assert_eq!((wc.opcode, wc.byte_len, wc.imm), (Opcode::RECV, 4096, None));
+    assert_eq!(
+        (wc.opcode(), wc.byte_len(), wc.imm()),
+        (Some(Opcode::RECV), Some(4096), None)
+    );
     assert_eq!(&got[..], &src[..]);
     let (wc, got) = wait(r2).unwrap();
-    assert_eq!((wc.byte_len, wc.imm), (100, Some(0x1234_5678)));
+    assert_eq!((wc.byte_len(), wc.imm()), (Some(100), Some(0x1234_5678)));
     assert_eq!(&got[..100], &src[..100]);
 }
 
@@ -113,8 +116,8 @@ fn write_and_write_imm<T: Transport>(ctx: &Context) -> (Pd, LocalQp<T>, LocalQp<
     wait(a.write_imm(src.slice(..64), dst.remote().offset(4096), 99)).unwrap();
     let (wc, _) = wait(recv).unwrap();
     assert_eq!(
-        (wc.opcode, wc.byte_len, wc.imm),
-        (Opcode::RECV_RDMA_WITH_IMM, 64, Some(99))
+        (wc.opcode(), wc.byte_len(), wc.imm()),
+        (Some(Opcode::RECV_RDMA_WITH_IMM), Some(64), Some(99))
     );
     let back = dst.reclaim();
     assert_eq!(&back[..4096], &src[..4096]);
@@ -143,6 +146,29 @@ fn rc_write_write_imm_and_read() {
 fn uc_write_and_write_imm() {
     let Some(ctx) = device() else { return };
     write_and_write_imm::<UC>(&ctx);
+}
+
+#[test]
+fn write_notification_does_not_fill_receive_buffer() {
+    let Some(ctx) = device() else { return };
+    let (pd, a, b) = pair::<RC>(&ctx, 8);
+    let src = filled(&pd, 64 * 1024, 17);
+    let dst = pd.alloc::<u8>(src.len()).unwrap().expose().unwrap();
+    let mut rq = pd.alloc::<u8>(8).unwrap();
+    rq.fill(0x5a);
+    let recv = b.recv(rq);
+    let sent = wait(a.write_imm(src.clone(), dst.remote(), 0xfedc_ba98)).unwrap();
+    assert_eq!(sent.opcode(), Some(Opcode::RDMA_WRITE));
+    assert_eq!(sent.byte_len(), None);
+    assert_eq!(sent.received_len(), None);
+    assert_eq!(sent.imm(), None);
+    let (wc, rq) = wait(recv).unwrap();
+    assert_eq!(wc.opcode(), Some(Opcode::RECV_RDMA_WITH_IMM));
+    assert_eq!(wc.byte_len(), Some(src.len() as u32));
+    assert_eq!(wc.received_len(), None);
+    assert_eq!(wc.imm(), Some(0xfedc_ba98));
+    assert_eq!(&rq[..], &[0x5a; 8]);
+    assert_eq!(&dst.reclaim()[..], &src[..]);
 }
 
 #[test]
@@ -176,7 +202,8 @@ fn batch_of_writes_is_one_request() {
         }
     }))
     .unwrap();
-    assert_eq!(wc.opcode, Opcode::RDMA_WRITE);
+    assert_eq!(wc.opcode(), Some(Opcode::RDMA_WRITE));
+    assert_eq!(wc.byte_len(), None);
     assert_eq!(a.with(|w, qp| w.send_ring(qp).posted()) - before, 1);
     let back = dst.reclaim();
     assert!(back[..].chunks(64).all(|c| c == &src[..]));
@@ -206,7 +233,7 @@ fn sink_of_writes_and_stream_of_receives() {
     while imms.len() < 10 {
         let (wc, buf) = wait(rx.next()).unwrap();
         assert!(wc.is_ok(), "{wc:?}");
-        imms.push(wc.imm.unwrap());
+        imms.push(wc.imm().unwrap());
         rx.repost(buf).unwrap();
     }
     assert_eq!(imms, (0..10).map(|i| i * 200 + 199).collect::<Vec<_>>());
@@ -239,7 +266,7 @@ fn repeated_sends_of_a_frozen_buffer_and_try_thaw() {
             1 => &src[4096..],
             _ => &src[i..i + 10],
         };
-        assert_eq!(&got[..wc.byte_len as usize], want);
+        assert_eq!(&got[..wc.received_len().unwrap() as usize], want);
     }
     let copy = src.clone();
     let src = src.try_thaw().expect_err("another view: no thaw");
@@ -365,7 +392,7 @@ fn backpressure_waits_for_room() {
                 }
             }
         });
-        assert_eq!(wc.imm, Some(i), "in order");
+        assert_eq!(wc.imm(), Some(i), "in order");
         rx.repost(buf).unwrap();
     }
 }
@@ -383,7 +410,7 @@ fn ring_buf_streams_messages() {
             .expect("room: earlier messages retired");
         wait(a.send(msg)).unwrap();
         let (wc, buf) = wait(rx.next()).unwrap();
-        assert_eq!(wc.byte_len as usize, len);
+        assert_eq!(wc.received_len().unwrap() as usize, len);
         assert!(buf[..len].iter().all(|&x| x == i));
         rx.repost(buf).unwrap();
     }
@@ -501,15 +528,16 @@ fn event_loop_on_four_qps_of_one_worker() {
             match c.queue {
                 Queue::Recv => {
                     let buf = c.leases.into_buf_mut::<u8>().unwrap();
-                    let len = c.wc.byte_len as usize;
+                    let len = c.wc.received_len().unwrap() as usize;
                     assert_eq!(&buf[..len], &srcs[i ^ 1][..len], "from its peer");
                     received[i] += 1;
                     w.post_recv(qps[i], buf.into_part(), false).unwrap();
                 }
                 Queue::Send => {
-                    if c.wc.opcode == Opcode::RDMA_READ {
+                    if c.wc.opcode() == Some(Opcode::RDMA_READ) {
                         let buf = c.leases.into_buf_mut::<u8>().unwrap();
-                        let len = buf.len();
+                        let len = c.wc.byte_len().unwrap() as usize;
+                        assert_eq!(len, buf.len());
                         assert_eq!(&buf[..], &filled(&pd, 256, 100 + (i ^ 1) as u8)[..len]);
                     }
                     done[i] += 1;
@@ -599,7 +627,7 @@ fn futures_on_four_qps_of_one_worker() {
             }
             for rx in &mut rxs {
                 let (wc, buf) = rx.next().await.unwrap();
-                assert_eq!(wc.byte_len, 1000);
+                assert_eq!(wc.received_len(), Some(1000));
                 assert_eq!(&buf[..1000], &src[..1000]);
                 rx.repost(buf).unwrap();
             }

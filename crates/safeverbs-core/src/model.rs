@@ -476,6 +476,8 @@ impl Fabric {
                 // allocated while registered.
                 unsafe { core::ptr::copy(data.as_ptr(), r.addr as usize as *mut u8, len) };
                 if let Some((recv, imm)) = recv {
+                    // The RQ WQE is only a notification credit: even a
+                    // zero-SGE receive can report this remote write's length.
                     self.push_cqe(
                         peer_cq,
                         recv_wc(
@@ -594,12 +596,9 @@ fn error_wc(wr_id: u64, status: Status, qp_num: u32) -> Wc {
 fn recv_wc(wr_id: u64, opcode: Opcode, len: usize, imm: Option<u32>, qp_num: u32) -> Wc {
     Wc {
         wr_id,
-        status: Status::SUCCESS,
-        opcode,
-        byte_len: len as u32,
         imm,
-        vendor_err: 0,
         qp_num,
+        ..Wc::success(opcode, len as u32)
     }
 }
 
@@ -792,7 +791,10 @@ impl NicQp for ModelQp {
     }
 }
 
-impl Nic for Model {
+// SAFETY: the fabric serializes all DMA and queue transitions under one
+// mutex, validates memory before access, and reports each retired WQE's
+// outcome. A QP is destroyed only after every outstanding WQE is retired.
+unsafe impl Nic for Model {
     type Pd = ModelPd;
     type Mr = ModelMr;
     type Cq = ModelCq;
