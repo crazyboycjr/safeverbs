@@ -226,6 +226,13 @@ pub enum Queue {
     Recv,
 }
 
+/// Names one WQE for good: its queue pair, queue and sequence number.
+pub struct WqeRef {
+    pub qp: QpId,
+    pub queue: Queue,
+    pub seq: nat,
+}
+
 /// A completion queue entry (`ibv_wc`). `seq` names the WQE it completes; the hardware
 /// reports only `wr_id`, which the library sets so that it determines `seq`.
 pub struct Cqe {
@@ -234,6 +241,22 @@ pub struct Cqe {
     pub wr_id: u64,
     pub outcome: Outcome,
     pub seq: nat,
+}
+
+/// The WQEs that polling `e` retires from `qp` (its own and every earlier one of its queue),
+/// with their outcomes.
+#[verifier::opaque]
+pub open spec fn retires(qp: Qp, e: Cqe) -> IMap<WqeRef, Outcome> {
+    match e.queue {
+        Queue::Send => IMap::new(
+            |w: WqeRef| w.qp == e.qp && w.queue is Send && qp.sq_head <= w.seq <= e.seq,
+            |w: WqeRef| qp.sq[w.seq - qp.sq_head].outcome->0,
+        ),
+        Queue::Recv => IMap::new(
+            |w: WqeRef| w.qp == e.qp && w.queue is Recv && qp.rq_head <= w.seq <= e.seq,
+            |w: WqeRef| qp.rq[w.seq - qp.rq_head].outcome->0,
+        ),
+    }
 }
 
 /// A completion queue. `reserved` holds each attached queue pair once per WQE it may have
@@ -285,6 +308,9 @@ state_machine! {
             pub mrs: Map<Key, Mr>,
             pub cqs: Map<CqId, Cq>,
             pub qps: Map<QpId, Qp>,
+            /// The outcome of every WQE retired so far, as the NIC reported it. Bookkeeping
+            /// (the hardware keeps no such log): F1 is stated against it.
+            pub retired: IMap<WqeRef, Outcome>,
         }
 
         // =================================================================================
@@ -387,6 +413,7 @@ state_machine! {
                 init mrs = Map::empty();
                 init cqs = Map::empty();
                 init qps = Map::empty();
+                init retired = IMap::empty();
             }
         }
 
@@ -442,6 +469,9 @@ state_machine! {
         transition! {
             create_qp(q: QpId, attr: QpAttr) {
                 require !pre.qps.contains_key(q);
+                // `q` is the model's name for the queue pair, never reused (hardware QP
+                // numbers are; the library maps them).
+                require forall|w: WqeRef| #[trigger] pre.retired.contains_key(w) ==> w.qp != q;
                 require pre.pds.contains(attr.pd);
                 require pre.cqs.contains_key(attr.send_cq) && pre.cqs.contains_key(attr.recv_cq);
                 require attr.sq_depth <= pre.caps.max_qp_wr && attr.rq_depth <= pre.caps.max_qp_wr;
@@ -523,6 +553,7 @@ state_machine! {
                 let e = pre.cqs[c].entries[0];
                 let qp = pre.qps[e.qp];
                 update cqs = pre.cqs.insert(c, pre.cqs[c].pop());
+                update retired = pre.retired.union_prefer_right(retires(qp, e));
                 update qps = pre.qps.insert(e.qp, match e.queue {
                     Queue::Send => {
                         let n = (e.seq + 1 - qp.sq_head) as nat;
@@ -706,76 +737,144 @@ state_machine! {
         // Inductiveness
 
         #[inductive(open)]
-        fn open_inductive(post: Self, caps: Caps) {}
+        pub fn open_inductive(post: Self, caps: Caps) {}
 
         #[inductive(alloc_pd)]
-        fn alloc_pd_inductive(pre: Self, post: Self, pd: PdId) {
+        pub fn alloc_pd_inductive(pre: Self, post: Self, pd: PdId) {
             crate::nic_proofs::lemma_alloc_pd(pre, post, pd);
         }
 
         #[inductive(reg_mr)]
-        fn reg_mr_inductive(pre: Self, post: Self, key: Key, mr: Mr) {
+        pub fn reg_mr_inductive(pre: Self, post: Self, key: Key, mr: Mr) {
             crate::nic_proofs::lemma_reg_mr(pre, post, key, mr);
         }
 
         #[inductive(dereg_mr)]
-        fn dereg_mr_inductive(pre: Self, post: Self, key: Key) {
+        pub fn dereg_mr_inductive(pre: Self, post: Self, key: Key) {
             crate::nic_proofs::lemma_dereg_mr(pre, post, key);
         }
 
         #[inductive(create_cq)]
-        fn create_cq_inductive(pre: Self, post: Self, c: CqId, cap: nat) {
+        pub fn create_cq_inductive(pre: Self, post: Self, c: CqId, cap: nat) {
             crate::nic_proofs::lemma_create_cq(pre, post, c, cap);
         }
 
         #[inductive(destroy_cq)]
-        fn destroy_cq_inductive(pre: Self, post: Self, c: CqId) {
+        pub fn destroy_cq_inductive(pre: Self, post: Self, c: CqId) {
             crate::nic_proofs::lemma_destroy_cq(pre, post, c);
         }
 
         #[inductive(create_qp)]
-        fn create_qp_inductive(pre: Self, post: Self, q: QpId, attr: QpAttr) {
+        pub fn create_qp_inductive(pre: Self, post: Self, q: QpId, attr: QpAttr) {
             crate::nic_proofs::lemma_create_qp(pre, post, q, attr);
         }
 
         #[inductive(modify_qp)]
-        fn modify_qp_inductive(pre: Self, post: Self, q: QpId, to: QpState) {
+        pub fn modify_qp_inductive(pre: Self, post: Self, q: QpId, to: QpState) {
             crate::nic_proofs::lemma_modify_qp(pre, post, q, to);
         }
 
         #[inductive(destroy_qp)]
-        fn destroy_qp_inductive(pre: Self, post: Self, q: QpId) {
+        pub fn destroy_qp_inductive(pre: Self, post: Self, q: QpId) {
             crate::nic_proofs::lemma_destroy_qp(pre, post, q);
         }
 
         #[inductive(post_send)]
-        fn post_send_inductive(pre: Self, post: Self, q: QpId, wrs: Seq<SendWr>) {
+        pub fn post_send_inductive(pre: Self, post: Self, q: QpId, wrs: Seq<SendWr>) {
             crate::nic_proofs::lemma_post_send(pre, post, q, wrs);
         }
 
         #[inductive(post_recv)]
-        fn post_recv_inductive(pre: Self, post: Self, q: QpId, wrs: Seq<RecvWr>) {
+        pub fn post_recv_inductive(pre: Self, post: Self, q: QpId, wrs: Seq<RecvWr>) {
             crate::nic_proofs::lemma_post_recv(pre, post, q, wrs);
         }
 
         #[inductive(poll_cq)]
-        fn poll_cq_inductive(pre: Self, post: Self, c: CqId) {
+        pub fn poll_cq_inductive(pre: Self, post: Self, c: CqId) {
             crate::nic_proofs::lemma_poll_cq(pre, post, c);
         }
 
         #[inductive(execute_send)]
-        fn execute_send_inductive(pre: Self, post: Self, q: QpId, o: Outcome) {
+        pub fn execute_send_inductive(pre: Self, post: Self, q: QpId, o: Outcome) {
             crate::nic_proofs::lemma_execute_send(pre, post, q, o);
         }
 
         #[inductive(execute_recv)]
-        fn execute_recv_inductive(pre: Self, post: Self, q: QpId, o: Outcome) {
+        pub fn execute_recv_inductive(pre: Self, post: Self, q: QpId, o: Outcome) {
             crate::nic_proofs::lemma_execute_recv(pre, post, q, o);
         }
 
         #[inductive(fault)]
-        fn fault_inductive(pre: Self, post: Self, q: QpId) {
+        pub fn fault_inductive(pre: Self, post: Self, q: QpId) {
             crate::nic_proofs::lemma_fault(pre, post, q);
         }
     }
 }
+
+verus! {
+
+// =========================================================================================
+// What M promises the library (proofs in `nic_proofs`)
+
+/// M's invariants hold in every state it can reach: every step, verb or NIC step, keeps them.
+pub proof fn lemma_step_keeps_invariant(pre: Nic::State, post: Nic::State)
+    requires
+        pre.invariant(),
+        Nic::State::next(pre, post),
+    ensures
+        post.invariant(),
+{
+    crate::nic_proofs::lemma_next(pre, post);
+}
+
+/// No CQ ever holds more entries than its capacity, given that every `create_qp` met its
+/// precondition (the reservation).
+pub proof fn lemma_cq_never_overflows(s: Nic::State, c: CqId)
+    requires
+        s.invariant(),
+        s.cqs.contains_key(c),
+    ensures
+        s.cqs[c].entries.len() <= s.cqs[c].cap,
+{
+    crate::nic_proofs::lemma_cq_bound(s, c);
+}
+
+/// Polling a CQE: it reports the id and outcome of the WQE it names, and retires that WQE and
+/// every earlier one of its queue. The earlier ones were unsignaled send WQEs that succeeded
+/// (a receive retires only itself). All of them land in `retired` with their outcomes.
+pub proof fn lemma_poll(pre: Nic::State, post: Nic::State, c: CqId)
+    requires
+        pre.invariant(),
+        Nic::State::poll_cq(pre, post, c),
+    ensures
+        ({
+            let e = pre.cqs[c].entries[0];
+            let qp = pre.qps[e.qp];
+            let me = WqeRef { qp: e.qp, queue: e.queue, seq: e.seq };
+            &&& pre.qps.contains_key(e.qp)
+            &&& e.queue is Send ==> e.wr_id == qp.sq[e.seq - qp.sq_head].wr.wr_id
+            &&& e.queue is Recv ==> e.wr_id == qp.rq[e.seq - qp.rq_head].wr.wr_id && e.seq == qp.rq_head
+            &&& post.retired.contains_key(me) && post.retired[me] == e.outcome
+            &&& e.queue is Send ==> forall|j: int| 0 <= j < e.seq - qp.sq_head ==> {
+                let w = WqeRef { qp: e.qp, queue: Queue::Send, seq: (qp.sq_head + j) as nat };
+                &&& !(#[trigger] qp.sq[j]).wr.signaled
+                &&& post.retired.contains_key(w) && post.retired[w].status is Success
+            }
+        }),
+{
+    crate::nic_proofs::lemma_poll_reports(pre, post, c);
+}
+
+/// The NIC only touches registered memory: whatever it may read or write lies in a region
+/// that is registered right now.
+pub proof fn lemma_nic_touches_registered(s: Nic::State, a: int)
+    requires
+        s.invariant(),
+        s.nic_may_read(a) || s.nic_may_write(a),
+    ensures
+        exists|key: Key| #[trigger] s.mrs.contains_key(key) && s.mrs[key].span.contains(a),
+{
+    crate::nic_proofs::lemma_touches_registered(s, a);
+}
+
+} // verus!

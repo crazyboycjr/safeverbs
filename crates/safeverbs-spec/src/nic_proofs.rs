@@ -256,6 +256,7 @@ pub proof fn lemma_destroy_cq(pre: Nic::State, post: Nic::State, c: CqId)
     }
 }
 
+#[verifier::spinoff_prover]
 pub proof fn lemma_create_qp(pre: Nic::State, post: Nic::State, q: QpId, attr: QpAttr)
     requires pre.invariant(), Nic::State::create_qp(pre, post, q, attr),
     ensures post.invariant(),
@@ -302,6 +303,7 @@ pub proof fn lemma_modify_qp(pre: Nic::State, post: Nic::State, q: QpId, to: QpS
 {
 }
 
+#[verifier::spinoff_prover]
 pub proof fn lemma_destroy_qp(pre: Nic::State, post: Nic::State, q: QpId)
     requires pre.invariant(), Nic::State::destroy_qp(pre, post, q),
     ensures post.invariant(),
@@ -392,6 +394,7 @@ pub proof fn lemma_poll_cq(pre: Nic::State, post: Nic::State, c: CqId)
 
 /// The head CQE of CQ `c` is the first CQE its queue has waiting: every earlier unretired
 /// WQE of that queue executed without producing one.
+#[verifier::spinoff_prover]
 pub proof fn lemma_head_is_first(pre: Nic::State, c: CqId)
     requires
         pre.invariant(),
@@ -453,6 +456,7 @@ pub open spec fn retired(pre: Nic::State, c: CqId) -> int {
 
 /// After `poll_cq`, queue pairs are well formed, still registered, and the polled queue
 /// pair waits for one CQE less on `c`.
+#[verifier::spinoff_prover]
 proof fn lemma_poll_qps(pre: Nic::State, post: Nic::State, c: CqId)
     requires
         pre.invariant(),
@@ -511,6 +515,7 @@ proof fn lemma_poll_qps(pre: Nic::State, post: Nic::State, c: CqId)
 }
 
 /// After `poll_cq`, every CQ is well formed.
+/// After `poll_cq`, every CQ is well formed.
 proof fn lemma_poll_cq_wf(pre: Nic::State, post: Nic::State, c: CqId, c2: CqId)
     requires
         pre.invariant(),
@@ -519,8 +524,65 @@ proof fn lemma_poll_cq_wf(pre: Nic::State, post: Nic::State, c: CqId, c2: CqId)
     ensures
         post.cq_wf(c2),
 {
+    lemma_poll_cq_counts(pre, post, c, c2);
+    lemma_poll_cq_entries(pre, post, c, c2);
+}
+
+/// After `poll_cq`, CQ `c2`'s bookkeeping still counts its entries and reservations.
+#[verifier::spinoff_prover]
+proof fn lemma_poll_cq_counts(pre: Nic::State, post: Nic::State, c: CqId, c2: CqId)
+    requires
+        pre.invariant(),
+        Nic::State::poll_cq(pre, post, c),
+        post.cqs.contains_key(c2),
+    ensures
+        ({
+            let cq = post.cqs[c2];
+            &&& cq.entries.len() == cq.used.len()
+            &&& cq.reserved.len() <= cq.cap
+            &&& forall|q: QpId| #[trigger] cq.used.count(q) == post.pending(c2, q)
+            &&& forall|q: QpId| #[trigger] cq.reserved.count(q) == post.reserved_by(c2, q)
+        }),
+{
     broadcast use vstd::multiset::group_multiset_axioms;
     lemma_poll_qps(pre, post, c);
+    lemma_head_is_first(pre, c);
+    let cq = pre.cqs[c2];
+    let e = pre.cqs[c].entries[0];
+    let q = e.qp;
+    let qp = pre.qps[q];
+    let qp2 = post.qps[q];
+    assert(pre.cq_wf(c2));
+    assert(pre.qp_wf(qp));
+    assert(e.queue is Send ==> qp2.rq == qp.rq && qp2.rq_head == qp.rq_head && qp2.rq_done == qp.rq_done);
+    assert(e.queue is Recv ==> qp2.sq == qp.sq && qp2.sq_head == qp.sq_head && qp2.sq_done == qp.sq_done);
+    assert forall|x: QpId| #[trigger] post.cqs[c2].reserved.count(x) == post.reserved_by(c2, x) by {
+        assert(cq.reserved.count(x) == pre.reserved_by(c2, x));
+    }
+    assert forall|x: QpId| #[trigger] post.cqs[c2].used.count(x) == post.pending(c2, x) by {
+        assert(cq.used.count(x) == pre.pending(c2, x));
+    }
+    if c2 == c {
+        assert(cq.used.count(q) >= 1);
+    }
+}
+
+/// After `poll_cq`, every entry of CQ `c2` still names its WQE, in order.
+#[verifier::spinoff_prover]
+proof fn lemma_poll_cq_entries(pre: Nic::State, post: Nic::State, c: CqId, c2: CqId)
+    requires
+        pre.invariant(),
+        Nic::State::poll_cq(pre, post, c),
+        post.cqs.contains_key(c2),
+    ensures
+        ({
+            let es = post.cqs[c2].entries;
+            &&& forall|m: int| 0 <= m < es.len() ==> post.cqe_wf(c2, #[trigger] es[m])
+            &&& forall|m1: int, m2: int| #![trigger es[m1], es[m2]]
+                0 <= m1 < m2 < es.len() && es[m1].qp == es[m2].qp && es[m1].queue == es[m2].queue
+                ==> es[m1].seq < es[m2].seq
+        }),
+{
     lemma_head_is_first(pre, c);
     let cq = pre.cqs[c2];
     let es = post.cqs[c2].entries;
@@ -531,18 +593,8 @@ proof fn lemma_poll_cq_wf(pre: Nic::State, post: Nic::State, c: CqId, c2: CqId)
     let n = retired(pre, c);
     assert(pre.cq_wf(c2));
     assert(pre.qp_wf(qp));
-    // The polled queue pair's other queue is untouched.
     assert(e.queue is Send ==> qp2.rq == qp.rq && qp2.rq_head == qp.rq_head && qp2.rq_done == qp.rq_done);
     assert(e.queue is Recv ==> qp2.sq == qp.sq && qp2.sq_head == qp.sq_head && qp2.sq_done == qp.sq_done);
-    assert forall|x: QpId| #[trigger] post.cqs[c2].reserved.count(x) == post.reserved_by(c2, x) by {
-        assert(cq.reserved.count(x) == pre.reserved_by(c2, x));
-    }
-    assert forall|x: QpId| #[trigger] post.cqs[c2].used.count(x) == post.pending(c2, x) by {
-        assert(cq.used.count(x) == pre.pending(c2, x));
-        if x == q && c2 != c {
-            assert(pre.qp_wf(qp));
-        }
-    }
     if c2 != c {
         assert(es == cq.entries);
         assert forall|m: int| 0 <= m < es.len() implies post.cqe_wf(c2, #[trigger] es[m]) by {
@@ -568,7 +620,6 @@ proof fn lemma_poll_cq_wf(pre: Nic::State, post: Nic::State, c: CqId, c2: CqId)
             implies es[m1].seq < es[m2].seq by {
             assert(es[m1] == cq.entries[m1 + 1] && es[m2] == cq.entries[m2 + 1]);
         }
-        assert(cq.used.count(q) >= 1);
     }
 }
 
@@ -599,6 +650,7 @@ proof fn lemma_poll_shift(pre: Nic::State, post: Nic::State, c: CqId, x: CqId, m
 {
 }
 
+#[verifier::spinoff_prover]
 proof fn lemma_poll_present_send(pre: Nic::State, post: Nic::State, c: CqId, q2: QpId)
     requires
         pre.invariant(),
@@ -646,6 +698,7 @@ proof fn lemma_poll_present_send(pre: Nic::State, post: Nic::State, c: CqId, q2:
     }
 }
 
+#[verifier::spinoff_prover]
 proof fn lemma_poll_present_recv(pre: Nic::State, post: Nic::State, c: CqId, q2: QpId)
     requires
         pre.invariant(),
@@ -693,6 +746,7 @@ proof fn lemma_poll_present_recv(pre: Nic::State, post: Nic::State, c: CqId, q2:
     }
 }
 
+#[verifier::spinoff_prover]
 pub proof fn lemma_execute_send(pre: Nic::State, post: Nic::State, q: QpId, o: Outcome)
     requires pre.invariant(), Nic::State::execute_send(pre, post, q, o),
     ensures post.invariant(),
@@ -755,6 +809,7 @@ pub proof fn lemma_execute_send(pre: Nic::State, post: Nic::State, q: QpId, o: O
 }
 
 /// After `execute_send`, every CQE that should wait still does.
+#[verifier::spinoff_prover]
 proof fn lemma_execute_send_present(pre: Nic::State, post: Nic::State, q: QpId, o: Outcome, q2: QpId)
     requires
         pre.invariant(),
@@ -809,6 +864,7 @@ proof fn lemma_execute_send_present(pre: Nic::State, post: Nic::State, q: QpId, 
     }
 }
 
+#[verifier::spinoff_prover]
 pub proof fn lemma_execute_recv(pre: Nic::State, post: Nic::State, q: QpId, o: Outcome)
     requires pre.invariant(), Nic::State::execute_recv(pre, post, q, o),
     ensures post.invariant(),
@@ -867,6 +923,7 @@ pub proof fn lemma_execute_recv(pre: Nic::State, post: Nic::State, q: QpId, o: O
 }
 
 /// After `execute_recv`, every CQE that should wait still does.
+#[verifier::spinoff_prover]
 proof fn lemma_execute_recv_present(pre: Nic::State, post: Nic::State, q: QpId, o: Outcome, q2: QpId)
     requires
         pre.invariant(),
@@ -923,6 +980,145 @@ pub proof fn lemma_fault(pre: Nic::State, post: Nic::State, q: QpId)
     requires pre.invariant(), Nic::State::fault(pre, post, q),
     ensures post.invariant(),
 {
+}
+
+// =========================================================================================
+// The properties `nic.rs` states
+
+pub proof fn lemma_next(pre: Nic::State, post: Nic::State)
+    requires
+        pre.invariant(),
+        Nic::State::next(pre, post),
+    ensures
+        post.invariant(),
+{
+    reveal(Nic::State::next);
+    reveal(Nic::State::next_by);
+    let step = choose|step: Nic::Step| Nic::State::next_by(pre, post, step);
+    match step {
+        Nic::Step::alloc_pd(pd) => lemma_alloc_pd(pre, post, pd),
+        Nic::Step::reg_mr(key, mr) => lemma_reg_mr(pre, post, key, mr),
+        Nic::Step::dereg_mr(key) => lemma_dereg_mr(pre, post, key),
+        Nic::Step::create_cq(c, cap) => lemma_create_cq(pre, post, c, cap),
+        Nic::Step::destroy_cq(c) => lemma_destroy_cq(pre, post, c),
+        Nic::Step::create_qp(q, attr) => lemma_create_qp(pre, post, q, attr),
+        Nic::Step::modify_qp(q, to) => lemma_modify_qp(pre, post, q, to),
+        Nic::Step::destroy_qp(q) => lemma_destroy_qp(pre, post, q),
+        Nic::Step::post_send(q, wrs) => lemma_post_send(pre, post, q, wrs),
+        Nic::Step::post_recv(q, wrs) => lemma_post_recv(pre, post, q, wrs),
+        Nic::Step::poll_cq(c) => lemma_poll_cq(pre, post, c),
+        Nic::Step::execute_send(q, o) => lemma_execute_send(pre, post, q, o),
+        Nic::Step::execute_recv(q, o) => lemma_execute_recv(pre, post, q, o),
+        Nic::Step::fault(q) => lemma_fault(pre, post, q),
+        Nic::Step::dummy_to_use_type_params(_) => {},
+    }
+}
+
+pub proof fn lemma_cq_bound(s: Nic::State, c: CqId)
+    requires
+        s.invariant(),
+        s.cqs.contains_key(c),
+    ensures
+        s.cqs[c].entries.len() <= s.cqs[c].cap,
+{
+    broadcast use vstd::multiset::group_multiset_axioms;
+    let cq = s.cqs[c];
+    assert(s.cq_wf(c));
+    assert forall|x: QpId| cq.used.count(x) <= cq.reserved.count(x) by {
+        assert(cq.used.count(x) == s.pending(c, x));
+        assert(cq.reserved.count(x) == s.reserved_by(c, x));
+        if s.qps.contains_key(x) {
+            assert(s.qp_wf(s.qps[x]));
+            lemma_sq_cqes_le(s.qps[x]);
+        }
+    }
+    lemma_subset_len(cq.used, cq.reserved);
+}
+
+pub proof fn lemma_poll_reports(pre: Nic::State, post: Nic::State, c: CqId)
+    requires
+        pre.invariant(),
+        Nic::State::poll_cq(pre, post, c),
+    ensures
+        ({
+            let e = pre.cqs[c].entries[0];
+            let qp = pre.qps[e.qp];
+            let me = WqeRef { qp: e.qp, queue: e.queue, seq: e.seq };
+            &&& pre.qps.contains_key(e.qp)
+            &&& e.queue is Send ==> e.wr_id == qp.sq[e.seq - qp.sq_head].wr.wr_id
+            &&& e.queue is Recv ==> e.wr_id == qp.rq[e.seq - qp.rq_head].wr.wr_id && e.seq == qp.rq_head
+            &&& post.retired.contains_key(me) && post.retired[me] == e.outcome
+            &&& e.queue is Send ==> forall|j: int| 0 <= j < e.seq - qp.sq_head ==> {
+                let w = WqeRef { qp: e.qp, queue: Queue::Send, seq: (qp.sq_head + j) as nat };
+                &&& !(#[trigger] qp.sq[j]).wr.signaled
+                &&& post.retired.contains_key(w) && post.retired[w].status is Success
+            }
+        }),
+{
+    lemma_head_is_first(pre, c);
+    let e = pre.cqs[c].entries[0];
+    let qp = pre.qps[e.qp];
+    assert(pre.qp_wf(qp));
+    let fresh = retires(qp, e);
+    reveal(retires);
+    assert(post.retired == pre.retired.union_prefer_right(fresh));
+    let me = WqeRef { qp: e.qp, queue: e.queue, seq: e.seq };
+    assert(fresh.contains_key(me));
+    if e.queue is Send {
+        assert forall|j: int| 0 <= j < e.seq - qp.sq_head implies {
+            let w = WqeRef { qp: e.qp, queue: Queue::Send, seq: (qp.sq_head + j) as nat };
+            &&& !(#[trigger] qp.sq[j]).wr.signaled
+            &&& post.retired.contains_key(w) && post.retired[w].status is Success
+        } by {
+            let w = WqeRef { qp: e.qp, queue: Queue::Send, seq: (qp.sq_head + j) as nat };
+            assert(!qp.sq[j].generates());
+            assert(qp.sq[j].outcome is Some);
+            assert(fresh.contains_key(w));
+            assert(fresh[w] == qp.sq[j].outcome->0);
+        }
+    }
+}
+
+pub proof fn lemma_touches_registered(s: Nic::State, a: int)
+    requires
+        s.invariant(),
+        s.nic_may_read(a) || s.nic_may_write(a),
+    ensures
+        exists|key: Key| #[trigger] s.mrs.contains_key(key) && s.mrs[key].span.contains(a),
+{
+    let in_sq = exists|q: QpId, k: int| #![trigger s.qps[q].sq[k]] s.qps.contains_key(q)
+        && 0 <= k < s.qps[q].sq.len() && !s.qps[q].sq[k].wr.inline && covers(s.qps[q].sq[k].wr.sges, a);
+    let in_rq = exists|q: QpId, k: int| #![trigger s.qps[q].rq[k]] s.qps.contains_key(q)
+        && 0 <= k < s.qps[q].rq.len() && covers(s.qps[q].rq[k].wr.sges, a);
+    if in_sq {
+        let (q, k) = choose|q: QpId, k: int| #![trigger s.qps[q].sq[k]] s.qps.contains_key(q)
+            && 0 <= k < s.qps[q].sq.len() && !s.qps[q].sq[k].wr.inline && covers(s.qps[q].sq[k].wr.sges, a);
+        let qp = s.qps[q];
+        let wr = qp.sq[k].wr;
+        assert(s.send_wr_ok(qp.attr, wr));
+        let i = choose|i: int| 0 <= i < wr.sges.len() && (#[trigger] wr.sges[i]).span().contains(a);
+        assert(s.registered(qp.attr.pd, wr.sges[i], wr.opcode.writes_local()));
+        assert(s.mrs[wr.sges[i].lkey].span.contains(a));
+    } else if in_rq {
+        let (q, k) = choose|q: QpId, k: int| #![trigger s.qps[q].rq[k]] s.qps.contains_key(q)
+            && 0 <= k < s.qps[q].rq.len() && covers(s.qps[q].rq[k].wr.sges, a);
+        let qp = s.qps[q];
+        let wr = qp.rq[k].wr;
+        assert(s.recv_wr_ok(qp.attr, wr));
+        let i = choose|i: int| 0 <= i < wr.sges.len() && (#[trigger] wr.sges[i]).span().contains(a);
+        assert(s.registered(qp.attr.pd, wr.sges[i], true));
+        assert(s.mrs[wr.sges[i].lkey].span.contains(a));
+    } else if s.nic_may_write(a) {
+        // An RDMA read's buffers: never inline, so covered by `in_sq` unless it is a region.
+        if exists|q: QpId, k: int| #![trigger s.qps[q].sq[k]] s.qps.contains_key(q)
+            && 0 <= k < s.qps[q].sq.len() && s.qps[q].sq[k].wr.opcode.writes_local()
+            && covers(s.qps[q].sq[k].wr.sges, a) {
+            let (q, k) = choose|q: QpId, k: int| #![trigger s.qps[q].sq[k]] s.qps.contains_key(q)
+                && 0 <= k < s.qps[q].sq.len() && s.qps[q].sq[k].wr.opcode.writes_local()
+                && covers(s.qps[q].sq[k].wr.sges, a);
+            assert(s.send_wr_ok(s.qps[q].attr, s.qps[q].sq[k].wr));
+        }
+    }
 }
 
 } // verus!

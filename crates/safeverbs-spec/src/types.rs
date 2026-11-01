@@ -76,10 +76,4 @@ pub struct Outcome {
     pub imm: Option<u32>,
 }
 
-/// The outcome the library reports for an unsignaled request retired by a later signaled
-/// completion: the NIC executed it without error (see `Nic::lemma_retired_unsignaled_succeeded`).
-pub open spec fn implied_success(byte_len: nat) -> Outcome {
-    Outcome { status: Status::Success, byte_len, imm: None }
-}
-
 } // verus!
