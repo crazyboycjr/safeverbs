@@ -1,0 +1,168 @@
+//! Memory-safe, zero-cost RDMA (ibverbs) for Rust.
+//!
+//! safeverbs makes the contracts of libibverbs part of Rust's type system:
+//! memory the NIC uses is owned by the work request until it completes,
+//! memory a peer may write is never readable as Rust values, queues never
+//! overflow, and only connected QPs post. This crate has no `unsafe` code;
+//! everything unsafe lives in `safeverbs-core` behind a small API.
+//!
+//! # Overview
+//!
+//! - Open a device with [`Context::open`] and allocate a protection domain
+//!   ([`Context::alloc_pd`]).
+//! - Allocate registered memory with [`Pd::alloc`]: a [`BufMut<T>`] is
+//!   unique and writable (receive into it, READ into it); freeze it into a
+//!   [`Buf<T>`], shared and read only, cheap to clone and slice, to send it
+//!   or any part of it as often as wanted. [`Buf::try_thaw`] gives the
+//!   `BufMut` back once nothing holds it. [`BufMut::expose`] lets a peer
+//!   WRITE, READ and run atomics on a buffer through its
+//!   [`RemoteBuf`]; [`Exposed::reclaim`] revokes that first.
+//! - Connect a QP: [`QueuePairBuilder`] → [`PreparedQp`] (exchange
+//!   [`Endpoint`]s with the peer) → [`PreparedQp::handshake`] →
+//!   [`LocalQp`] (or [`SharedQp`] for several threads).
+//! - Post: every operation ([`LocalQp::send`], [`LocalQp::write`],
+//!   [`LocalQp::read`], [`LocalQp::recv`], atomics, [`LocalQp::batch`]) is
+//!   posted when called and returns a future of its outcome; a
+//!   [`LocalQp::sink`] streams WRITEs with as few completions as the queue
+//!   allows; a [`LocalQp::receiver`] is a stream of receives.
+//! - Or drive the [`sync`] layer yourself: post into the ring, commit,
+//!   poll, take each request's completion and buffers back.
+//!
+//! Awaiting a future polls the QP's completion queue: there is no
+//! background task, and a pending future asks to be polled again (busy
+//! polling, as RDMA applications do).
+//!
+//! # Example
+//!
+//! Two RC QPs connected to each other on the simulated NIC ([`Model`]),
+//! which needs no hardware; with a device, open it with
+//! [`Context::open`] instead and exchange the endpoints over the network.
+//!
+//! ```
+//! use futures::{StreamExt, executor::block_on};
+//! use safeverbs::{Context, Model, QueuePairBuilder, RC};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let ctx = Context::new(Model::new(1));
+//! let pd = ctx.alloc_pd()?;
+//! let a = QueuePairBuilder::<RC, _>::new(&pd).build()?;
+//! let b = QueuePairBuilder::<RC, _>::new(&pd).build()?;
+//! let (ea, eb) = (a.endpoint(), b.endpoint());
+//! let (qp, peer) = (a.handshake(eb)?, b.handshake(ea)?);
+//!
+//! block_on(async {
+//!     // The peer exposes a buffer to WRITE into and posts receives.
+//!     let dst = pd.alloc::<u8>(4096)?.expose()?;
+//!     let mut rx = peer.receiver((0..4).map(|_| pd.alloc::<u8>(64).unwrap()));
+//!
+//!     let mut buf = pd.alloc::<u8>(4096)?; // BufMut: unique, writable
+//!     buf.fill(42);
+//!     let buf = buf.freeze(); // Buf: shared, read only
+//!     qp.write(buf.slice(..), dst.remote()).await?;
+//!     qp.send(buf.slice(..64)).await?;
+//!
+//!     let (wc, got) = rx.next().await.expect("a receive");
+//!     assert_eq!(wc.byte_len, 64);
+//!     assert!(got.iter().all(|&b| b == 42));
+//!     rx.repost(got)?;
+//!     let mut copy = vec![0; 4096];
+//!     dst.copy_to_slice(&mut copy); // volatile: the peer may still write
+//!     assert!(copy.iter().all(|&b| b == 42));
+//!
+//!     // Nothing holds the frozen buffer any more: write into it again.
+//!     let mut buf = buf.try_thaw().expect("no other handle, nothing in flight");
+//!     buf.fill(7);
+//!     Ok::<(), Box<dyn std::error::Error>>(())
+//! })?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The shapes of the other operations:
+//!
+//! ```no_run
+//! # use futures::{SinkExt, StreamExt};
+//! # use safeverbs::{BufMut, LocalQp, Pd, RC, RemoteBuf, WriteOp};
+//! # async fn f(pd: Pd, qp: LocalQp<RC>, dst: RemoteBuf, bufs: Vec<BufMut<u8>>) -> Result<(), Box<dyn std::error::Error>> {
+//! let mut buf = pd.alloc::<u8>(1 << 20)?; // BufMut
+//! buf.fill(42);
+//! let buf = buf.freeze(); // Buf
+//! qp.send(buf.slice(..)).await?;
+//! qp.send(buf.slice(4096..8192)).await?;
+//! // One doorbell, one completion.
+//! qp.batch(|b| {
+//!     for i in 0..128 {
+//!         b.write(buf.slice(..64), dst.offset(i * 64));
+//!     }
+//! })
+//! .await?;
+//! let mut tx = qp.sink();
+//! let mut ops = futures::stream::iter((0..1000u64).map(|i| Ok(WriteOp::new(buf.slice(..64), dst.offset(i % 128 * 64)))));
+//! tx.send_all(&mut ops).await?;
+//! let mut rx = qp.receiver(bufs);
+//! while let Some((wc, buf)) = rx.next().await {
+//!     println!("received {} bytes", wc.byte_len);
+//!     rx.repost(buf)?;
+//! }
+//! # Ok(()) }
+//! ```
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+mod backlog;
+mod batch;
+mod builder;
+mod op;
+mod qp;
+mod receiver;
+mod sink;
+
+pub use batch::Batch;
+pub use builder::{PreparedQp, QueuePairBuilder, RcQueuePairBuilder, UcQueuePairBuilder};
+pub use op::{Flush, Op, Outcome, Read, Recv, Sent};
+pub use qp::{LocalQp, QpState, QueueAccess, SharedQp};
+pub use receiver::Receiver;
+pub use safeverbs_core::model::Model;
+pub use safeverbs_core::verbs::{Verbs, devices};
+pub use safeverbs_core::{
+    Access, Buf, BufError, BufMut, Chunks, Context, Endpoint, Error, Exposed, Gid, GidEntry, Nic,
+    Opcode, Pd, PortInfo, RC, Reliable, RemoteBuf, Result, RingBuf, Status, Transport, UC, Wc,
+};
+pub use sink::{WriteOp, WriteSink};
+
+/// The synchronous layer under the futures: a [`QueuePair`](sync::QueuePair)
+/// whose requests are written into a completion ring and the hardware queue
+/// together, committed with one doorbell, retired by polling, and taken
+/// back (completion and buffers) by sequence number.
+///
+/// Reach it through [`LocalQp::with`] or [`LocalQp::into_inner`]. Lend
+/// buffers with [`Buf::into_part`] and [`BufMut::into_part`]; get them back
+/// with [`Leases::into_buf_mut`](sync::Leases::into_buf_mut).
+///
+/// ```no_run
+/// # use safeverbs::{Buf, LocalQp, RC, RemoteBuf};
+/// # use safeverbs::sync::WrOp;
+/// # fn f(qp: LocalQp<RC>, buf: Buf<u8>, dst: RemoteBuf) -> safeverbs::Result<()> {
+/// qp.with(|qp| {
+///     let mut req = qp.request();
+///     for i in 0..16 {
+///         req.push(WrOp::Write(dst.offset(i * 64)), buf.slice(..64).into_part())?;
+///     }
+///     let seq = req.finish(true, false).expect("WQEs were added");
+///     qp.commit()?;
+///     loop {
+///         qp.poll_send();
+///         if let Some((wc, _leases)) = qp.take_send(seq) {
+///             println!("{:?}", wc.status);
+///             break Ok(());
+///         }
+///     }
+/// })
+/// # }
+/// ```
+pub mod sync {
+    pub use safeverbs_core::qp::{MAX_SGES, QueuePair, Request};
+    pub use safeverbs_core::ring::{Ring, State};
+    pub use safeverbs_core::{Leases, Part, Seq, WrOp};
+}

@@ -1,0 +1,26 @@
+[package]
+name = "safeverbs"
+description = "Memory-safe, zero-cost RDMA (ibverbs) for Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["rdma", "ibverbs", "verbs", "async"]
+categories = ["network-programming", "asynchronous"]
+# Not a native library: the key only passes rdma-core's library directory on
+# to dependents (`DEP_SAFEVERBS_LIB_DIR`), see build.rs.
+links = "safeverbs"
+
+[dependencies]
+futures-core = "0.3.34"
+futures-sink = "0.3.34"
+safeverbs-core = { version = "0.1.0", path = "../safeverbs-core" }
+zerocopy = "0.8.63"
+
+[dev-dependencies]
+futures = "0.3.34"
+zerocopy = { version = "0.8.63", features = ["derive"] }
+
+[features]
+## Serialize the values peers exchange (endpoints, remote buffers).
+serde = ["safeverbs-core/serde"]
