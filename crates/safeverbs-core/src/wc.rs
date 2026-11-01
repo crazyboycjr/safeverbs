@@ -55,6 +55,24 @@ impl Status {
     {
         self.0 == 0
     }
+
+    /// The status as the formal model names it (`safeverbs_spec::types::Status`): success,
+    /// a flush, the responder's refusal, the two retry counters, or else a local error.
+    pub open spec fn model(self) -> safeverbs_spec::types::Status {
+        if self.0 == 0 {
+            safeverbs_spec::types::Status::Success
+        } else if self.0 == 5 {
+            safeverbs_spec::types::Status::FlushErr
+        } else if self.0 == 7 || self.0 == 9 || self.0 == 10 || self.0 == 11 || self.0 == 16 {
+            safeverbs_spec::types::Status::RemoteErr
+        } else if self.0 == 13 {
+            safeverbs_spec::types::Status::RnrRetryExceeded
+        } else if self.0 == 12 || self.0 == 20 {
+            safeverbs_spec::types::Status::RetryExceeded
+        } else {
+            safeverbs_spec::types::Status::LocalErr
+        }
+    }
 }
 
 } // verus!
@@ -177,6 +195,15 @@ impl Wc {
     /// Whether the work request succeeded (for proofs).
     pub open spec fn spec_ok(&self) -> bool {
         self.status.0 == 0
+    }
+
+    /// The outcome as the formal model sees it (`safeverbs_spec::types::Outcome`).
+    pub open spec fn outcome(&self) -> safeverbs_spec::types::Outcome {
+        safeverbs_spec::types::Outcome {
+            status: self.status.model(),
+            byte_len: self.byte_len as nat,
+            imm: self.imm,
+        }
     }
 }
 

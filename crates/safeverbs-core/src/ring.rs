@@ -101,6 +101,7 @@
 
 use core::task::Waker;
 
+use safeverbs_spec::abs::{Phase, WakerId};
 use vstd::prelude::*;
 
 use crate::wc::Wc;
@@ -119,22 +120,78 @@ pub type Seq = u64;
 #[verifier::external_body]
 pub struct ExWaker(Waker);
 
+/// The name A gives a waker: wakers of the same task share it.
+pub uninterp spec fn waker_id(waker: Waker) -> WakerId;
+
 /// Wakes the task `waker` belongs to.
 #[verifier::external_body]
 fn wake(waker: Waker) {
     waker.wake();
 }
 
-/// Whether `a` and `b` would wake the same task.
+/// Whether `a` and `b` would wake the same task (then they share a name).
 #[verifier::external_body]
-fn will_wake(a: &Waker, b: &Waker) -> bool {
+fn will_wake(a: &Waker, b: &Waker) -> (same: bool)
+    ensures
+        same ==> waker_id(*a) == waker_id(*b),
+{
     a.will_wake(b)
 }
 
 /// Another handle to the task `waker` belongs to.
 #[verifier::external_body]
-fn clone_waker(waker: &Waker) -> Waker {
+fn clone_waker(waker: &Waker) -> (clone: Waker)
+    ensures
+        waker_id(clone) == waker_id(*waker),
+{
     waker.clone()
+}
+
+/// The name of the waker in `waker`, if any.
+pub open spec fn waker_name(waker: Option<Waker>) -> Option<WakerId> {
+    match waker {
+        Some(w) => Some(waker_id(w)),
+        None => None,
+    }
+}
+
+// =============================================================================
+// What the abstract machine sees
+
+/// A request of the ring as the abstract machine A sees it
+/// (`safeverbs_spec::abs::Req`, less its queue pair and direction, which the
+/// queue pair knows), with what it holds.
+pub ghost struct ReqView<L> {
+    /// In flight, or complete with its outcome.
+    pub phase: Phase,
+    /// The waker its future registered.
+    pub waker: Option<WakerId>,
+    /// Its future was dropped (or it never had one).
+    pub detached: bool,
+    /// Its leases: the memory the NIC may use while it is in flight.
+    pub leases: L,
+}
+
+impl<L> ReqView<L> {
+    /// A newly written request: in flight once posted, no waker yet.
+    pub open spec fn new(detached: bool, leases: L) -> ReqView<L> {
+        ReqView { phase: Phase::InFlight, waker: None, detached, leases }
+    }
+
+    /// A's `register`: the future registered `waker`.
+    pub open spec fn with_waker(self, waker: WakerId) -> ReqView<L> {
+        ReqView { waker: Some(waker), ..self }
+    }
+
+    /// A's `detach` of a request not complete: no owner, no waker.
+    pub open spec fn detach(self) -> ReqView<L> {
+        ReqView { waker: None, detached: true, ..self }
+    }
+
+    /// A's `complete` of a request with an owner: the outcome, no waker.
+    pub open spec fn completed(self, outcome: Wc) -> ReqView<L> {
+        ReqView { phase: Phase::Complete(outcome.outcome()), waker: None, ..self }
+    }
 }
 
 // =============================================================================
@@ -254,6 +311,8 @@ pub struct Ring<L> {
     failed: bool,
     /// The first error of a detached request, until someone takes it.
     detached_error: Option<Wc>,
+    /// The names of the wakers woken so far, in order (ghost).
+    woken: Ghost<vstd::seq::Seq<WakerId>>,
 }
 
 /// Requests less than `n` apart live in different slots of a ring of `n`.
@@ -470,6 +529,54 @@ impl<L> Ring<L> {
         }
     }
 
+    /// What slot `s` holds, as a request.
+    closed spec fn view_of(&self, s: int) -> ReqView<L> {
+        let slot = self.slot(s);
+        ReqView {
+            phase: if slot.state == State::Retired {
+                Phase::Complete(slot.outcome->0.outcome())
+            } else {
+                Phase::InFlight
+            },
+            waker: waker_name(slot.waker),
+            detached: slot.detached,
+            leases: slot.leases->0,
+        }
+    }
+
+    /// Request `s` as A sees it, if A sees it: posted to the NIC (committed)
+    /// and not freed (retired and taken, or detached).
+    pub closed spec fn req(&self, s: int) -> Option<ReqView<L>> {
+        if self.head <= s < self.committed && self.slot(s).state != State::Free {
+            Some(self.view_of(s))
+        } else {
+            None
+        }
+    }
+
+    /// Request `s` if it is staged: written but not posted. A does not see
+    /// it yet (its leases are still the program's).
+    pub closed spec fn staged(&self, s: int) -> Option<ReqView<L>> {
+        if self.committed <= s < self.posted {
+            Some(self.view_of(s))
+        } else {
+            None
+        }
+    }
+
+    /// The names of the wakers the ring has woken, in order.
+    pub closed spec fn woken(&self) -> vstd::seq::Seq<WakerId> {
+        self.woken@
+    }
+
+    /// A sees the same requests in `self` and `other`, with the same staged
+    /// ones and wakers woken: a stuttering step.
+    pub closed spec fn same_view(&self, other: &Self) -> bool {
+        &&& forall|s: int| #[trigger] self.req(s) == other.req(s)
+        &&& forall|s: int| #[trigger] self.staged(s) == other.staged(s)
+        &&& self.woken() == other.woken()
+    }
+
     /// `self` and `other` agree on everything but the slots.
     closed spec fn same_counters(&self, other: &Self) -> bool {
         &&& self.head == other.head
@@ -487,6 +594,7 @@ impl<L> Ring<L> {
         &&& self.open_wqes == other.open_wqes
         &&& self.failed == other.failed
         &&& self.detached_error == other.detached_error
+        &&& self.woken == other.woken
     }
 
     /// The slot invariants depend on the slots and the window counters only.
@@ -562,6 +670,9 @@ impl<L> Ring<L> {
             1 <= max_wqes <= depth,
         ensures
             ring.inv(),
+            forall|s: int| #[trigger] ring.req(s) is None,
+            forall|s: int| #[trigger] ring.staged(s) is None,
+            ring.woken() == vstd::seq::Seq::<WakerId>::empty(),
     {
         assert!(slots >= 1, "a ring needs a slot");
         assert!(max_wqes >= 1 && max_wqes <= depth, "a request needs 1..=depth WQEs");
@@ -594,6 +705,7 @@ impl<L> Ring<L> {
             open_wqes: 0,
             failed: false,
             detached_error: None,
+            woken: Ghost(vstd::seq::Seq::empty()),
         };
         proof {
             reveal(Ring::inv_slots);
@@ -767,6 +879,7 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            final(self).same_view(old(self)),
     {
         let error = self.detached_error.take();
         proof {
@@ -803,6 +916,10 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            final(self).same_view(old(self)),
+            seq is Some ==> seq == Some(old(self).spec_posted()) && final(self).is_open()
+                && final(self).open_wqes() == 0,
+            seq is None ==> *final(self) == *old(self),
     {
         if self.open || !self.has_free_slot() {
             return None;
@@ -864,6 +981,9 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            final(self).same_view(old(self)),
+            final(self).is_open() == old(self).is_open(),
+            id is Some ==> final(self).open_wqes() == old(self).open_wqes() + 1,
     {
         if self.wqe_room() == 0 {
             return None;
@@ -919,6 +1039,16 @@ impl<L> Ring<L> {
             old(self).open_wqes() >= 1,
         ensures
             final(self).inv(),
+            !final(self).is_open(),
+            r.0 == old(self).spec_posted(),
+            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
+            forall|s: int|
+                #[trigger] final(self).staged(s) == if s == old(self).spec_posted() {
+                    Some(ReqView::new(detached, leases))
+                } else {
+                    old(self).staged(s)
+                },
+            final(self).woken() == old(self).woken(),
     {
         assert!(self.open && self.open_wqes >= 1, "no open request with a WQE");
         let signaled = want_signal || self.must_signal();
@@ -945,6 +1075,7 @@ impl<L> Ring<L> {
         self.open_wqes = 0;
         proof {
             self.lemma_end(&pre, seq as int);
+            assert(self.view_of(seq as int) == ReqView::new(detached, leases));
         }
         (seq, signaled)
     }
@@ -978,8 +1109,16 @@ impl<L> Ring<L> {
             self.committed_sig_end == pre.committed_sig_end,
             !self.open,
             self.open_wqes == 0,
+            self.woken == pre.woken,
         ensures
             self.inv(),
+            forall|s: int| #[trigger] self.req(s) == pre.req(s),
+            forall|s: int|
+                #[trigger] self.staged(s) == if s == p {
+                    Some(self.view_of(p))
+                } else {
+                    pre.staged(s)
+                },
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -988,6 +1127,21 @@ impl<L> Ring<L> {
             s,
         ) by {
             lemma_other(n, p, s);
+        }
+        assert forall|s: int| #[trigger] self.req(s) == pre.req(s) by {
+            if pre.head <= s < pre.committed {
+                assert(self.slot(s) == pre.slot(s));
+            }
+        }
+        assert forall|s: int|
+            #[trigger] self.staged(s) == if s == p {
+                Some(self.view_of(p))
+            } else {
+                pre.staged(s)
+            } by {
+            if pre.committed <= s < p {
+                assert(self.slot(s) == pre.slot(s));
+            }
         }
         assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
             assert(pre.done_ok(s));
@@ -1028,6 +1182,14 @@ impl<L> Ring<L> {
             !old(self).is_open(),
         ensures
             final(self).inv(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if old(self).staged(s) is Some {
+                    old(self).staged(s)
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int| #[trigger] final(self).staged(s) is None,
+            final(self).woken() == old(self).woken(),
     {
         assert!(!self.open, "commit with an open request");
         let ghost pre = *self;
@@ -1069,6 +1231,7 @@ impl<L> Ring<L> {
         self.committed = self.posted;
         self.wqe_committed = self.wqe_posted;
         self.committed_sig_end = self.sig_end;
+        assert(self.woken == pre.woken);
         proof {
             assert forall|s: int| pre.head <= s < pre.head + pre.n() implies #[trigger] self.slot(s)
                 == looped.slot(s) by {}
@@ -1103,6 +1266,13 @@ impl<L> Ring<L> {
             self.open_wqes == pre.open_wqes,
         ensures
             self.inv(),
+            forall|s: int|
+                #[trigger] self.req(s) == if pre.staged(s) is Some {
+                    pre.staged(s)
+                } else {
+                    pre.req(s)
+                },
+            forall|s: int| #[trigger] self.staged(s) is None,
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1111,6 +1281,23 @@ impl<L> Ring<L> {
         }
         assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
             assert(pre.live_ok(s));
+        }
+        assert forall|s: int|
+            #[trigger] self.req(s) == if pre.staged(s) is Some {
+                pre.staged(s)
+            } else {
+                pre.req(s)
+            } by {
+            if pre.head <= s < pre.posted {
+                assert(self.slot(s) == if pre.committed <= s < pre.posted {
+                    pre.slot(s).with_state(State::InFlight)
+                } else {
+                    pre.slot(s)
+                });
+                if pre.committed <= s {
+                    assert(pre.live_ok(s));
+                }
+            }
         }
         assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(
             s,
@@ -1140,6 +1327,10 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            !final(self).is_open(),
+            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
+            forall|s: int| #[trigger] final(self).staged(s) is None,
+            final(self).woken() == old(self).woken(),
     {
         let dropped = self.posted - self.committed;
         // No request is staged at `posted`: every lease is released.
@@ -1157,7 +1348,14 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).inv(),
-            kept is Some <==> old(self).committed() <= keep < old(self).posted(),
+            !final(self).is_open(),
+            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
+            forall|s: int| #[trigger] final(self).staged(s) is None,
+            final(self).woken() == old(self).woken(),
+            kept == match old(self).staged(keep as int) {
+                Some(r) => Some(r.leases),
+                None => None,
+            },
     {
         let ghost pre = *self;
         let mut kept = None;
@@ -1175,7 +1373,11 @@ impl<L> Ring<L> {
                     } else {
                         pre.slot(s)
                     },
-                kept is Some <==> pre.committed <= keep < seq,
+                kept == if pre.committed <= keep < seq {
+                    pre.slot(keep as int).leases
+                } else {
+                    None
+                },
             decreases pre.posted - seq,
         {
             let i = self.index(seq);
@@ -1184,6 +1386,9 @@ impl<L> Ring<L> {
                 reveal(Ring::inv_slots);
                 assert(pre.live_ok(seq as int));
                 assert(before.slot(seq as int) == pre.slot(seq as int));
+                if pre.committed <= keep < pre.posted {
+                    assert(pre.live_ok(keep as int));
+                }
             }
             let slot = &mut self.slots[i];
             slot.state = State::Free;
@@ -1210,6 +1415,7 @@ impl<L> Ring<L> {
             seq += 1;
         }
         let ghost looped = *self;
+        assert(self.woken == pre.woken);
         self.posted = self.committed;
         self.wqe_posted = self.wqe_committed;
         self.sig_end = self.committed_sig_end;
@@ -1219,6 +1425,10 @@ impl<L> Ring<L> {
             assert forall|s: int| pre.head <= s < pre.head + pre.n() implies #[trigger] self.slot(s)
                 == looped.slot(s) by {}
             self.lemma_abort(&pre);
+            if pre.committed <= keep < pre.posted {
+                reveal(Ring::inv_slots);
+                assert(pre.live_ok(keep as int));
+            }
         }
         kept
     }
@@ -1249,6 +1459,8 @@ impl<L> Ring<L> {
             self.open_wqes == 0,
         ensures
             self.inv(),
+            forall|s: int| #[trigger] self.req(s) == pre.req(s),
+            forall|s: int| #[trigger] self.staged(s) is None,
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1263,6 +1475,11 @@ impl<L> Ring<L> {
         ) by {
             if s >= pre.posted {
                 assert(pre.free_ok(s));
+            }
+        }
+        assert forall|s: int| #[trigger] self.req(s) == pre.req(s) by {
+            if pre.head <= s < pre.committed {
+                assert(self.slot(s) == pre.slot(s));
             }
         }
         assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
@@ -1288,6 +1505,47 @@ impl<L> Ring<L> {
         self.wqe_committed
     }
 
+    /// The outcome request `s` retires with when WQE `wqe` completes with
+    /// `wc`: an error recorded on it before, else `wc` if it ends at `wqe`,
+    /// else the outcome implied at posting.
+    pub closed spec fn retire_outcome(&self, s: int, wqe: u64, wc: Wc) -> Wc {
+        let slot = self.slot(s);
+        match slot.outcome {
+            Some(recorded) => recorded,
+            None => if slot.end_wqe == wqe + 1 {
+                wc
+            } else {
+                slot.implied
+            },
+        }
+    }
+
+    /// What A sees of request `s` once it retired with `outcome` (A's
+    /// `complete`): a detached request is gone (its leases released), an
+    /// owned one is complete.
+    pub closed spec fn retired_view(&self, s: int, outcome: Wc) -> Option<ReqView<L>> {
+        if self.slot(s).detached {
+            None
+        } else {
+            Some(self.view_of(s).completed(outcome))
+        }
+    }
+
+    /// The names of the wakers held by requests `[from, to)`, in order.
+    pub closed spec fn wakers(&self, from: int, to: int) -> vstd::seq::Seq<WakerId>
+        decreases to - from,
+    {
+        if to <= from {
+            vstd::seq::Seq::empty()
+        } else {
+            let before = self.wakers(from, to - 1);
+            match self.slot(to - 1).waker {
+                Some(w) => before.push(waker_id(w)),
+                None => before,
+            }
+        }
+    }
+
     /// Records the completion of WQE `wqe` (its `wr_id`): retires every
     /// committed request whose WQEs all lie at or before it.
     ///
@@ -1303,25 +1561,61 @@ impl<L> Ring<L> {
         ensures
             final(self).inv(),
             known == (wqe < old(self).spec_wqe_committed()),
+            old(self).spec_retired() <= final(self).spec_retired(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if old(self).spec_retired() <= s < final(self).spec_retired() {
+                    old(self).retired_view(s, old(self).retire_outcome(s, wqe, wc))
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int| #[trigger] final(self).staged(s) == old(self).staged(s),
+            final(self).woken() == old(self).woken() + old(self).wakers(
+                old(self).spec_retired() as int,
+                final(self).spec_retired() as int,
+            ),
     {
         if wqe >= self.wqe_committed {
             return false;
         }
         if wqe < self.wqe_retired {
+            proof {
+                assert(self.woken() =~= self.woken() + self.wakers(
+                    self.retired as int,
+                    self.retired as int,
+                ));
+            }
             return true;
         }
-        let ghost committed = self.committed;
-        let ghost wqe_committed = self.wqe_committed;
+        let ghost pre = *self;
         while self.retired < self.committed
+            invariant_except_break
+                forall|s: int| self.retired <= s < pre.posted ==> #[trigger] self.slot(s) == pre.slot(
+                    s,
+                ),
             invariant
                 self.inv_body(),
-                self.committed == committed,
-                self.wqe_committed == wqe_committed,
+                pre.inv(),
+                self.committed == pre.committed,
+                self.posted == pre.posted,
+                self.wqe_committed == pre.wqe_committed,
                 wqe < self.wqe_committed,
+                pre.retired <= self.retired,
+                forall|s: int|
+                    #[trigger] self.req(s) == if pre.retired <= s < self.retired {
+                        pre.retired_view(s, pre.retire_outcome(s, wqe, wc))
+                    } else {
+                        pre.req(s)
+                    },
+                forall|s: int| #[trigger] self.staged(s) == pre.staged(s),
+                self.woken() == pre.woken() + pre.wakers(pre.retired as int, self.retired as int),
             decreases self.committed - self.retired,
         {
             let i = self.index(self.retired);
             let end = self.slots[i].end_wqe;
+            let ghost r = self.retired as int;
+            proof {
+                assert(self.slot(r) == pre.slot(r));
+            }
             if end <= wqe + 1 {
                 let outcome = match self.slots[i].outcome {
                     Some(recorded) => recorded,
@@ -1333,13 +1627,28 @@ impl<L> Ring<L> {
                         }
                     },
                 };
+                let ghost before = *self;
                 self.retire(i, outcome);
+                proof {
+                    assert(pre.wakers(pre.retired as int, r + 1) == match pre.slot(r).waker {
+                        Some(w) => pre.wakers(pre.retired as int, r).push(waker_id(w)),
+                        None => pre.wakers(pre.retired as int, r),
+                    });
+                    assert(self.woken() =~= pre.woken() + pre.wakers(
+                        pre.retired as int,
+                        self.retired as int,
+                    ));
+                    assert forall|s: int| self.retired <= s < pre.posted implies #[trigger] self.slot(s)
+                        == pre.slot(s) by {
+                        assert(before.slot(s) == pre.slot(s));
+                    }
+                }
             } else {
                 if !wc.is_ok() && self.slots[i].outcome.is_none() {
-                    let ghost pre = *self;
+                    let ghost before = *self;
                     self.slots[i].outcome = Some(wc);
                     proof {
-                        self.lemma_record(&pre);
+                        self.lemma_record(&before);
                     }
                 }
                 break;
@@ -1362,6 +1671,8 @@ impl<L> Ring<L> {
             ),
         ensures
             self.inv_body(),
+            forall|s: int| #[trigger] self.req(s) == pre.req(s),
+            forall|s: int| #[trigger] self.staged(s) == pre.staged(s),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1387,6 +1698,17 @@ impl<L> Ring<L> {
             == self.slot(s - 1).end_wqe by {
             assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
         }
+        assert(pre.live_ok(r));
+        assert forall|s: int| #[trigger] self.req(s) == pre.req(s) by {
+            if pre.head <= s < pre.committed && s != r {
+                assert(self.slot(s) == pre.slot(s));
+            }
+        }
+        assert forall|s: int| #[trigger] self.staged(s) == pre.staged(s) by {
+            if pre.committed <= s < pre.posted {
+                assert(self.slot(s) == pre.slot(s));
+            }
+        }
     }
 
     /// Retires the oldest in-flight request, in slot `i`, with `outcome`.
@@ -1400,7 +1722,22 @@ impl<L> Ring<L> {
             final(self).retired == old(self).retired + 1,
             final(self).head == old(self).head,
             final(self).committed == old(self).committed,
+            final(self).posted == old(self).posted,
             final(self).wqe_committed == old(self).wqe_committed,
+            forall|s: int|
+                #[trigger] final(self).req(s) == if s == old(self).retired {
+                    old(self).retired_view(s, outcome)
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int| #[trigger] final(self).staged(s) == old(self).staged(s),
+            forall|s: int|
+                old(self).head <= s < old(self).head + old(self).n() && s != old(self).retired
+                    ==> #[trigger] final(self).slot(s) == old(self).slot(s),
+            final(self).woken() == match old(self).slot(old(self).retired as int).waker {
+                Some(w) => old(self).woken().push(waker_id(w)),
+                None => old(self).woken(),
+            },
     {
         let ghost pre = *self;
         if !outcome.is_ok() {
@@ -1423,17 +1760,24 @@ impl<L> Ring<L> {
             slot.state = State::Retired;
             slot.outcome = Some(outcome);
         }
+        let ghost woken = self.woken@;
+        self.woken = Ghost(
+            match waker_name(waker) {
+                Some(id) => woken.push(id),
+                None => woken,
+            },
+        );
         proof {
             let r = pre.retired as int;
             assert(self.slots@ =~= pre.slots@.update(r % pre.n(), self.slot(r)));
-            self.lemma_retire(&pre);
+            self.lemma_retire(&pre, outcome);
         }
         if let Some(waker) = waker {
             wake(waker);
         }
     }
 
-    proof fn lemma_retire(&self, pre: &Self)
+    proof fn lemma_retire(&self, pre: &Self, outcome: Wc)
         requires
             pre.inv_body(),
             pre.retired < pre.committed,
@@ -1448,7 +1792,7 @@ impl<L> Ring<L> {
                     new_slot.is_empty()
                 } else {
                     &&& new_slot.state == State::Retired
-                    &&& new_slot.outcome is Some
+                    &&& new_slot.outcome == Some(outcome)
                     &&& new_slot.leases == old_slot.leases
                     &&& new_slot.seq == old_slot.seq
                     &&& new_slot.detached == old_slot.detached
@@ -1469,6 +1813,16 @@ impl<L> Ring<L> {
             self.open_wqes == pre.open_wqes,
         ensures
             self.inv_body(),
+            forall|s: int|
+                #[trigger] self.req(s) == if s == pre.retired {
+                    pre.retired_view(s, outcome)
+                } else {
+                    pre.req(s)
+                },
+            forall|s: int| #[trigger] self.staged(s) == pre.staged(s),
+            forall|s: int|
+                pre.head <= s < pre.head + pre.n() && s != pre.retired ==> #[trigger] self.slot(s)
+                    == pre.slot(s),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1507,6 +1861,21 @@ impl<L> Ring<L> {
         if self.committed < self.posted {
             assert(pre.slot(self.posted - 1) == self.slot(self.posted - 1));
         }
+        assert forall|s: int|
+            #[trigger] self.req(s) == if s == pre.retired {
+                pre.retired_view(s, outcome)
+            } else {
+                pre.req(s)
+            } by {
+            if pre.head <= s < pre.committed && s != r {
+                assert(self.slot(s) == pre.slot(s));
+            }
+        }
+        assert forall|s: int| #[trigger] self.staged(s) == pre.staged(s) by {
+            if pre.committed <= s < pre.posted {
+                assert(self.slot(s) == pre.slot(s));
+            }
+        }
     }
 
     /// Moves `head` past the free slots at the front of the window.
@@ -1523,6 +1892,7 @@ impl<L> Ring<L> {
             final(self).wqe_retired == old(self).wqe_retired,
             final(self).wqe_committed == old(self).wqe_committed,
             final(self).wqe_posted == old(self).wqe_posted,
+            final(self).same_view(old(self)),
     {
         let ghost pre = *self;
         while self.head < self.retired && matches!(self.slots[self.index(self.head)].state, State::Free)
@@ -1530,6 +1900,8 @@ impl<L> Ring<L> {
                 self.inv_body(),
                 self.slots@ == pre.slots@,
                 self.head >= pre.head,
+                self.woken == pre.woken,
+                forall|s: int| pre.head <= s < self.head ==> #[trigger] pre.slot(s).state == State::Free,
                 self.retired == pre.retired,
                 self.committed == pre.committed,
                 self.posted == pre.posted,
@@ -1542,6 +1914,13 @@ impl<L> Ring<L> {
             self.head += 1;
             proof {
                 self.lemma_head(&before);
+            }
+        }
+        proof {
+            assert forall|s: int| #[trigger] self.req(s) == pre.req(s) by {
+                if pre.head <= s < self.head {
+                    assert(pre.slot(s).state == State::Free);
+                }
             }
         }
     }
@@ -1606,8 +1985,26 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).inv(),
-            taken is Some <==> old(self).state_of(seq as int) == State::Retired,
+            match taken {
+                Some((outcome, leases)) => old(self).req(seq as int) == Some(
+                    ReqView { phase: Phase::Complete(outcome.outcome()), waker: None, detached: false, leases },
+                ),
+                None => !(old(self).req(seq as int) is Some && old(self).req(
+                    seq as int,
+                )->0.phase is Complete),
+            },
+            forall|s: int|
+                #[trigger] final(self).req(s) == if taken is Some && s == seq {
+                    None
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int| #[trigger] final(self).staged(s) == old(self).staged(s),
+            final(self).woken() == old(self).woken(),
     {
+        proof {
+            self.lemma_state_views(seq as int);
+        }
         if !matches!(self.state(seq), State::Retired) {
             return None;
         }
@@ -1624,9 +2021,41 @@ impl<L> Ring<L> {
             self.lemma_free(&pre, seq as int);
         }
         self.advance_head();
+        proof {
+            assert(pre.req(seq as int) == Some(
+                ReqView {
+                    phase: Phase::Complete(outcome->0.outcome()),
+                    waker: None,
+                    detached: false,
+                    leases: leases->0,
+                },
+            ));
+        }
         match (outcome, leases) {
             (Some(outcome), Some(leases)) => Some((outcome, leases)),
             _ => None,
+        }
+    }
+
+    /// What [`Ring::state`] reports, in terms of what A sees.
+    proof fn lemma_state_views(&self, seq: int)
+        requires
+            self.inv(),
+        ensures
+            (self.state_of(seq) == State::Retired) == (self.req(seq) is Some && self.req(
+                seq,
+            )->0.phase is Complete),
+            (self.state_of(seq) == State::InFlight) == (self.req(seq) is Some && self.req(
+                seq,
+            )->0.phase is InFlight),
+            (self.state_of(seq) == State::Staged) == (self.staged(seq) is Some),
+            self.req(seq) is Some ==> self.staged(seq) is None,
+    {
+        reveal(Ring::inv_slots);
+        if self.head <= seq < self.retired {
+            assert(self.done_ok(seq));
+        } else if self.retired <= seq < self.posted {
+            assert(self.live_ok(seq));
         }
     }
 
@@ -1661,6 +2090,13 @@ impl<L> Ring<L> {
             self.slot(seq).is_empty(),
         ensures
             self.inv_body(),
+            forall|s: int|
+                #[trigger] self.req(s) == if s == seq {
+                    None
+                } else {
+                    pre.req(s)
+                },
+            forall|s: int| #[trigger] self.staged(s) == pre.staged(s),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1693,6 +2129,21 @@ impl<L> Ring<L> {
         if self.committed < self.posted {
             assert(pre.slot(self.posted - 1) == self.slot(self.posted - 1));
         }
+        assert forall|s: int|
+            #[trigger] self.req(s) == if s == seq {
+                None
+            } else {
+                pre.req(s)
+            } by {
+            if pre.head <= s < pre.committed && s != seq {
+                assert(self.slot(s) == pre.slot(s));
+            }
+        }
+        assert forall|s: int| #[trigger] self.staged(s) == pre.staged(s) by {
+            if pre.committed <= s < pre.posted {
+                assert(self.slot(s) == pre.slot(s));
+            }
+        }
     }
 
     /// Gives up ownership of request `seq`: a retired request is freed and
@@ -1702,7 +2153,27 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if s == seq && old(self).req(s) is Some {
+                    if old(self).req(s)->0.phase is Complete {
+                        None
+                    } else {
+                        Some(old(self).req(s)->0.detach())
+                    }
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int|
+                #[trigger] final(self).staged(s) == if s == seq && old(self).staged(s) is Some {
+                    Some(old(self).staged(s)->0.detach())
+                } else {
+                    old(self).staged(s)
+                },
+            final(self).woken() == old(self).woken(),
     {
+        proof {
+            self.lemma_state_views(seq as int);
+        }
         let state = self.state(seq);
         let i = self.index(seq);
         if matches!(state, State::Retired) {
@@ -1768,6 +2239,18 @@ impl<L> Ring<L> {
             }),
         ensures
             self.inv(),
+            forall|s: int|
+                #[trigger] self.req(s) == if s == seq && pre.req(s) is Some {
+                    Some(self.view_of(s))
+                } else {
+                    pre.req(s)
+                },
+            forall|s: int|
+                #[trigger] self.staged(s) == if s == seq && pre.staged(s) is Some {
+                    Some(self.view_of(s))
+                } else {
+                    pre.staged(s)
+                },
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1805,6 +2288,26 @@ impl<L> Ring<L> {
         if self.head < self.retired {
             assert(pre.slot(self.head as int) == self.slot(self.head as int));
         }
+        assert forall|s: int|
+            #[trigger] self.req(s) == if s == seq && pre.req(s) is Some {
+                Some(self.view_of(s))
+            } else {
+                pre.req(s)
+            } by {
+            if pre.head <= s < pre.committed && s != seq {
+                assert(self.slot(s) == pre.slot(s));
+            }
+        }
+        assert forall|s: int|
+            #[trigger] self.staged(s) == if s == seq && pre.staged(s) is Some {
+                Some(self.view_of(s))
+            } else {
+                pre.staged(s)
+            } by {
+            if pre.committed <= s < pre.posted && s != seq {
+                assert(self.slot(s) == pre.slot(s));
+            }
+        }
     }
 
     /// Registers `waker` to be woken when request `seq` retires (a staged or
@@ -1815,7 +2318,24 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if s == seq && old(self).req(s) is Some && old(self).req(s)->0.phase is InFlight && !old(self).req(s)->0.detached {
+                    Some(old(self).req(s)->0.with_waker(waker_id(*waker)))
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int|
+                #[trigger] final(self).staged(s) == if s == seq && old(self).staged(s) is Some
+                    && !old(self).staged(s)->0.detached {
+                    Some(old(self).staged(s)->0.with_waker(waker_id(*waker)))
+                } else {
+                    old(self).staged(s)
+                },
+            final(self).woken() == old(self).woken(),
     {
+        proof {
+            self.lemma_state_views(seq as int);
+        }
         let state = self.state(seq);
         if !matches!(state, State::Staged) && !matches!(state, State::InFlight) {
             return;
@@ -1851,6 +2371,9 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).inv(),
+            forall|s: int| #[trigger] final(self).req(s) is None,
+            forall|s: int| #[trigger] final(self).staged(s) is None,
+            final(self).woken() == old(self).woken(),
     {
         let ghost pre = *self;
         let mut i = 0;

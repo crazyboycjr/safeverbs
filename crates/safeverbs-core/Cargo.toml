@@ -12,6 +12,7 @@ categories = ["network-programming"]
 links = "safeverbs-core"
 
 [dependencies]
+safeverbs-spec = { version = "0.1.0", path = "../safeverbs-spec" }
 safeverbs-sys = { version = "0.1.0", path = "../safeverbs-sys" }
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 vstd = { version = "=0.0.0-2026-10-25-0158", default-features = false, features = ["alloc"] }

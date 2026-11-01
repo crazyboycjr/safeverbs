@@ -512,10 +512,19 @@ dependencies = [
 name = "safeverbs-core"
 version = "0.1.0"
 dependencies = [
+ "safeverbs-spec",
  "safeverbs-sys",
  "serde",
  "vstd",
  "zerocopy",
+]
+
+[[package]]
+name = "safeverbs-spec"
+version = "0.1.0"
+dependencies = [
+ "verus_state_machines_macros",
+ "vstd",
 ]
 
 [[package]]
