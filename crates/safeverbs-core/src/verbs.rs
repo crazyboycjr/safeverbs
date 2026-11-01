@@ -567,7 +567,7 @@ impl Nic for Verbs {
             | F::IBV_QP_EX_WITH_RDMA_WRITE
             | F::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM;
         if qp_type == QpType::Rc {
-            ops = ops | F::IBV_QP_EX_WITH_RDMA_READ;
+            ops |= F::IBV_QP_EX_WITH_RDMA_READ;
             if self.caps.atomics {
                 ops = ops
                     | F::IBV_QP_EX_WITH_ATOMIC_CMP_AND_SWP

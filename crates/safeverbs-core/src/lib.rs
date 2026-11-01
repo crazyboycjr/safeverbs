@@ -32,6 +32,8 @@
 //! peer may write is never readable as Rust values. Rings never let more
 //! WQEs be in flight than the queues and CQs hold.
 
+#![warn(missing_docs)]
+
 pub mod buf;
 pub mod error;
 pub mod model;

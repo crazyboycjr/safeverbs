@@ -353,11 +353,11 @@ fn backpressure_waits_for_room() {
         let (wc, buf) = wait(async {
             loop {
                 // Poll the sender too, so waiting sends get posted.
-                if let Some(f) = first.as_mut() {
-                    if let Poll::Ready(r) = futures::poll!(f) {
-                        r.unwrap();
-                        first = sends.next();
-                    }
+                if let Some(f) = first.as_mut()
+                    && let Poll::Ready(r) = futures::poll!(f)
+                {
+                    r.unwrap();
+                    first = sends.next();
                 }
                 if let Poll::Ready(item) = futures::poll!(rx.next()) {
                     break item.unwrap();

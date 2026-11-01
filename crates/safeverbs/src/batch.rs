@@ -22,6 +22,9 @@ pub struct Batch<'a, T: Transport, N: Nic = Verbs> {
     ops: usize,
 }
 
+/// Where a batch's operations go. (A direct request keeps its held WQE
+/// inline: the batch lives on the stack only while its closure runs.)
+#[allow(clippy::large_enum_variant)]
 enum Target<'a, T: Transport, N: Nic> {
     /// Written into the send queue as added.
     Direct(Request<'a, T, N>),

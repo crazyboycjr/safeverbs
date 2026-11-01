@@ -9,7 +9,9 @@ use std::collections::VecDeque;
 use safeverbs_core::qp::{MAX_SGES, QueuePair};
 use safeverbs_core::{Error, Leases, Nic, Part, Seq, Transport, WrOp};
 
-/// Work for one request.
+/// Work for one request. (A gather list is kept inline, which makes the
+/// enum large; it only lives in the backlog while a queue is full.)
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Work<N: Nic> {
     /// One send-queue WQE.
     One(WrOp, Part<N>),
@@ -169,10 +171,10 @@ pub(crate) fn post<T: Transport, N: Nic>(qp: &mut QueuePair<T, N>, work: Work<N>
             let mut req = qp.request();
             let mut error = None;
             for (op, part) in ops {
-                if error.is_none() {
-                    if let Err(e) = req.push(op, part) {
-                        error = Some(e.error);
-                    }
+                if error.is_none()
+                    && let Err(e) = req.push(op, part)
+                {
+                    error = Some(e.error);
                 }
             }
             match error {

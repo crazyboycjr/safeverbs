@@ -144,7 +144,9 @@ impl<N: Nic> RawMut<N> {
 
     /// Whether the bytes can hold `[T]` (aligned, a whole number of `T`).
     fn fits<T>(&self) -> bool {
-        size_of::<T>() > 0 && self.offset % align_of::<T>() == 0 && self.len % size_of::<T>() == 0
+        size_of::<T>() > 0
+            && self.offset.is_multiple_of(align_of::<T>())
+            && self.len.is_multiple_of(size_of::<T>())
     }
 }
 
@@ -668,10 +670,10 @@ impl<N: Nic> Leases<N> {
             Some(l) => Some(l),
             None => self.first.as_ref(),
         };
-        if let (Some(Lease::Shared(a)), Lease::Shared(b)) = (last, &lease) {
-            if Arc::ptr_eq(a, b) {
-                return;
-            }
+        if let (Some(Lease::Shared(a)), Lease::Shared(b)) = (last, &lease)
+            && Arc::ptr_eq(a, b)
+        {
+            return;
         }
         if self.first.is_none() {
             self.first = Some(lease);

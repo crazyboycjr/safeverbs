@@ -182,6 +182,10 @@ impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
 
 impl<Q: QueueAccess, K: Outcome<Q::N>> Unpin for Op<'_, Q, K> {}
 
+/// A retired request's completion and buffers, or why it was not posted
+/// and its buffers.
+type Finished<N> = Result<(Wc, Leases<N>), (Error, Leases<N>)>;
+
 /// One poll of a request: its outcome if it retired, else `None` with the
 /// waker registered.
 fn poll_request<T: safeverbs_core::Transport, N: Nic>(
@@ -189,7 +193,7 @@ fn poll_request<T: safeverbs_core::Transport, N: Nic>(
     side: Side,
     state: &mut State<N>,
     cx: &Context<'_>,
-) -> Option<Result<(Wc, Leases<N>), (Error, Leases<N>)>> {
+) -> Option<Finished<N>> {
     s.drain();
     if let State::Queued(ticket) = *state {
         match s.take_ticket(side, ticket) {

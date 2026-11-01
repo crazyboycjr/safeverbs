@@ -446,23 +446,10 @@ impl<L> Ring<L> {
     /// leases. Returns how many staged requests were dropped.
     pub fn abort(&mut self) -> u64 {
         let dropped = self.posted - self.committed;
-        let mut seq = self.committed;
-        while seq < self.posted {
-            let i = self.index(seq);
-            let slot = &mut self.slots[i];
-            slot.state = State::Free;
-            slot.outcome = None;
-            slot.waker = None;
-            let leases = slot.leases.take();
-            drop(leases);
-            seq += 1;
-        }
-        self.posted = self.committed;
-        self.wqe_posted = self.wqe_committed;
-        self.sig_end = self.committed_sig_end;
-        self.open = false;
-        self.open_wqes = 0;
-        debug_assert!(self.invariant());
+        // No request is staged at `posted`: every lease is released.
+        let kept = self.abort_keeping(self.posted);
+        debug_assert!(kept.is_none());
+        drop(kept);
         dropped
     }
 
