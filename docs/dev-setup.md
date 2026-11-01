@@ -157,7 +157,9 @@ cargo test --workspace
 - `safeverbs-core`: unit tests of the completion ring (`ring.rs`), among
   them random sequences of posts, commits, aborts, in-order completions
   with errors and flushes, takes and detaches, checking the invariant after
-  every step and that every lease is released exactly once.
+  every step (a run-time cross-check of what Verus proves,
+  `scripts/verify.sh`) and that every lease is released exactly once; and
+  a doorbell the simulated NIC refuses (`qp.rs`).
 - `safeverbs` (`crates/safeverbs/tests/model.rs`): the public API on the
   simulated NIC (`Model`), which needs no device: every operation, the sink
   and the stream, dropped futures, errors and flushes, and random

@@ -9,8 +9,10 @@ with plain `cargo`. The design behind it is in [`design.md`](design.md).
 
 ### Proved (checked by `scripts/verify.sh`)
 
-Everything below is in `crates/safeverbs-spec` and verified with no `assume`, `admit`,
-`external_body` or assumed specification anywhere in the crate (the script refuses them).
+The model, the abstract machine and the theorem's composition are in `crates/safeverbs-spec`
+and verified with no `assume`, `admit`, `external_body` or assumed specification anywhere in
+the crate (the script refuses them). The core's verified parts follow them, under
+"The core".
 
 **A, the abstract machine** (`abs.rs`). Its invariants are inductive: they hold in its start
 state and every transition preserves them (`lemma_step_keeps_invariant`). The guarantees are
@@ -53,12 +55,56 @@ gives it, and the outcome a client takes is the one M recorded for that request'
 **Worked examples** (`examples.rs`) are concrete executions checked step by step; they show
 that the transitions can happen, so no lemma above is vacuous.
 
+#### The core
+
+The code of `crates/safeverbs-core` written inside `verus!` is verified with no `assume` or
+`admit`; it trusts only the items listed in `scripts/trusted.txt` (see "Trusted computing
+base" below), and the script refuses any other.
+
+**The completion ring** (`ring.rs`). `Ring::new` establishes the eight invariants of the
+module documentation (`Ring::inv`) and every operation requires and keeps them; Verus also
+checks that no operation panics (indexing, the `assert!`s left for callers outside the
+proofs) or overflows. The only run-time check added for the proofs is one comparison in
+`has_free_slot`, which refuses a new request once the WQE numbers could not hold `max_wqes`
+more (after 2^64 WQEs). Every operation is specified by what A sees of the ring: its requests
+(`Ring::req`: posted and not freed, in flight or complete, with waker, owner and leases), the
+requests written but not posted (`Ring::staged`) and the wakers woken (`Ring::woken`, a ghost
+log). `take` returns exactly the outcome and the very leases of a complete request; the
+leases a request holds are the value `end` moved in, until it retires, is taken, is aborted
+or the queue pair is destroyed.
+
+**The ring refines A** (`refine.rs`). In every state of A where the ring's requests sit
+(`placed`: each request A sees in the ring is a request lease of A, on the ring's queue
+pair, with the same phase, waker and owner; each staged request's leases a program lease of
+A; no two the same), each operation's change is zero or more steps of A to a state where they
+sit again: none for `begin`, `push_wqe`, `end` and `take_detached_error`; `post_request` (then
+`register` or `detach`) for each request `commit` posts; `drop` for each staged lease an
+abort releases; A's `complete` for each request `complete` retires, in order, A's wakes
+growing by exactly the wakers the ring woke (L1 for the ring); A's `take`, `detach` and
+`register` for `take`, `detach` and `set_waker`; and for `release_all` a flush, `detach` and
+`drop` that leave nothing of the queue pair in A. The async layer's side list of results
+moved out of a clogged ring is covered as well (`with_side`): moving a result there is no
+step, taking it is A's `take` with the outcome and leases the ring gave. This is the ring's
+share of the obligations of `Refines`.
+
+**The trusted verbs** (`trusted.rs`). The data path's calls into the NIC (`start`, `post`,
+`doorbell`, `abort`, `post_recv`, `poll`) have contracts taken from M: each requires M's
+precondition and ensures the NIC's own steps followed by the verb's (`doorbell` posts the WRs
+written since `start` as one `post_send`; `poll` reports the CQE each `poll_cq` step pops).
+The NIC's state is a ghost token (`NicToken`) nothing else can make. These are trusted, not
+proved; they are the interface the queue pair is to be verified against.
+
 ### Stated, not yet proved
 
 - **Theorem 1 for the real library.** The obligations of `Refines` (start states; every API
   call is zero or more steps of A and of M; the invariant couples A and M) are what
-  `safeverbs-core` must prove. The core is not written yet; until it is, Theorem 1 holds for
-  any implementation that discharges them, not yet for SafeVerbs itself.
+  `safeverbs-core` must prove. The ring discharges its share against A (above); what remains
+  is the queue pair as a whole (`qp.rs`, still outside `verus!`): calling the trusted verbs
+  with their preconditions (S2), keeping the map from requests to WQEs (`ids` and the WQE
+  numbers the ring hands out) that couples A and M, and the buffers (`buf.rs`), whose
+  allocation, splitting, freezing and exposure are A's buffer transitions. Until then Theorem
+  1 holds for any implementation that discharges the obligations, and for the ring's part of
+  SafeVerbs.
 - **Theorem 2**, two SafeVerbs endpoints under assume-guarantee (no receiver-not-ready or
   remote access errors; every error completion due to a fault). It is stated in
   `refinement.rs` and `design.md` only.
@@ -71,6 +117,35 @@ of the trusted verbs wrappers. M is the assumption users should read: every rule
 library relies on about hardware is a transition or precondition there, not prose. Evidence
 that real NICs conform will come from differential testing on hardware and soft-RoCE.
 
+### Trusted computing base
+
+Beyond the toolchain and M, the verified core trusts exactly the items of
+`scripts/trusted.txt`; `scripts/verify.sh` fails if an `external_body` or external
+specification appears anywhere else in `crates/safeverbs-core`, or if a listed item no longer
+exists. Each of them, and why it is trusted:
+
+| Item (`crates/safeverbs-core/src/`) | What Verus takes on trust |
+| --- | --- |
+| `ring.rs` `ExWaker` | `core::task::Waker` is an opaque type |
+| `ring.rs` `wake` | `Waker::wake` wakes the task (no contract: the ring logs the waker's name itself) |
+| `ring.rs` `will_wake` | `Waker::will_wake`: when it says two wakers wake the same task, they share a name in A (`waker_id`) |
+| `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name |
+| `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp` | the definitions of these plain data types, as written in `nic.rs` |
+| `trusted.rs` `ExError` | `Error` is an opaque type |
+| `trusted.rs` `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
+| `trusted.rs` `start`, `post`, `abort` | `ibv_wr_start`, `ibv_wr_*`, `ibv_wr_abort`: writing WRs changes nothing in M until the doorbell; an abort discards them |
+| `trusted.rs` `doorbell` | `ibv_wr_complete` is M's `post_send` of the WRs written since the start (after the NIC's own steps), or nothing on error |
+| `trusted.rs` `post_recv` | `ibv_post_recv` of one WR is M's `post_recv`, or nothing on error |
+| `trusted.rs` `poll` | each CQE `ibv_poll_cq` returns is the one M's `poll_cq` pops, with its `wr_id` and outcome |
+
+Two modelling choices sit in these contracts: M has no atomics, and the contracts treat a
+fetch-and-add or compare-and-swap as an RDMA READ (locally both have the NIC write the local
+buffer); and a `Wc`'s status maps to M's six statuses as `Status::model` says.
+
+`Waker::wake` and the verbs' bodies are the only code the proofs call without checking it.
+The rest of `safeverbs-core` (`buf.rs`, `qp.rs`, `verbs.rs`, `model.rs`, `pd.rs`) is outside
+`verus!`: not trusted by the proofs, but not verified either (see above).
+
 Liveness is outside the claim: that every request eventually completes needs the NIC to
 make progress, the executor to poll woken tasks and someone to poll the CQ.
 
@@ -78,7 +153,9 @@ make progress, the executor to poll woken tasks and someone to poll the CQ.
 
 Install a Verus release (the binary release from GitHub, or on Arch Linux the AUR package
 `verus-bin`) so that `verus` and `cargo-verus` are on `PATH`, and install the Rust toolchain
-it names:
+it names. The core is verified in the main workspace, which needs the rdma-core submodule
+and what building `safeverbs-sys` needs (`docs/dev-setup.md`); `VERIFY_SPEC_ONLY=1` checks
+only the specification crate, which needs neither.
 
 ```console
 $ verus --version
@@ -90,13 +167,15 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 115 verified, 0 errors
+safeverbs-core: verification results:: 120 verified, 0 errors
 ```
 
-The script first builds the crate with plain `cargo` (it must compile with its ghost code
-erased, as users build it), then runs `cargo verus verify` on it with the toolchain Verus
-names (whatever `rust-toolchain.toml` pins). It always re-verifies the crate while vstd stays
-cached, runs under a memory cap when `systemd-run` is available (`VERIFY_MEMORY_MAX`, default
-`6G`), and exits non-zero on any failure. The first run also verifies vstd itself (about
+The script first checks that neither crate assumes anything and that the core trusts only
+the listed items, then, for each crate, builds it with plain `cargo` (it must compile with
+its ghost code erased, as users build it) and runs `cargo verus verify` on it with the
+toolchain Verus names (whatever `rust-toolchain.toml` pins). It always re-verifies the crates
+while vstd stays cached, runs under a memory cap when `systemd-run` is available
+(`VERIFY_MEMORY_MAX`, default `6G`), and exits non-zero on any failure. The first run also verifies vstd itself (about
 1900 items); after that a run takes a few seconds. Extra arguments go to Verus, for example
 `scripts/verify.sh --rlimit 2`, which still passes: the proofs are not at the edge of the
 solver's resource limit.
@@ -109,8 +188,8 @@ $ cd crates/safeverbs-spec && verus --crate-type=lib src/lib.rs
 
 ## Building `verus!` code with plain cargo
 
-`safeverbs-core` will be written inside `verus!` and must still build with plain `cargo` for
-users who never install Verus. We tried this with a crate shaped like the core (exec code
+Parts of `safeverbs-core` are written inside `verus!` and must still build with plain `cargo`
+for users who never install Verus. We tried this with a crate shaped like the core (exec code
 whose contracts use this crate's ghost types, a trusted `external_body` wrapper, a tracked
 token, `#![no_std]` and `#![forbid(unsafe_code)]`), verified with `cargo verus verify` and
 built and tested with plain `cargo test` on stable Rust. What we found:
@@ -119,14 +198,17 @@ built and tested with plain `cargo test` on stable Rust. What we found:
   published for every Verus build with a date version; pin the one that belongs to your
   Verus release (it is the version in that release's `source/vstd/Cargo.toml`), here
   `vstd = { version = "=0.0.0-2026-10-25-0158", default-features = false }`
-  (`default-features = false` gives a `no_std` vstd). `state_machine!` is not re-exported by
+  (`default-features = false` gives a `no_std` vstd; a crate whose verified code uses `Vec`
+  adds `features = ["alloc"]`, as the core does). `state_machine!` is not re-exported by
   vstd: a crate that defines state machines also depends on `verus_state_machines_macros` of
   the same version and puts `state_machine!` outside `verus!`.
 - **Erasure.** Without Verus, the `verus!` macro erases ghost code: `spec` and `proof`
   functions disappear, `requires` and `ensures` are dropped, and `Ghost<T>` and `Tracked<T>`
   values and ghost fields become zero-sized. So a `use` of a spec or proof function fails to
-  compile without Verus; call it by its path inside the proof instead (or guard the `use`
-  with `#[cfg(verus_only)]`). A plain build produces the code it would produce
+  compile without Verus; call it by its path inside the proof instead, import it with a glob
+  (globs tolerate missing items), or guard the `use` with `#[cfg(verus_only)]`. An external
+  type or trait specification is a real item after erasure; the core puts it under
+  `#[cfg(verus_keep_ghost)]` so that a plain build has none. A plain build produces the code it would produce
   without Verus. It also checks nothing: a function with a false `ensures` compiles. Proofs
   are checked only by `cargo verus verify` (or `scripts/verify.sh`), which CI must run.
 - **Ghost parameters stay in signatures.** A `Tracked<T>` or `Ghost<T>` parameter is still a
@@ -159,12 +241,12 @@ built and tested with plain `cargo test` on stable Rust. What we found:
   `[lints.rust] unexpected_cfgs` to silence warnings, and allow `non_snake_case` for the
   modules `state_machine!` generates.
 
-A `Cargo.toml` for `safeverbs-core` would then look like this:
+The `Cargo.toml` of `safeverbs-core` has, besides its other dependencies:
 
 ```toml
 [dependencies]
-vstd = { version = "=0.0.0-2026-10-25-0158", default-features = false }
-safeverbs-spec = { path = "../safeverbs-spec" }
+safeverbs-spec = { version = "0.1.0", path = "../safeverbs-spec" }
+vstd = { version = "=0.0.0-2026-10-25-0158", default-features = false, features = ["alloc"] }
 
 [package.metadata.verus]
 verify = true
@@ -173,16 +255,19 @@ verify = true
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
 ```
 
-## How the core will connect to the model
+## How the core connects to the model
 
 The core's state carries ghost state that the abstraction function reads: a tracked token
 whose view is M's state, the map from requests to WRs, and the leases of A. Three pieces
-connect it to this crate.
+connect it to the specification crate. The first two exist (`trusted.rs`, `refine.rs`); the
+third waits for the queue pair to move into `verus!`.
 
-**Trusted verbs wrappers.** Each verb is one small function with an `external_body` and a
-contract taken from M. The precondition is checked by Verus at every call site, which is S2;
-the postcondition says the verb happened after whatever the NIC did meanwhile, which
-`lemma_nic_env_keeps_enabled` shows is consistent. A sketch for posting:
+**Trusted verbs wrappers** (`trusted.rs`). Each verb is one small function with an
+`external_body` and a contract taken from M. The precondition is checked by Verus at every
+call site, which is S2; the postcondition says the verb happened after whatever the NIC did
+meanwhile, which `lemma_nic_env_keeps_enabled` shows is consistent. The sketch below was the
+plan; the module follows it, with the WRs written since `start` kept in the token and
+posted together by the doorbell:
 
 ```rust
 verus! {
@@ -202,6 +287,16 @@ fn post_send(qp: &RawQp, wrs: &WrList, Tracked(nic): Tracked<&mut NicToken>)
 
 Polling is the same with `Nic::Step::poll_cq`, and returns the CQE that M's `poll_cq` pops.
 
+**Leases.** The ring tracks each request's leases as the value itself: the `L` A sees a
+request hold is the one `end` moved into its slot, and `take` or `abort_keeping` hands back
+that value (`refine.rs`); the ghost maps from sequence numbers to A's lease ids and
+directions belong to the queue pair. The plan for the buffers is linear ghost permissions,
+below. A ghost token cannot cross unverified code (a caller outside `verus!` cannot pass a
+`Tracked` argument without assuming it), so the permissions come with the queue pair's move
+into `verus!`; and since M is one state for the whole device while each `LocalQp` moves
+between threads alone, the queue pair will need its own share of M (a tokenized M, or one
+token per queue pair over M's per-QP state).
+
 **Memory as linear ghost permissions.** The core holds vstd's `PointsToRaw` permission for
 every byte of every buffer. A `BufMut` or `Buf` carries the permissions for its bytes (a
 `Buf` shares them read-only). Posting moves the permissions of the WR's bytes into the NIC
@@ -212,4 +307,5 @@ implementation, and turning bytes into a `T` goes through `FromBytes` or `TryFro
 
 **The `Refines` implementation.** The core implements `refinement::Refines` for its state,
 relates each public function's postcondition to `step`, and proves the three obligations;
-`theorem_1` does the rest.
+`theorem_1` does the rest. The ring's lemmas in `refine.rs` (`lemma_ring_*`) are the steps of
+A for its part of each call.
