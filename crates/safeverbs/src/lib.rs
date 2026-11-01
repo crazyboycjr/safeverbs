@@ -179,6 +179,25 @@
 //! # }
 //! ```
 
+//!
+//! A synchronous worker moves between threads as one value, but is used by
+//! one thread at a time:
+//!
+//! ```
+//! fn moves<T: Send>(_: T) {}
+//! # fn f(w: safeverbs::sync::Worker) {
+//! moves(w);
+//! # }
+//! ```
+//!
+//! ```compile_fail,E0277
+//! # fn f(w: safeverbs::sync::Worker) {
+//! std::thread::scope(|s| {
+//!     s.spawn(|| w.cq_size());
+//! });
+//! # }
+//! ```
+
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
