@@ -145,7 +145,10 @@ impl<Q: QueueAccess, U: IntoBytes + Immutable> Sink<WriteOp<U, Q::N>> for WriteS
         let done = match this.last {
             Some(last) => this.q.with_qp(|qp| {
                 qp.poll_send();
-                qp.send_ring().retired() > last
+                let ring = qp.send_ring();
+                // Retired; or dropped, never posted, by a doorbell the device
+                // refused (the ring then records a flush error for it).
+                ring.retired() > last || ring.posted() <= last
             }),
             None => true,
         };

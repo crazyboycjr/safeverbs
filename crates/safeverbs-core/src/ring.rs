@@ -688,8 +688,6 @@ impl<L> Ring<L> {
         &&& self.committed_sig_end == other.committed_sig_end
         &&& self.open == other.open
         &&& self.open_wqes == other.open_wqes
-        &&& self.failed == other.failed
-        &&& self.detached_error == other.detached_error
         &&& self.woken == other.woken
     }
 
@@ -967,6 +965,11 @@ impl<L> Ring<L> {
     /// Whether an error completion has retired a request.
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// The detached error waiting to be taken.
+    pub closed spec fn spec_detached_error(&self) -> Option<Wc> {
+        self.detached_error
     }
 
     /// The first error completion of a detached request, once.
@@ -1439,6 +1442,11 @@ impl<L> Ring<L> {
 
     /// Like [`Ring::abort`], but hands back the leases of staged request
     /// `keep` instead of releasing them (`None` if it is not staged).
+    ///
+    /// A request without an owner learns of nothing but through the
+    /// detached error: if one is dropped, and no detached error waits, it
+    /// becomes a flush error of that request (it was not executed), so that
+    /// the loss is reported, not taken for success.
     pub fn abort_keeping(&mut self, keep: Seq) -> (kept: Option<L>)
         requires
             old(self).inv(),
@@ -1452,6 +1460,10 @@ impl<L> Ring<L> {
                 Some(r) => Some(r.leases),
                 None => None,
             },
+            final(self).spec_detached_error() is None ==> forall|s: int|
+                #[trigger] old(self).staged(s) is Some && s != keep ==> !old(self).staged(
+                    s,
+                )->0.detached,
     {
         let ghost pre = *self;
         let mut kept = None;
@@ -1460,6 +1472,8 @@ impl<L> Ring<L> {
             invariant
                 pre.inv(),
                 self.same_counters(&pre),
+                self.detached_error is None ==> forall|s: int|
+                    pre.committed <= s < seq && s != keep ==> !(#[trigger] pre.slot(s)).detached,
                 self.slots@.len() == pre.slots@.len(),
                 pre.committed <= seq <= pre.posted,
                 forall|s: int|
@@ -1486,6 +1500,12 @@ impl<L> Ring<L> {
                     assert(pre.live_ok(keep as int));
                 }
             }
+            let detached = self.slots[i].detached;
+            let flushed = Wc {
+                wr_id: self.slots[i].end_wqe - 1,
+                status: crate::wc::Status::WR_FLUSH_ERR,
+                ..self.slots[i].implied
+            };
             let slot = &mut self.slots[i];
             slot.state = State::Free;
             slot.outcome = None;
@@ -1495,6 +1515,9 @@ impl<L> Ring<L> {
             } else {
                 // Releases the leases.
                 slot.leases = None;
+                if detached && self.detached_error.is_none() {
+                    self.detached_error = Some(flushed);
+                }
             }
             proof {
                 assert forall|s: int| pre.head <= s < pre.head + pre.n() implies #[trigger] self.slot(s)

@@ -213,7 +213,12 @@ impl<T: Transport, N: Nic> QueuePair<T, N> {
 
     /// Rings the doorbell for every request written since the last one. If
     /// the device refuses, those requests are dropped and their buffers
-    /// released.
+    /// released: each one without an owner is reported by
+    /// [`QueuePair::take_send_error`] as a flush error, and the sequence
+    /// number of each one with an owner names nothing any more (a later
+    /// request may get it), so its owner must not take or detach it.
+    /// [`Request::submit`] and [`QueuePair::commit_or_take`] hand the
+    /// buffers of their own request back instead.
     pub fn commit(&mut self) -> Result<()> {
         if !self.started {
             return Ok(());
@@ -599,7 +604,8 @@ impl<T: Transport, N: Nic> Request<'_, T, N> {
     /// Finishes the request: signaled if `signal` (else only if the ring
     /// needs it), `detached` if nobody will take it back. Returns its
     /// sequence number, `None` if it has no WQE. It goes out at the next
-    /// commit.
+    /// commit; if the device refuses that doorbell, the request is dropped
+    /// and the number is void (see [`QueuePair::commit`]).
     pub fn finish(mut self, signal: bool, detached: bool) -> Option<Seq> {
         if self.open {
             Some(self.close(signal, detached))
@@ -634,5 +640,44 @@ impl<T: Transport, N: Nic> Drop for Request<'_, T, N> {
         if self.open {
             self.close(true, true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Model;
+    use crate::pd::Context;
+    use crate::transport::RC;
+
+    /// A refused doorbell drops a request without an owner written before
+    /// it; the loss is reported as a flush error, not taken for success.
+    #[test]
+    fn refused_doorbell_reports_dropped_requests() {
+        let pd = Context::new(Model::new(7)).alloc_pd().unwrap();
+        let caps = QpCaps {
+            max_send_wr: 8,
+            max_recv_wr: 8,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 0,
+        };
+        // Not connected: the model refuses the doorbell.
+        let mut qp = QueuePair::<RC, Model>::new(&pd, caps, 4, true).unwrap();
+        let buf = pd.alloc::<u8>(64).unwrap().freeze();
+        let mut req = qp.request();
+        req.push(WrOp::Send, buf.clone().into_part()).unwrap();
+        assert!(req.finish(false, true).is_some());
+        let mut req = qp.request();
+        req.push(WrOp::Send, buf.into_part()).unwrap();
+        let (error, leases) = req.submit(true).unwrap().unwrap_err();
+        assert!(matches!(error, Error::Os(_)));
+        drop(leases);
+        assert_eq!(qp.send_ring().posted(), 0);
+        let wc = qp
+            .take_send_error()
+            .expect("the dropped request is reported");
+        assert_eq!(wc.status, crate::wc::Status::WR_FLUSH_ERR);
+        assert!(qp.take_send_error().is_none());
     }
 }
