@@ -5,7 +5,7 @@
 //! iterator chains. It is written inside `verus!` and proved: Verus checks
 //! that every operation keeps the invariants below, never panics and never
 //! overflows (`scripts/verify.sh`; a plain `cargo build` erases the proofs).
-//! The queue pair (`crate::qp`) drives it next to the hardware queue.
+//! The worker (`crate::worker`) drives it next to the hardware queue.
 //!
 //! # Requests, WQEs and sequence numbers
 //!

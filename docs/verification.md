@@ -65,46 +65,72 @@ base" below), and the script refuses any other.
 module documentation (`Ring::inv`) and every operation requires and keeps them; Verus also
 checks that no operation panics (indexing, the `assert!`s left for callers outside the
 proofs) or overflows. The only run-time check added for the proofs is one comparison in
-`has_free_slot`, which refuses a new request once the WQE numbers could not hold `max_wqes`
-more (after 2^64 WQEs). Every operation is specified by what A sees of the ring: its requests
-(`Ring::req`: posted and not freed, in flight or complete, with waker, owner and leases), the
-requests written but not posted (`Ring::staged`) and the wakers woken (`Ring::woken`, a ghost
-log). `take` returns exactly the outcome and the very leases of a complete request; the
-leases a request holds are the value `end` moved in, until it retires, is taken, is aborted
+`has_free_slot`, which refuses a new request once the WQE or request numbers could not hold
+`max_wqes` more (after 2^64 of them; one comparison of their bitwise or covers both). Every
+operation is specified by what A sees of the ring: its requests (`Ring::req`: posted and not
+freed, in flight or complete, with waker, owner and leases), the requests written but not
+posted (`Ring::staged`), the requests whose doorbell the device refused (`Ring::refused`:
+never posted, their leases kept for their owners) and the wakers woken (`Ring::woken`, a ghost
+log). `take` returns exactly the outcome and the very leases of a complete request, or of a
+refused one with a flush error; the leases a request holds are the value `end` moved in,
+until it retires, is taken, is refused without an owner, is handed back by `abort_keeping`
 or the queue pair is destroyed.
+
+A refused doorbell (`abort`, `abort_keeping`) never makes a sequence number void: each staged
+request with an owner becomes a refused one in the window, with no WQEs (the invariants allow
+such void slots among the requests in flight, `Ring::void_ok`), which its owner takes or
+drops at any time; `retired` moves past them without a completion, and the WQE numbers the
+NIC never saw leave the accounting and go to the next requests. Wakers registered on the
+staged requests are woken (the ring's log grows by them; A, which never saw those requests,
+wakes nothing).
 
 **The ring refines A** (`refine.rs`). In every state of A where the ring's requests sit
 (`placed`: each request A sees in the ring is a request lease of A, on the ring's queue
-pair, with the same phase, waker and owner; each staged request's leases a program lease of
-A; no two the same), each operation's change is zero or more steps of A to a state where they
-sit again: none for `begin`, `push_wqe`, `end` and `take_detached_error`; `post_request` (then
-`register` or `detach`) for each request `commit` posts; `drop` for each staged lease an
-abort releases; A's `complete` for each request `complete` retires, in order, A's wakes
-growing by exactly the wakers the ring woke (L1 for the ring); A's `take`, `detach` and
-`register` for `take`, `detach` and `set_waker`; and for `release_all` a flush, `detach` and
+pair, with the same phase, waker and owner; each staged or refused request's leases a program
+lease of A; no two the same), each operation's change is zero or more steps of A to a state
+where they sit again: none for `begin`, `push_wqe`, `end` and `take_detached_error`;
+`post_request` (then `register` or `detach`) for each request `commit` posts; `drop` for each
+staged lease without an owner an abort releases, none for the others (their leases stay the
+program's, kept in the ring or handed back); A's `complete` for each request `complete`
+retires, in order, A's wakes growing by exactly the wakers the ring woke (L1 for the ring);
+A's `take`, `detach` and `register` for `take`, `detach` and `set_waker`, none for taking a
+refused request and `drop` for detaching one; and for `release_all` a flush, `detach` and
 `drop` that leave nothing of the queue pair in A. The async layer's side list of results
 moved out of a clogged ring is covered as well (`with_side`): moving a result there is no
-step, taking it is A's `take` with the outcome and leases the ring gave. This is the ring's
-share of the obligations of `Refines`.
+step, taking it is A's `take` with the outcome and leases the ring gave (no step for a
+refused one). This is the ring's share of the obligations of `Refines`.
 
 **The trusted verbs** (`trusted.rs`). The data path's calls into the NIC (`start`, `post`,
 `doorbell`, `abort`, `post_recv`, `poll`) have contracts taken from M: each requires M's
 precondition and ensures the NIC's own steps followed by the verb's (`doorbell` posts the WRs
 written since `start` as one `post_send`; `poll` reports the CQE each `poll_cq` step pops).
 The NIC's state is a ghost token (`NicToken`) nothing else can make. These are trusted, not
-proved; they are the interface the queue pair is to be verified against.
+proved; they are the interface the worker and its queue pairs are to be verified against.
 
 ### Stated, not yet proved
 
 - **Theorem 1 for the real library.** The obligations of `Refines` (start states; every API
   call is zero or more steps of A and of M; the invariant couples A and M) are what
   `safeverbs-core` must prove. The ring discharges its share against A (above); what remains
-  is the queue pair as a whole (`qp.rs`, still outside `verus!`): calling the trusted verbs
-  with their preconditions (S2), keeping the map from requests to WQEs (`ids` and the WQE
-  numbers the ring hands out) that couples A and M, and the buffers (`buf.rs`), whose
-  allocation, splitting, freezing and exposure are A's buffer transitions. Until then Theorem
-  1 holds for any implementation that discharges the obligations, and for the ring's part of
-  SafeVerbs.
+  is the worker and its queue pairs (`worker.rs`, still outside `verus!`):
+  - calling the trusted verbs with their preconditions (S2), including M's `create_qp`
+    reservation, which the worker checks when it attaches a queue pair to its CQ (the sum of
+    the depths within the CQ's size), and `destroy_qp`, which M allows only with empty queues
+    while the worker destroys a queue pair with work in flight;
+  - the map from requests to WQEs that couples A and M: the `wr_id` the worker builds from
+    the queue pair's index, the queue and the low bits of the ring's WQE number, and its
+    recovery from a completion (`wqe_of`), which must name the WQE M's `poll_cq` retired, for
+    the right queue pair even after another took a removed one's index (the worker drains
+    the CQ first);
+  - the lease tokens: the buffers (`buf.rs`), whose allocation, splitting, freezing and
+    exposure are A's buffer transitions, as linear ghost permissions (below);
+  - the worker's share of M: M is one state for the whole device, while each worker, with its
+    CQ and queue pairs, belongs to one thread and moves between threads alone, so the token
+    the trusted verbs take must be split per worker (a tokenized M, or one token per worker
+    over its CQ and queue pairs).
+
+  Until then Theorem 1 holds for any implementation that discharges the obligations, and for
+  the ring's part of SafeVerbs.
 - **Theorem 2**, two SafeVerbs endpoints under assume-guarantee (no receiver-not-ready or
   remote access errors; every error completion due to a fault). It is stated in
   `refinement.rs` and `design.md` only.
@@ -143,8 +169,8 @@ fetch-and-add or compare-and-swap as an RDMA READ (locally both have the NIC wri
 buffer); and a `Wc`'s status maps to M's six statuses as `Status::model` says.
 
 `Waker::wake` and the verbs' bodies are the only code the proofs call without checking it.
-The rest of `safeverbs-core` (`buf.rs`, `qp.rs`, `verbs.rs`, `model.rs`, `pd.rs`) is outside
-`verus!`: not trusted by the proofs, but not verified either (see above).
+The rest of `safeverbs-core` (`buf.rs`, `worker.rs`, `verbs.rs`, `model.rs`, `pd.rs`) is
+outside `verus!`: not trusted by the proofs, but not verified either (see above).
 
 Liveness is outside the claim: that every request eventually completes needs the NIC to
 make progress, the executor to poll woken tasks and someone to poll the CQ.
@@ -167,7 +193,7 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 115 verified, 0 errors
-safeverbs-core: verification results:: 120 verified, 0 errors
+safeverbs-core: verification results:: 136 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only
@@ -293,9 +319,9 @@ that value (`refine.rs`); the ghost maps from sequence numbers to A's lease ids 
 directions belong to the queue pair. The plan for the buffers is linear ghost permissions,
 below. A ghost token cannot cross unverified code (a caller outside `verus!` cannot pass a
 `Tracked` argument without assuming it), so the permissions come with the queue pair's move
-into `verus!`; and since M is one state for the whole device while each `LocalQp` moves
-between threads alone, the queue pair will need its own share of M (a tokenized M, or one
-token per queue pair over M's per-QP state).
+into `verus!`; and since M is one state for the whole device while each worker moves
+between threads alone, the worker will need its own share of M (a tokenized M, or one
+token per worker over M's state of its CQ and queue pairs).
 
 **Memory as linear ghost permissions.** The core holds vstd's `PointsToRaw` permission for
 every byte of every buffer. A `BufMut` or `Buf` carries the permissions for its bytes (a

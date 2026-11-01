@@ -155,18 +155,26 @@ cargo test --workspace
 - `safeverbs-sys` (`crates/safeverbs-sys/tests/loopback.rs`): smoke tests
   over the raw FFI, below.
 - `safeverbs-core`: unit tests of the completion ring (`ring.rs`), among
-  them random sequences of posts, commits, aborts, in-order completions
-  with errors and flushes, takes and detaches, checking the invariant after
-  every step (a run-time cross-check of what Verus proves,
-  `scripts/verify.sh`) and that every lease is released exactly once; and
-  a doorbell the simulated NIC refuses (`qp.rs`).
+  them random sequences of posts, commits, refused doorbells, in-order
+  completions with errors and flushes, takes and detaches, checking the
+  invariant after every step (a run-time cross-check of what Verus proves,
+  `scripts/verify.sh`) and that every lease is released exactly once; of
+  the worker (`worker.rs`): `wr_id` routing, CQ reservations, a refused
+  doorbell; and (`crates/safeverbs-core/tests/worker.rs`) pairs of QPs on
+  one worker, whose CQ is exactly as large as they reserve, driven by the
+  event loop through random operations, dropped requests, injected errors,
+  flushes and refused doorbells, checking that every completion reaches
+  its own QP and request once, with its own buffer, and that the simulated
+  NIC's CQ is never overrun.
 - `safeverbs` (`crates/safeverbs/tests/model.rs`): the public API on the
   simulated NIC (`Model`), which needs no device: every operation, the sink
-  and the stream, dropped futures, errors and flushes, and random
-  operation sequences with injected errors after which every buffer is
-  back or released once and nothing stays registered.
+  and the stream, dropped futures, errors and flushes, QPs sharing one
+  worker, and random operation sequences (on two QPs, and on several QPs of
+  one worker, with refused doorbells too) with injected errors after which
+  every buffer is back or released once and nothing stays registered.
 - `safeverbs` (`crates/safeverbs/tests/rxe.rs`): one test per feature on a
-  real device, two QPs of it connected to each other.
+  real device, two QPs of it connected to each other; and four QPs on one
+  worker, connected pairwise, driven by the event loop and by futures.
 - The crate documentation of `safeverbs` runs its example on the model
   and has `compile_fail` tests for what the types rule out.
 
@@ -184,8 +192,9 @@ are, client and server on the same device, for example:
 ```sh
 cargo run -p greeter --bin greeter_server &
 cargo run -p greeter --bin greeter_client
-cargo run -p perftest --bin safeverbs_write_bw &
-cargo run -p perftest --bin safeverbs_write_bw -- 127.0.0.1
+cargo run -p perftest --bin safeverbs_write_bw -- --qps 4 &
+cargo run -p perftest --bin safeverbs_write_bw -- 127.0.0.1 --qps 4
+cargo run -p event_loop -- svrxe0 4
 cargo run -p demo --bin datapath            # on the simulated NIC
 SAFEVERBS_DEVICE=svrxe0 cargo run -p demo --bin datapath
 ```

@@ -61,7 +61,7 @@ library so that a verifier can check the guarantee.
    no sequence of safe calls, and nothing the peer does, can cause undefined behaviour,
    misuse a verb, mix up completions, leak or prematurely free a buffer, or lose a wakeup.
 2. **Zero cost on the data path.** Posting checks only what the hardware needs checked
-   (ring space). A thread-local queue pair takes no lock. Unsignaled WRs, batches with one
+   (ring space). A thread's worker (its CQ and queue pairs) takes no lock. Unsignaled WRs, batches with one
    doorbell and one completion, and repeated sends of the same buffer are all safe API.
 3. **One verifier.** The whole claim is checked by Verus. No part of the guarantee depends
    on Kani, loom, Miri or testing; tests and differential runs on hardware gather evidence
@@ -234,7 +234,7 @@ doorbell and `poll_close` waits until everything completed. `receiver` turns a s
 buffers into a stream of received messages, each with its buffer, which the user may repost.
 
 A future holds only `(qp, seq)`: the queue pair and the sequence number of its slot. The
-waker lives in the slot. Futures poll the CQ themselves when they are polled, so there is no
+waker lives in the slot. Futures poll their worker's CQ themselves when they are polled (section 10), so there is no
 background task and no thread; an interrupt-driven mode through the completion channel can
 come later. Dropping a future detaches it (see 3.2): the slot keeps the buffers until the
 NIC completes the WR, and the completion is then discarded.
@@ -298,20 +298,79 @@ the program's until the rkey is revoked) and is registered on its own, so that t
 reaches exactly that buffer and nothing next to it. These are exactly the rules of A's
 `post_request` and `expose`.
 
-## 10. Queue pairs and completion queues
+## 10. Workers, queue pairs and completion queues
 
-`LocalQp` is `Send + !Sync`. It is created on a thread domain (`ibv_alloc_td`) through a
-parent domain (`ibv_alloc_parent_domain`), on which mlx5 skips the queue pair's spinlocks
-and gives the queue pair its own doorbell page (UAR); where that is not supported, it falls
-back to a normal queue pair. `SharedQp` is a `Mutex<LocalQp>`: one lock covers both our ring
-and the hardware queue, so the two can never disagree.
+The efficient way to use RDMA is one CQ per thread, shared by all of that thread's queue
+pairs, and a loop that polls it, dispatches each completion and posts new work. SafeVerbs
+offers that directly: a thread drives its queue pairs through a **worker**, one completion
+queue and the queue pairs attached to it, the unit of thread affinity.
 
-CQs are per thread, created with `IBV_CREATE_CQ_ATTR_SINGLE_THREADED` and polled with the
-`ibv_start_poll` family. Attaching a queue pair to a CQ reserves capacity for every
-completion it may produce (its queue depths), and creation fails when the CQ would be
-over-committed; M's `create_qp` precondition is exactly this rule, and M proves that no CQ
-can then overflow. Device capabilities (queue depths, scatter/gather elements, inline size,
-CQ size) are checked when objects are created, not on every post.
+In the synchronous core (`safeverbs-core::worker::Worker`) a worker is one value, `Send` but
+not `Sync`: it moves between threads as a whole, with its queue pairs, and is used by one
+thread at a time. Its CQ is created with `IBV_CREATE_CQ_ATTR_SINGLE_THREADED` and polled with
+the `ibv_start_poll` family. Where the device has thread domains, the worker allocates one
+(`ibv_alloc_td`) with a parent domain over its protection domain
+(`ibv_alloc_parent_domain`) and creates every queue pair there: mlx5 then takes no queue pair
+locks and gives the worker's queue pairs a doorbell page of their own, which they share.
+Where that fails (rxe) they are plain queue pairs. A worker belongs to one protection domain.
+
+**Capacity.** Each queue pair reserves a CQ entry for every completion it may produce, its
+send and receive depths, when it is created, and one that does not fit in what is left is
+refused (`Error::CqFull`). The rings never let more WQEs be in flight than the queues hold,
+and each WQE produces at most one completion, so the CQ cannot overrun. This is the rule of
+M's `create_qp`, under which M proves that no CQ overflows. Removing a queue pair polls the
+CQ until its last completions are out before its reservation, or its index, can be reused.
+
+**Routing.** One CQ serves all the queue pairs, so each completion must find its queue pair
+and queue. The `wr_id` the library gives a WQE holds the queue pair's index in the worker (16
+bits), the queue (1 bit: a failed completion's opcode is undefined, so the queue must be in
+the `wr_id` in any case) and the low 47 bits of the WQE's number in its ring; the full number
+is recovered from the oldest WQE in flight, since the WQEs in flight span at most the
+queue's depth. Routing is a shift, a mask and an array index, the same at any number of queue
+pairs. Finding the queue pair by its `qp_num` instead costs as much with a few queue pairs
+but grows with them when scanning (about 2 ns at 16 queue pairs, 11 ns at 64 and 35 ns at
+256, against 1.2 ns at any number for the `wr_id`, on the development machine), or takes a
+hash lookup (about 6 ns). The test `worker::tests::demux_cost` measures routing alone (`cargo
+test --release -p safeverbs-core -- --ignored --nocapture demux_cost`); next to what the
+model NIC or the driver spends per completion it is small either way, and the `wr_id` keeps
+it constant.
+
+**Two ways to drive a worker.** The event loop (`Worker::poll`) polls the CQ and hands every
+request that retired with an owner to a callback, with the queue pair's index, the queue, the
+sequence number, the outcome and the buffers, in each queue's order; the callback may post
+new work. Nothing is allocated. Owners that take their results by sequence number
+(`Worker::progress`, then `take_send` or `take_recv`) are how the futures work: polling
+retires requests into their rings and wakes their wakers. One worker is driven one way or
+the other, since `poll` hands out the results owners would wait for.
+
+**Futures.** The asynchronous layer puts a worker behind an `Rc<RefCell<..>>`
+(`LocalWorker`): one borrow flag, no atomics. Each `LocalQp` holds a handle to its worker;
+every pending future polls the worker's CQ once, which retires the requests of all its queue
+pairs and wakes their futures, and then takes its own result if it retired. A `LocalQp` is
+therefore neither `Send` nor `Sync`: it lives on its worker's thread, as thread-per-core
+runtimes want (tokio's `current_thread` runtime or `LocalSet`, or a plain `block_on`).
+`QueuePairBuilder::build_on` creates a queue pair on a given worker; `build` gives it a worker
+of its own, sized to its queues, which is the standalone queue pair of the first version.
+`SharedQp` is such a worker of one queue pair behind a `Mutex`: one lock covers the ring, the
+hardware queue and the CQ, so they can never disagree. The trade-off is that every thread
+using it takes the lock, and its CQ serves that one queue pair: threads that each drive queue
+pairs of their own do better with a worker each.
+
+**Refused doorbells.** When the device refuses a doorbell (`ibv_wr_complete` fails), none of
+the requests written since the last doorbell was posted. A request with an owner retires at
+once with a flush error, which its owner takes with its buffers (the event loop gets it at
+once too); one without an owner releases its buffers and is reported as its queue's detached
+error. Sequence numbers are never reused, so no owner can take another request's result. The
+ring keeps the refused requests in its window with no WQEs, and their WQE numbers, which the
+NIC never saw, go to the next requests. A refused doorbell may take with it the signaled
+request that would have retired the unsignaled ones before it; those retire with the next
+signaled request of their queue.
+
+Device capabilities (queue depths, scatter/gather elements, inline size, CQ size) are checked
+when objects are created, not on every post. What a WQE asks of its queue pair is checked
+against the hardware queue pair as well (READ and atomics only on RC, atomics only where the
+device has them): the synchronous API is safe, and a queue pair key could name another queue
+pair than the one its type was made for.
 
 Connection setup keeps the typestate and builder pattern of the first version. Once a queue
 pair is ready to send, its run-time state is "ready, or in error and not yet noticed", as M
@@ -328,7 +387,7 @@ says.
 | flushed completions looked up as slab keys | flushes complete their slots in order |
 | `remote_memory()` exposes a whole region while the program writes it | exposure takes the buffer away from the program and registers exactly it |
 | CQ size unrelated to queue depths | attachment reserves CQ capacity |
-| everything `Send + Sync` | `LocalQp` and per-thread CQs, `SharedQp` when sharing is needed |
+| everything `Send + Sync`, a CQ per queue pair | a worker per thread: one CQ shared by its queue pairs, no locks; `SharedQp` when sharing is needed |
 | `unsafe` spread through the crate | all `unsafe` in `safeverbs-core`, the rest `forbid(unsafe_code)` |
 | no statement of the guarantee | Theorem 1 over M and A, checked by Verus |
 
@@ -337,12 +396,18 @@ async style of the API carry over.
 
 ## 12. Open questions
 
-- Which thread owns a CQ when a `LocalQp` moves between threads: a `LocalQp` is `Send`, but
-  its CQ is single-threaded. The first core answers it the simplest way: each queue pair owns
-  a send CQ and a receive CQ sized to its queues, so the queue pair and its CQs are one
-  `Send + !Sync` value that moves as a unit, and attachment reserves the whole CQ. Sharing a
-  CQ between queue pairs would take a group that owns the CQ and the queue pairs attached to
-  it and moves as a unit in the same way.
+- Which thread owns a CQ shared by several queue pairs is answered by the worker (section
+  10): a group that owns the CQ and the queue pairs attached to it, reserves each queue pair's
+  depths on attach, routes completions by `wr_id` and moves between threads as one unit.
+- A queue pair is destroyed with work in flight, and its buffers released after: M's
+  `destroy_qp` asks for empty queues first. Draining before destroying (to the error state,
+  then polling until every request retired) would match M, at the price of waiting for the
+  NIC when a queue pair or worker is dropped.
+- Theorem 1 for the worker: M is one state for the whole device, while each worker is one
+  thread's. The proof needs each worker's share of M (a tokenized M, or a token per worker
+  over its CQ and queue pairs), next to the lease tokens of the buffers.
+- Whether a request should say who takes its result (the event loop or its owner), so that
+  futures and the event loop can share a worker.
 - Out-of-order transports and SRQs need their own completion rules in M before the core
   supports them.
 - How much of the ring's state the trusted wrappers expose: the less they know, the smaller

@@ -16,9 +16,10 @@
 //! the start, and the doorbell posts that list.
 //!
 //! The NIC's state is a ghost token, [`NicToken`], that only these wrappers
-//! change and that nothing else can make. The queue pair is not verified
-//! yet, so nothing calls them so far: they are the interface it will be
-//! verified against (see `docs/verification.md`, "What remains").
+//! change and that nothing else can make. The worker and its queue pairs
+//! are not verified yet, so nothing calls them so far: they are the
+//! interface those will be verified against (see `docs/verification.md`,
+//! "Stated, not yet proved").
 //
 // The imports are used by ghost code too.
 #![allow(unused_imports)]
