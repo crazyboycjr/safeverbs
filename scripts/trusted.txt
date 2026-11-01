@@ -9,14 +9,47 @@ crates/safeverbs-core/src/ring.rs wake
 crates/safeverbs-core/src/ring.rs will_wake
 crates/safeverbs-core/src/ring.rs clone_waker
 
-# The exec types the verbs' contracts read: their definitions, as written (Error opaque).
+# The exec types the verbs' contracts read: their definitions, as written.
 crates/safeverbs-core/src/trusted.rs ExSge
 crates/safeverbs-core/src/trusted.rs ExRemoteBuf
 crates/safeverbs-core/src/trusted.rs ExWrOp
+crates/safeverbs-core/src/trusted.rs ExQpCaps
+crates/safeverbs-core/src/trusted.rs ExDeviceCaps
+crates/safeverbs-core/src/trusted.rs ExQpType
 crates/safeverbs-core/src/trusted.rs ExError
+crates/safeverbs-core/src/trusted.rs ExBufError
+# Types only the device or buf.rs reads: opaque.
+crates/safeverbs-core/src/trusted.rs ExConnectAttr
+crates/safeverbs-core/src/trusted.rs ExEndpoint
+crates/safeverbs-core/src/trusted.rs ExPd
+crates/safeverbs-core/src/trusted.rs ExPart
+crates/safeverbs-core/src/trusted.rs ExLeases
 # The NIC traits, declared without specifications (the wrappers carry them).
+crates/safeverbs-core/src/trusted.rs ExNic
 crates/safeverbs-core/src/trusted.rs ExNicQp
 crates/safeverbs-core/src/trusted.rs ExNicCq
+# The control path, each with its contract from M (create_cq makes a worker's token).
+crates/safeverbs-core/src/trusted.rs device_caps
+crates/safeverbs-core/src/trusted.rs create_cq
+crates/safeverbs-core/src/trusted.rs alloc_domain
+crates/safeverbs-core/src/trusted.rs create_qp
+crates/safeverbs-core/src/trusted.rs connect
+crates/safeverbs-core/src/trusted.rs to_error
+crates/safeverbs-core/src/trusted.rs destroy_qp
+crates/safeverbs-core/src/trusted.rs destroy_cq
+# Facts of no meaning in M, and the panic of a bad key.
+crates/safeverbs-core/src/trusted.rs qp_num_of
+crates/safeverbs-core/src/trusted.rs qp_lock_free
+crates/safeverbs-core/src/trusted.rs no_qp
+# The buffer boundary (buf.rs is not verified yet): a part's fields, its lease's promise.
+crates/safeverbs-core/src/trusted.rs pd_id_of
+crates/safeverbs-core/src/trusted.rs part_sge_of
+crates/safeverbs-core/src/trusted.rs part_pd_of
+crates/safeverbs-core/src/trusted.rs part_writable_of
+crates/safeverbs-core/src/trusted.rs registered
+crates/safeverbs-core/src/trusted.rs registered_all
+crates/safeverbs-core/src/trusted.rs no_leases
+crates/safeverbs-core/src/trusted.rs keep_lease
 # The verbs of the data path, each with its contract from M; their bodies call the NIC.
 crates/safeverbs-core/src/trusted.rs start
 crates/safeverbs-core/src/trusted.rs post
