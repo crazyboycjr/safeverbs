@@ -23,7 +23,10 @@
 //!     └──────────────────────────────┴──────────────────────┴──────────────┘
 //! ```
 //!
-//! *Staged* requests have their WQEs written but the doorbell not rung;
+//! *Staged* requests have their WQEs written but the doorbell not rung
+//! (the WQEs of a batch or a sink before its flush); they are not posted
+//! yet, and enter the abstract machine A and the NIC model M of
+//! `crates/safeverbs-spec` only when committed;
 //! [`Ring::commit`] rings it (all staged requests at once), [`Ring::abort`]
 //! discards them. *Retired* requests have their outcome and still hold their
 //! buffer leases until the owner takes them ([`Ring::take`]). A *detached*

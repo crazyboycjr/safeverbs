@@ -8,6 +8,8 @@ members = [
     # "examples/perftest",
     # "examples/uchan",
 ]
+# Its own workspace, so that it verifies on a plain clone (scripts/verify.sh).
+exclude = ["crates/safeverbs-spec"]
 
 [workspace.package]
 version = "0.1.0"

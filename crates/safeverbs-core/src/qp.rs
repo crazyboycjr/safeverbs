@@ -6,11 +6,19 @@
 //! This is the layer the futures of `safeverbs` are built on, and the one
 //! for callers who drive their own loop.
 //!
-//! Each QP has a send CQ and a receive CQ of its own, sized to its queues,
+//! Each QP owns a send CQ and a receive CQ of its own, sized to its queues,
 //! so a CQ can never overrun: every WQE in flight produces at most one
 //! completion and the rings never let more WQEs be in flight than the
-//! queues hold. (CQs shared by several QPs would reserve each QP's depth
-//! when it attaches; that, and the demultiplexing it needs, is future work.)
+//! queues hold (the CQ's whole capacity is reserved by its one QP).
+//!
+//! Owning its CQs also answers which thread polls a single-threaded CQ: the
+//! QP and its CQs are one value, `Send` but not `Sync`, that moves between
+//! threads as a unit, so a CQ created `IBV_CREATE_CQ_ATTR_SINGLE_THREADED`
+//! is only ever polled by the thread that holds its QP (or under the lock
+//! of a `SharedQp`). A CQ shared by several QPs would be the next step: a
+//! group owning the CQ and the QPs attached to it, reserving each QP's
+//! depth on attach and demultiplexing completions by QP number
+//! (`Wc::qp_num`), moving between threads as one unit in the same way.
 
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;

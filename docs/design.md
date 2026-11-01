@@ -338,8 +338,11 @@ async style of the API carry over.
 ## 12. Open questions
 
 - Which thread owns a CQ when a `LocalQp` moves between threads: a `LocalQp` is `Send`, but
-  its CQ is single-threaded. One answer is a group that owns a CQ and the queue pairs
-  attached to it and moves as a unit.
+  its CQ is single-threaded. The first core answers it the simplest way: each queue pair owns
+  a send CQ and a receive CQ sized to its queues, so the queue pair and its CQs are one
+  `Send + !Sync` value that moves as a unit, and attachment reserves the whole CQ. Sharing a
+  CQ between queue pairs would take a group that owns the CQ and the queue pairs attached to
+  it and moves as a unit in the same way.
 - Out-of-order transports and SRQs need their own completion rules in M before the core
   supports them.
 - How much of the ring's state the trusted wrappers expose: the less they know, the smaller
