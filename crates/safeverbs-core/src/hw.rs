@@ -1969,8 +1969,6 @@ impl<N: Device> Hw<N> {
             start.qps@[index] is Some,
             t.same_worker(&t0),
             t.same_writing_but(&t0, start.qps@[index]->0.id()),
-            !t.started(start.qps@[index]->0.id()),
-            t.written(start.qps@[index]->0.id()).len() == 0,
             self.qps@.len() == start.qps@.len(),
             forall|i: int| 0 <= i < self.qps@.len() && i != index ==> #[trigger] self.qps@[i] == start.qps@[i],
             self.qps@[index] is Some,
@@ -2027,13 +2025,16 @@ impl<N: Device> Hw<N> {
         }
         assert forall|p: QpId| #[trigger] writes(t, p) implies exists|i: int|
             0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
-            assert(p != q);
-            assert(t.started(p) == t0.started(p));
-            assert(t.written(p) == t0.written(p));
-            assert(writes(t0, p));
-            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
-            if i != index {
-                assert(self.qps@[i] == start.qps@[i]);
+            if p == q {
+                assert(self.qps@[index] is Some);
+            } else {
+                assert(t.started(p) == t0.started(p));
+                assert(t.written(p) == t0.written(p));
+                assert(writes(t0, p));
+                let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+                if i != index {
+                    assert(self.qps@[i] == start.qps@[i]);
+                }
             }
         }
         assert forall|a: nat| #[trigger] t.share().owns.contains(t.name(a)) by {
@@ -2050,6 +2051,176 @@ impl<N: Device> Hw<N> {
             implies w.qp != #[trigger] t.name(k) by {
             assert(t.name(k) == t0.name(k));
         }
+    }
+}
+
+// =============================================================================
+// Requests
+
+/// The bytes of a scatter/gather list, as M counts them.
+spec fn sges_len(sges: Seq<Sge>) -> nat {
+    total_len(sges.map_values(|sge: Sge| sge_model(sge)))
+}
+
+/// M accepts a held WQE once its parts' regions are registered.
+proof fn lemma_held_wr_ok<N: Device>(h: Held, parts: Seq<Part<N>>, index: u16, num: int, m: Nic::State, attr: QpAttr, pd_id: u64, signaled: bool)
+    requires
+        held_ok(h, parts, index, num, attr, pd_id, m.caps.max_msg),
+        forall|j: int|
+            0 <= j < parts.len() ==> m.registered(attr.pd, sge_model(part_sge(#[trigger] parts[j])), part_writable(parts[j])),
+    ensures
+        m.send_wr_ok(attr, held_wr(h, signaled)),
+{
+    let wr = held_wr(h, signaled);
+    let sges = h.sges@.take(h.n as int);
+    assert forall|i: int| 0 <= i < wr.sges.len() implies m.registered(attr.pd, #[trigger] wr.sges[i], wr.opcode.writes_local()) by {
+        assert(wr.sges[i] == sge_model(sges[i]));
+        assert(sges[i] == h.sges@[i]);
+        assert(h.sges@[i] == part_sge(parts[i]));
+        assert(m.registered(attr.pd, sge_model(part_sge(parts[i])), part_writable(parts[i])));
+    }
+}
+
+impl<N: Device> Hw<N> {
+    /// Whether QP `index` has a request open (between its first WQE and
+    /// [`Hw::close`]).
+    pub fn is_open(&self, index: usize) -> bool
+        requires
+            self.inv(),
+    {
+        if index >= self.qps.len() {
+            return false;
+        }
+        proof {
+            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+        }
+        match &self.qps[index] {
+            Some(e) => e.send.is_open(),
+            None => false,
+        }
+    }
+
+    /// Closes QP `index`'s open request: stages it in the ring and writes its
+    /// last WQE, signaled if `signal` or if the ring says so; `detached` if
+    /// nobody will take it back. Returns its sequence number, `None` without
+    /// an open request. It goes out at the next doorbell.
+    pub fn close(&mut self, index: usize, signal: bool, detached: bool) -> (r: Option<RingSeq>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        if index >= self.qps.len() {
+            return None;
+        }
+        proof {
+            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+        }
+        let open = match &self.qps[index] {
+            Some(e) => e.send.is_open(),
+            None => false,
+        };
+        if !open {
+            return None;
+        }
+        let ghost start = *self;
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        let ghost sh = t0.share();
+        // The held WQE's regions are registered (its parts' leases say so).
+        match &self.qps[index] {
+            Some(e) => registered_all(&e.held_parts, &self.pd, Tracked(self.token.borrow_mut())),
+            None => {},
+        }
+        let ghost t1 = self.token@;
+        let ghost m1 = t1.nic();
+        proof {
+            start.lemma_rely(t0, m0, m1);
+            start.lemma_same_token(t0, t1, m1);
+            self.lemma_inv_fields(&start, t1, m1);
+        }
+        let ghost mid1 = *self;
+        let r = match &mut self.qps[index] {
+            Some(e) => {
+                let ghost q = e.id@;
+                let ghost e1 = *e;
+                proof {
+                    assert(mid1.entry_ok(index as int, t1, m1));
+                }
+                let h = match e.held {
+                    Some(h) => h,
+                    None => {
+                        proof { assert(false); }
+                        return None;
+                    },
+                };
+                while e.held_parts.len() > 0
+                    invariant
+                        e.open_leases == e.open_leases,
+                    decreases e.held_parts@.len(),
+                {
+                    match e.held_parts.pop() {
+                        Some(part) => keep_lease(&mut e.open_leases, part),
+                        None => {},
+                    }
+                }
+                let mut leases = no_leases();
+                core::mem::swap(&mut leases, &mut e.open_leases);
+                let bytes = if e.open_bytes > u32::MAX as u64 {
+                    u32::MAX
+                } else {
+                    e.open_bytes as u32
+                };
+                let implied = Wc::success(opcode_of(&h.op), bytes);
+                proof {
+                    e1.send.lemma_wqes();
+                }
+                let (seq, signaled) = e.send.end(signal, detached, implied, leases);
+                if !e.started {
+                    crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                    e.started = true;
+                }
+                let sges = vstd::slice::slice_subrange(h.sges.as_slice(), 0, h.n);
+                post(&mut e.hw, h.wr_id, signaled, &h.op, sges, Ghost(q), Tracked(self.token.borrow_mut()));
+                e.held = None;
+                e.open_bytes = 0;
+                proof {
+                    assert(sges@ == h.sges@.take(h.n as int));
+                    lemma_held_wr_ok(h, e1.held_parts@, index as u16, e1.send.spec_wqe_committed() + t1.written(q).len(), m1, m1.qps[q].attr, e1.pd_id@, signaled);
+                }
+                Some(seq)
+            },
+            None => None,
+        };
+        proof {
+            let t = self.token@;
+            let q = mid1.qps@[index as int]->0.id();
+            let e = self.qps@[index as int]->0;
+            let e1 = mid1.qps@[index as int]->0;
+            assert(mid1.entry_ok(index as int, t1, m1));
+            let written = t.written(q);
+            let attr = m1.qps[q].attr;
+            assert forall|j: int| 0 <= j < written.len() implies m1.send_wr_ok(attr, #[trigger] written[j]) by {
+                if j < t1.written(q).len() {
+                    assert(written[j] == t1.written(q)[j]);
+                }
+            }
+            assert(writing_ok(e.send, index as u16, m1, attr, t.started(q), written, false));
+            assert(self.entry_ok(index as int, t, m1));
+            self.lemma_commit_frame(&mid1, t1, t, m1, m1, index as int);
+        }
+        r
+    }
+}
+
+/// The opcode a successful completion of `op` reports.
+fn opcode_of(op: &WrOp) -> Opcode {
+    match op {
+        WrOp::Send | WrOp::SendImm(_) => Opcode::SEND,
+        WrOp::Write(_) | WrOp::WriteImm(..) => Opcode::RDMA_WRITE,
+        WrOp::Read(_) => Opcode::RDMA_READ,
+        WrOp::FetchAdd { .. } => Opcode::FETCH_ADD,
+        WrOp::CompareSwap { .. } => Opcode::COMP_SWAP,
     }
 }
 
