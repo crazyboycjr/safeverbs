@@ -2,3 +2,6 @@
 	path = rust-ibverbs
 	url = https://github.com/crazyboycjr/rust-ibverbs.git
 	branch = safeverbs
+[submodule "crates/safeverbs-sys/vendor/rdma-core"]
+	path = crates/safeverbs-sys/vendor/rdma-core
+	url = https://github.com/linux-rdma/rdma-core.git

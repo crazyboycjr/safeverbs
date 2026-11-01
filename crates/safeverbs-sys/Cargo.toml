@@ -1,0 +1,25 @@
+[package]
+name = "safeverbs-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Raw FFI bindings for libibverbs and mlx5dv (rdma-core)"
+license = "BSD-3-Clause"
+repository = "https://github.com/crazyboycjr/safeverbs"
+keywords = ["rdma", "ibverbs", "mlx5", "ffi"]
+categories = ["network-programming", "external-ffi-bindings"]
+build = "build.rs"
+links = "rdma-core"
+
+[features]
+default = ["vendored"]
+## Build the rdma-core submodule (pinned) and link against it. Without this
+## feature the system's libibverbs and libmlx5 are found through pkg-config.
+vendored = ["dep:cmake"]
+
+[dependencies]
+
+[build-dependencies]
+bindgen = { version = "0.73.2", features = ["experimental"] }
+cc = "1.10.0"
+cmake = { version = "0.1.58", optional = true }
+pkg-config = "0.3.34"
