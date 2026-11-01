@@ -3,7 +3,11 @@ __SafeVerbs__ implements a memory-safe RDMA API in Rust. It leverages Rust’s t
 
 - 🛡️ __Memory-Safe__: Memory the NIC uses belongs to the work request until it completes, memory a peer may write is never readable as Rust values, and queues never overflow. No `unsafe` in your code, and none in the public crate either.
 - ✨ __User-Friendly__: Typestate connection setup with a builder, registered buffers that behave like `Box<[T]>` and `bytes::Bytes`, and every operation an `async` future, a `Sink` or a `Stream`.
-- 🚀 __High Performance__: Unsignaled work requests, batches with one doorbell and one completion, and repeated sends of the same buffer are safe API with no runtime checks on the data path; each thread runs a worker, one completion queue shared by all of its queue pairs, with no locks.
+- 🚀 __High Performance__: Unsignaled work requests, batches with one doorbell and one completion, and repeated sends of the same buffer are safe API without interval-tree checks. Each thread runs a worker with one completion queue shared by all of its queue pairs; supported providers can omit their locks. Device limits and posting arguments are checked before submission.
+
+This branch is undergoing formal verification. The completion ring and hardware-facing
+worker have checked component proofs; the complete library refinement theorem and
+buffer permission integration remain unfinished. See [the exact proof boundary](docs/verification.md).
 
 ```rust
 let mut buf = pd.alloc::<u8>(1 << 20)?;   // BufMut: unique, writable
