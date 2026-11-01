@@ -28,8 +28,18 @@
 //! The unverified worker (`crate::worker`) drives a `Hw` through its public
 //! methods only; each requires and keeps the invariant.
 //
-// The imports are used by ghost code too; `global` erases to a block.
+// The imports are used by ghost code too; `global` erases to a block. The
+// code keeps the plain forms the proofs reason about (explicit matches,
+// lengths, loops).
 #![allow(unused_imports, unused_braces)]
+#![allow(
+    clippy::single_match,
+    clippy::len_zero,
+    clippy::manual_map,
+    clippy::explicit_counter_loop,
+    clippy::question_mark,
+    clippy::needless_return
+)]
 
 use safeverbs_spec::nic::*;
 use safeverbs_spec::refinement::*;
@@ -99,8 +109,10 @@ pub struct HwQp<N: Device> {
     /// out.
     dirty: bool,
     /// M's name of the QP.
+    #[allow(dead_code)]
     id: Ghost<QpId>,
     /// The protection domain's number ([`Pd::id`]).
+    #[allow(dead_code)]
     pd_id: Ghost<u64>,
     /// The WQE the open request holds back until it knows whether it is
     /// its last (so that the last can be written signaled), with its parts.
@@ -787,7 +799,7 @@ impl<N: Device> Hw<N> {
         } else {
             self.qps.set(index, Some(entry));
         }
-        self.reserved = self.reserved + need as u32;
+        self.reserved += need as u32;
         self.next_name = Ghost(self.next_name@ + 1);
         proof {
             let t = self.token@;
@@ -1635,7 +1647,7 @@ impl<N: Device> Hw<N> {
                     proof {
                         assert(wqe == e.seq);
                     }
-                    let known = qp_entry.recv.complete(wqe, *wc);
+                    let _known = qp_entry.recv.complete(wqe, *wc);
                     changed = qp_entry.recv.retired() != retired;
                     proof {
                         assert(qp_entry.send == e0.send);
@@ -1649,7 +1661,7 @@ impl<N: Device> Hw<N> {
                     proof {
                         assert(wqe == e.seq);
                     }
-                    let known = qp_entry.send.complete(wqe, *wc);
+                    let _known = qp_entry.send.complete(wqe, *wc);
                     changed = qp_entry.send.retired() != retired;
                     proof {
                         assert(qp_entry.recv == e0.recv);
@@ -2538,7 +2550,7 @@ impl<N: Device> Hw<N> {
                 assert(sges@.take(i as int) =~= before.take(i as int));
                 lemma_sges_len_step(sges@, i as int);
             }
-            total = total + sge.length as u64;
+            total += sge.length as u64;
             if total > limit {
                 bad = Some(Error::TooLong { len: total, max: limit });
                 break;
@@ -3442,7 +3454,7 @@ impl<N: Device> Hw<N> {
         // The hardware QP first; the rest of the entry, the rings with the
         // buffers, goes when this returns, once the NIC holds none of them.
         destroy_qp(entry.hw, Ghost(q), Tracked(self.token.borrow_mut()));
-        self.reserved = self.reserved - need;
+        self.reserved -= need;
         proof {
             let t = self.token@;
             let n = t.nic();
@@ -3502,9 +3514,62 @@ impl<N: Device> Hw<N> {
                 }
             }
         }
-        let Hw { cq, token, .. } = self;
-        destroy_cq(cq, token);
+        let Hw { cq: the_cq, token: the_token, .. } = self;
+        destroy_cq(the_cq, the_token);
         Ok(())
+    }
+}
+
+impl<N: Device> Hw<N> {
+    /// Drops the parts gathered on QP `index` for a WQE that will not be
+    /// pushed.
+    #[verifier::spinoff_prover]
+    pub fn drop_gathered(&mut self, index: usize)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        if index >= self.qps.len() {
+            return;
+        }
+        let ghost start = *self;
+        let ghost t = self.token@;
+        let ghost m = t.nic();
+        proof {
+            assert(start.entry_ok(index as int, t, m));
+        }
+        match &mut self.qps[index] {
+            Some(e) => {
+                Self::give_back(&mut e.building);
+            },
+            None => {},
+        }
+        proof {
+            if start.qps@[index as int] is Some {
+                assert(self.entry_ok(index as int, t, m));
+                self.lemma_touch_one(&start, t, m, m, index as int);
+            } else {
+                assert(self.qps@ =~= start.qps@);
+                self.lemma_inv_fields(&start, t, m);
+            }
+        }
+    }
+
+    /// Waits until a new send request of at least one WQE fits on QP
+    /// `index` ([`Hw::make_send_room`]).
+    pub fn make_room(&mut self, index: usize) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        if index >= self.qps.len() || self.qps[index].is_none() {
+            no_qp(index);
+            return Err(Error::Invalid("no such QP"));
+        }
+        self.make_send_room(index)
     }
 }
 
