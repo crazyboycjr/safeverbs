@@ -375,9 +375,9 @@ state_machine! {
 
         // What the NIC may access (S1 is stated against these).
 
-        /// The NIC may read byte `a`: it lies in a buffer of a posted, unretired send, RDMA
-        /// write or (as the source) anything but an RDMA read, unless inline; or the peer
-        /// holds the rkey of a region allowing remote read.
+        /// The NIC may read byte `a`: it lies in a buffer of a posted, unretired send WQE
+        /// that the NIC reads (a send, or the source of an RDMA write) and that is not
+        /// inline; or in a region allowing remote read, whose rkey the peer may hold.
         pub open spec fn nic_may_read(self, a: int) -> bool {
             ||| exists|q: QpId, k: int| #![trigger self.qps[q].sq[k]] self.qps.contains_key(q)
                     && 0 <= k < self.qps[q].sq.len() && {
@@ -545,7 +545,7 @@ state_machine! {
 
         /// Polling one CQE (`ibv_poll_cq` returning it). It retires its WQE and every earlier
         /// one of the same queue: those executed without a CQE, which means they were
-        /// unsignaled and succeeded (`lemma_retired_unsignaled_succeeded`).
+        /// unsignaled and succeeded (`lemma_poll`).
         transition! {
             poll_cq(c: CqId) {
                 require pre.cqs.contains_key(c);
@@ -821,17 +821,17 @@ verus! {
 // compile against. These wrappers carry them across (their meaning comes along in Verus's
 // exported definitions).
 
-/// `s` satisfies the invariants of Nic (`Nic::State::invariant`).
+/// `s` satisfies M's invariants (`Nic::State::invariant`).
 pub open spec fn nic_inv(s: Nic::State) -> bool {
     s.invariant()
 }
 
-/// `s` is a start state of Nic.
+/// `s` is a start state of M.
 pub open spec fn nic_init(s: Nic::State) -> bool {
     Nic::State::init(s)
 }
 
-/// `post` follows from `pre` by one step of Nic, any step.
+/// `post` follows from `pre` by one step of M, any step.
 pub open spec fn nic_next(pre: Nic::State, post: Nic::State) -> bool {
     Nic::State::next(pre, post)
 }
@@ -888,7 +888,7 @@ pub open spec fn is_verb(step: Nic::Step) -> bool {
     !is_nic_step(step) && !(step is dummy_to_use_type_params)
 }
 
-/// A step by `step` is a step of Nic.
+/// A step by `step` is a step of M.
 pub proof fn lemma_nic_step_is_next(pre: Nic::State, post: Nic::State, step: Nic::Step)
     requires
         nic_step(pre, post, step),

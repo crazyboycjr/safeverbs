@@ -493,17 +493,17 @@ verus! {
 // compile against. These wrappers carry them across (their meaning comes along in Verus's
 // exported definitions).
 
-/// `s` satisfies the invariants of Abs (`Abs::State::invariant`).
+/// `s` satisfies A's invariants (`Abs::State::invariant`).
 pub open spec fn abs_inv(s: Abs::State) -> bool {
     s.invariant()
 }
 
-/// `s` is a start state of Abs.
+/// `s` is a start state of A.
 pub open spec fn abs_init(s: Abs::State) -> bool {
     Abs::State::init(s)
 }
 
-/// `post` follows from `pre` by one step of Abs, any step.
+/// `post` follows from `pre` by one step of A, any step.
 pub open spec fn abs_next(pre: Abs::State, post: Abs::State) -> bool {
     Abs::State::next(pre, post)
 }
@@ -530,7 +530,7 @@ pub open spec fn abs_step(pre: Abs::State, post: Abs::State, step: Abs::Step) ->
     }
 }
 
-/// A step by `step` is a step of Abs.
+/// A step by `step` is a step of A.
 pub proof fn lemma_abs_step_is_next(pre: Abs::State, post: Abs::State, step: Abs::Step)
     requires
         abs_step(pre, post, step),

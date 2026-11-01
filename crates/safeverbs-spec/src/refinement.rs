@@ -8,9 +8,11 @@
 //!
 //! **Why `nic()` is honest.** The core's view of the NIC is a ghost token that only the
 //! trusted verbs wrappers change. Each wrapper's contract is M: it *requires* the verb's
-//! precondition (`Nic::State::post_send_enabled(..)` and so on) and *ensures* that the token
-//! moved by the NIC's own steps and then by that verb. Verus checks every call site against
-//! the `requires`; that is S2. Polling reports a CQE exactly as M's `poll_cq` describes it.
+//! precondition (`nic_enabled(token, Nic::Step::post_send(..))` and so on) and *ensures* that
+//! the token moved by the NIC's own steps ([`nic_env_reaches`]) and then by that verb
+//! (`nic_step`). Verus checks every call site against the `requires`; that is S2.
+//! [`lemma_nic_env_keeps_enabled`] shows the contract is consistent. Polling reports a CQE
+//! exactly as M's `poll_cq` describes it.
 //! The wrappers' bodies call rdma-core and are trusted, not verified: they are where M meets
 //! the real NIC (see `docs/verification.md`).
 //!
