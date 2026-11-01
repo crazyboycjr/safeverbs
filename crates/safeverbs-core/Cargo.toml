@@ -1,0 +1,22 @@
+[package]
+name = "safeverbs-core"
+description = "The unsafe core of safeverbs: verbs resources, registered memory and the completion ring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["rdma", "ibverbs", "verbs"]
+categories = ["network-programming"]
+# Not a native library: the key only passes rdma-core's library directory on
+# to dependents (`DEP_SAFEVERBS_CORE_LIB_DIR`), see build.rs.
+links = "safeverbs-core"
+
+[dependencies]
+safeverbs-sys = { version = "0.1.0", path = "../safeverbs-sys" }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+zerocopy = "0.8.63"
+
+[features]
+## Serialize the values peers exchange (endpoints, remote buffers).
+serde = ["dep:serde"]
+
