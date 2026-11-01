@@ -1,0 +1,10 @@
+# The trusted items of the verified core: every item of crates/safeverbs-core that Verus
+# takes on trust (`external_body`, an external specification) is listed here, one per line
+# as `<file> <item>`, and scripts/verify.sh refuses any other. docs/verification.md (section
+# "Trusted computing base") says why each is trusted.
+
+# Wakers: the standard library's, opaque to the proofs.
+crates/safeverbs-core/src/ring.rs ExWaker
+crates/safeverbs-core/src/ring.rs wake
+crates/safeverbs-core/src/ring.rs will_wake
+crates/safeverbs-core/src/ring.rs clone_waker
