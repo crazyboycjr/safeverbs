@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use futures::task::noop_waker;
 use futures::{SinkExt, StreamExt};
+use safeverbs::sync::{ConnectAttr, QpCaps, QpKey, Queue, Worker, WrOp};
 use safeverbs::{
-    Buf, Context, Error, LocalQp, Nic, Opcode, Pd, QueuePairBuilder, RC, Status, Transport, UC,
-    WriteOp,
+    Access, Buf, Context, Error, LocalQp, LocalWorker, Nic, Opcode, Pd, QueuePairBuilder, RC,
+    Status, Transport, UC, WriteOp,
 };
 
 /// How long any one wait may take.
@@ -387,4 +388,225 @@ fn ring_buf_streams_messages() {
         rx.repost(buf).unwrap();
     }
     assert_eq!(ring.in_use(), 0);
+}
+
+/// The attributes that connect a QP of the test device, as the builder's
+/// defaults have them.
+fn connect_attr(ctx: &Context) -> ConnectAttr {
+    let rd = ctx.nic().caps().max_qp_rd_atom.clamp(1, 16) as u8;
+    ConnectAttr {
+        port: 1,
+        access: Access::LOCAL_WRITE | Access::REMOTE_WRITE | Access::REMOTE_READ,
+        path_mtu: ctx.port(1).unwrap().active_mtu,
+        rq_psn: 0,
+        sq_psn: 0,
+        gid_index: gid_index(ctx),
+        traffic_class: 0,
+        timeout: 14,
+        retry_count: 7,
+        rnr_retry: 7,
+        min_rnr_timer: 12,
+        max_rd_atomic: rd,
+        max_dest_rd_atomic: rd,
+    }
+}
+
+fn gid_index(ctx: &Context) -> Option<u8> {
+    match std::env::var("SAFEVERBS_TEST_GID_INDEX") {
+        Ok(i) => Some(i.parse().expect("SAFEVERBS_TEST_GID_INDEX")),
+        Err(_) => ctx.default_gid_index(1).unwrap(),
+    }
+}
+
+/// Four QPs on one worker, connected pairwise, driven by the event loop:
+/// SENDs into posted receives, WRITEs and READs on every QP at once, each
+/// completion handed to the loop with its QP and buffers, which repost and
+/// post more.
+#[test]
+fn event_loop_on_four_qps_of_one_worker() {
+    let Some(ctx) = device() else { return };
+    let pd = ctx.alloc_pd().unwrap();
+    let depth = 32;
+    let caps = QpCaps {
+        max_send_wr: depth,
+        max_recv_wr: depth,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: 0,
+    };
+    let mut w = Worker::new(&pd, 4 * 2 * depth).unwrap();
+    let qps: Vec<QpKey<RC>> = (0..4).map(|_| w.create_qp(caps, 8).unwrap()).collect();
+    let attr = connect_attr(&ctx);
+    let gid = gid_index(&ctx);
+    for pair in qps.chunks(2) {
+        let ea = w.endpoint(pair[0], 1, gid).unwrap();
+        let eb = w.endpoint(pair[1], 1, gid).unwrap();
+        w.connect(pair[0], &attr, &eb).unwrap();
+        w.connect(pair[1], &attr, &ea).unwrap();
+    }
+    // What each QP sends, what its peer exposes for it to read, and where
+    // its peer lets it write.
+    let srcs: Vec<Buf<u8>> = (0..4).map(|i| filled(&pd, 256, i as u8)).collect();
+    let readable: Vec<_> = (0..4)
+        .map(|i| {
+            let mut b = pd.alloc::<u8>(256).unwrap();
+            b.copy_from_slice(&filled(&pd, 256, 100 + i as u8));
+            b.expose().unwrap()
+        })
+        .collect();
+    let writable: Vec<_> = (0..4)
+        .map(|_| pd.alloc::<u8>(256).unwrap().expose().unwrap())
+        .collect();
+    for &qp in &qps {
+        for _ in 0..depth / 2 {
+            w.post_recv(qp, pd.alloc::<u8>(256).unwrap().into_part(), false)
+                .unwrap();
+        }
+    }
+    const OPS: usize = 300;
+    let mut posted = [0usize; 4];
+    let mut done = [0usize; 4];
+    let mut received = [0usize; 4];
+    let post = |w: &mut Worker, i: usize, posted: &mut [usize; 4]| {
+        let qp = qps[i];
+        let peer = i ^ 1;
+        let mut req = w.request(qp);
+        let len = 1 + posted[i] % 256;
+        let op = match posted[i] % 3 {
+            0 => req.push(WrOp::Send, srcs[i].slice(..len).into_part()),
+            1 => req.push(
+                WrOp::Write(writable[peer].remote()),
+                srcs[i].slice(..).into_part(),
+            ),
+            _ => req.push(
+                WrOp::Read(readable[peer].remote().slice(..len as u64)),
+                pd.alloc::<u8>(len).unwrap().into_part(),
+            ),
+        };
+        op.unwrap();
+        req.submit(true).unwrap().unwrap();
+        posted[i] += 1;
+    };
+    // A few requests in flight on every QP to start.
+    for i in 0..4 {
+        for _ in 0..4 {
+            post(&mut w, i, &mut posted);
+        }
+    }
+    let start = Instant::now();
+    while done.iter().any(|&d| d < OPS) || received.iter().any(|&r| r < OPS.div_ceil(3)) {
+        w.poll(|w, c| {
+            let i = qps.iter().position(|q| q.index() == c.qp).unwrap();
+            assert!(c.wc.is_ok(), "{:?}", c.wc);
+            match c.queue {
+                Queue::Recv => {
+                    let buf = c.leases.into_buf_mut::<u8>().unwrap();
+                    let len = c.wc.byte_len as usize;
+                    assert_eq!(&buf[..len], &srcs[i ^ 1][..len], "from its peer");
+                    received[i] += 1;
+                    w.post_recv(qps[i], buf.into_part(), false).unwrap();
+                }
+                Queue::Send => {
+                    if c.wc.opcode == Opcode::RDMA_READ {
+                        let buf = c.leases.into_buf_mut::<u8>().unwrap();
+                        let len = buf.len();
+                        assert_eq!(&buf[..], &filled(&pd, 256, 100 + (i ^ 1) as u8)[..len]);
+                    }
+                    done[i] += 1;
+                    if posted[i] < OPS {
+                        post(w, i, &mut posted);
+                    }
+                }
+            }
+        });
+        assert!(
+            start.elapsed() < DEADLINE,
+            "timed out: {done:?} {received:?}"
+        );
+    }
+    assert_eq!(done, [OPS; 4]);
+    for (i, buf) in writable.into_iter().enumerate() {
+        let back = buf.reclaim();
+        assert_eq!(&back[..], &srcs[i ^ 1][..], "written by its peer");
+    }
+}
+
+/// Four QPs on one worker, connected pairwise, with futures: every
+/// future's poll drives the shared CQ for all of them.
+#[test]
+fn futures_on_four_qps_of_one_worker() {
+    let Some(ctx) = device() else { return };
+    let pd = ctx.alloc_pd().unwrap();
+    let worker = LocalWorker::new(&pd, 4 * 2 * 64).unwrap();
+    let build = || {
+        let mut b = QueuePairBuilder::<RC>::new(&pd);
+        b.set_send_depth(64).set_recv_depth(64);
+        if let Some(i) = gid_index(&ctx) {
+            b.set_gid_index(i);
+        }
+        b.build_on(&worker).unwrap()
+    };
+    let mut qps = Vec::new();
+    for _ in 0..2 {
+        let (a, b) = (build(), build());
+        let (ea, eb) = (a.endpoint(), b.endpoint());
+        qps.push(a.handshake(eb).unwrap());
+        qps.push(b.handshake(ea).unwrap());
+    }
+    let readable: Vec<_> = (0..4)
+        .map(|i| {
+            let mut b = pd.alloc::<u8>(4096).unwrap();
+            b.copy_from_slice(&filled(&pd, 4096, i as u8));
+            b.expose().unwrap()
+        })
+        .collect();
+    let dst = pd.alloc::<u8>(4 * 4096).unwrap().expose().unwrap();
+    let mut rxs: Vec<_> = qps
+        .iter()
+        .map(|q| q.receiver((0..8).map(|_| pd.alloc::<u8>(4096).unwrap())))
+        .collect();
+    wait(async {
+        for round in 0..20u8 {
+            let src = filled(&pd, 4096, round);
+            // On every QP at once: a SEND, a WRITE and a READ.
+            let sends: Vec<_> = qps.iter().map(|q| q.send(src.slice(..1000))).collect();
+            let writes: Vec<_> = qps
+                .iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    q.write(
+                        src.clone(),
+                        dst.remote().slice(i as u64 * 4096..(i as u64 + 1) * 4096),
+                    )
+                })
+                .collect();
+            let reads: Vec<_> = qps
+                .iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    q.read(
+                        pd.alloc::<u8>(512).unwrap(),
+                        readable[i ^ 1].remote().slice(..512),
+                    )
+                })
+                .collect();
+            for (i, r) in reads.into_iter().enumerate() {
+                let got = r.await.unwrap();
+                assert_eq!(&got[..], &filled(&pd, 4096, (i ^ 1) as u8)[..512]);
+            }
+            for f in sends.into_iter().chain(writes) {
+                f.await.unwrap();
+            }
+            for rx in &mut rxs {
+                let (wc, buf) = rx.next().await.unwrap();
+                assert_eq!(wc.byte_len, 1000);
+                assert_eq!(&buf[..1000], &src[..1000]);
+                rx.repost(buf).unwrap();
+            }
+        }
+    });
+    let back = dst.reclaim();
+    for i in 0..4 {
+        assert_eq!(&back[i * 4096..(i + 1) * 4096], &filled(&pd, 4096, 19)[..]);
+    }
 }

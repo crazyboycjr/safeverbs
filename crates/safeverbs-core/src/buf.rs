@@ -653,6 +653,12 @@ pub struct Leases<N: Nic = Verbs> {
     rest: Vec<Lease<N>>,
 }
 
+impl<N: Nic> fmt::Debug for Leases<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Leases({})", self.len())
+    }
+}
+
 impl<N: Nic> Default for Leases<N> {
     fn default() -> Self {
         Leases {
