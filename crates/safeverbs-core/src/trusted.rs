@@ -715,6 +715,26 @@ pub fn registered<N: Device>(_part: &Part<N>, _pd: &Pd<N>, Tracked(token): Track
 {
 }
 
+/// [`registered`] for several parts at once: every one's region is
+/// registered in the present view.
+#[verifier::external_body]
+pub fn registered_all<N: Device>(_parts: &Vec<Part<N>>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
+    requires
+        forall|j: int| 0 <= j < _parts@.len() ==> part_pd(#[trigger] _parts@[j]) == pd_id(*_pd),
+        pd_of(*_pd) == old(token).pd(),
+    ensures
+        final(token).same_worker(old(token)),
+        final(token).same_writings(old(token)),
+        rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
+        forall|j: int|
+            0 <= j < _parts@.len() ==> final(token).nic().registered(
+                final(token).pd(),
+                sge_model(part_sge(#[trigger] _parts@[j])),
+                part_writable(_parts@[j]),
+            ),
+{
+}
+
 /// No leases (`Leases::default`).
 #[verifier::external_body]
 pub fn no_leases<N: Device>() -> Leases<N> {

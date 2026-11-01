@@ -1032,6 +1032,13 @@ impl<L> Ring<L> {
         &&& self.spec_depth() == other.spec_depth()
     }
 
+    /// `self` and `other` agree on the open request: whether there is one,
+    /// and its WQEs.
+    pub open spec fn same_open(&self, other: &Self) -> bool {
+        &&& self.spec_is_open() == other.spec_is_open()
+        &&& self.spec_open_wqes() == other.spec_open_wqes()
+    }
+
     /// The WQE accounting (invariant 2): the WQEs retired, committed and
     /// handed out come in that order, at most `depth` of them in flight, and
     /// the open request's are the last ones handed out.
@@ -1154,6 +1161,7 @@ impl<L> Ring<L> {
             final(self).inv(),
             final(self).same_view(old(self)),
             final(self).same_wqes(old(self)),
+            final(self).same_open(old(self)),
     {
         let error = self.detached_error.take();
         proof {
@@ -1936,6 +1944,7 @@ impl<L> Ring<L> {
             final(self).wqe_posted == old(self).wqe_posted,
             final(self).depth == old(self).depth,
             final(self).open == old(self).open,
+            final(self).open_wqes == old(self).open_wqes,
             final(self).detached_error == old(self).detached_error,
             final(self).same_view(old(self)),
     {
@@ -2119,7 +2128,7 @@ impl<L> Ring<L> {
             final(self).spec_depth() == old(self).spec_depth(),
             old(self).spec_wqe_retired() <= final(self).spec_wqe_retired(),
             wqe >= old(self).spec_wqe_retired() ==> final(self).spec_wqe_retired() <= wqe + 1,
-            final(self).spec_is_open() == old(self).spec_is_open(),
+            final(self).same_open(old(self)),
     {
         if wqe >= self.wqe_committed {
             return false;
@@ -2148,6 +2157,7 @@ impl<L> Ring<L> {
                 self.wqe_posted == pre.wqe_posted,
                 self.depth == pre.depth,
                 self.open == pre.open,
+                self.open_wqes == pre.open_wqes,
                 pre.wqe_retired <= self.wqe_retired <= wqe + 1,
                 wqe < self.wqe_committed,
                 pre.retired <= self.retired,
@@ -2309,6 +2319,7 @@ impl<L> Ring<L> {
             final(self).depth == old(self).depth,
             final(self).wqe_retired == old(self).slot(old(self).retired as int).end_wqe,
             final(self).open == old(self).open,
+            final(self).open_wqes == old(self).open_wqes,
             forall|s: int|
                 #[trigger] final(self).req(s) == if s == old(self).retired {
                     old(self).retired_view(s, outcome)
@@ -2487,6 +2498,7 @@ impl<L> Ring<L> {
             final(self).wqe_posted == old(self).wqe_posted,
             final(self).depth == old(self).depth,
             final(self).open == old(self).open,
+            final(self).open_wqes == old(self).open_wqes,
             final(self).detached_error == old(self).detached_error,
             final(self).same_view(old(self)),
     {
@@ -2613,6 +2625,7 @@ impl<L> Ring<L> {
                 },
             final(self).woken() == old(self).woken(),
             final(self).same_wqes(old(self)),
+            final(self).same_open(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -2826,6 +2839,7 @@ impl<L> Ring<L> {
                 },
             final(self).woken() == old(self).woken(),
             final(self).same_wqes(old(self)),
+            final(self).same_open(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -2999,6 +3013,7 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
             final(self).woken() == old(self).woken(),
             final(self).same_wqes(old(self)),
+            final(self).same_open(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);

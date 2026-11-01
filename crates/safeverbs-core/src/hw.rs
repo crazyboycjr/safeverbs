@@ -100,6 +100,47 @@ pub struct HwQp<N: Device> {
     dirty: bool,
     /// M's name of the QP.
     id: Ghost<QpId>,
+    /// The protection domain's number ([`Pd::id`]).
+    pd_id: Ghost<u64>,
+    /// The WQE the open request holds back until it knows whether it is
+    /// its last (so that the last can be written signaled), with its parts.
+    held: Option<Held>,
+    held_parts: Vec<Part<N>>,
+    /// The parts of the WQE being gathered.
+    building: Vec<Part<N>>,
+    /// The leases of the open request's WQEs written so far.
+    open_leases: Leases<N>,
+    /// The bytes of the open request.
+    open_bytes: u64,
+}
+
+/// A WQE held back: its `wr_id`, operation and scatter/gather list.
+#[derive(Clone, Copy)]
+struct Held {
+    wr_id: u64,
+    op: WrOp,
+    sges: [Sge; MAX_SGES],
+    n: usize,
+}
+
+/// The WR M sees for a held WQE.
+spec fn held_wr(h: Held, signaled: bool) -> SendWr {
+    send_wr(h.wr_id, signaled, h.op, h.sges@.take(h.n as int))
+}
+
+/// A held WQE with parts `parts`, number `num`, on a QP with attributes
+/// `attr`, is one M accepts once its parts' regions are registered: its
+/// `wr_id`, its parts' ranges, domain and uniqueness, its length.
+spec fn held_ok<N: Device>(h: Held, parts: Seq<Part<N>>, index: u16, num: int, attr: QpAttr, pd_id: u64, max_msg: nat) -> bool {
+    &&& h.wr_id == spec_wr_id(index, false, num as u64)
+    &&& 1 <= h.n <= MAX_SGES
+    &&& parts.len() == h.n
+    &&& forall|j: int|
+        0 <= j < h.n ==> h.sges@[j] == part_sge(#[trigger] parts[j]) && part_pd(parts[j]) == pd_id
+            && (opcode_model(h.op).writes_local() ==> part_writable(parts[j]))
+    &&& h.n <= attr.max_sge
+    &&& opcode_model(h.op).allowed_on(attr.transport)
+    &&& total_len(h.sges@.take(h.n as int).map_values(|sge: Sge| sge_model(sge))) <= max_msg
 }
 
 /// The hardware side of a worker: its CQ, its QPs and its share of M.
@@ -167,8 +208,8 @@ pub open spec fn phase_ok(phase: Phase, state: QpState) -> bool {
 }
 
 /// The send WRs written since the last doorbell are the ring's WQEs handed
-/// out and not committed, each with its number's `wr_id`, each one M
-/// accepts.
+/// out and not committed (but the one held back, if any), each with its
+/// number's `wr_id`, each one M accepts.
 pub open spec fn writing_ok<L>(
     r: Ring<L>,
     index: u16,
@@ -176,9 +217,14 @@ pub open spec fn writing_ok<L>(
     attr: QpAttr,
     started: bool,
     written: Seq<SendWr>,
+    held: bool,
 ) -> bool {
     &&& !started ==> written.len() == 0
-    &&& written.len() == r.spec_wqe_posted() - r.spec_wqe_committed()
+    &&& written.len() + (if held {
+        1int
+    } else {
+        0int
+    }) == r.spec_wqe_posted() - r.spec_wqe_committed()
     &&& forall|j: int|
         0 <= j < written.len() ==> (#[trigger] written[j]).wr_id == spec_wr_id(
             index,
@@ -224,7 +270,20 @@ impl<N: Device> HwQp<N> {
             && self.send.spec_wqe_committed() == self.send.spec_wqe_retired()
             && self.recv.spec_wqe_committed() == self.recv.spec_wqe_retired()
         &&& self.started == started
-        &&& writing_ok(self.send, index, m, qp.attr, started, written)
+        &&& writing_ok(self.send, index, m, qp.attr, started, written, self.held is Some)
+        &&& self.held is Some <==> self.send.spec_is_open()
+        &&& self.held is Some ==> self.send.spec_open_wqes() >= 1
+        &&& self.held is None ==> self.held_parts@.len() == 0
+        &&& self.held matches Some(h) ==> held_ok(
+            h,
+            self.held_parts@,
+            index,
+            self.send.spec_wqe_committed() + written.len(),
+            qp.attr,
+            self.pd_id@,
+            m.caps.max_msg,
+        )
+        &&& self.building@.len() <= MAX_SGES
     }
 }
 
@@ -243,7 +302,8 @@ impl<N: Device> Hw<N> {
     /// share and writing.
     pub closed spec fn entry_ok(&self, i: int, t: NicToken, m: Nic::State) -> bool {
         match self.qps@[i] {
-            Some(e) => e.ok(i as u16, m, t.share(), t.pd(), t.started(e.id()), t.written(e.id())),
+            Some(e) => e.ok(i as u16, m, t.share(), t.pd(), t.started(e.id()), t.written(e.id()))
+                && e.pd_id@ == pd_id(self.pd),
             None => true,
         }
     }
@@ -690,6 +750,12 @@ impl<N: Device> Hw<N> {
             refused: false,
             dirty: false,
             id: Ghost(q),
+            pd_id: Ghost(pd_id(self.pd)),
+            held: None,
+            held_parts: Vec::with_capacity(MAX_SGES),
+            building: Vec::with_capacity(MAX_SGES),
+            open_leases: no_leases(),
+            open_bytes: 0,
         };
         let ghost before = *self;
         if index == self.qps.len() {
@@ -1214,7 +1280,7 @@ impl<N: Device> Hw<N> {
             assert(phase_ok(e.phase, b.state));
             assert(sq_linked(e.send, index as u16, b));
             assert(rq_linked(e.recv, index as u16, b));
-            assert(writing_ok(e.send, index as u16, n, b.attr, t0.started(q), written));
+            assert(writing_ok(e.send, index as u16, n, b.attr, t0.started(q), written, e.held is Some));
             assert(self.entry_ok(index as int, t0, n));
             self.lemma_but_one(&start, t0, m0, n, index as int);
             self.lemma_same_token(t0, t, n);
