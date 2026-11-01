@@ -12,7 +12,8 @@
 //!   [`Exposed`], [`RingBuf`]) and the leases that keep it alive while the
 //!   NIC uses it;
 //! - [`ring`]: the completion ring of a work queue, pure bookkeeping
-//!   without FFI or `unsafe`, written to be verified;
+//!   without FFI or `unsafe`, verified with Verus; [`refine`] proves that
+//!   it refines the abstract machine of `safeverbs-spec`;
 //! - [`qp`]: a connected queue pair driven synchronously ([`QueuePair`]):
 //!   post requests into the ring and the hardware queue, commit them with
 //!   one doorbell, poll, and take each request's completion and buffers
@@ -40,6 +41,7 @@ pub mod model;
 pub mod nic;
 pub mod pd;
 pub mod qp;
+pub mod refine;
 pub mod ring;
 pub mod transport;
 pub mod verbs;

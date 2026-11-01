@@ -577,6 +577,102 @@ impl<L> Ring<L> {
         &&& self.woken() == other.woken()
     }
 
+    /// What A sees of the ring, as functions of the sequence number.
+    pub open spec fn view(&self) -> crate::refine::View<L> {
+        crate::refine::View { req: |s: int| self.req(s), staged: |s: int| self.staged(s) }
+    }
+
+    /// The ring's view is well formed (`crate::refine::wf`): requests in
+    /// `[retired, committed)` are in flight, those before complete or gone,
+    /// those in `[committed, posted)` staged.
+    pub proof fn lemma_view(&self)
+        requires
+            self.inv(),
+        ensures
+            crate::refine::wf(self.view()),
+            self.spec_head() <= self.spec_retired() <= self.spec_committed() <= self.spec_posted(),
+            forall|s: int|
+                (#[trigger] self.staged(s) is Some) == (self.spec_committed() <= s
+                    < self.spec_posted()),
+            forall|s: int|
+                #[trigger] self.req(s) is Some ==> self.spec_head() <= s < self.spec_committed() && (
+                self.req(s)->0.phase is InFlight) == (self.spec_retired() <= s),
+            forall|s: int|
+                self.spec_retired() <= s < self.spec_committed() ==> #[trigger] self.req(s) is Some,
+    {
+        reveal(Ring::inv_slots);
+        assert forall|s: int| #[trigger] (self.view().req)(s) is Some implies crate::refine::req_wf(
+            (self.view().req)(s)->0,
+        ) by {
+            if s < self.retired {
+                assert(self.done_ok(s));
+            } else {
+                assert(self.live_ok(s));
+            }
+        }
+        assert forall|s: int| #[trigger] (self.view().staged)(s) is Some implies crate::refine::staged_wf(
+            (self.view().staged)(s)->0,
+        ) by {
+            assert(self.live_ok(s));
+        }
+        assert forall|s: int| #[trigger] self.req(s) is Some implies self.spec_head() <= s
+            < self.spec_committed() && (self.req(s)->0.phase is InFlight) == (self.spec_retired()
+            <= s) by {
+            if s < self.retired {
+                assert(self.done_ok(s));
+            } else {
+                assert(self.live_ok(s));
+            }
+        }
+        assert forall|s: int| self.spec_retired() <= s < self.spec_committed() implies #[trigger] self.req(
+            s,
+        ) is Some by {
+            assert(self.live_ok(s));
+        }
+    }
+
+    /// A stuttering step changes nothing A sees.
+    pub proof fn lemma_same_view(&self, other: &Self)
+        requires
+            self.same_view(other),
+        ensures
+            crate::refine::same(other.view(), self.view()),
+    {
+    }
+
+    /// A request in flight retires as A's `complete` says.
+    pub proof fn lemma_retired_view(&self, s: int, outcome: Wc)
+        requires
+            self.inv(),
+            self.spec_retired() <= s < self.spec_committed(),
+        ensures
+            self.req(s) is Some,
+            self.retired_view(s, outcome) == if self.req(s)->0.detached {
+                None
+            } else {
+                Some(self.req(s)->0.completed(outcome))
+            },
+    {
+        reveal(Ring::inv_slots);
+        assert(self.live_ok(s));
+    }
+
+    /// The wakers of requests in flight, as A sees them.
+    pub proof fn lemma_wakers(&self, from: int, to: int)
+        requires
+            self.inv(),
+            self.spec_retired() <= from <= to <= self.spec_committed(),
+        ensures
+            self.wakers(from, to) == crate::refine::wakers(self.view(), from, to),
+        decreases to - from,
+    {
+        reveal(Ring::inv_slots);
+        if from < to {
+            self.lemma_wakers(from, to - 1);
+            assert(self.live_ok(to - 1));
+        }
+    }
+
     /// `self` and `other` agree on everything but the slots.
     closed spec fn same_counters(&self, other: &Self) -> bool {
         &&& self.head == other.head
@@ -1561,7 +1657,7 @@ impl<L> Ring<L> {
         ensures
             final(self).inv(),
             known == (wqe < old(self).spec_wqe_committed()),
-            old(self).spec_retired() <= final(self).spec_retired(),
+            old(self).spec_retired() <= final(self).spec_retired() <= old(self).spec_committed(),
             forall|s: int|
                 #[trigger] final(self).req(s) == if old(self).spec_retired() <= s < final(self).spec_retired() {
                     old(self).retired_view(s, old(self).retire_outcome(s, wqe, wc))
