@@ -19,6 +19,13 @@ if ! command -v verus >/dev/null || ! command -v cargo-verus >/dev/null; then
     exit 2
 fi
 
+# The specification proves everything it states: no escape hatches.
+if grep -rnE '\b(assume|admit)\(|verifier::external|external_body|assume_specification' \
+    "$crate/src" --include='*.rs' | grep -vE '^[^:]+:[0-9]+:\s*//'; then
+    echo "verify.sh: the lines above skip verification; crates/safeverbs-spec must not" >&2
+    exit 1
+fi
+
 # The repository pins an older toolchain; Verus runs cargo with its own.
 toolchain="$(verus --version 2>/dev/null | sed -n 's/^ *Toolchain: \([^ ]*\).*/\1/p')"
 if [ -z "$toolchain" ]; then
