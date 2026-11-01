@@ -10,6 +10,16 @@
 //! of the NIC. The local worker must account for its own completions as its own A steps.
 //! This is a frame foundation, not a worker `Refines` implementation, a memory permission
 //! construction, or a theorem composing all workers' concrete states.
+//!
+//! Frame equality does not preserve operation enabledness. A foreign read-only clone can
+//! leave a local lease unchanged while invalidating its `thaw` precondition. Each worker
+//! must establish A's current preconditions when taking its own next step.
+//!
+//! A currently gives each request one lease and one `Dir`. A synchronous concrete request
+//! can group READ destinations with shared SEND sources, so its leases need not be all
+//! unique or all read-only. This foundation supplies no abstraction for that group and
+//! restricts no concrete API. A grouped-request model with per-lease access directions
+//! and uniqueness is still needed before proving the concrete worker refines A.
 #![allow(unused_imports)]
 
 use crate::abs::*;
