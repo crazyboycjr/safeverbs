@@ -862,6 +862,11 @@ impl<L> Ring<L> {
             1 <= max_wqes <= depth,
         ensures
             ring.inv(),
+            ring.spec_wqe_retired() == 0,
+            ring.spec_wqe_committed() == 0,
+            ring.spec_wqe_posted() == 0,
+            ring.spec_depth() == depth,
+            !ring.spec_is_open(),
             forall|s: int| #[trigger] ring.req(s) is None,
             forall|s: int| #[trigger] ring.staged(s) is None,
             forall|s: int| #[trigger] ring.refused(s) is None,
@@ -923,9 +928,11 @@ impl<L> Ring<L> {
     }
 
     /// The queue's depth in WQEs.
-    pub fn depth(&self) -> u32
+    pub fn depth(&self) -> (depth: u32)
         requires
             self.inv(),
+        ensures
+            depth == self.spec_depth(),
     {
         self.depth as u32
     }
@@ -995,10 +1002,54 @@ impl<L> Ring<L> {
         self.committed
     }
 
-    /// WQEs posted and not retired.
-    pub fn in_flight_wqes(&self) -> u32
+    /// [`Ring::wqe_retired`], as a specification: one past the last retired
+    /// WQE.
+    pub closed spec fn spec_wqe_retired(&self) -> u64 {
+        self.wqe_retired
+    }
+
+    /// One past the last WQE handed out (the open request's included).
+    pub closed spec fn spec_wqe_posted(&self) -> u64 {
+        self.wqe_posted
+    }
+
+    /// [`Ring::depth`], as a specification.
+    pub closed spec fn spec_depth(&self) -> u64 {
+        self.depth
+    }
+
+    /// `self` and `other` agree on the WQE accounting: what the hardware
+    /// queue holds is the same.
+    pub open spec fn same_wqes(&self, other: &Self) -> bool {
+        &&& self.spec_wqe_retired() == other.spec_wqe_retired()
+        &&& self.spec_wqe_committed() == other.spec_wqe_committed()
+        &&& self.spec_wqe_posted() == other.spec_wqe_posted()
+        &&& self.spec_depth() == other.spec_depth()
+    }
+
+    /// The WQE accounting (invariant 2): the WQEs retired, committed and
+    /// handed out come in that order, at most `depth` of them in flight, and
+    /// the open request's are the last ones handed out.
+    pub proof fn lemma_wqes(&self)
         requires
             self.inv(),
+        ensures
+            self.spec_wqe_retired() <= self.spec_wqe_committed() <= self.spec_wqe_posted(),
+            self.spec_wqe_posted() - self.spec_wqe_retired() <= self.spec_depth(),
+            1 <= self.spec_depth() <= u32::MAX,
+            self.spec_has_wqe_room() ==> self.spec_wqe_posted() - self.spec_wqe_retired()
+                < self.spec_depth(),
+            self.spec_open_wqes() as int <= self.spec_wqe_posted() - self.spec_wqe_committed(),
+            !self.spec_is_open() ==> self.spec_open_wqes() == 0,
+    {
+    }
+
+    /// WQEs posted and not retired.
+    pub fn in_flight_wqes(&self) -> (n: u32)
+        requires
+            self.inv(),
+        ensures
+            n == self.spec_wqe_posted() - self.spec_wqe_retired(),
     {
         (self.wqe_posted - self.wqe_retired) as u32
     }
@@ -1048,15 +1099,21 @@ impl<L> Ring<L> {
     /// One past the last retired WQE: every WQE before it has completed (or
     /// was never seen by the NIC). A completion names a WQE at most
     /// [`Ring::depth`] after it.
-    pub fn wqe_retired(&self) -> u64 {
+    pub fn wqe_retired(&self) -> (wqe: u64)
+        ensures
+            wqe == self.spec_wqe_retired(),
+    {
         self.wqe_retired
     }
 
     /// Whether a new request of one WQE could be posted now: a free slot and
     /// room for a WQE.
-    pub fn can_post(&self) -> bool
+    pub fn can_post(&self) -> (can: bool)
         requires
             self.inv(),
+        ensures
+            can == (!self.spec_is_open() && self.spec_has_free_slot() && self.spec_wqe_posted()
+                - self.spec_wqe_retired() < self.spec_depth()),
     {
         !self.open && self.has_free_slot() && self.wqe_posted - self.wqe_retired < self.depth
     }
@@ -1087,6 +1144,7 @@ impl<L> Ring<L> {
         ensures
             final(self).inv(),
             final(self).same_view(old(self)),
+            final(self).same_wqes(old(self)),
     {
         let error = self.detached_error.take();
         proof {
@@ -1127,6 +1185,8 @@ impl<L> Ring<L> {
             seq is Some ==> seq == Some(old(self).spec_posted()) && final(self).is_open()
                 && final(self).open_wqes() == 0,
             seq is None ==> *final(self) == *old(self),
+            seq is Some <==> !old(self).spec_is_open() && old(self).spec_has_free_slot(),
+            final(self).same_wqes(old(self)),
     {
         if self.open || !self.has_free_slot() {
             return None;
@@ -1194,6 +1254,14 @@ impl<L> Ring<L> {
             final(self).same_view(old(self)),
             final(self).is_open() == old(self).is_open(),
             id is Some ==> final(self).open_wqes() == old(self).open_wqes() + 1,
+            id is None ==> final(self).open_wqes() == old(self).open_wqes(),
+            id is Some <==> old(self).spec_has_wqe_room(),
+            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            id is Some ==> id->0 == old(self).spec_wqe_posted() && final(self).spec_wqe_posted()
+                == old(self).spec_wqe_posted() + 1,
+            id is None ==> final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
     {
         if self.wqe_room() == 0 {
             return None;
@@ -1251,6 +1319,7 @@ impl<L> Ring<L> {
             final(self).inv(),
             !final(self).is_open(),
             r.0 == old(self).spec_posted(),
+            final(self).same_wqes(old(self)),
             forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
             forall|s: int|
                 #[trigger] final(self).staged(s) == if s == old(self).spec_posted() {
@@ -1408,6 +1477,10 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] final(self).staged(s) is None,
             forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
             final(self).woken() == old(self).woken(),
+            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_posted(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
+            final(self).spec_depth() == old(self).spec_depth(),
     {
         assert!(!self.open, "commit with an open request");
         let ghost pre = *self;
@@ -1577,6 +1650,10 @@ impl<L> Ring<L> {
                 old(self).spec_committed() as int,
                 old(self).spec_posted() as int,
             ),
+            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
+            final(self).spec_depth() == old(self).spec_depth(),
     {
         let dropped = self.posted - self.committed;
         // No request is staged at `posted`: none is handed back.
@@ -1616,6 +1693,10 @@ impl<L> Ring<L> {
                 Some(r) => Some(r.leases),
                 None => None,
             },
+            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
+            final(self).spec_depth() == old(self).spec_depth(),
             final(self).spec_detached_error() is None ==> forall|s: int|
                 #[trigger] old(self).staged(s) is Some && s != keep ==> !old(self).staged(
                     s,
@@ -1843,6 +1924,7 @@ impl<L> Ring<L> {
             final(self).wqe_retired == old(self).wqe_retired,
             final(self).wqe_committed == old(self).wqe_committed,
             final(self).wqe_posted == old(self).wqe_posted,
+            final(self).depth == old(self).depth,
             final(self).open == old(self).open,
             final(self).detached_error == old(self).detached_error,
             final(self).same_view(old(self)),
@@ -2022,6 +2104,11 @@ impl<L> Ring<L> {
                 old(self).spec_retired() as int,
                 final(self).spec_retired() as int,
             ),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            old(self).spec_wqe_retired() <= final(self).spec_wqe_retired(),
+            wqe >= old(self).spec_wqe_retired() ==> final(self).spec_wqe_retired() <= wqe + 1,
     {
         if wqe >= self.wqe_committed {
             return false;
@@ -2047,6 +2134,9 @@ impl<L> Ring<L> {
                 self.committed == pre.committed,
                 self.posted == pre.posted,
                 self.wqe_committed == pre.wqe_committed,
+                self.wqe_posted == pre.wqe_posted,
+                self.depth == pre.depth,
+                pre.wqe_retired <= self.wqe_retired <= wqe + 1,
                 wqe < self.wqe_committed,
                 pre.retired <= self.retired,
                 forall|s: int|
@@ -2084,6 +2174,10 @@ impl<L> Ring<L> {
                     }
                 }
             } else if end <= wqe + 1 {
+                proof {
+                    reveal(Ring::inv_slots);
+                    assert(self.live_ok(r));
+                }
                 let outcome = match self.slots[i].outcome {
                     Some(recorded) => recorded,
                     None => {
@@ -2199,6 +2293,9 @@ impl<L> Ring<L> {
             final(self).committed == old(self).committed,
             final(self).posted == old(self).posted,
             final(self).wqe_committed == old(self).wqe_committed,
+            final(self).wqe_posted == old(self).wqe_posted,
+            final(self).depth == old(self).depth,
+            final(self).wqe_retired == old(self).slot(old(self).retired as int).end_wqe,
             forall|s: int|
                 #[trigger] final(self).req(s) == if s == old(self).retired {
                     old(self).retired_view(s, outcome)
@@ -2375,6 +2472,7 @@ impl<L> Ring<L> {
             final(self).wqe_retired == old(self).wqe_retired,
             final(self).wqe_committed == old(self).wqe_committed,
             final(self).wqe_posted == old(self).wqe_posted,
+            final(self).depth == old(self).depth,
             final(self).open == old(self).open,
             final(self).detached_error == old(self).detached_error,
             final(self).same_view(old(self)),
@@ -2501,6 +2599,7 @@ impl<L> Ring<L> {
                     old(self).refused(s)
                 },
             final(self).woken() == old(self).woken(),
+            final(self).same_wqes(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -2713,6 +2812,7 @@ impl<L> Ring<L> {
                     old(self).refused(s)
                 },
             final(self).woken() == old(self).woken(),
+            final(self).same_wqes(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -2885,6 +2985,7 @@ impl<L> Ring<L> {
                 },
             forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
             final(self).woken() == old(self).woken(),
+            final(self).same_wqes(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -2927,6 +3028,10 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] final(self).staged(s) is None,
             forall|s: int| #[trigger] final(self).refused(s) is None,
             final(self).woken() == old(self).woken(),
+            final(self).spec_wqe_retired() == old(self).spec_wqe_posted(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_posted(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
+            final(self).spec_depth() == old(self).spec_depth(),
     {
         let ghost pre = *self;
         let mut i = 0;
