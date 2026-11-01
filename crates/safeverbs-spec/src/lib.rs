@@ -17,7 +17,8 @@
 //!    fit together.
 //! 5. [`share`]: each worker's share of M, and what the threads of one device rely on and
 //!    guarantee each other.
-//! 6. [`examples`]: concrete executions of A and M.
+//! 6. [`abs_share`]: abstract worker ownership, foreign-step framing and lease transfers.
+//! 7. [`examples`]: concrete executions of A and M.
 //!
 //! [`types`] holds what A and M share; [`nic_proofs`] holds the proofs about M.
 //!

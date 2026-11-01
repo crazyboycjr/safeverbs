@@ -64,6 +64,19 @@ rely run is a run of M (`lemma_rely_is_nic_run`); and a worker's own verbs are f
 for every disjoint share (`lemma_mine_is_foreign`, the guarantee) and keep its own share well
 formed (`lemma_mine_keeps_share_wf`).
 
+**Each worker's share of A** (`abs_share.rs`). A share owns QP names and historical
+lease IDs, not disjoint byte ranges: readonly clones may overlap across workers.
+`foreign` covers every real transition of A; `lemma_foreign_step` and `lemma_rely_frame`
+prove that foreign steps preserve local leases (including wakers and phases), posted
+bytes, outcomes and QPs. Fresh allocations may advance the allocator and foreign
+completions may append wakes. `lemma_mine_is_foreign` supplies the disjoint-share
+compatibility rule. `lemma_transfer` proves explicit ownership transfer for program
+leases without changing A. Concrete two-worker examples cover local in-flight state,
+foreign allocation/completion and overlapping readonly clones with transferred IDs.
+These are ghost ownership/frame proofs; they do not construct concrete buffer permission
+tokens or the real worker's simulation. A local thaw's enabledness is not preserved by
+foreign readonly cloning, so the implementation must still test uniqueness.
+
 **The refinement theorem's composition** (`refinement.rs`). `theorem_1` proves that for any
 implementation meeting the obligations of the `Refines` trait, along any execution, A's and
 M's invariants hold, every verb met its precondition (S2), and A and M stay coupled.
@@ -183,14 +196,20 @@ a token over a fresh share. These are trusted, not proved.
   - **A's side is proved for the ring** (`refine.rs`), not yet for the worker: the worker has
     no ghost map from its rings' requests to A's leases (`ids`, `dirs` of `placed`), and so no
     `impl Refines`. What that needs: the ghost state of A (which leases the program holds) in
-    the worker, which only the buffers can supply (next point); and the A-side counterpart of
-    rely, since A, too, is one state for every thread.
+    the worker, which only the buffers can supply (next point); and integration with the
+    checked A-side frame/transfer rules of `abs_share.rs`.
   - **Buffers.** `buf.rs` is outside `verus!`: a part's range, domain and uniqueness, and the
     registration of its region while its lease lives, are a trusted boundary
     (`registered`, `registered_all`, the part accessors). Lease memory as linear ghost
     permissions (vstd `PointsToRaw` or a token of our own) moving into the NIC's share on
     commit and back on retire would turn S1 into a byte-level fact against M and supply A's
     leases; this is not done.
+  - **Grouped memory permissions.** A request currently carries one lease and one
+    direction. The synchronous request builder can mix READ destinations and shared
+    SEND/WRITE sources in one request. A single uniform direction cannot represent that
+    group faithfully: the next memory model must track each member's access rights and
+    join their completion lifetime without declaring shared sources uniquely writable.
+    The WQE interval/first-error result above solves outcome aggregation only.
   - **Composition.** Each worker's view is coupled to M under rely, and every worker verb is a
     foreign step for the others (`lemma_mine_is_foreign`); that the interleaving of all
     threads' steps is a run of M follows, but is argued, not a theorem in Verus (the tokens are
@@ -286,7 +305,7 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 147 verified, 0 errors
+safeverbs-spec: verification results:: 160 verified, 0 errors
 safeverbs-core: verification results:: 237 verified, 0 errors
 ```
 
