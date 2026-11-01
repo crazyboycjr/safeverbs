@@ -212,13 +212,13 @@ impl<T: Transport, N: Nic> QueuePair<T, N> {
     }
 
     /// Rings the doorbell for every request written since the last one. If
-    /// the device refuses, those requests are dropped and their buffers
-    /// released: each one without an owner is reported by
-    /// [`QueuePair::take_send_error`] as a flush error, and the sequence
-    /// number of each one with an owner names nothing any more (a later
-    /// request may get it), so its owner must not take or detach it.
-    /// [`Request::submit`] and [`QueuePair::commit_or_take`] hand the
-    /// buffers of their own request back instead.
+    /// the device refuses, none of them is posted: each one with an owner
+    /// retires at once with a flush error, which its owner takes with its
+    /// buffers ([`QueuePair::take_send`]); each one without an owner
+    /// releases its buffers and is reported by
+    /// [`QueuePair::take_send_error`] as a flush error. Sequence numbers are
+    /// never reused. [`Request::submit`] and [`QueuePair::commit_or_take`]
+    /// hand the buffers of their own request back with the error instead.
     pub fn commit(&mut self) -> Result<()> {
         if !self.started {
             return Ok(());
@@ -604,8 +604,8 @@ impl<T: Transport, N: Nic> Request<'_, T, N> {
     /// Finishes the request: signaled if `signal` (else only if the ring
     /// needs it), `detached` if nobody will take it back. Returns its
     /// sequence number, `None` if it has no WQE. It goes out at the next
-    /// commit; if the device refuses that doorbell, the request is dropped
-    /// and the number is void (see [`QueuePair::commit`]).
+    /// commit; if the device refuses that doorbell, it retires with a flush
+    /// error (see [`QueuePair::commit`]).
     pub fn finish(mut self, signal: bool, detached: bool) -> Option<Seq> {
         if self.open {
             Some(self.close(signal, detached))
@@ -673,7 +673,9 @@ mod tests {
         let (error, leases) = req.submit(true).unwrap().unwrap_err();
         assert!(matches!(error, Error::Os(_)));
         drop(leases);
-        assert_eq!(qp.send_ring().posted(), 0);
+        // Nothing is in flight, and the numbers are not reused.
+        assert_eq!(qp.send_ring().posted(), 2);
+        assert_eq!(qp.send_ring().in_flight_wqes(), 0);
         let wc = qp
             .take_send_error()
             .expect("the dropped request is reported");
