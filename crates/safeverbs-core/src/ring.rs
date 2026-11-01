@@ -43,7 +43,7 @@
 //! retires every request whose WQEs all lie at or before `n`. A request
 //! whose last WQE is not signaled produces no completion of its own and is
 //! retired by a later one, with the outcome made up at posting
-//! ([`Slot::implied`]). An error completion is produced for unsignaled WQEs
+//! (`Slot::implied`). An error completion is produced for unsignaled WQEs
 //! as well; one for a WQE inside a batch is recorded on the batch, which
 //! retires with that error once its last WQE completes (normally with a
 //! flush error, after the QP entered the error state). Out-of-order queues

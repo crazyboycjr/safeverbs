@@ -1,24 +1,29 @@
 //! The ring refines the abstract machine A (`safeverbs_spec::abs`).
 //!
 //! Every operation of [`Ring`] is specified by what A sees of the ring: its
-//! requests ([`Ring::req`]: posted and not freed), the requests written but
-//! not posted ([`Ring::staged`]) and the wakers woken ([`Ring::woken`]).
+//! requests (`Ring::req`: posted and not freed), the requests written but
+//! not posted (`Ring::staged`) and the wakers woken (`Ring::woken`).
 //! This module proves that each of those changes is zero or more steps of
-//! A, from any state of A in which the ring's requests sit ([`placed`]) to
+//! A, from any state of A in which the ring's requests sit (`placed`) to
 //! one in which they sit again. That is the ring's share of the obligations
 //! of `safeverbs_spec::refinement::Refines`:
 //!
 //! | Ring operation | Steps of A |
 //! | --- | --- |
-//! | `begin`, `push_wqe`, `take_detached_error` | none |
-//! | `end` | none: a staged request's leases are still the program's ([`lemma_end`]) |
-//! | `commit` | `post_request` for each staged request, then its `register` or `detach` ([`lemma_commit`]) |
-//! | `abort`, `abort_keeping` | `drop` for each staged request released ([`lemma_abort`]) |
-//! | `complete` | `complete` for each request retired, in order, waking the same wakers ([`lemma_complete`]) |
-//! | `take` | `take` ([`lemma_take`]) |
-//! | `detach` | `detach`, none for a staged request ([`lemma_detach`]) |
-//! | `set_waker` | `register`, none for a staged request ([`lemma_register`]) |
-//! | `release_all` | `complete` for each request in flight, then `detach`, and `drop` for each staged one ([`lemma_release_all`]) |
+//! | `begin`, `push_wqe`, `take_detached_error` | none (`lemma_ring_stutter`) |
+//! | `end` | none: a staged request's leases are still the program's (`lemma_ring_end`) |
+//! | `commit` | `post_request` for each staged request, then its `register` or `detach` (`lemma_ring_commit`) |
+//! | `abort`, `abort_keeping` | `drop` for each staged request released (`lemma_ring_abort`) |
+//! | `complete` | `complete` for each request retired, in order, waking the same wakers (`lemma_ring_complete`) |
+//! | `take` | `take` (`lemma_ring_take`) |
+//! | `detach` | `detach`, none for a staged request (`lemma_ring_detach`) |
+//! | `set_waker` | `register`, none for a staged request (`lemma_ring_register`) |
+//! | `release_all` | `complete` for each request in flight, then `detach`, and `drop` for each staged one (`lemma_ring_release_all`) |
+//!
+//! The async layer's side list of results moved out of a clogged ring is
+//! covered too (`with_side`, `lemma_side_move`, `lemma_side_take`, `lemma_side_detach`): moving a result there is no step, taking it
+//! is A's `take` with the outcome and leases the ring gave, dropping its
+//! future A's `detach`.
 //!
 //! Leases are tracked as values: the `L` that A sees a request hold is the
 //! one `end` moved into the ring, and `take` and `abort_keeping` hand back
@@ -1373,6 +1378,128 @@ pub proof fn lemma_ring_release_all<L>(
     let a2 = lemma_abort(v1, a1, q, ids, dirs, c, p, p);
     lemma_same(dropped_range(v1, c, p), post.view(), a2, q, ids, dirs);
     safeverbs_spec::refinement::lemma_abs_reaches_trans(a, a1, a2);
+    a2
+}
+
+// =============================================================================
+// Results moved out of the ring
+//
+// `safeverbs` moves results nobody has taken yet out of a clogged ring into a
+// side list (`QpState::unclog`), where their futures find them. A still sees
+// each such result as a complete request with an owner: moving it is no
+// step, and taking it from the side list (or dropping its future) is A's
+// `take` (or `detach`), with exactly the outcome and leases the ring gave.
+
+/// `v` with the side list `side`: by sequence number, the outcome and leases
+/// of complete requests moved out of the ring, each a complete request with
+/// an owner in A.
+pub open spec fn with_side<L>(v: View<L>, side: Map<int, (Wc, L)>) -> View<L> {
+    View {
+        req: |s: int|
+            if side.contains_key(s) {
+                Some(
+                    ReqView {
+                        phase: Phase::Complete(side[s].0.outcome()),
+                        waker: None,
+                        detached: false,
+                        leases: side[s].1,
+                    },
+                )
+            } else {
+                (v.req)(s)
+            },
+        staged: v.staged,
+    }
+}
+
+/// Moving a complete request's outcome and leases, as `take` returned them,
+/// from the ring to the side list is no step of A.
+pub proof fn lemma_side_move<L>(
+    pre: Ring<L>,
+    post: Ring<L>,
+    seq: int,
+    outcome: Wc,
+    leases: L,
+    side: Map<int, (Wc, L)>,
+    a: Abs::State,
+    q: QpId,
+    ids: Map<int, Id>,
+    dirs: Map<int, Dir>,
+)
+    requires
+        placed(with_side(pre.view(), side), a, q, ids, dirs),
+        !side.contains_key(seq),
+        pre.req(seq) == Some(
+            ReqView { phase: Phase::Complete(outcome.outcome()), waker: None, detached: false, leases },
+        ),
+        forall|s: int|
+            #[trigger] post.req(s) == if s == seq {
+                None
+            } else {
+                pre.req(s)
+            },
+        forall|s: int| #[trigger] post.staged(s) == pre.staged(s),
+    ensures
+        placed(with_side(post.view(), side.insert(seq, (outcome, leases))), a, q, ids, dirs),
+{
+    lemma_same(
+        with_side(pre.view(), side),
+        with_side(post.view(), side.insert(seq, (outcome, leases))),
+        a,
+        q,
+        ids,
+        dirs,
+    );
+}
+
+/// Taking a result from the side list is A's `take`: the outcome and the
+/// leases the ring gave, the program holding the same bytes again.
+pub proof fn lemma_side_take<L>(
+    v: View<L>,
+    seq: int,
+    side: Map<int, (Wc, L)>,
+    a: Abs::State,
+    q: QpId,
+    ids: Map<int, Id>,
+    dirs: Map<int, Dir>,
+) -> (a2: Abs::State)
+    requires
+        placed(with_side(v, side), a, q, ids, dirs),
+        side.contains_key(seq),
+        (v.req)(seq) is None,
+    ensures
+        abs_step(a, a2, Abs::Step::take(ids[seq], side[seq].0.outcome())),
+        placed(with_side(v, side.remove(seq)), a2, q, ids, dirs),
+        a2.is_program(a.next_id) && a2.leases[a.next_id].mem == a.leases[ids[seq]].mem,
+{
+    let w = with_side(v, side);
+    let a2 = lemma_take(w, a, q, ids, dirs, seq, side[seq].0, side[seq].1);
+    lemma_same(without(w, seq), with_side(v, side.remove(seq)), a2, q, ids, dirs);
+    a2
+}
+
+/// Dropping the future of a result in the side list is A's `detach`, which
+/// releases its leases.
+pub proof fn lemma_side_detach<L>(
+    v: View<L>,
+    seq: int,
+    side: Map<int, (Wc, L)>,
+    a: Abs::State,
+    q: QpId,
+    ids: Map<int, Id>,
+    dirs: Map<int, Dir>,
+) -> (a2: Abs::State)
+    requires
+        placed(with_side(v, side), a, q, ids, dirs),
+        side.contains_key(seq),
+        (v.req)(seq) is None,
+    ensures
+        safeverbs_spec::refinement::abs_reaches(a, a2),
+        placed(with_side(v, side.remove(seq)), a2, q, ids, dirs),
+{
+    let w = with_side(v, side);
+    let a2 = lemma_detach(w, a, q, ids, dirs, seq);
+    lemma_same(detached(w, seq), with_side(v, side.remove(seq)), a2, q, ids, dirs);
     a2
 }
 
