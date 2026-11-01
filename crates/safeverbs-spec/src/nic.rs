@@ -21,10 +21,14 @@
 //! between the program and the NIC (see `docs/verification.md`).
 //!
 //! Completions follow the in-order rule of RC, UC and UD send queues (MRC's are the same)
-//! and of receive queues: work requests execute in posting order, an unsignaled one that
-//! succeeds produces no completion, and a polled completion retires its work request and
+//! and of receive queues: work requests become eligible for local completion in posting
+//! order, an unsignaled success produces no completion, and a polled completion retires its work request and
 //! every earlier one. An error moves the queue pair to `Err`; from then on every work
 //! request completes with an error (normally `FlushErr`), in order, signaled or not.
+//! These ordered steps abstract local completion eligibility, not the order of remote
+//! memory effects. A later SEND/WRITE can have remote effects before an earlier READ
+//! finishes; protocol ordering needs a fence or waiting for that READ. M keeps conservative
+//! local access permissions until retirement and does not model transferred byte values.
 #![allow(unused_imports)]
 
 use crate::types::*;
@@ -464,6 +468,7 @@ state_machine! {
             reg_mr(key: Key, mr: Mr) {
                 require pre.pds.contains(mr.pd);
                 require !pre.mrs.contains_key(key);
+                require mr.remote_write ==> mr.local_write;
                 update mrs = pre.mrs.insert(key, mr);
             }
         }
