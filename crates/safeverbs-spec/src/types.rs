@@ -67,13 +67,36 @@ impl Status {
     }
 }
 
-/// What the NIC reports for one work request: the fields of `ibv_wc` that reach the user.
+/// Which successful completion fields have a meaning to the application.
+///
+/// SEND and WRITE acknowledgements, and every error, carry status only. A WRITE with
+/// immediate notification reports a remote write, not bytes in the posted RQ buffer.
+pub enum CompletionKind {
+    StatusOnly,
+    Read,
+    Receive,
+    WriteNotification,
+}
+
+/// The defined fields of a work completion, after discarding undefined provider values.
 pub struct Outcome {
     pub status: Status,
-    /// Bytes received (receives) or transferred (RDMA read).
+    pub kind: CompletionKind,
+    /// Bytes received or read, or the remote write length for a notification. Zero when
+    /// the length is undefined; this is a canonical representation, not a transfer count.
     pub byte_len: nat,
     /// Immediate data, for receives completed by a send or write with immediate.
     pub imm: Option<u32>,
+}
+
+impl Outcome {
+    /// Error metadata is undefined. Status-only successes have no length or immediate.
+    pub open spec fn canonical(self) -> bool {
+        &&& self.status.is_err() ==> self.kind is StatusOnly
+        &&& self.kind is StatusOnly ==> self.byte_len == 0 && self.imm is None
+        &&& self.kind is Read ==> self.imm is None
+        &&& self.kind is WriteNotification ==> self.imm is Some
+    }
 }
 
 } // verus!

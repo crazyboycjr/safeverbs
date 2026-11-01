@@ -114,6 +114,17 @@ impl Opcode {
             Transport::Ud => self is Send || self is SendImm,
         }
     }
+
+    /// SQ completion metadata: SEND/WRITE (including their immediate variants) have
+    /// status only. A successful READ completes the requested local transfer in full.
+    /// Immediate data belongs to the peer's receive completion, never this SQ outcome.
+    pub open spec fn allows_outcome(self, bytes: nat, o: Outcome) -> bool {
+        &&& o.canonical()
+        &&& o.status is Success ==> match self {
+            Opcode::Read => o.kind is Read && o.byte_len == bytes,
+            _ => o.kind is StatusOnly,
+        }
+    }
 }
 
 /// A send work request (`ibv_send_wr`, one element of its list).
@@ -130,6 +141,19 @@ pub struct SendWr {
 pub struct RecvWr {
     pub wr_id: u64,
     pub sges: Seq<Sge>,
+}
+
+impl RecvWr {
+    /// Ordinary SEND payloads land in these SGEs. WRITE_WITH_IMM only consumes the RQ
+    /// entry: its bytes land in the separately exposed remote region, so the notification
+    /// length need not fit this receive buffer (which may have no SGEs).
+    pub open spec fn allows_outcome(self, t: Transport, o: Outcome) -> bool {
+        &&& o.canonical()
+        &&& o.status is Success ==> (
+            (o.kind is Receive && o.byte_len <= total_len(self.sges))
+            || (o.kind is WriteNotification && !(t is Ud))
+        )
+    }
 }
 
 pub enum QpState {
@@ -592,6 +616,7 @@ state_machine! {
                 require qp.state is Err ==> o.status.is_err();
                 require o.status is FlushErr ==> qp.state is Err;
                 let slot = qp.sq[qp.sq_done as int];
+                require slot.wr.opcode.allows_outcome(total_len(slot.wr.sges), o);
                 let done = SendSlot { wr: slot.wr, outcome: Some(o) };
                 update qps = pre.qps.insert(q, Qp {
                     sq: qp.sq.update(qp.sq_done as int, done),
@@ -623,7 +648,7 @@ state_machine! {
                 require qp.state is Err ==> o.status.is_err();
                 require o.status is FlushErr ==> qp.state is Err;
                 let slot = qp.rq[qp.rq_done as int];
-                require o.status is Success ==> o.byte_len <= total_len(slot.wr.sges);
+                require slot.wr.allows_outcome(qp.attr.transport, o);
                 let c = qp.attr.recv_cq;
                 assert(pre.cqs[c].entries.len() < pre.cqs[c].cap) by {
                     crate::nic_proofs::lemma_room_for_recv_cqe(pre, q);

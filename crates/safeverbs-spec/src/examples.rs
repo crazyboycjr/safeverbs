@@ -14,12 +14,37 @@ use vstd::prelude::*;
 
 verus! {
 
+/// M distinguishes payload, local read data and remote write notifications. Undefined
+/// provider lengths and immediate words are never part of the promised SQ outcome.
+pub proof fn example_operation_metadata() {
+    let ack = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    assert(Opcode::Send.allows_outcome(64, ack));
+    assert(Opcode::SendImm(7).allows_outcome(64, ack));
+    assert(Opcode::Write.allows_outcome(4096, ack));
+    assert(Opcode::WriteImm(7).allows_outcome(4096, ack));
+    let read = Outcome { status: Status::Success, kind: CompletionKind::Read, byte_len: 64, imm: None };
+    assert(Opcode::Read.allows_outcome(64, read));
+    assert(!Opcode::Read.allows_outcome(65, read));
+    assert(!Opcode::Write.allows_outcome(64, read));
+    let notify = Outcome { status: Status::Success, kind: CompletionKind::WriteNotification, byte_len: 4096, imm: Some(7) };
+    let empty = RecvWr { wr_id: 0, sges: Seq::empty() };
+    assert(empty.allows_outcome(Transport::Rc, notify));
+    assert(empty.allows_outcome(Transport::Uc, notify));
+    assert(!empty.allows_outcome(Transport::Ud, notify));
+    let payload = Outcome { kind: CompletionKind::Receive, ..notify };
+    reveal(total_len);
+    assert(!empty.allows_outcome(Transport::Rc, payload));
+    let failed = Outcome { status: Status::RemoteErr, ..ack };
+    assert(Opcode::Read.allows_outcome(64, failed));
+    assert(empty.allows_outcome(Transport::Rc, failed));
+}
+
 /// A: allocate a buffer, freeze it, send it, poll once (`Pending`, registering a waker), let
 /// the NIC complete it (the waker runs), take the outcome and the buffer back.
 #[verifier::spinoff_prover]
 pub proof fn example_send_in_a() {
     let mem = Span { start: 0, len: 64 }.bytes();
-    let ok = Outcome { status: Status::Success, byte_len: 64, imm: None };
+    let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
 
     let s0 = Abs::State {
         qps: Set::empty(),
@@ -79,7 +104,7 @@ pub proof fn example_send_in_a() {
 /// request keeps the buffer until the NIC completes it, and only then is the lease released.
 pub proof fn example_dropped_receive_in_a() {
     let mem = Span { start: 4096, len: 4096 }.bytes();
-    let got = Outcome { status: Status::Success, byte_len: 100, imm: Some(5) };
+    let got = Outcome { status: Status::Success, kind: CompletionKind::Receive, byte_len: 100, imm: Some(5) };
     let buf = Lease { mem, unique: true, any_bytes: true, holder: Holder::Program };
     let s0 = Abs::State {
         qps: Set::empty().insert(7),
@@ -120,7 +145,7 @@ pub proof fn example_unsignaled_in_m() {
     broadcast use vstd::multiset::group_multiset_axioms;
     reveal_with_fuel(total_len, 2);
     let caps = Caps { max_qp_wr: 16, max_sge: 4, max_inline: 64, max_cqe: 64, max_msg: 1024 };
-    let ok = Outcome { status: Status::Success, byte_len: 0, imm: None };
+    let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
 
     let m0 = Nic::State {
         caps,

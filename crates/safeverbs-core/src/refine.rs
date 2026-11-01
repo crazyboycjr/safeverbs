@@ -160,7 +160,7 @@ pub open spec fn same<L>(v: View<L>, w: View<L>) -> bool {
 
 /// The outcome A gives a request in flight when its queue pair is destroyed.
 pub open spec fn flushed() -> Outcome {
-    Outcome { status: Status::FlushErr, byte_len: 0, imm: None }
+    Outcome { status: Status::FlushErr, kind: safeverbs_spec::types::CompletionKind::StatusOnly, byte_len: 0, imm: None }
 }
 
 // =============================================================================
