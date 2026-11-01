@@ -1,16 +1,18 @@
 [package]
 name = "perftest"
-version = "0.1.0"
-edition = "2021"
+description = "RDMA WRITE bandwidth over SafeVerbs, like perftest's ib_write_bw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
 
 [dependencies]
-anyhow = "1.0.94"
-bincode = "1.3.3"
-clap = { version = "4.5.23", features = ["derive"] }
-futures = "0.3.31"
-minstant = "0.1.7"
-safeverbs = { workspace = true, features = ["serde"] }
-serde.workspace = true
+anyhow = "1.0.104"
+bincode = "1"
+clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3.34"
+safeverbs = { version = "0.1.0", path = "../../crates/safeverbs", features = ["serde"] }
+serde = "1.0.229"
 
 [[bin]]
 name = "safeverbs_write_bw"

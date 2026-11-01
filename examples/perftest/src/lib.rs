@@ -1,43 +1,55 @@
+//! What the perftest binaries share: arguments, the device and the TCP
+//! exchanges.
+
 pub mod cli;
-use cli::get_args;
 
-use safeverbs::{Context, QpCapability, QueuePairEndpoint};
-use std::net::TcpStream;
 use std::io::{Read, Write};
+use std::net::TcpStream;
 
-pub fn find_and_open_device() -> anyhow::Result<Context> {
+use cli::get_args;
+use safeverbs::{Context, Nic, QueuePairBuilder, Transport};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+/// Opens the device the arguments name, or the first.
+pub fn open_device() -> anyhow::Result<Context> {
+    Ok(Context::open(get_args().device.as_deref())?)
+}
+
+/// A QP builder configured from the arguments.
+pub fn builder<T: Transport, N: Nic>(pd: &safeverbs::Pd<N>) -> QueuePairBuilder<T, N> {
     let args = get_args();
-    let devlist = safeverbs::devices()?;
-    let device = devlist
-        .iter()
-        .find(|dev| dev.name().unwrap().to_bytes() == args.device.as_bytes())
-        .unwrap_or_else(|| panic!("{} not found", args.device));
-    Ok(Context::with_device(&device)?)
+    let mut b = QueuePairBuilder::new(pd);
+    b.set_send_depth(args.tx_depth)
+        .set_traffic_class(args.traffic_class);
+    if let Some(i) = args.gid_index {
+        b.set_gid_index(i);
+    }
+    b
 }
 
-pub fn qp_capability() -> QpCapability {
-    QpCapability(safeverbs::ffi::ibv_qp_cap {
-        max_send_wr: get_args().tx_depth,
-        max_recv_wr: 128,
-        max_send_sge: 1,
-        max_recv_sge: 1,
-        max_inline_data: 32,
-    })
-}
-
-pub fn exchange_endpoint(
+/// Sends `value` and receives the peer's (length-prefixed bincode).
+pub fn exchange<T: Serialize + DeserializeOwned>(
     stream: &mut TcpStream,
-    local: QueuePairEndpoint,
-) -> anyhow::Result<QueuePairEndpoint> {
-    let buf = bincode::serialize(&local)?;
+    value: &T,
+) -> anyhow::Result<T> {
+    send(stream, value)?;
+    recv(stream)
+}
+
+/// Sends `value` (length-prefixed bincode).
+pub fn send<T: Serialize>(stream: &mut TcpStream, value: &T) -> anyhow::Result<()> {
+    let buf = bincode::serialize(value)?;
     stream.write_all(&(buf.len() as u32).to_be_bytes())?;
     stream.write_all(&buf)?;
+    Ok(())
+}
 
-    let mut len_buf = [0u8; 4];
-    stream.read(len_buf.as_mut())?;
-    let len = u32::from_be_bytes(len_buf);
-    let mut remote_buf = vec![0u8; len as usize];
-    stream.read_exact(&mut remote_buf)?;
-    let remote = bincode::deserialize(&remote_buf)?;
-    Ok(remote)
+/// Receives a value (length-prefixed bincode).
+pub fn recv<T: DeserializeOwned>(stream: &mut TcpStream) -> anyhow::Result<T> {
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len)?;
+    let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+    stream.read_exact(&mut buf)?;
+    Ok(bincode::deserialize(&buf)?)
 }

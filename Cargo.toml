@@ -4,9 +4,9 @@ members = [
     "crates/safeverbs-sys",
     "crates/safeverbs-core",
     "crates/safeverbs",
-    # "examples/greeter",
-    # "examples/perftest",
-    # "examples/uchan",
+    "examples/greeter",
+    "examples/perftest",
+    "examples/uchan",
 ]
 # Its own workspace, so that it verifies on a plain clone (scripts/verify.sh).
 exclude = ["crates/safeverbs-spec"]

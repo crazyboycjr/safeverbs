@@ -1,13 +1,15 @@
 [package]
 name = "greeter"
-version = "0.1.0"
-edition = "2021"
+description = "Hello world over SafeVerbs: one SEND into one receive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
 
 [dependencies]
-bincode = "1.3.3"
-futures = "0.3.31"
-safeverbs = { workspace = true, features = ["serde"] }
-serde.workspace = true
+bincode = "1"
+futures = "0.3.34"
+safeverbs = { version = "0.1.0", path = "../../crates/safeverbs", features = ["serde"] }
 
 [[bin]]
 name = "greeter_client"

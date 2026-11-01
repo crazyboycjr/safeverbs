@@ -1,25 +1,30 @@
+//! Command-line arguments.
+
+use std::sync::OnceLock;
+
 use clap::Parser;
 
+/// Perftest for SafeVerbs.
 #[derive(Parser, Debug)]
-#[command(about = "Perftest for SafeVerbs.")]
+#[command(about = "RDMA WRITE bandwidth test for SafeVerbs.")]
 pub struct Args {
-    /// The host address to connect, can be an IP address or domain name.
-    /// If not specified, the binary runs as a server that listens on 0.0.0.0.
+    /// The host to connect to, an IP address or a name. Without it the
+    /// binary runs as the server and listens on 0.0.0.0.
     pub host: Option<String>,
 
-    /// The port number to use.
+    /// The TCP port to use.
     #[arg(short, long, default_value = "5000")]
     pub port: u16,
 
-    /// The IB device to use.
-    #[arg(short, long, default_value = "mlx5_0")]
-    pub device: String,
+    /// The RDMA device to use (default: the first).
+    #[arg(short, long)]
+    pub device: Option<String>,
 
     /// Send queue depth (max_send_wr).
     #[arg(short, long, default_value = "128")]
     pub tx_depth: u32,
 
-    /// Total number of iterations.
+    /// Number of measured iterations.
     #[arg(short, long, default_value = "5000")]
     pub num_iters: usize,
 
@@ -27,45 +32,30 @@ pub struct Args {
     #[arg(short, long, default_value = "100")]
     pub warmup: usize,
 
-    /// Message size.
+    /// Message size in bytes.
     #[arg(short, long, default_value = "65536")]
     pub size: usize,
 
-    /// Connection type, RC/UC.
+    /// Connection type, RC or UC.
     #[arg(short, long, default_value = "RC")]
     pub connection: String,
 
-    /// Uses GID with GID index. Equivalent to -x flags in perftest.
+    /// The GID index (perftest's -x); default: the first RoCE v2 GID with an
+    /// IPv4 address.
     #[arg(short = 'x', long)]
     pub gid_index: Option<u8>,
 
-    /// Traffic class if GRH is in use
+    /// Traffic class with a GRH.
     #[arg(long, default_value = "0")]
     pub traffic_class: u8,
-    // /// Number of QPs in each thread.
-    // #[arg(long, default_value = "1")]
-    // pub num_qp: usize,
-
-    // /// Number of threads. num_threads * num_qp is mapped to to num_server_qps
-    // /// in a round-robin way.
-    // #[arg(long, default_value = "1")]
-    // pub num_threads: usize,
-
-    // /// Number of server QPs.
-    // #[arg(long, default_value = "1")]
-    // pub num_server_qps: usize,
 }
 
-#[inline]
+/// The arguments, parsed once.
 pub fn get_args() -> &'static Args {
-    use std::sync::OnceLock;
     static ARGS: OnceLock<Args> = OnceLock::new();
-
-    let args: &Args = ARGS.get_or_init(|| {
+    ARGS.get_or_init(|| {
         let args = Args::parse();
-        println!("args: {:#?}", args);
+        println!("args: {args:#?}");
         args
-    });
-
-    args
+    })
 }
