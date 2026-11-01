@@ -773,4 +773,454 @@ impl<N: Device> Hw<N> {
     }
 }
 
+// =============================================================================
+// Changing one QP
+
+/// QP `b` is QP `a` with maybe another state: the same attributes, the same
+/// WQEs, the executed ones with the same outcomes, maybe more executed.
+pub open spec fn kept_but_state(a: Qp, b: Qp) -> bool {
+    &&& b.attr == a.attr
+    &&& b.sq_head == a.sq_head && b.sq.len() == a.sq.len() && a.sq_done <= b.sq_done
+    &&& b.rq_head == a.rq_head && b.rq.len() == a.rq.len() && a.rq_done <= b.rq_done
+    &&& forall|k: int| 0 <= k < a.sq.len() ==> (#[trigger] b.sq[k]).wr == a.sq[k].wr
+    &&& forall|k: int| 0 <= k < a.rq.len() ==> (#[trigger] b.rq[k]).wr == a.rq[k].wr
+}
+
+/// `framed`, but QP `q` of the share may have changed state (as `modify_qp`
+/// changes it): the same as `framed` for everything else.
+pub open spec fn framed_but(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State, q: QpId) -> bool {
+    &&& n.caps == m.caps
+    &&& m.pds.subset_of(n.pds)
+    &&& forall|k: Key| #[trigger] pins.contains(k) && m.mrs.contains_key(k)
+        ==> n.mrs.contains_key(k) && n.mrs[k] == m.mrs[k]
+    &&& forall|p: QpId| #[trigger] sh.owns.contains(p)
+        ==> (n.qps.contains_key(p) <==> m.qps.contains_key(p))
+    &&& forall|p: QpId| #[trigger] sh.owns.contains(p) && m.qps.contains_key(p) && p != q
+        ==> qp_kept(m.qps[p], n.qps[p])
+    &&& m.qps.contains_key(q) ==> kept_but_state(m.qps[q], n.qps[q])
+    &&& n.cqs.contains_key(sh.cq)
+    &&& n.cqs[sh.cq].cap == m.cqs[sh.cq].cap
+    &&& n.cqs[sh.cq].reserved == m.cqs[sh.cq].reserved
+    &&& forall|w: WqeRef| #[trigger] sh.owns.contains(w.qp) ==> (n.retired.contains_key(w)
+        <==> m.retired.contains_key(w))
+}
+
+/// What `modify_qp` steps of the worker's own QP `q` (to states other than
+/// `Reset`), with rely in between, keep: the share as `framed_but` says, and
+/// `q` in the last state asked for, or `Err`.
+proof fn lemma_modified(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State, q: QpId, tos: Seq<QpState>)
+    requires
+        nic_inv(m),
+        share_wf(m, sh),
+        sh.owns.contains(q),
+        m.qps.contains_key(q),
+        modified(sh, pins, m, n, q, tos),
+        forall|i: int| 0 <= i < tos.len() ==> !(#[trigger] tos[i] is Reset),
+    ensures
+        nic_inv(n),
+        share_wf(n, sh),
+        framed_but(sh, pins, m, n, q),
+        tos.len() == 0 ==> state_kept(m.qps[q].state, n.qps[q].state),
+        tos.len() > 0 ==> n.qps[q].state == tos.last() || n.qps[q].state is Err,
+    decreases tos.len(),
+{
+    if tos.len() == 0 {
+        lemma_rely_frame(sh, pins, m, n);
+    } else {
+        let to = tos.last();
+        let (mid, before) = choose|mid: Nic::State, before: Nic::State|
+            modified(sh, pins, m, mid, q, tos.drop_last()) && rely_reaches(sh, pins, mid, before)
+                && nic_step(before, n, Nic::Step::modify_qp(q, to));
+        assert forall|i: int| 0 <= i < tos.drop_last().len() implies !(#[trigger] tos.drop_last()[i] is Reset) by {
+            assert(tos.drop_last()[i] == tos[i]);
+        }
+        lemma_modified(sh, pins, m, mid, q, tos.drop_last());
+        lemma_rely_frame(sh, pins, mid, before);
+        assert(tos[tos.len() - 1] == to);
+        lemma_nic_step_is_next(before, n, Nic::Step::modify_qp(q, to));
+        lemma_step_keeps_invariant(before, n);
+        lemma_mine_keeps_share_wf(sh, pins, before, n, Nic::Step::modify_qp(q, to));
+        // Compose: m to mid (framed but q), mid to before (framed), before to
+        // n (only q's state).
+        assert forall|p: QpId| #[trigger] sh.owns.contains(p) && m.qps.contains_key(p) && p != q
+            implies qp_kept(m.qps[p], n.qps[p]) by {
+            let (a, b, c) = (m.qps[p], mid.qps[p], before.qps[p]);
+            assert(qp_kept(a, b) && qp_kept(b, c) && n.qps[p] == c);
+            assert forall|k: int| 0 <= k < a.sq.len() implies (#[trigger] c.sq[k]).wr == a.sq[k].wr by {
+                assert(b.sq[k].wr == a.sq[k].wr);
+            }
+            assert forall|k: int| 0 <= k < a.rq.len() implies (#[trigger] c.rq[k]).wr == a.rq[k].wr by {
+                assert(b.rq[k].wr == a.rq[k].wr);
+            }
+            assert forall|k: int| 0 <= k < a.sq_done implies (#[trigger] c.sq[k]).outcome == a.sq[k].outcome by {
+                assert(b.sq[k].outcome == a.sq[k].outcome);
+            }
+            assert forall|k: int| 0 <= k < a.rq_done implies (#[trigger] c.rq[k]).outcome == a.rq[k].outcome by {
+                assert(b.rq[k].outcome == a.rq[k].outcome);
+            }
+        }
+        let (a, b, c, d) = (m.qps[q], mid.qps[q], before.qps[q], n.qps[q]);
+        assert(kept_but_state(a, b) && qp_kept(b, c));
+        assert(d == c.with_state(d.state));
+        assert forall|k: int| 0 <= k < a.sq.len() implies (#[trigger] d.sq[k]).wr == a.sq[k].wr by {
+            assert(b.sq[k].wr == a.sq[k].wr && c.sq[k].wr == b.sq[k].wr);
+        }
+        assert forall|k: int| 0 <= k < a.rq.len() implies (#[trigger] d.rq[k]).wr == a.rq[k].wr by {
+            assert(b.rq[k].wr == a.rq[k].wr && c.rq[k].wr == b.rq[k].wr);
+        }
+        assert forall|w: WqeRef| #[trigger] sh.owns.contains(w.qp) implies (n.retired.contains_key(w)
+            <==> m.retired.contains_key(w)) by {
+            assert(mid.retired.contains_key(w) == m.retired.contains_key(w));
+            assert(before.retired.contains_key(w) == mid.retired.contains_key(w));
+        }
+    }
+}
+
+impl<N: Device> Hw<N> {
+    /// After a step that changed only entry `index`'s QP in M (and the
+    /// entry), the invariant holds again.
+    proof fn lemma_touch_one(&self, start: &Self, t: NicToken, mid: Nic::State, n: Nic::State, index: int)
+        requires
+            start.inv_with(t, mid),
+            nic_inv(n),
+            share_wf(n, t.share()),
+            0 <= index < start.qps@.len(),
+            start.qps@[index] is Some,
+            self.qps@.len() == start.qps@.len(),
+            forall|i: int| 0 <= i < self.qps@.len() && i != index ==> #[trigger] self.qps@[i] == start.qps@[i],
+            self.qps@[index] is Some,
+            self.qps@[index]->0.id() == start.qps@[index]->0.id(),
+            self.entry_ok(index, t, n),
+            self.cq == start.cq,
+            self.pd == start.pd,
+            self.caps == start.caps,
+            self.cq_size == start.cq_size,
+            self.reserved == start.reserved,
+            self.next_name == start.next_name,
+            n.qps.dom() =~= mid.qps.dom(),
+            forall|p: QpId| #[trigger] mid.qps.contains_key(p) && p != start.qps@[index]->0.id() ==> n.qps[p] == mid.qps[p],
+            n.caps == mid.caps,
+            n.mrs == mid.mrs,
+            n.pds == mid.pds,
+            n.retired == mid.retired,
+            n.cqs[t.share().cq].cap == mid.cqs[t.share().cq].cap,
+            n.cqs[t.share().cq].reserved == mid.cqs[t.share().cq].reserved,
+        ensures
+            self.inv_with(t, n),
+    {
+        let q = start.qps@[index]->0.id();
+        assert forall|i: int| 0 <= i < self.qps@.len() implies #[trigger] self.entry_ok(i, t, n) by {
+            if i != index {
+                assert(start.entry_ok(i, t, mid));
+                if let Some(e) = self.qps@[i] {
+                    assert(e.id() != q);
+                    lemma_ok_same(e, i as u16, mid, n, t.share(), t.pd(), t.started(e.id()), t.written(e.id()));
+                }
+            }
+        }
+        assert forall|i: int, j: int|
+            #![trigger self.qps@[i], self.qps@[j]]
+            0 <= i < self.qps@.len() && 0 <= j < self.qps@.len() && i != j && self.qps@[i] is Some
+                && self.qps@[j] is Some implies self.qps@[i]->0.id() != self.qps@[j]->0.id() by {
+            if i != index && j != index {
+                assert(self.qps@[i] == start.qps@[i] && self.qps@[j] == start.qps@[j]);
+            } else if i == index {
+                assert(self.qps@[j] == start.qps@[j]);
+            } else {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|p: QpId| #[trigger] n.qps.contains_key(p) && t.share().owns.contains(p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            assert(mid.qps.contains_key(p));
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            if i != index {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|p: QpId| #[trigger] writes(t, p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            if i != index {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|k: nat| k >= self.next_name@ implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
+            assert(!mid.qps.contains_key(t.name(k)));
+        }
+    }
+
+    /// Moves QP `index` to the error state: every request in flight
+    /// completes with a flush error. Work posted from then on is flushed
+    /// too.
+    pub fn to_error(&mut self, index: usize) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        if index >= self.qps.len() {
+            no_qp(index);
+            return Err(Error::Invalid("no such QP"));
+        }
+        let ghost start = *self;
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        let ghost sh = t0.share();
+        proof {
+            assert(start.entry_ok(index as int, t0, m0));
+        }
+        let r = match &mut self.qps[index] {
+            Some(e) => {
+                if e.removed {
+                    no_qp(index);
+                }
+                let ghost q = e.id@;
+                let r = to_error(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                if r.is_ok() {
+                    e.phase = Phase::Ready;
+                }
+                r
+            },
+            None => {
+                no_qp(index);
+                Err(Error::Invalid("no such QP"))
+            },
+        };
+        proof {
+            let t = self.token@;
+            let n = t.nic();
+            let e0 = start.qps@[index as int]->0;
+            let q = e0.id();
+            if r is Ok {
+                let mid = choose|mid: Nic::State| rely_reaches(sh, pinned(t0), m0, mid) && nic_step(mid, n, Nic::Step::modify_qp(q, QpState::Err));
+                start.lemma_rely(t0, m0, mid);
+                start.lemma_same_token(t0, t, mid);
+                lemma_nic_step_is_next(mid, n, Nic::Step::modify_qp(q, QpState::Err));
+                lemma_step_keeps_invariant(mid, n);
+                lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::modify_qp(q, QpState::Err));
+                assert(start.entry_ok(index as int, t, mid));
+                let e = self.qps@[index as int]->0;
+                let written = t.written(q);
+                assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(n.qps[q].attr, #[trigger] written[j]) by {
+                    assert(mid.send_wr_ok(mid.qps[q].attr, written[j]));
+                }
+                assert(self.entry_ok(index as int, t, n));
+                self.lemma_touch_one(&start, t, mid, n, index as int);
+            } else {
+                start.lemma_rely(t0, m0, n);
+                start.lemma_same_token(t0, t, n);
+                assert(start.entry_ok(index as int, t, n));
+                self.lemma_touch_one(&start, t, n, n, index as int);
+            }
+        }
+        r
+    }
+}
+
+impl<N: Device> Hw<N> {
+    /// After steps that frame the share but QP `q` of entry `index` (and a
+    /// change of that entry), the invariant holds again.
+    proof fn lemma_but_one(&self, start: &Self, t: NicToken, m: Nic::State, n: Nic::State, index: int)
+        requires
+            start.inv_with(t, m),
+            nic_inv(n),
+            share_wf(n, t.share()),
+            0 <= index < start.qps@.len(),
+            start.qps@[index] is Some,
+            framed_but(t.share(), pinned(t), m, n, start.qps@[index]->0.id()),
+            self.qps@.len() == start.qps@.len(),
+            forall|i: int| 0 <= i < self.qps@.len() && i != index ==> #[trigger] self.qps@[i] == start.qps@[i],
+            self.qps@[index] is Some,
+            self.qps@[index]->0.id() == start.qps@[index]->0.id(),
+            self.entry_ok(index, t, n),
+            self.cq == start.cq,
+            self.pd == start.pd,
+            self.caps == start.caps,
+            self.cq_size == start.cq_size,
+            self.reserved == start.reserved,
+            self.next_name == start.next_name,
+        ensures
+            self.inv_with(t, n),
+    {
+        let q = start.qps@[index]->0.id();
+        let sh = t.share();
+        assert forall|i: int| 0 <= i < self.qps@.len() implies #[trigger] self.entry_ok(i, t, n) by {
+            if i != index {
+                assert(start.entry_ok(i, t, m));
+                if let Some(e) = self.qps@[i] {
+                    let p = e.id();
+                    assert(p != q);
+                    let (a, b) = (m.qps[p], n.qps[p]);
+                    assert(qp_kept(a, b));
+                    assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
+                        i as u16,
+                        false,
+                        (b.sq_head + k) as u64,
+                    ) by {
+                        assert(b.sq[k].wr == a.sq[k].wr);
+                    }
+                    assert forall|k: int| 0 <= k < b.rq.len() implies (#[trigger] b.rq[k]).wr.wr_id == spec_wr_id(
+                        i as u16,
+                        true,
+                        (b.rq_head + k) as u64,
+                    ) by {
+                        assert(b.rq[k].wr == a.rq[k].wr);
+                    }
+                    let written = t.written(p);
+                    assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(b.attr, #[trigger] written[j]) by {
+                        lemma_written_pinned(t, p, j);
+                        let wr = written[j];
+                        assert(m.send_wr_ok(a.attr, wr));
+                        if !wr.inline {
+                            assert forall|x: int| 0 <= x < wr.sges.len() implies n.registered(a.attr.pd, #[trigger] wr.sges[x], wr.opcode.writes_local()) by {
+                                assert(m.registered(a.attr.pd, wr.sges[x], wr.opcode.writes_local()));
+                                assert(pinned(t).contains(wr.sges[x].lkey));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert forall|i: int, j: int|
+            #![trigger self.qps@[i], self.qps@[j]]
+            0 <= i < self.qps@.len() && 0 <= j < self.qps@.len() && i != j && self.qps@[i] is Some
+                && self.qps@[j] is Some implies self.qps@[i]->0.id() != self.qps@[j]->0.id() by {
+            if i != index && j != index {
+                assert(self.qps@[i] == start.qps@[i] && self.qps@[j] == start.qps@[j]);
+            } else if i == index {
+                assert(self.qps@[j] == start.qps@[j]);
+            } else {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|p: QpId| #[trigger] n.qps.contains_key(p) && sh.owns.contains(p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            assert(m.qps.contains_key(p));
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            if i != index {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|p: QpId| #[trigger] writes(t, p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            if i != index {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|k: nat| k >= self.next_name@ implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
+            assert(sh.owns.contains(t.name(k)));
+            assert(!m.qps.contains_key(t.name(k)));
+        }
+        assert forall|k: nat, w: WqeRef| k >= self.next_name@ && #[trigger] n.retired.contains_key(w)
+            implies w.qp != #[trigger] t.name(k) by {
+            if w.qp == t.name(k) {
+                assert(sh.owns.contains(w.qp));
+                assert(m.retired.contains_key(w));
+            }
+        }
+    }
+
+    /// Connects QP `index` to `remote` (RESET to INIT, RTR and RTS). A QP
+    /// connects once: from RESET, as created. If connecting fails part way,
+    /// the QP takes no work until it is moved to the error state.
+    pub fn connect(&mut self, index: usize, attr: &ConnectAttr, remote: &Endpoint) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        if index >= self.qps.len() {
+            no_qp(index);
+            return Err(Error::Invalid("no such QP"));
+        }
+        let ghost start = *self;
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        let ghost sh = t0.share();
+        proof {
+            assert(start.entry_ok(index as int, t0, m0));
+        }
+        let phase = match &self.qps[index] {
+            Some(e) => e.phase,
+            None => Phase::Broken,
+        };
+        if !matches!(phase, Phase::Reset) {
+            return Err(Error::Invalid("a QP connects once, from RESET"));
+        }
+        proof {
+            assert(self.qps@[index as int]->0.phase == Phase::Reset);
+        }
+        let r = match &mut self.qps[index] {
+            Some(e) => {
+                if e.removed {
+                    no_qp(index);
+                }
+                let ghost q = e.id@;
+                proof {
+                    assert(e.phase == Phase::Reset);
+                    assert(phase_ok(e.phase, m0.qps[q].state));
+                }
+                let r = connect(&mut e.hw, attr, remote, Ghost(q), Tracked(self.token.borrow_mut()));
+                e.phase = if r.is_ok() {
+                    Phase::Ready
+                } else {
+                    Phase::Broken
+                };
+                r
+            },
+            None => {
+                no_qp(index);
+                Err(Error::Invalid("no such QP"))
+            },
+        };
+        proof {
+            let t = self.token@;
+            let n = t.nic();
+            let q = start.qps@[index as int]->0.id();
+            let tos = if r is Ok {
+                connect_states()
+            } else {
+                let k = choose|k: int| 0 <= k < 3 && modified(sh, pinned(t0), m0, n, q, connect_states().take(k));
+                connect_states().take(k)
+            };
+            assert forall|i: int| 0 <= i < tos.len() implies !(#[trigger] tos[i] is Reset) by {
+                assert(tos[i] == connect_states()[i]);
+            }
+            lemma_modified(sh, pinned(t0), m0, n, q, tos);
+            let written = t0.written(q);
+            let (a, b) = (m0.qps[q], n.qps[q]);
+            assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(b.attr, #[trigger] written[j]) by {
+                lemma_written_pinned(t0, q, j);
+                let wr = written[j];
+                assert(m0.send_wr_ok(a.attr, wr));
+                if !wr.inline {
+                    assert forall|x: int| 0 <= x < wr.sges.len() implies n.registered(a.attr.pd, #[trigger] wr.sges[x], wr.opcode.writes_local()) by {
+                        assert(m0.registered(a.attr.pd, wr.sges[x], wr.opcode.writes_local()));
+                        assert(pinned(t0).contains(wr.sges[x].lkey));
+                    }
+                }
+            }
+            let cs = connect_states();
+            assert(cs[0] == QpState::Init && cs[1] == QpState::Rtr && cs[2] == QpState::Rts);
+            if tos.len() > 0 {
+                assert(tos.last() == tos[tos.len() - 1]);
+                assert(tos[tos.len() - 1] == cs[tos.len() - 1]);
+            }
+            let e = self.qps@[index as int]->0;
+            let e0 = start.qps@[index as int]->0;
+            assert(e0.ok(index as u16, m0, sh, t0.pd(), t0.started(q), t0.written(q)));
+            assert(phase_ok(e.phase, b.state));
+            assert(sq_linked(e.send, index as u16, b));
+            assert(rq_linked(e.recv, index as u16, b));
+            assert(writing_ok(e.send, index as u16, n, b.attr, t0.started(q), written));
+            assert(self.entry_ok(index as int, t0, n));
+            self.lemma_but_one(&start, t0, m0, n, index as int);
+            self.lemma_same_token(t0, t, n);
+        }
+        r
+    }
+}
+
 } // verus!
