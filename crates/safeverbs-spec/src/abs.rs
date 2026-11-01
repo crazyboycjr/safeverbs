@@ -434,51 +434,86 @@ state_machine! {
         // Inductiveness
 
         #[inductive(start)]
-        fn start_inductive(post: Self) {}
+        pub fn start_inductive(post: Self) {}
 
         #[inductive(create_qp)]
-        fn create_qp_inductive(pre: Self, post: Self, q: QpId) {}
+        pub fn create_qp_inductive(pre: Self, post: Self, q: QpId) {}
 
         #[inductive(drop_qp)]
-        fn drop_qp_inductive(pre: Self, post: Self, q: QpId) {}
+        pub fn drop_qp_inductive(pre: Self, post: Self, q: QpId) {}
 
         #[inductive(alloc)]
-        fn alloc_inductive(pre: Self, post: Self, mem: ISet<int>, any_bytes: bool) {}
+        pub fn alloc_inductive(pre: Self, post: Self, mem: ISet<int>, any_bytes: bool) {}
 
         #[inductive(split)]
-        fn split_inductive(pre: Self, post: Self, i: Id, left: ISet<int>) {}
+        pub fn split_inductive(pre: Self, post: Self, i: Id, left: ISet<int>) {}
 
         #[inductive(freeze)]
-        fn freeze_inductive(pre: Self, post: Self, i: Id) {}
+        pub fn freeze_inductive(pre: Self, post: Self, i: Id) {}
 
         #[inductive(share)]
-        fn share_inductive(pre: Self, post: Self, i: Id, sub: ISet<int>) {}
+        pub fn share_inductive(pre: Self, post: Self, i: Id, sub: ISet<int>) {}
 
         #[inductive(thaw)]
-        fn thaw_inductive(pre: Self, post: Self, i: Id) {}
+        pub fn thaw_inductive(pre: Self, post: Self, i: Id) {}
 
         #[inductive(drop)]
-        fn drop_inductive(pre: Self, post: Self, i: Id) {}
+        pub fn drop_inductive(pre: Self, post: Self, i: Id) {}
 
         #[inductive(post_request)]
-        fn post_request_inductive(pre: Self, post: Self, i: Id, q: QpId, dir: Dir) {}
+        pub fn post_request_inductive(pre: Self, post: Self, i: Id, q: QpId, dir: Dir) {}
 
         #[inductive(complete)]
-        fn complete_inductive(pre: Self, post: Self, r: Id, o: Outcome) {}
+        pub fn complete_inductive(pre: Self, post: Self, r: Id, o: Outcome) {}
 
         #[inductive(register)]
-        fn register_inductive(pre: Self, post: Self, r: Id, w: WakerId) {}
+        pub fn register_inductive(pre: Self, post: Self, r: Id, w: WakerId) {}
 
         #[inductive(take)]
-        fn take_inductive(pre: Self, post: Self, r: Id, o: Outcome) {}
+        pub fn take_inductive(pre: Self, post: Self, r: Id, o: Outcome) {}
 
         #[inductive(detach)]
-        fn detach_inductive(pre: Self, post: Self, r: Id) {}
+        pub fn detach_inductive(pre: Self, post: Self, r: Id) {}
 
         #[inductive(expose)]
-        fn expose_inductive(pre: Self, post: Self, i: Id, remote_write: bool) {}
+        pub fn expose_inductive(pre: Self, post: Self, i: Id, remote_write: bool) {}
 
         #[inductive(unexpose)]
-        fn unexpose_inductive(pre: Self, post: Self, i: Id) {}
+        pub fn unexpose_inductive(pre: Self, post: Self, i: Id) {}
     }
 }
+
+verus! {
+
+/// A's invariants hold in every state it can reach: every step keeps them.
+pub proof fn lemma_step_keeps_invariant(pre: Abs::State, post: Abs::State)
+    requires
+        pre.invariant(),
+        Abs::State::next(pre, post),
+    ensures
+        post.invariant(),
+{
+    reveal(Abs::State::next);
+    reveal(Abs::State::next_by);
+    let step = choose|step: Abs::Step| Abs::State::next_by(pre, post, step);
+    match step {
+        Abs::Step::create_qp(q) => Abs::State::create_qp_inductive(pre, post, q),
+        Abs::Step::drop_qp(q) => Abs::State::drop_qp_inductive(pre, post, q),
+        Abs::Step::alloc(mem, any_bytes) => Abs::State::alloc_inductive(pre, post, mem, any_bytes),
+        Abs::Step::split(i, left) => Abs::State::split_inductive(pre, post, i, left),
+        Abs::Step::freeze(i) => Abs::State::freeze_inductive(pre, post, i),
+        Abs::Step::share(i, sub) => Abs::State::share_inductive(pre, post, i, sub),
+        Abs::Step::thaw(i) => Abs::State::thaw_inductive(pre, post, i),
+        Abs::Step::drop(i) => Abs::State::drop_inductive(pre, post, i),
+        Abs::Step::post_request(i, q, dir) => Abs::State::post_request_inductive(pre, post, i, q, dir),
+        Abs::Step::complete(r, o) => Abs::State::complete_inductive(pre, post, r, o),
+        Abs::Step::register(r, w) => Abs::State::register_inductive(pre, post, r, w),
+        Abs::Step::take(r, o) => Abs::State::take_inductive(pre, post, r, o),
+        Abs::Step::detach(r) => Abs::State::detach_inductive(pre, post, r),
+        Abs::Step::expose(i, remote_write) => Abs::State::expose_inductive(pre, post, i, remote_write),
+        Abs::Step::unexpose(i) => Abs::State::unexpose_inductive(pre, post, i),
+        Abs::Step::dummy_to_use_type_params(_) => {},
+    }
+}
+
+} // verus!
