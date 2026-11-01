@@ -814,6 +814,83 @@ state_machine! {
 verus! {
 
 // =========================================================================================
+// Names for other crates
+//
+// `state_machine!` emits its relations, `invariant()` and the `_enabled` predicates only when
+// Verus keeps ghost bodies, which it does not for the copy of this crate that dependent crates
+// compile against. These wrappers carry them across (their meaning comes along in Verus's
+// exported definitions).
+
+/// `s` satisfies the invariants of Nic (`Nic::State::invariant`).
+pub open spec fn nic_inv(s: Nic::State) -> bool {
+    s.invariant()
+}
+
+/// `s` is a start state of Nic.
+pub open spec fn nic_init(s: Nic::State) -> bool {
+    Nic::State::init(s)
+}
+
+/// `post` follows from `pre` by one step of Nic, any step.
+pub open spec fn nic_next(pre: Nic::State, post: Nic::State) -> bool {
+    Nic::State::next(pre, post)
+}
+
+/// `post` follows from `pre` by `step`.
+pub open spec fn nic_step(pre: Nic::State, post: Nic::State, step: Nic::Step) -> bool {
+    match step {
+        Nic::Step::alloc_pd(pd) => Nic::State::alloc_pd(pre, post, pd),
+        Nic::Step::reg_mr(key, mr) => Nic::State::reg_mr(pre, post, key, mr),
+        Nic::Step::dereg_mr(key) => Nic::State::dereg_mr(pre, post, key),
+        Nic::Step::create_cq(c, cap) => Nic::State::create_cq(pre, post, c, cap),
+        Nic::Step::destroy_cq(c) => Nic::State::destroy_cq(pre, post, c),
+        Nic::Step::create_qp(q, attr) => Nic::State::create_qp(pre, post, q, attr),
+        Nic::Step::modify_qp(q, to) => Nic::State::modify_qp(pre, post, q, to),
+        Nic::Step::destroy_qp(q) => Nic::State::destroy_qp(pre, post, q),
+        Nic::Step::post_send(q, wrs) => Nic::State::post_send(pre, post, q, wrs),
+        Nic::Step::post_recv(q, wrs) => Nic::State::post_recv(pre, post, q, wrs),
+        Nic::Step::poll_cq(c) => Nic::State::poll_cq(pre, post, c),
+        Nic::Step::execute_send(q, o) => Nic::State::execute_send(pre, post, q, o),
+        Nic::Step::execute_recv(q, o) => Nic::State::execute_recv(pre, post, q, o),
+        Nic::Step::fault(q) => Nic::State::fault(pre, post, q),
+        Nic::Step::dummy_to_use_type_params(_) => false,
+    }
+}
+
+/// `step` may happen in `pre`: for a verb, its precondition (what S2 promises).
+pub open spec fn nic_enabled(pre: Nic::State, step: Nic::Step) -> bool {
+    match step {
+        Nic::Step::alloc_pd(pd) => Nic::State::alloc_pd_enabled(pre, pd),
+        Nic::Step::reg_mr(key, mr) => Nic::State::reg_mr_enabled(pre, key, mr),
+        Nic::Step::dereg_mr(key) => Nic::State::dereg_mr_enabled(pre, key),
+        Nic::Step::create_cq(c, cap) => Nic::State::create_cq_enabled(pre, c, cap),
+        Nic::Step::destroy_cq(c) => Nic::State::destroy_cq_enabled(pre, c),
+        Nic::Step::create_qp(q, attr) => Nic::State::create_qp_enabled(pre, q, attr),
+        Nic::Step::modify_qp(q, to) => Nic::State::modify_qp_enabled(pre, q, to),
+        Nic::Step::destroy_qp(q) => Nic::State::destroy_qp_enabled(pre, q),
+        Nic::Step::post_send(q, wrs) => Nic::State::post_send_enabled(pre, q, wrs),
+        Nic::Step::post_recv(q, wrs) => Nic::State::post_recv_enabled(pre, q, wrs),
+        Nic::Step::poll_cq(c) => Nic::State::poll_cq_enabled(pre, c),
+        Nic::Step::execute_send(q, o) => Nic::State::execute_send_enabled(pre, q, o),
+        Nic::Step::execute_recv(q, o) => Nic::State::execute_recv_enabled(pre, q, o),
+        Nic::Step::fault(q) => Nic::State::fault_enabled(pre, q),
+        Nic::Step::dummy_to_use_type_params(_) => false,
+    }
+}
+
+/// A step by `step` is a step of Nic.
+pub proof fn lemma_nic_step_is_next(pre: Nic::State, post: Nic::State, step: Nic::Step)
+    requires
+        nic_step(pre, post, step),
+    ensures
+        nic_next(pre, post),
+{
+    reveal(Nic::State::next);
+    reveal(Nic::State::next_by);
+    assert(Nic::State::next_by(pre, post, step));
+}
+
+// =========================================================================================
 // What M promises the library (proofs in `nic_proofs`)
 
 /// M's invariants hold in every state it can reach: every step, verb or NIC step, keeps them.

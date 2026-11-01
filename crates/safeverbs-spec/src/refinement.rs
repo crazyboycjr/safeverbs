@@ -115,8 +115,8 @@ pub trait Refines: Sized {
             c.init(),
         ensures
             c.inv(),
-            Abs::State::init(c.abs()),
-            Nic::State::init(c.nic()),
+            abs_init(c.abs()),
+            nic_init(c.nic()),
     ;
 
     /// Every call keeps the invariant, is zero or more steps of A, and moves the NIC by
@@ -159,13 +159,13 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
         run[0].init(),
         forall|i: int| 0 <= i < run.len() - 1 ==> (#[trigger] run[i]).step(&run[i + 1]),
     ensures
-        Abs::State::init(run[0].abs()),
-        Nic::State::init(run[0].nic()),
+        abs_init(run[0].abs()),
+        nic_init(run[0].nic()),
         forall|i: int| 0 <= i < run.len() ==> {
             let c = #[trigger] run[i];
             &&& c.inv()
-            &&& abs_reaches(run[0].abs(), c.abs()) && c.abs().invariant()
-            &&& nic_reaches(run[0].nic(), c.nic()) && c.nic().invariant()
+            &&& abs_reaches(run[0].abs(), c.abs()) && abs_inv(c.abs())
+            &&& nic_reaches(run[0].nic(), c.nic()) && nic_inv(c.nic())
             &&& coupled(c.abs(), c.nic(), c.wqe())
         },
     decreases run.len(),
@@ -201,8 +201,8 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
         assert forall|i: int| 0 <= i < run.len() implies {
             let c = #[trigger] run[i];
             &&& c.inv()
-            &&& abs_reaches(a0, c.abs()) && c.abs().invariant()
-            &&& nic_reaches(m0, c.nic()) && c.nic().invariant()
+            &&& abs_reaches(a0, c.abs()) && abs_inv(c.abs())
+            &&& nic_reaches(m0, c.nic()) && nic_inv(c.nic())
             &&& coupled(c.abs(), c.nic(), c.wqe())
         } by {
             if i < n {
@@ -216,7 +216,7 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
 /// or the peer as M defines their reach, and nothing the program may read is written by them.
 pub proof fn corollary_s1(a: Abs::State, m: Nic::State, wqe: Map<Id, WqeRef>, x: int)
     requires
-        a.invariant(),
+        abs_inv(a),
         coupled(a, m, wqe),
     ensures
         !(a.program_writes(x) && (m.nic_may_read(x) || m.nic_may_write(x))),
@@ -236,7 +236,7 @@ pub proof fn corollary_f1(
     o: Outcome,
 )
     requires
-        a.invariant(),
+        abs_inv(a),
         coupled(a, m, wqe),
         Abs::State::take(a, a2, r, o),
     ensures
@@ -249,24 +249,48 @@ pub proof fn corollary_f1(
 }
 
 // =========================================================================================
-// Executions: reflexive, transitive, and they keep the invariants
+// Executions: reflexive, transitive, and they keep the invariants (for the core's proofs too)
 
-proof fn lemma_abs_init_invariant(a: Abs::State)
+/// One step of A is an execution of A.
+pub proof fn lemma_abs_reaches_next(a: Abs::State, b: Abs::State)
     requires
-        Abs::State::init(a),
+        abs_next(a, b),
     ensures
-        a.invariant(),
+        abs_reaches(a, b),
+{
+    let run = seq![a, b];
+    assert(run.last() == b);
+    assert(abs_run(run));
+}
+
+/// One step of M is an execution of M.
+pub proof fn lemma_nic_reaches_next(a: Nic::State, b: Nic::State)
+    requires
+        nic_next(a, b),
+    ensures
+        nic_reaches(a, b),
+{
+    let run = seq![a, b];
+    assert(run.last() == b);
+    assert(nic_run(run));
+}
+
+pub proof fn lemma_abs_init_invariant(a: Abs::State)
+    requires
+        abs_init(a),
+    ensures
+        abs_inv(a),
 {
     reveal(Abs::State::init);
     reveal(Abs::State::init_by);
     Abs::State::start_inductive(a);
 }
 
-proof fn lemma_nic_init_invariant(m: Nic::State)
+pub proof fn lemma_nic_init_invariant(m: Nic::State)
     requires
-        Nic::State::init(m),
+        nic_init(m),
     ensures
-        m.invariant(),
+        nic_inv(m),
 {
     reveal(Nic::State::init);
     reveal(Nic::State::init_by);
@@ -274,7 +298,7 @@ proof fn lemma_nic_init_invariant(m: Nic::State)
     Nic::State::open_inductive(m, caps);
 }
 
-proof fn lemma_abs_reaches_refl(a: Abs::State)
+pub proof fn lemma_abs_reaches_refl(a: Abs::State)
     ensures
         abs_reaches(a, a),
 {
@@ -282,7 +306,7 @@ proof fn lemma_abs_reaches_refl(a: Abs::State)
     assert(run.last() == a);
 }
 
-proof fn lemma_nic_reaches_refl(m: Nic::State)
+pub proof fn lemma_nic_reaches_refl(m: Nic::State)
     ensures
         nic_reaches(m, m),
 {
@@ -290,7 +314,7 @@ proof fn lemma_nic_reaches_refl(m: Nic::State)
     assert(run.last() == m);
 }
 
-proof fn lemma_abs_reaches_trans(a: Abs::State, b: Abs::State, c: Abs::State)
+pub proof fn lemma_abs_reaches_trans(a: Abs::State, b: Abs::State, c: Abs::State)
     requires
         abs_reaches(a, b),
         abs_reaches(b, c),
@@ -311,7 +335,7 @@ proof fn lemma_abs_reaches_trans(a: Abs::State, b: Abs::State, c: Abs::State)
     assert(run.last() == c);
 }
 
-proof fn lemma_nic_reaches_trans(a: Nic::State, b: Nic::State, c: Nic::State)
+pub proof fn lemma_nic_reaches_trans(a: Nic::State, b: Nic::State, c: Nic::State)
     requires
         nic_reaches(a, b),
         nic_reaches(b, c),
@@ -332,7 +356,7 @@ proof fn lemma_nic_reaches_trans(a: Nic::State, b: Nic::State, c: Nic::State)
     assert(run.last() == c);
 }
 
-proof fn lemma_abs_run_invariant(run: Seq<Abs::State>)
+pub proof fn lemma_abs_run_invariant(run: Seq<Abs::State>)
     requires
         run.len() > 0,
         run[0].invariant(),
@@ -352,7 +376,7 @@ proof fn lemma_abs_run_invariant(run: Seq<Abs::State>)
     }
 }
 
-proof fn lemma_nic_run_invariant(run: Seq<Nic::State>)
+pub proof fn lemma_nic_run_invariant(run: Seq<Nic::State>)
     requires
         run.len() > 0,
         run[0].invariant(),
@@ -372,23 +396,23 @@ proof fn lemma_nic_run_invariant(run: Seq<Nic::State>)
     }
 }
 
-proof fn lemma_abs_reaches_invariant(a: Abs::State, b: Abs::State)
+pub proof fn lemma_abs_reaches_invariant(a: Abs::State, b: Abs::State)
     requires
-        a.invariant(),
+        abs_inv(a),
         abs_reaches(a, b),
     ensures
-        b.invariant(),
+        abs_inv(b),
 {
     let run = choose|run: Seq<Abs::State>| run.len() > 0 && run[0] == a && run.last() == b && abs_run(run);
     lemma_abs_run_invariant(run);
 }
 
-proof fn lemma_nic_reaches_invariant(a: Nic::State, b: Nic::State)
+pub proof fn lemma_nic_reaches_invariant(a: Nic::State, b: Nic::State)
     requires
-        a.invariant(),
+        nic_inv(a),
         nic_reaches(a, b),
     ensures
-        b.invariant(),
+        nic_inv(b),
 {
     let run = choose|run: Seq<Nic::State>| run.len() > 0 && run[0] == a && run.last() == b && nic_run(run);
     lemma_nic_run_invariant(run);

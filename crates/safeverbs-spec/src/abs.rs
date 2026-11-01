@@ -485,6 +485,63 @@ state_machine! {
 
 verus! {
 
+// =========================================================================================
+// Names for other crates
+//
+// `state_machine!` emits its relations, `invariant()` and the `_enabled` predicates only when
+// Verus keeps ghost bodies, which it does not for the copy of this crate that dependent crates
+// compile against. These wrappers carry them across (their meaning comes along in Verus's
+// exported definitions).
+
+/// `s` satisfies the invariants of Abs (`Abs::State::invariant`).
+pub open spec fn abs_inv(s: Abs::State) -> bool {
+    s.invariant()
+}
+
+/// `s` is a start state of Abs.
+pub open spec fn abs_init(s: Abs::State) -> bool {
+    Abs::State::init(s)
+}
+
+/// `post` follows from `pre` by one step of Abs, any step.
+pub open spec fn abs_next(pre: Abs::State, post: Abs::State) -> bool {
+    Abs::State::next(pre, post)
+}
+
+/// `post` follows from `pre` by `step`.
+pub open spec fn abs_step(pre: Abs::State, post: Abs::State, step: Abs::Step) -> bool {
+    match step {
+        Abs::Step::create_qp(q) => Abs::State::create_qp(pre, post, q),
+        Abs::Step::drop_qp(q) => Abs::State::drop_qp(pre, post, q),
+        Abs::Step::alloc(mem, any_bytes) => Abs::State::alloc(pre, post, mem, any_bytes),
+        Abs::Step::split(i, left) => Abs::State::split(pre, post, i, left),
+        Abs::Step::freeze(i) => Abs::State::freeze(pre, post, i),
+        Abs::Step::share(i, sub) => Abs::State::share(pre, post, i, sub),
+        Abs::Step::thaw(i) => Abs::State::thaw(pre, post, i),
+        Abs::Step::drop(i) => Abs::State::drop(pre, post, i),
+        Abs::Step::post_request(i, q, dir) => Abs::State::post_request(pre, post, i, q, dir),
+        Abs::Step::complete(r, o) => Abs::State::complete(pre, post, r, o),
+        Abs::Step::register(r, w) => Abs::State::register(pre, post, r, w),
+        Abs::Step::take(r, o) => Abs::State::take(pre, post, r, o),
+        Abs::Step::detach(r) => Abs::State::detach(pre, post, r),
+        Abs::Step::expose(i, remote_write) => Abs::State::expose(pre, post, i, remote_write),
+        Abs::Step::unexpose(i) => Abs::State::unexpose(pre, post, i),
+        Abs::Step::dummy_to_use_type_params(_) => false,
+    }
+}
+
+/// A step by `step` is a step of Abs.
+pub proof fn lemma_abs_step_is_next(pre: Abs::State, post: Abs::State, step: Abs::Step)
+    requires
+        abs_step(pre, post, step),
+    ensures
+        abs_next(pre, post),
+{
+    reveal(Abs::State::next);
+    reveal(Abs::State::next_by);
+    assert(Abs::State::next_by(pre, post, step));
+}
+
 /// A's invariants hold in every state it can reach: every step keeps them.
 pub proof fn lemma_step_keeps_invariant(pre: Abs::State, post: Abs::State)
     requires
