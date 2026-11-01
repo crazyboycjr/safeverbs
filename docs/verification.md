@@ -92,8 +92,10 @@ $ scripts/verify.sh
 safeverbs-spec: verification results:: 115 verified, 0 errors
 ```
 
-The script runs `cargo verus verify` on the crate with the toolchain Verus names (whatever
-`rust-toolchain.toml` pins), always re-verifies the crate while vstd stays cached, runs under a memory cap when `systemd-run` is available (`VERIFY_MEMORY_MAX`, default
+The script first builds the crate with plain `cargo` (it must compile with its ghost code
+erased, as users build it), then runs `cargo verus verify` on it with the toolchain Verus
+names (whatever `rust-toolchain.toml` pins). It always re-verifies the crate while vstd stays
+cached, runs under a memory cap when `systemd-run` is available (`VERIFY_MEMORY_MAX`, default
 `6G`), and exits non-zero on any failure. The first run also verifies vstd itself (about
 1900 items); after that a run takes a few seconds. Extra arguments go to Verus, for example
 `scripts/verify.sh --rlimit 2`, which still passes: the proofs are not at the edge of the
@@ -122,7 +124,9 @@ built and tested with plain `cargo test` on stable Rust. What we found:
   the same version and puts `state_machine!` outside `verus!`.
 - **Erasure.** Without Verus, the `verus!` macro erases ghost code: `spec` and `proof`
   functions disappear, `requires` and `ensures` are dropped, and `Ghost<T>` and `Tracked<T>`
-  values and ghost fields become zero-sized. A plain build produces the code it would produce
+  values and ghost fields become zero-sized. So a `use` of a spec or proof function fails to
+  compile without Verus; call it by its path inside the proof instead (or guard the `use`
+  with `#[cfg(verus_only)]`). A plain build produces the code it would produce
   without Verus. It also checks nothing: a function with a false `ensures` compiles. Proofs
   are checked only by `cargo verus verify` (or `scripts/verify.sh`), which CI must run.
 - **Ghost parameters stay in signatures.** A `Tracked<T>` or `Ghost<T>` parameter is still a

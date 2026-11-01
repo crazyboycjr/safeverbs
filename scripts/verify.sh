@@ -37,14 +37,25 @@ export RUSTUP_TOOLCHAIN="$toolchain"
 # Cargo skips crates it considers fresh; always re-verify ours (vstd stays cached).
 cargo clean --quiet --manifest-path "$crate/Cargo.toml" -p safeverbs-spec
 
-cmd=(nice -n 19 cargo verus verify --manifest-path "$crate/Cargo.toml" -j "${VERIFY_JOBS:-4}")
-if [ "$#" -gt 0 ]; then
-    cmd+=(-- "$@")
+# Run a command at low priority, under a memory cap when systemd-run is available.
+memory="${VERIFY_MEMORY_MAX:-6G}"
+run() {
+    if [ "$memory" != "none" ] && command -v systemd-run >/dev/null; then
+        systemd-run --user --scope --quiet -p "MemoryMax=$memory" -p MemorySwapMax=0 nice -n 19 "$@"
+    else
+        nice -n 19 "$@"
+    fi
+}
+
+# Users build the crate without Verus: it must compile with its ghost code erased.
+if ! run cargo build --quiet --manifest-path "$crate/Cargo.toml" -j "${VERIFY_JOBS:-4}"; then
+    echo "verify.sh: FAILED (the crate does not build without Verus)" >&2
+    exit 1
 fi
 
-memory="${VERIFY_MEMORY_MAX:-6G}"
-if [ "$memory" != "none" ] && command -v systemd-run >/dev/null; then
-    cmd=(systemd-run --user --scope --quiet -p "MemoryMax=$memory" -p MemorySwapMax=0 "${cmd[@]}")
+cmd=(run cargo verus verify --manifest-path "$crate/Cargo.toml" -j "${VERIFY_JOBS:-4}")
+if [ "$#" -gt 0 ]; then
+    cmd+=(-- "$@")
 fi
 
 log="$(mktemp)"

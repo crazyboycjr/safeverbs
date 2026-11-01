@@ -8,7 +8,6 @@
 
 use crate::abs::*;
 use crate::nic::*;
-use crate::nic_proofs::lemma_copies;
 use crate::types::*;
 use vstd::multiset::*;
 use vstd::prelude::*;
@@ -147,7 +146,7 @@ pub proof fn example_unsignaled_in_m() {
     let attr = QpAttr { pd: 1, transport: Transport::Rc, send_cq: 3, recv_cq: 3, sq_depth: 4, rq_depth: 4, max_sge: 1, max_inline: 0 };
     let cqs1 = m3.cqs.insert(3, m3.cqs[3].reserve(7, 4));
     let cqs2 = cqs1.insert(3, cqs1[3].reserve(7, 4));
-    lemma_copies(7, 4);
+    crate::nic_proofs::lemma_copies(7, 4);
     assert(cqs2[3].reserved.len() == 8);
     let qp0 = Qp { attr, state: QpState::Reset, sq: Seq::empty(), sq_head: 0, sq_done: 0, rq: Seq::empty(), rq_head: 0, rq_done: 0 };
     let m4 = Nic::State { cqs: cqs2, qps: m3.qps.insert(7, qp0), ..m3 };
