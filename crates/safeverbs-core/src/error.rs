@@ -30,6 +30,14 @@ pub enum Error {
     },
     /// The receive queue is full.
     QueueFull,
+    /// A worker's CQ has no room for another QP's queues: every QP reserves
+    /// a CQ entry for each WQE its queues hold.
+    CqFull {
+        /// Entries the QP needs (its send and receive depths).
+        need: u64,
+        /// Entries not reserved yet.
+        free: u64,
+    },
     /// Every slot of the ring holds a result nobody took: too many
     /// operations whose futures were neither awaited nor dropped.
     Clogged,
@@ -69,6 +77,9 @@ impl fmt::Display for Error {
             }
             Error::TooLong { len, max } => write!(f, "{len} bytes where {max} fit"),
             Error::QueueFull => f.write_str("receive queue full"),
+            Error::CqFull { need, free } => {
+                write!(f, "the CQ has {free} entries left, the QP needs {need}")
+            }
             Error::Clogged => f.write_str("every slot holds a result nobody took"),
             Error::QpFailed => f.write_str("the queue pair is in the error state"),
             Error::Unsupported(what) => write!(f, "not supported: {what}"),

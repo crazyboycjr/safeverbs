@@ -1,14 +1,15 @@
-//! Connected queue pairs with the asynchronous API: [`LocalQp`] for one
-//! thread, [`SharedQp`] behind a lock.
+//! Connected queue pairs with the asynchronous API: [`LocalQp`] on a
+//! worker of one thread ([`LocalWorker`]), [`SharedQp`] behind a lock.
 
 use core::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Mutex;
 
 use safeverbs_core::Wc;
-use safeverbs_core::qp::{MAX_SGES, QueuePair};
+use safeverbs_core::worker::MAX_SGES;
 use safeverbs_core::{
-    Buf, BufMut, Endpoint, Error, Leases, Nic, Part, Pd, Reliable, RemoteBuf, Result, Seq,
-    Transport, WrOp,
+    Buf, BufMut, Endpoint, Error, Leases, Nic, Part, Pd, QpCaps, QpKey, Reliable, RemoteBuf,
+    Result, Seq, Transport, Worker, WrOp,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -18,15 +19,15 @@ use crate::batch::Batch;
 use crate::op::{Flush, Op, Read, Recv, Sent, Side};
 use crate::receiver::Receiver;
 use crate::sink::WriteSink;
+use crate::worker::LocalWorker;
 
 mod sealed {
     pub trait Sealed {}
 }
 
-/// What is behind a QP: the synchronous queue pair and the work waiting
-/// for room in each of its queues.
-pub struct QpState<T: Transport, N: Nic> {
-    qp: QueuePair<T, N>,
+/// The futures' share of a QP: the work waiting for room in each of its
+/// queues and the results moved out of its rings.
+pub(crate) struct Queues<N: Nic> {
     sends: Backlog<N>,
     recvs: Backlog<N>,
     /// Results moved out of the send ring to free their slots (see
@@ -36,35 +37,97 @@ pub struct QpState<T: Transport, N: Nic> {
     recvs_done: Vec<(Seq, Wc, Leases<N>)>,
 }
 
-impl<T: Transport, N: Nic> QpState<T, N> {
-    fn new(qp: QueuePair<T, N>) -> Self {
-        QpState {
-            qp,
+/// What a worker of the asynchronous layer holds: the synchronous worker
+/// and, by the index of each of its QPs, the futures' share of it.
+pub(crate) struct State<N: Nic> {
+    pub(crate) worker: Worker<N>,
+    queues: Vec<Option<Queues<N>>>,
+}
+
+impl<N: Nic> State<N> {
+    pub(crate) fn new(worker: Worker<N>) -> Self {
+        State {
+            worker,
+            queues: Vec::new(),
+        }
+    }
+
+    /// Creates a QP on the worker.
+    pub(crate) fn add_qp<T: Transport>(
+        &mut self,
+        caps: QpCaps,
+        max_batch: u32,
+    ) -> Result<QpKey<T>> {
+        let key = self.worker.create_qp::<T>(caps, max_batch)?;
+        let i = key.index();
+        if self.queues.len() <= i {
+            self.queues.resize_with(i + 1, || None);
+        }
+        self.queues[i] = Some(Queues {
             sends: Backlog::new(),
             recvs: Backlog::new(),
             sends_done: Vec::new(),
             recvs_done: Vec::new(),
+        });
+        Ok(key)
+    }
+
+    /// Destroys a QP of the worker, then drops the work and results the
+    /// futures left with it.
+    pub(crate) fn remove_qp<T: Transport>(&mut self, key: QpKey<T>) {
+        self.worker.remove_qp(key);
+        if let Some(q) = self.queues.get_mut(key.index()) {
+            *q = None;
         }
     }
 
-    /// The synchronous queue pair. Work posted on it directly goes ahead
-    /// of work the futures queued while the queue was full.
-    pub fn qp(&mut self) -> &mut QueuePair<T, N> {
-        &mut self.qp
+    /// The state of QP `key`.
+    pub(crate) fn qp<T: Transport>(&mut self, key: QpKey<T>) -> QpState<'_, T, N> {
+        let q = match self.queues.get_mut(key.index()) {
+            Some(Some(q)) => q,
+            _ => panic!("no QP {} in this worker", key.index()),
+        };
+        QpState {
+            w: &mut self.worker,
+            q,
+            key,
+        }
+    }
+}
+
+/// What is behind a QP: the worker it is on (the CQ it shares with the
+/// worker's other QPs, and its rings) and the work waiting for room in
+/// each of its queues.
+pub struct QpState<'a, T: Transport, N: Nic> {
+    w: &'a mut Worker<N>,
+    q: &'a mut Queues<N>,
+    key: QpKey<T>,
+}
+
+impl<T: Transport, N: Nic> QpState<'_, T, N> {
+    /// The synchronous worker the QP is on. Work posted there on the QP
+    /// goes ahead of work the futures queued while the queue was full.
+    pub fn worker(&mut self) -> &mut Worker<N> {
+        self.w
     }
 
-    /// Posts waiting work while it fits (polling the CQs first, and ringing
+    /// The QP's key in its worker.
+    pub fn key(&self) -> QpKey<T> {
+        self.key
+    }
+
+    /// Posts waiting work while it fits (polling the CQ first, and ringing
     /// the doorbell for what is written, so that room can appear).
     pub(crate) fn drain(&mut self) {
         self.unclog();
-        if !self.sends.is_idle() {
-            let _ = self.qp.commit();
-            self.qp.poll_send();
-            self.sends.drain(&mut self.qp);
+        if !self.q.sends.is_idle() {
+            let _ = self.w.commit(self.key);
+            self.w.progress();
+            self.q.sends.drain(self.w, self.key);
         }
-        if !self.recvs.is_idle() {
-            self.qp.poll_recv();
-            self.recvs.drain(&mut self.qp);
+        if !self.q.recvs.is_idle() {
+            self.w.progress();
+            self.q.recvs.drain(self.w, self.key);
         }
     }
 
@@ -73,17 +136,18 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     /// their futures find them. So a ring never clogs, whatever order the
     /// futures are awaited in.
     pub(crate) fn unclog(&mut self) {
-        while self.qp.send_ring().is_clogged() {
-            let seq = self.qp.send_ring().head();
-            match self.qp.take_send(seq) {
-                Some((wc, leases)) => self.sends_done.push((seq, wc, leases)),
+        let k = self.key;
+        while self.w.send_ring(k).is_clogged() {
+            let seq = self.w.send_ring(k).head();
+            match self.w.take_send(k, seq) {
+                Some((wc, leases)) => self.q.sends_done.push((seq, wc, leases)),
                 None => break,
             }
         }
-        while self.qp.recv_ring().is_clogged() {
-            let seq = self.qp.recv_ring().head();
-            match self.qp.take_recv(seq) {
-                Some((wc, leases)) => self.recvs_done.push((seq, wc, leases)),
+        while self.w.recv_ring(k).is_clogged() {
+            let seq = self.w.recv_ring(k).head();
+            match self.w.take_recv(k, seq) {
+                Some((wc, leases)) => self.q.recvs_done.push((seq, wc, leases)),
                 None => break,
             }
         }
@@ -93,8 +157,8 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     /// slot or the side list.
     pub(crate) fn take_request(&mut self, side: Side, seq: Seq) -> Option<(Wc, Leases<N>)> {
         let (taken, done) = match side {
-            Side::Send => (self.qp.take_send(seq), &mut self.sends_done),
-            Side::Recv => (self.qp.take_recv(seq), &mut self.recvs_done),
+            Side::Send => (self.w.take_send(self.key, seq), &mut self.q.sends_done),
+            Side::Recv => (self.w.take_recv(self.key, seq), &mut self.q.recvs_done),
         };
         if taken.is_some() {
             return taken;
@@ -104,9 +168,17 @@ impl<T: Transport, N: Nic> QpState<T, N> {
         Some((wc, leases))
     }
 
+    /// Wakes `waker` when request `seq` retires.
+    pub(crate) fn set_waker(&mut self, side: Side, seq: Seq, waker: &core::task::Waker) {
+        match side {
+            Side::Send => self.w.set_send_waker(self.key, seq, waker),
+            Side::Recv => self.w.set_recv_waker(self.key, seq, waker),
+        }
+    }
+
     /// Whether no send-queue work waits for room.
     pub(crate) fn sends_idle(&self) -> bool {
-        self.sends.is_idle()
+        self.q.sends.is_idle()
     }
 
     /// Posts `work` now if nothing waits before it and it fits; else queues
@@ -114,11 +186,11 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     pub(crate) fn submit(&mut self, side: Side, work: Work<N>) -> Result<Posted<N>, u64> {
         self.unclog();
         let backlog = match side {
-            Side::Send => &mut self.sends,
-            Side::Recv => &mut self.recvs,
+            Side::Send => &mut self.q.sends,
+            Side::Recv => &mut self.q.recvs,
         };
-        if backlog.is_idle() && backlog::fits(&self.qp, &work) {
-            Ok(backlog::post(&mut self.qp, work))
+        if backlog.is_idle() && backlog::fits(self.w, self.key, &work) {
+            Ok(backlog::post(self.w, self.key, work))
         } else {
             Err(backlog.push(work))
         }
@@ -127,8 +199,8 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     /// The posting result of queued work, once posted.
     pub(crate) fn take_ticket(&mut self, side: Side, ticket: u64) -> Option<Posted<N>> {
         match side {
-            Side::Send => self.sends.take(ticket),
-            Side::Recv => self.recvs.take(ticket),
+            Side::Send => self.q.sends.take(ticket),
+            Side::Recv => self.q.recvs.take(ticket),
         }
     }
 
@@ -136,8 +208,8 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     /// for it is returned.
     pub(crate) fn cancel(&mut self, side: Side, ticket: u64) -> Option<Seq> {
         match side {
-            Side::Send => self.sends.cancel(ticket),
-            Side::Recv => self.recvs.cancel(ticket),
+            Side::Send => self.q.sends.cancel(ticket),
+            Side::Recv => self.q.recvs.cancel(ticket),
         }
     }
 
@@ -145,23 +217,23 @@ impl<T: Transport, N: Nic> QpState<T, N> {
     /// retires).
     pub(crate) fn detach(&mut self, side: Side, seq: Seq) {
         let done = match side {
-            Side::Send => &mut self.sends_done,
-            Side::Recv => &mut self.recvs_done,
+            Side::Send => &mut self.q.sends_done,
+            Side::Recv => &mut self.q.recvs_done,
         };
         if let Some(i) = done.iter().position(|d| d.0 == seq) {
             done.swap_remove(i);
             return;
         }
         match side {
-            Side::Send => self.qp.detach_send(seq),
-            Side::Recv => self.qp.detach_recv(seq),
+            Side::Send => self.w.detach_send(self.key, seq),
+            Side::Recv => self.w.detach_recv(self.key, seq),
         }
     }
 }
 
-/// Access to what is behind a QP: a `RefCell` borrow for [`LocalQp`], a
-/// lock for [`SharedQp`]. The futures, sinks and streams of this crate are
-/// generic over it.
+/// Access to what is behind a QP: a `RefCell` borrow of its worker for
+/// [`LocalQp`], a lock for [`SharedQp`]. The futures, sinks and streams of
+/// this crate are generic over it.
 pub trait QueueAccess: sealed::Sealed {
     /// The transport.
     type T: Transport;
@@ -172,36 +244,76 @@ pub trait QueueAccess: sealed::Sealed {
     ///
     /// # Panics
     ///
-    /// For a [`LocalQp`], if called again from inside `f` (the `RefCell`
-    /// is borrowed).
-    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<Self::T, Self::N>) -> R) -> R;
+    /// For a [`LocalQp`], if called from inside `f` for a QP of the same
+    /// worker (the worker's `RefCell` is borrowed).
+    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<'_, Self::T, Self::N>) -> R) -> R;
 
-    /// Runs `f` on the synchronous queue pair.
-    fn with_qp<R>(&self, f: impl FnOnce(&mut QueuePair<Self::T, Self::N>) -> R) -> R {
-        self.with_state(|s| f(s.qp()))
+    /// Runs `f` on the synchronous worker and the QP's key.
+    fn with_qp<R>(&self, f: impl FnOnce(&mut Worker<Self::N>, QpKey<Self::T>) -> R) -> R {
+        self.with_state(|s| {
+            let key = s.key;
+            f(s.w, key)
+        })
     }
 }
 
-/// A connected QP for one thread at a time: `Send` but not `Sync`, its
-/// ring a plain array behind a `RefCell` (no atomics, no locks), created on
-/// a thread domain where the device has them (so the driver takes no locks
-/// either).
+/// A QP of a worker, removed from it (destroyed, its buffers released)
+/// when dropped.
+pub(crate) struct QpGuard<T: Transport, N: Nic> {
+    /// The worker; `None` once handed on.
+    state: Option<Rc<RefCell<State<N>>>>,
+    pub(crate) key: QpKey<T>,
+}
+
+impl<T: Transport, N: Nic> QpGuard<T, N> {
+    pub(crate) fn new(state: Rc<RefCell<State<N>>>, key: QpKey<T>) -> Self {
+        QpGuard {
+            state: Some(state),
+            key,
+        }
+    }
+
+    pub(crate) fn state(&self) -> &Rc<RefCell<State<N>>> {
+        self.state.as_ref().expect("a QP's worker")
+    }
+}
+
+impl<T: Transport, N: Nic> Drop for QpGuard<T, N> {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            state.borrow_mut().remove_qp(self.key);
+        }
+    }
+}
+
+/// A connected QP on a worker of one thread ([`LocalWorker`]): neither
+/// `Send` nor `Sync`. The QPs of a worker share its CQ, and its ring and
+/// the CQ are plain data behind one `RefCell` (no atomics, no locks); the
+/// QP is created on the worker's thread domain where the device has them
+/// (so the driver takes no locks either).
 ///
 /// Every operation posts at once (or, while the queue is full, as soon as
 /// there is room, in order) and returns a future of its outcome; awaiting
-/// it polls the QP's CQ. Dropping a future never cancels a posted work
-/// request: the buffers stay with the QP until it completes. Dropping the
-/// QP destroys the hardware QP before releasing any buffer still in flight.
+/// it polls the worker's CQ, which retires the requests of every QP of the
+/// worker and wakes their futures. Dropping a future never cancels a posted
+/// work request: the buffers stay with the QP until it completes. Dropping
+/// the QP destroys the hardware QP before releasing any buffer still in
+/// flight.
 pub struct LocalQp<T: Transport, N: Nic = Verbs> {
-    state: RefCell<QpState<T, N>>,
+    guard: QpGuard<T, N>,
     endpoint: Endpoint,
 }
 
-/// A connected QP shared between threads: a [`LocalQp`]'s state behind a
-/// `Mutex`, which is the only lock taken (the QP is still created on a
-/// thread domain where possible, so the driver takes none).
+/// A connected QP shared between threads: a worker of its own, with this
+/// one QP, behind a `Mutex`, which is the only lock taken (the QP is still
+/// created on a thread domain where possible, so the driver takes none).
+///
+/// The trade-off: every thread that uses it takes the lock, and its CQ
+/// serves this QP alone. Threads that each drive QPs of their own do better
+/// with a [`LocalWorker`] each.
 pub struct SharedQp<T: Transport, N: Nic = Verbs> {
-    state: Mutex<QpState<T, N>>,
+    state: Mutex<State<N>>,
+    key: QpKey<T>,
     endpoint: Endpoint,
 }
 
@@ -211,48 +323,62 @@ impl<T: Transport, N: Nic> sealed::Sealed for SharedQp<T, N> {}
 impl<T: Transport, N: Nic> QueueAccess for LocalQp<T, N> {
     type T = T;
     type N = N;
-    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<T, N>) -> R) -> R {
-        f(&mut self.state.borrow_mut())
+    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<'_, T, N>) -> R) -> R {
+        let mut state = self.guard.state().borrow_mut();
+        f(&mut state.qp(self.guard.key))
     }
 }
 
 impl<T: Transport, N: Nic> QueueAccess for SharedQp<T, N> {
     type T = T;
     type N = N;
-    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<T, N>) -> R) -> R {
-        f(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()))
+    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<'_, T, N>) -> R) -> R {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut state.qp(self.key))
     }
 }
 
 impl<T: Transport, N: Nic> LocalQp<T, N> {
-    pub(crate) fn new(qp: QueuePair<T, N>, endpoint: Endpoint) -> Self {
-        LocalQp {
-            state: RefCell::new(QpState::new(qp)),
-            endpoint,
-        }
+    pub(crate) fn new(guard: QpGuard<T, N>, endpoint: Endpoint) -> Self {
+        LocalQp { guard, endpoint }
     }
 
-    /// Makes it shareable between threads (behind a lock).
-    pub fn into_shared(self) -> SharedQp<T, N> {
-        SharedQp {
-            state: Mutex::new(self.state.into_inner()),
-            endpoint: self.endpoint,
-        }
+    /// The worker the QP is on: build more QPs on it with
+    /// [`QueuePairBuilder::build_on`](crate::QueuePairBuilder::build_on).
+    pub fn worker(&self) -> LocalWorker<N> {
+        LocalWorker::from_state(self.guard.state().clone())
     }
 
-    /// The synchronous queue pair under it.
-    pub fn into_inner(self) -> QueuePair<T, N> {
-        self.state.into_inner().qp
+    /// The QP's key in its worker.
+    pub fn key(&self) -> QpKey<T> {
+        self.guard.key
+    }
+
+    /// Makes it shareable between threads (behind a lock). Only a QP that
+    /// is alone on its worker, with no other handle to the worker, can be
+    /// (as one built with [`QueuePairBuilder::build`](crate::QueuePairBuilder::build));
+    /// else it is handed back.
+    pub fn into_shared(mut self) -> Result<SharedQp<T, N>, LocalQp<T, N>> {
+        let key = self.guard.key;
+        let state = self.guard.state.take().expect("a QP's worker");
+        match Rc::try_unwrap(state) {
+            Ok(state) => Ok(SharedQp {
+                state: Mutex::new(state.into_inner()),
+                key,
+                endpoint: self.endpoint,
+            }),
+            Err(state) => {
+                self.guard.state = Some(state);
+                Err(self)
+            }
+        }
     }
 }
 
 impl<T: Transport, N: Nic> SharedQp<T, N> {
-    /// The synchronous queue pair under it.
-    pub fn into_inner(self) -> QueuePair<T, N> {
-        self.state
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner())
-            .qp
+    /// The QP's key in its worker.
+    pub fn key(&self) -> QpKey<T> {
+        self.key
     }
 }
 
@@ -268,17 +394,17 @@ fn post_batch<'q, Q: QueueAccess>(
     }
     let outcome = q.with_state(|s| {
         s.drain();
-        let ring = s.qp.send_ring();
+        let ring = s.w.send_ring(s.key);
         let room = ring.depth() - ring.in_flight_wqes();
-        if s.sends.is_idle() && ring.can_post() && room >= ring.max_wqes() {
-            let mut batch = Batch::direct(s.qp.request());
+        if s.q.sends.is_idle() && ring.can_post() && room >= ring.max_wqes() {
+            let mut batch = Batch::direct(s.w.request(s.key));
             f(&mut batch);
             Outcome::Now(batch.post())
         } else {
             let mut batch = Batch::collect();
             f(&mut batch);
             match batch.into_ops() {
-                Ok(ops) => Outcome::Queued(s.sends.push(Work::Batch(ops))),
+                Ok(ops) => Outcome::Queued(s.q.sends.push(Work::Batch(ops))),
                 Err(error) => Outcome::Now(Err((error, Leases::default()))),
             }
         }
@@ -308,20 +434,24 @@ macro_rules! qp_api {
 
             /// The protection domain.
             pub fn pd(&self) -> Pd<N> {
-                self.with(|qp| qp.pd().clone())
+                self.with(|w, _| w.pd().clone())
             }
 
             /// Whether the QP was created without the driver's locks (on a
             /// thread domain; not every device has them).
             pub fn is_lock_free(&self) -> bool {
-                self.with(|qp| qp.is_lock_free())
+                self.with(|w, qp| w.qp_is_lock_free(qp))
             }
 
-            /// Runs `f` on the synchronous queue pair under this QP, for
-            /// callers who drive their own loop. Work posted there goes
-            /// ahead of work the futures queued while the queue was full.
-            pub fn with<R>(&self, f: impl FnOnce(&mut QueuePair<T, N>) -> R) -> R {
-                self.with_state(|s| f(s.qp()))
+            /// Runs `f` on the synchronous worker under this QP, with the
+            /// QP's key, for callers who drive their own loop. Work posted
+            /// there goes ahead of work the futures queued while the queue
+            /// was full. On a worker the futures drive, take results by
+            /// sequence number ([`Worker::progress`],
+            /// [`Worker::take_send`]), not with [`Worker::poll`], which would
+            /// hand out the futures' results too.
+            pub fn with<R>(&self, f: impl FnOnce(&mut Worker<N>, QpKey<T>) -> R) -> R {
+                self.with_qp(f)
             }
 
             /// SENDs `buf` into the peer's next receive.
@@ -394,7 +524,8 @@ macro_rules! qp_api {
             /// Posts the SENDs and WRITEs `f` adds as one request: one
             /// doorbell, one completion. A batch longer than the QP's
             /// `max_batch` is split into requests of that size (which may
-            /// wait for room by polling).
+            /// wait for room by polling). `f` runs with the QP's worker
+            /// borrowed: it must not use another QP of the same worker.
             pub fn batch(&self, f: impl FnOnce(&mut Batch<'_, T, N>)) -> Op<'_, Self, Sent> {
                 post_batch(self, f)
             }
@@ -431,12 +562,13 @@ macro_rules! qp_api {
                 Flush { q: self }
             }
 
-            /// Polls both CQs once, retiring what completed (and waking the
-            /// futures waiting on it), and posts waiting work that now
-            /// fits; returns the number of completions.
+            /// Polls the worker's CQ once, retiring what completed on any
+            /// of its QPs (and waking the futures waiting on it), and posts
+            /// this QP's waiting work that now fits; returns the number of
+            /// completions.
             pub fn poll(&self) -> usize {
                 self.with_state(|s| {
-                    let n = s.qp().poll_send() + s.qp().poll_recv();
+                    let n = s.w.progress();
                     s.drain();
                     n
                 })
@@ -445,7 +577,7 @@ macro_rules! qp_api {
             /// Moves the QP to the error state: every request in flight
             /// completes with a flush error, handing its buffers back.
             pub fn force_error(&self) -> Result<()> {
-                self.with(|qp| qp.to_error())
+                self.with(|w, qp| w.to_error(qp))
             }
         }
 

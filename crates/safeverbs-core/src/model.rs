@@ -533,6 +533,9 @@ impl Drop for ModelMr {
     }
 }
 
+/// A thread domain of the model (QPs of the model take no locks anyway).
+pub struct ModelDomain;
+
 /// A completion queue of the model; polling it carries out work.
 pub struct ModelCq {
     fabric: Arc<Mutex<Fabric>>,
@@ -676,6 +679,7 @@ impl Nic for Model {
     type Mr = ModelMr;
     type Cq = ModelCq;
     type Qp = ModelQp;
+    type Domain = ModelDomain;
 
     fn name(&self) -> &str {
         "model"
@@ -754,14 +758,18 @@ impl Nic for Model {
         })
     }
 
+    fn alloc_domain(&self, _pd: &ModelPd) -> Option<ModelDomain> {
+        Some(ModelDomain)
+    }
+
     fn create_qp(
         &self,
         pd: &ModelPd,
+        _domain: Option<&ModelDomain>,
         send_cq: &ModelCq,
         recv_cq: &ModelCq,
         qp_type: QpType,
         caps: &QpCaps,
-        _local: bool,
     ) -> Result<ModelQp> {
         let mut f = self.lock();
         let num = f.id();

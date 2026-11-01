@@ -324,6 +324,10 @@ pub trait Nic: Send + Sync + Sized + 'static {
     type Cq: NicCq + 'static;
     /// A queue pair.
     type Qp: NicQp + 'static;
+    /// A thread domain with a parent domain over a PD: QPs created on it
+    /// are used by one thread at a time, so the driver may skip their locks
+    /// (and give them a doorbell of their own, shared among them).
+    type Domain: Send + 'static;
 
     /// The device's name.
     fn name(&self) -> &str;
@@ -362,17 +366,24 @@ pub trait Nic: Send + Sync + Sized + 'static {
     /// one thread at a time when `single_threaded`.
     fn create_cq(&self, entries: u32, single_threaded: bool) -> Result<Self::Cq>;
 
-    /// Creates a QP in `pd` with its queues on the two CQs. With `local`,
-    /// the driver may skip its own locks (a thread domain): the caller
-    /// serializes every use of the QP.
+    /// Allocates a thread domain and a parent domain over `pd` (with them,
+    /// mlx5 drops the locks of the QPs created there); `None` where the
+    /// device has none (rxe).
+    fn alloc_domain(&self, pd: &Self::Pd) -> Option<Self::Domain>;
+
+    /// Creates a QP in `pd` with its queues on the two CQs (they may be the
+    /// same). On `domain`, which must be over `pd`, the driver may skip its
+    /// own locks: the caller serializes every use of the QP and of the
+    /// other QPs of the domain. If the device refuses a QP on the domain,
+    /// it is created without.
     fn create_qp(
         &self,
         pd: &Self::Pd,
+        domain: Option<&Self::Domain>,
         send_cq: &Self::Cq,
         recv_cq: &Self::Cq,
         qp_type: QpType,
         caps: &QpCaps,
-        local: bool,
     ) -> Result<Self::Qp>;
 }
 
@@ -381,7 +392,8 @@ pub trait NicQp: Send {
     /// The QP number.
     fn qp_num(&self) -> u32;
 
-    /// Whether the QP was created without the driver's locks.
+    /// Whether the QP was created without the driver's locks (on a thread
+    /// domain).
     fn is_lock_free(&self) -> bool;
 
     /// Moves the QP from RESET through INIT and RTR to RTS, connected to

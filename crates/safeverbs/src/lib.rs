@@ -19,16 +19,20 @@
 //!   [`RemoteBuf`]; [`Exposed::reclaim`] revokes that first.
 //! - Connect a QP: [`QueuePairBuilder`] → [`PreparedQp`] (exchange
 //!   [`Endpoint`]s with the peer) → [`PreparedQp::handshake`] →
-//!   [`LocalQp`] (or [`SharedQp`] for several threads).
+//!   [`LocalQp`] (or [`SharedQp`] for several threads). Build the QPs of a
+//!   thread on one [`LocalWorker`] ([`QueuePairBuilder::build_on`]): they
+//!   share its completion queue, which every future of the thread polls.
 //! - Post: every operation ([`LocalQp::send`], [`LocalQp::write`],
 //!   [`LocalQp::read`], [`LocalQp::recv`], atomics, [`LocalQp::batch`]) is
 //!   posted when called and returns a future of its outcome; a
 //!   [`LocalQp::sink`] streams WRITEs with as few completions as the queue
 //!   allows; a [`LocalQp::receiver`] is a stream of receives.
-//! - Or drive the [`sync`] layer yourself: post into the ring, commit,
-//!   poll, take each request's completion and buffers back.
+//! - Or drive the [`sync`] layer yourself: a [`Worker`](sync::Worker) is a
+//!   completion queue with its QPs, one value that moves between threads;
+//!   post into the rings, commit, and poll the CQ for each request's
+//!   completion and buffers, in a loop of your own.
 //!
-//! Awaiting a future polls the QP's completion queue: there is no
+//! Awaiting a future polls its worker's completion queue: there is no
 //! background task, and a pending future asks to be polled again (busy
 //! polling, as RDMA applications do).
 //!
@@ -164,7 +168,7 @@
 //! # Ok(()) }
 //! ```
 //!
-//! A `LocalQp` belongs to one thread at a time (use a [`SharedQp`] to
+//! A `LocalQp` belongs to the thread of its worker (use a [`SharedQp`] to
 //! share one):
 //!
 //! ```compile_fail,E0277
@@ -185,6 +189,7 @@ mod op;
 mod qp;
 mod receiver;
 mod sink;
+mod worker;
 
 pub use batch::Batch;
 pub use builder::{PreparedQp, QueuePairBuilder, RcQueuePairBuilder, UcQueuePairBuilder};
@@ -198,39 +203,48 @@ pub use safeverbs_core::{
     Opcode, Pd, PortInfo, RC, Reliable, RemoteBuf, Result, RingBuf, Status, Transport, UC, Wc,
 };
 pub use sink::{WriteOp, WriteSink};
+pub use worker::LocalWorker;
 
-/// The synchronous layer under the futures: a [`QueuePair`](sync::QueuePair)
-/// whose requests are written into a completion ring and the hardware queue
-/// together, committed with one doorbell, retired by polling, and taken
-/// back (completion and buffers) by sequence number.
+/// The synchronous layer under the futures: a [`Worker`](sync::Worker) is a
+/// completion queue and the QPs attached to it, one value that is `Send`
+/// but not `Sync`; its QPs' requests are written into completion rings and
+/// the hardware queues together, committed with one doorbell, and come back
+/// (completion and buffers) when the CQ is polled.
 ///
-/// Reach it through [`LocalQp::with`] or [`LocalQp::into_inner`]. Lend
-/// buffers with [`Buf::into_part`] and [`BufMut::into_part`]; get them back
-/// with [`Leases::into_buf_mut`](sync::Leases::into_buf_mut).
+/// This is the zero-cost core: a thread's loop polls its worker, dispatches
+/// each completion and posts new work. Lend buffers with
+/// [`Buf::into_part`] and [`BufMut::into_part`]; get them back with
+/// [`Leases::into_buf_mut`](sync::Leases::into_buf_mut).
 ///
 /// ```no_run
-/// # use safeverbs::{Buf, LocalQp, RC, RemoteBuf};
-/// # use safeverbs::sync::WrOp;
-/// # fn f(qp: LocalQp<RC>, buf: Buf<u8>, dst: RemoteBuf) -> safeverbs::Result<()> {
-/// qp.with(|qp| {
-///     let mut req = qp.request();
-///     for i in 0..16 {
-///         req.push(WrOp::Write(dst.offset(i * 64)), buf.slice(..64).into_part())?;
-///     }
-///     let seq = req.finish(true, false).expect("WQEs were added");
-///     qp.commit()?;
-///     loop {
-///         qp.poll_send();
-///         if let Some((wc, _leases)) = qp.take_send(seq) {
-///             println!("{:?}", wc.status);
-///             break Ok(());
-///         }
-///     }
-/// })
+/// # use safeverbs::{Buf, Pd, RC, RemoteBuf};
+/// # use safeverbs::sync::{QpCaps, Worker, WrOp};
+/// # fn f(pd: Pd, buf: Buf<u8>, dst: RemoteBuf) -> safeverbs::Result<()> {
+/// let caps = QpCaps { max_send_wr: 128, max_recv_wr: 128, max_send_sge: 1, max_recv_sge: 1, max_inline_data: 0 };
+/// let mut w = Worker::new(&pd, 4096)?;
+/// let qps: Vec<_> = (0..8).map(|_| w.create_qp::<RC>(caps, 32)).collect::<Result<_, _>>()?;
+/// // ... exchange endpoints (`w.endpoint(qp, ..)`) and `w.connect(qp, ..)` each ...
+/// for &qp in &qps {
+///     let mut req = w.request(qp);
+///     req.push(WrOp::Write(dst), buf.slice(..64).into_part())?;
+///     req.submit(true);
+/// }
+/// loop {
+///     w.poll(|w, c| {
+///         // `c.qp` is the QP's index, `c.wc` the outcome, `c.leases` the buffers.
+///         let qp = qps[c.qp];
+///         let mut req = w.request(qp);
+///         let _ = req.push(WrOp::Write(dst), buf.slice(..64).into_part());
+///         req.submit(true);
+///     });
+/// }
 /// # }
 /// ```
 pub mod sync {
-    pub use safeverbs_core::qp::{MAX_SGES, QueuePair, Request};
+    pub use safeverbs_core::nic::QpCaps;
     pub use safeverbs_core::ring::{Ring, State};
-    pub use safeverbs_core::{Leases, Part, Seq, WrOp};
+    pub use safeverbs_core::worker::{
+        Completion, MAX_QPS, MAX_SGES, QpKey, Queue, Request, Worker,
+    };
+    pub use safeverbs_core::{ConnectAttr, Endpoint, Leases, Part, Seq, WrOp};
 }

@@ -103,8 +103,9 @@ impl<T: FromBytes, N: Nic> Outcome<N> for Recv<T> {
 ///
 /// The request is posted when the operation is called, or, if the queue is
 /// full (or earlier work waits), as soon as there is room, in order, by
-/// whichever future of the QP is polled. Polling polls the QP's CQ (no
-/// background task is needed) and, until the request retires, registers the
+/// whichever future of the QP is polled. Polling polls the CQ of the QP's
+/// worker (no background task is needed), retiring the requests of every
+/// QP of the worker, and, until its own request retires, registers the
 /// task's waker in the request's slot and asks to be polled again (the CQ
 /// is polled, not interrupt driven).
 ///
@@ -189,7 +190,7 @@ type Finished<N> = Result<(Wc, Leases<N>), (Error, Leases<N>)>;
 /// One poll of a request: its outcome if it retired, else `None` with the
 /// waker registered.
 fn poll_request<T: safeverbs_core::Transport, N: Nic>(
-    s: &mut QpState<T, N>,
+    s: &mut QpState<'_, T, N>,
     side: Side,
     state: &mut State<N>,
     cx: &Context<'_>,
@@ -205,16 +206,11 @@ fn poll_request<T: safeverbs_core::Transport, N: Nic>(
     let State::Posted(seq) = *state else {
         unreachable!("polled in a final state")
     };
-    match side {
-        Side::Send => s.qp().poll_send(),
-        Side::Recv => s.qp().poll_recv(),
-    };
+    // One poll of the worker's CQ retires the requests of all its QPs.
+    s.worker().progress();
     let taken = s.take_request(side, seq);
     if taken.is_none() {
-        match side {
-            Side::Send => s.qp().set_send_waker(seq, cx.waker()),
-            Side::Recv => s.qp().set_recv_waker(seq, cx.waker()),
-        }
+        s.set_waker(side, seq, cx.waker());
     }
     taken.map(Ok)
 }
@@ -273,10 +269,12 @@ impl<Q: QueueAccess> Future for Flush<'_, Q> {
         let done = self.q.with_state(|s| {
             s.drain();
             let idle = s.sends_idle();
-            let qp = s.qp();
-            qp.commit()?;
-            qp.poll_send();
-            Ok::<bool, Error>(idle && qp.send_ring().retired() >= qp.send_ring().posted())
+            let qp = s.key();
+            let w = s.worker();
+            w.commit(qp)?;
+            w.progress();
+            let ring = w.send_ring(qp);
+            Ok::<bool, Error>(idle && ring.retired() >= ring.posted())
         })?;
         if done {
             Poll::Ready(Ok(()))

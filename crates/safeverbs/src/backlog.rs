@@ -6,8 +6,8 @@
 
 use std::collections::VecDeque;
 
-use safeverbs_core::qp::{MAX_SGES, QueuePair};
-use safeverbs_core::{Error, Leases, Nic, Part, Seq, Transport, WrOp};
+use safeverbs_core::worker::MAX_SGES;
+use safeverbs_core::{Error, Leases, Nic, Part, QpKey, Seq, Transport, Worker, WrOp};
 
 /// Work for one request. (A gather list is kept inline, which makes the
 /// enum large; it only lives in the backlog while a queue is full.)
@@ -75,12 +75,12 @@ impl<N: Nic> Backlog<N> {
     }
 
     /// Posts waiting work in order while it fits.
-    pub(crate) fn drain<T: Transport>(&mut self, qp: &mut QueuePair<T, N>) {
+    pub(crate) fn drain<T: Transport>(&mut self, w: &mut Worker<N>, qp: QpKey<T>) {
         let mut i = 0;
         while i < self.entries.len() {
             if self.entries[i].work.is_some() {
                 let fits = match &self.entries[i].work {
-                    Some(work) => fits(qp, work),
+                    Some(work) => fits(w, qp, work),
                     None => true,
                 };
                 if !fits {
@@ -89,7 +89,7 @@ impl<N: Nic> Backlog<N> {
                 // A dropped future's work was dropped with it, so whoever
                 // waits here still wants the result.
                 let work = self.entries[i].work.take().expect("work");
-                self.entries[i].result = Some(post(qp, work));
+                self.entries[i].result = Some(post(w, qp, work));
             }
             i += 1;
         }
@@ -138,37 +138,41 @@ impl<N: Nic> Backlog<N> {
 /// room in the queue and for a free slot: when every slot holds a result
 /// that its future has not taken yet, it waits for those futures to be
 /// polled.
-pub(crate) fn fits<T: Transport, N: Nic>(qp: &QueuePair<T, N>, work: &Work<N>) -> bool {
+pub(crate) fn fits<T: Transport, N: Nic>(w: &Worker<N>, qp: QpKey<T>, work: &Work<N>) -> bool {
     match work {
-        Work::One(..) | Work::Gather(..) => qp.send_ring().can_post(),
+        Work::One(..) | Work::Gather(..) => w.send_ring(qp).can_post(),
         Work::Batch(ops) => {
-            let ring = qp.send_ring();
+            let ring = w.send_ring(qp);
             let want = ops.len().min(ring.max_wqes() as usize) as u32;
             ring.can_post() && ring.depth() - ring.in_flight_wqes() >= want
         }
-        Work::Recv(_) => qp.recv_ring().can_post(),
+        Work::Recv(_) => w.recv_ring(qp).can_post(),
     }
 }
 
-/// Posts `work` now (and rings the doorbell).
-pub(crate) fn post<T: Transport, N: Nic>(qp: &mut QueuePair<T, N>, work: Work<N>) -> Posted<N> {
+/// Posts `work` now on QP `qp` of `w` (and rings the doorbell).
+pub(crate) fn post<T: Transport, N: Nic>(
+    w: &mut Worker<N>,
+    qp: QpKey<T>,
+    work: Work<N>,
+) -> Posted<N> {
     match work {
         Work::One(op, part) => {
-            let mut req = qp.request();
+            let mut req = w.request(qp);
             if let Err(e) = req.push(op, part) {
                 return Err((e.error, Leases::from(e.buf)));
             }
             req.submit(true).expect("a WQE was added")
         }
         Work::Gather(op, parts) => {
-            let mut req = qp.request();
+            let mut req = w.request(qp);
             if let Err(e) = req.push_gather(op, parts.into_iter().flatten()) {
                 return Err((e, Leases::default()));
             }
             req.submit(true).expect("a WQE was added")
         }
         Work::Batch(ops) => {
-            let mut req = qp.request();
+            let mut req = w.request(qp);
             let mut error = None;
             for (op, part) in ops {
                 if error.is_none()
@@ -189,8 +193,8 @@ pub(crate) fn post<T: Transport, N: Nic>(qp: &mut QueuePair<T, N>, work: Work<N>
                     .unwrap_or(Err((Error::Invalid("an empty batch"), Leases::default()))),
             }
         }
-        Work::Recv(part) => qp
-            .post_recv(part, false)
+        Work::Recv(part) => w
+            .post_recv(qp, part, false)
             .map_err(|e| (e.error, Leases::from(e.buf))),
     }
 }

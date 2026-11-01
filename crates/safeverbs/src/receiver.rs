@@ -55,14 +55,15 @@ impl<'q, Q: QueueAccess, U: FromBytes + IntoBytes> Receiver<'q, Q, U> {
         let q = self.q;
         q.with_state(|s| {
             s.unclog();
-            let qp = s.qp();
-            if qp.recv_ring().failed() {
+            let qp = s.key();
+            let w = s.worker();
+            if w.recv_ring(qp).failed() {
                 return Err(BufError {
                     error: Error::QpFailed,
                     buf,
                 });
             }
-            match qp.post_recv(buf.into_part(), false) {
+            match w.post_recv(qp, buf.into_part(), false) {
                 Ok(seq) => {
                     self.posted.push_back(seq);
                     Ok(())
@@ -94,10 +95,12 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
         let q = this.q;
         let next = q.with_state(|s| {
             s.unclog();
-            let qp = s.qp();
-            while !this.spare.is_empty() && qp.recv_ring().can_post() && !qp.recv_ring().failed() {
+            let qp = s.key();
+            let w = s.worker();
+            while !this.spare.is_empty() && w.recv_ring(qp).can_post() && !w.recv_ring(qp).failed()
+            {
                 let buf = this.spare.pop().expect("a spare buffer");
-                match qp.post_recv(buf.into_part(), false) {
+                match w.post_recv(qp, buf.into_part(), false) {
                     Ok(seq) => this.posted.push_back(seq),
                     Err(e) => {
                         this.spare
@@ -106,8 +109,8 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
                     }
                 }
             }
-            qp.poll_recv();
-            let failed = qp.recv_ring().failed();
+            w.progress();
+            let failed = w.recv_ring(qp).failed();
             match this.posted.front() {
                 Some(&seq) => match s.take_request(Side::Recv, seq) {
                     Some((wc, leases)) => {
@@ -116,7 +119,7 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
                         Poll::Ready(Some((wc, buf)))
                     }
                     None => {
-                        s.qp().set_recv_waker(seq, cx.waker());
+                        s.set_waker(Side::Recv, seq, cx.waker());
                         Poll::Pending
                     }
                 },

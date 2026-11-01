@@ -7,11 +7,12 @@
 //! `verbs.h` are reimplemented here as calls through the provider's function
 //! pointers in `ibv_qp_ex` and `ibv_cq_ex`, which is all they do.
 //!
-//! A QP created `local` (one user at a time) asks for a thread domain
-//! (`ibv_alloc_td`) and a parent domain over it, on which mlx5 drops the
-//! QP's locks and gives it a doorbell of its own; on devices without thread
-//! domains (rxe) it falls back to a plain QP. CQs polled by one thread at a
-//! time are created `IBV_CREATE_CQ_ATTR_SINGLE_THREADED`.
+//! A worker asks for a thread domain (`ibv_alloc_td`) and a parent domain
+//! over it ([`VerbsDomain`]), on which mlx5 drops the locks of the QPs
+//! created there and gives them a doorbell of their own, which they share;
+//! on devices without thread domains (rxe) its QPs are plain ones. CQs
+//! polled by one thread at a time are created
+//! `IBV_CREATE_CQ_ATTR_SINGLE_THREADED`.
 
 use core::ffi::CStr;
 use core::mem::zeroed;
@@ -235,14 +236,34 @@ impl NicCq for VerbsCq {
     }
 }
 
+/// A thread domain and a parent domain over a PD (`struct ibv_td`, and
+/// the `struct ibv_pd` of `ibv_alloc_parent_domain`).
+pub struct VerbsDomain {
+    td: *mut ffi::ibv_td,
+    parent: *mut ffi::ibv_pd,
+}
+
+// SAFETY: the domain is a handle; it moves with the QPs created on it,
+// which are used by one thread at a time.
+unsafe impl Send for VerbsDomain {}
+
+impl Drop for VerbsDomain {
+    fn drop(&mut self) {
+        // SAFETY: the QPs created on it are gone (the worker drops them
+        // first); the parent domain goes before its thread domain.
+        unsafe {
+            ffi::ibv_dealloc_pd(self.parent);
+            ffi::ibv_dealloc_td(self.td);
+        }
+    }
+}
+
 /// A queue pair (`struct ibv_qp_ex`), possibly on a thread domain.
 pub struct VerbsQp {
     qp: *mut ffi::ibv_qp,
     qpx: *mut ffi::ibv_qp_ex,
-    /// The parent domain it was created on, if any.
-    parent: *mut ffi::ibv_pd,
-    /// The thread domain under the parent domain, if any.
-    td: *mut ffi::ibv_td,
+    /// Whether it was created on a thread domain.
+    lock_free: bool,
     qp_type: QpType,
 }
 
@@ -251,15 +272,9 @@ unsafe impl Send for VerbsQp {}
 
 impl Drop for VerbsQp {
     fn drop(&mut self) {
-        // SAFETY: the QP goes first, then the domains it was created on.
+        // SAFETY: a live QP, destroyed once; its domain outlives it.
         unsafe {
             ffi::ibv_destroy_qp(self.qp);
-            if !self.parent.is_null() {
-                ffi::ibv_dealloc_pd(self.parent);
-            }
-            if !self.td.is_null() {
-                ffi::ibv_dealloc_td(self.td);
-            }
         }
     }
 }
@@ -279,7 +294,7 @@ impl NicQp for VerbsQp {
     }
 
     fn is_lock_free(&self) -> bool {
-        !self.td.is_null()
+        self.lock_free
     }
 
     fn connect(&mut self, a: &ConnectAttr, remote: &Endpoint) -> Result<()> {
@@ -447,6 +462,7 @@ impl Nic for Verbs {
     type Mr = VerbsMr;
     type Cq = VerbsCq;
     type Qp = VerbsQp;
+    type Domain = VerbsDomain;
 
     fn name(&self) -> &str {
         &self.name
@@ -552,14 +568,35 @@ impl Nic for Verbs {
         }
     }
 
+    fn alloc_domain(&self, pd: &VerbsPd) -> Option<VerbsDomain> {
+        // SAFETY: a live context and PD, and filled attributes; the thread
+        // domain is released if the parent domain fails.
+        unsafe {
+            let mut td_attr = ffi::ibv_td_init_attr { comp_mask: 0 };
+            let td = ffi::ibv_alloc_td(self.ctx, &mut td_attr);
+            if td.is_null() {
+                return None;
+            }
+            let mut pd_attr: ffi::ibv_parent_domain_init_attr = zeroed();
+            pd_attr.pd = pd.pd;
+            pd_attr.td = td;
+            let parent = ffi::ibv_alloc_parent_domain(self.ctx, &mut pd_attr);
+            if parent.is_null() {
+                ffi::ibv_dealloc_td(td);
+                return None;
+            }
+            Some(VerbsDomain { td, parent })
+        }
+    }
+
     fn create_qp(
         &self,
         pd: &VerbsPd,
+        domain: Option<&VerbsDomain>,
         send_cq: &VerbsCq,
         recv_cq: &VerbsCq,
         qp_type: QpType,
         caps: &QpCaps,
-        local: bool,
     ) -> Result<VerbsQp> {
         use ffi::ibv_qp_create_send_ops_flags as F;
         let mut ops = F::IBV_QP_EX_WITH_SEND
@@ -574,24 +611,9 @@ impl Nic for Verbs {
                     | F::IBV_QP_EX_WITH_ATOMIC_FETCH_AND_ADD;
             }
         }
-        // SAFETY: live resources and filled attributes; every object made
-        // here is released on the failure paths.
+        // SAFETY: live resources and filled attributes; the QP is destroyed
+        // on the failure path.
         unsafe {
-            let (mut td, mut parent) = (null_mut(), null_mut());
-            if local {
-                let mut td_attr = ffi::ibv_td_init_attr { comp_mask: 0 };
-                td = ffi::ibv_alloc_td(self.ctx, &mut td_attr);
-                if !td.is_null() {
-                    let mut pd_attr: ffi::ibv_parent_domain_init_attr = zeroed();
-                    pd_attr.pd = pd.pd;
-                    pd_attr.td = td;
-                    parent = ffi::ibv_alloc_parent_domain(self.ctx, &mut pd_attr);
-                    if parent.is_null() {
-                        ffi::ibv_dealloc_td(td);
-                        td = null_mut();
-                    }
-                }
-            }
             let mut attr: ffi::ibv_qp_init_attr_ex = zeroed();
             attr.send_cq = ffi::ibv_cq_ex_to_cq(send_cq.cq);
             attr.recv_cq = ffi::ibv_cq_ex_to_cq(recv_cq.cq);
@@ -612,13 +634,14 @@ impl Nic for Verbs {
                 | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS)
                 .0;
             attr.send_ops_flags = ops.0 as u64;
-            attr.pd = if parent.is_null() { pd.pd } else { parent };
-            let mut qp = ffi::ibv_create_qp_ex(self.ctx, &mut attr);
-            if qp.is_null() && !parent.is_null() {
-                ffi::ibv_dealloc_pd(parent);
-                ffi::ibv_dealloc_td(td);
-                parent = null_mut();
-                td = null_mut();
+            let mut lock_free = false;
+            let mut qp = null_mut();
+            if let Some(domain) = domain {
+                attr.pd = domain.parent;
+                qp = ffi::ibv_create_qp_ex(self.ctx, &mut attr);
+                lock_free = !qp.is_null();
+            }
+            if qp.is_null() {
                 attr.pd = pd.pd;
                 qp = ffi::ibv_create_qp_ex(self.ctx, &mut attr);
             }
@@ -628,17 +651,12 @@ impl Nic for Verbs {
             let qpx = ffi::ibv_qp_to_qp_ex(qp);
             if qpx.is_null() {
                 ffi::ibv_destroy_qp(qp);
-                if !parent.is_null() {
-                    ffi::ibv_dealloc_pd(parent);
-                    ffi::ibv_dealloc_td(td);
-                }
                 return Err(Error::Unsupported("extended QP"));
             }
             Ok(VerbsQp {
                 qp,
                 qpx,
-                parent,
-                td,
+                lock_free,
                 qp_type,
             })
         }

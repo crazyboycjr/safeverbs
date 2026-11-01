@@ -72,8 +72,8 @@ impl<'q, Q: QueueAccess, U> WriteSink<'q, Q, U> {
             Some(imm) => WrOp::WriteImm(op.dst, imm),
             None => WrOp::Write(op.dst),
         };
-        let seq = self.q.with_qp(|qp| {
-            let mut req = qp.request();
+        let seq = self.q.with_qp(|w, qp| {
+            let mut req = w.request(qp);
             req.push(wr, op.buf.into_part()).map_err(|e| e.error)?;
             Ok::<_, Error>(req.finish(signal, true))
         })?;
@@ -88,11 +88,11 @@ impl<'q, Q: QueueAccess, U> WriteSink<'q, Q, U> {
         if let Some(op) = self.held.take() {
             self.post(op, true)?;
         }
-        self.q.with_qp(|qp| qp.commit())
+        self.q.with_qp(|w, qp| w.commit(qp))
     }
 
     fn take_error(&self) -> Result<(), Error> {
-        match self.q.with_qp(|qp| qp.take_send_error()) {
+        match self.q.with_qp(|w, qp| w.take_send_error(qp)) {
             Some(wc) => Err(Error::Completion(wc)),
             None => Ok(()),
         }
@@ -109,13 +109,14 @@ impl<Q: QueueAccess, U: IntoBytes + Immutable> Sink<WriteOp<U, Q::N>> for WriteS
         let ready = self.q.with_state(|s| {
             s.drain();
             let idle = s.sends_idle();
-            let qp = s.qp();
-            qp.poll_send();
-            if idle && qp.send_ring().can_post() {
+            let qp = s.key();
+            let w = s.worker();
+            w.progress();
+            if idle && w.send_ring(qp).can_post() {
                 return Ok::<bool, Error>(true);
             }
             // What is written needs the doorbell to ever complete.
-            qp.commit()?;
+            w.commit(qp)?;
             Ok(false)
         })?;
         if ready {
@@ -144,12 +145,12 @@ impl<Q: QueueAccess, U: IntoBytes + Immutable> Sink<WriteOp<U, Q::N>> for WriteS
         let this = self.get_mut();
         this.flush_now()?;
         let done = match this.last {
-            Some(last) => this.q.with_qp(|qp| {
-                qp.poll_send();
+            Some(last) => this.q.with_qp(|w, qp| {
+                w.progress();
                 // Retired (and freed, it has no owner); or refused by the
                 // device with its doorbell (the ring then records a flush
                 // error for it).
-                matches!(qp.send_ring().state(last), State::Free)
+                matches!(w.send_ring(qp).state(last), State::Free)
             }),
             None => true,
         };

@@ -1,15 +1,18 @@
 //! Connection setup in typestate: a [`QueuePairBuilder`] configures a QP,
-//! [`QueuePairBuilder::build`] creates it as a [`PreparedQp`] whose
-//! [`Endpoint`] goes to the peer, and [`PreparedQp::handshake`] with the
-//! peer's endpoint connects it into a [`LocalQp`]. Only connected QPs can
-//! post, and settings that only apply to RC exist only on RC builders.
+//! [`QueuePairBuilder::build_on`] creates it on a worker (or
+//! [`QueuePairBuilder::build`] on a worker of its own) as a [`PreparedQp`]
+//! whose [`Endpoint`] goes to the peer, and [`PreparedQp::handshake`] with
+//! the peer's endpoint connects it into a [`LocalQp`]. Only connected QPs
+//! can post, and settings that only apply to RC exist only on RC builders.
 
 use core::marker::PhantomData;
 
-use safeverbs_core::qp::QueuePair;
-use safeverbs_core::{Access, ConnectAttr, Endpoint, Nic, Pd, QpCaps, RC, Result, Transport, UC};
+use safeverbs_core::{
+    Access, ConnectAttr, Endpoint, Error, Nic, Pd, QpCaps, RC, Result, Transport, UC,
+};
 
-use crate::{LocalQp, Verbs};
+use crate::qp::QpGuard;
+use crate::{LocalQp, LocalWorker, Verbs};
 
 /// A builder of RC QPs.
 pub type RcQueuePairBuilder<N = Verbs> = QueuePairBuilder<RC, N>;
@@ -155,9 +158,21 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
         self
     }
 
-    /// Creates the QP (and its CQs) with the queues' sizes checked against
-    /// the device.
+    /// Creates the QP on a worker of its own, whose CQ holds exactly the
+    /// QP's queues, with the queues' sizes checked against the device.
     pub fn build(&self) -> Result<PreparedQp<T, N>> {
+        let cq_size = self.caps.max_send_wr.saturating_add(self.caps.max_recv_wr);
+        let worker = LocalWorker::new(&self.pd, cq_size)?;
+        self.build_on(&worker)
+    }
+
+    /// Creates the QP on `worker`, attached to its CQ, with the queues'
+    /// sizes checked against the device. Fails with
+    /// [`Error::CqFull`](crate::Error::CqFull) if the CQ has no room left
+    /// for the QP's queues, and with
+    /// [`Error::PdMismatch`](crate::Error::PdMismatch) if the worker is of
+    /// another protection domain.
+    pub fn build_on(&self, worker: &LocalWorker<N>) -> Result<PreparedQp<T, N>> {
         let ctx = self.pd.context();
         let port = ctx.port(self.port)?;
         let gid_index = match self.gid_index {
@@ -165,8 +180,13 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
             None => ctx.default_gid_index(self.port)?,
         };
         let max_batch = self.max_batch.unwrap_or((self.caps.max_send_wr / 2).max(1));
-        let qp = QueuePair::new(&self.pd, self.caps, max_batch, true)?;
-        let endpoint = qp.endpoint(self.port, gid_index)?;
+        let state = worker.state();
+        if state.borrow().worker.pd().id() != self.pd.id() {
+            return Err(Error::PdMismatch);
+        }
+        let key = state.borrow_mut().add_qp::<T>(self.caps, max_batch)?;
+        let guard = QpGuard::new(state.clone(), key);
+        let endpoint = state.borrow().worker.endpoint(key, self.port, gid_index)?;
         let rd = ctx.nic().caps().max_qp_rd_atom.clamp(1, 16) as u8;
         let attr = ConnectAttr {
             port: self.port,
@@ -183,7 +203,11 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
             max_rd_atomic: self.max_rd_atomic.unwrap_or(rd),
             max_dest_rd_atomic: self.max_dest_rd_atomic.unwrap_or(rd),
         };
-        Ok(PreparedQp { qp, attr, endpoint })
+        Ok(PreparedQp {
+            guard,
+            attr,
+            endpoint,
+        })
     }
 }
 
@@ -229,8 +253,10 @@ impl<N: Nic> QueuePairBuilder<RC, N> {
 
 /// A created QP, not connected yet: send its [`PreparedQp::endpoint`] to
 /// the peer and [`PreparedQp::handshake`] with the peer's.
+///
+/// Dropping it removes the QP from its worker.
 pub struct PreparedQp<T: Transport, N: Nic = Verbs> {
-    qp: QueuePair<T, N>,
+    guard: QpGuard<T, N>,
     attr: ConnectAttr,
     endpoint: Endpoint,
 }
@@ -242,8 +268,13 @@ impl<T: Transport, N: Nic> PreparedQp<T, N> {
     }
 
     /// Connects to the peer at `remote` (INIT, RTR, RTS).
-    pub fn handshake(mut self, remote: Endpoint) -> Result<LocalQp<T, N>> {
-        self.qp.connect(&self.attr, &remote)?;
-        Ok(LocalQp::new(self.qp, self.endpoint))
+    pub fn handshake(self, remote: Endpoint) -> Result<LocalQp<T, N>> {
+        let key = self.guard.key;
+        self.guard
+            .state()
+            .borrow_mut()
+            .worker
+            .connect(key, &self.attr, &remote)?;
+        Ok(LocalQp::new(self.guard, self.endpoint))
     }
 }

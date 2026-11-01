@@ -15,11 +15,11 @@
 //!   without FFI or `unsafe`, verified with Verus; [`refine`] proves that
 //!   it refines the abstract machine of `safeverbs-spec`;
 //! - [`trusted`]: the verbs of the data path with their contracts from the
-//!   NIC model, the interface the queue pair is to be verified against;
-//! - [`qp`]: a connected queue pair driven synchronously ([`QueuePair`]):
-//!   post requests into the ring and the hardware queue, commit them with
-//!   one doorbell, poll, and take each request's completion and buffers
-//!   back.
+//!   NIC model, the interface the queue pairs are to be verified against;
+//! - [`worker`]: a completion queue and the queue pairs attached to it,
+//!   driven synchronously ([`Worker`]): post requests into the rings and the
+//!   hardware queues, commit them with one doorbell, poll the CQ, and get
+//!   each request's completion and buffers back.
 //!
 //! # Soundness in one paragraph
 //!
@@ -33,7 +33,8 @@
 //! slot, unreachable until it comes back); memory it reads is lent as a
 //! shared frozen buffer (read only until every handle is gone); memory a
 //! peer may write is never readable as Rust values. Rings never let more
-//! WQEs be in flight than the queues and CQs hold.
+//! WQEs be in flight than the queues hold, and a worker's CQ reserves room
+//! for every completion its QPs' queues may produce.
 
 #![warn(missing_docs)]
 
@@ -42,13 +43,13 @@ pub mod error;
 pub mod model;
 pub mod nic;
 pub mod pd;
-pub mod qp;
 pub mod refine;
 pub mod ring;
 pub mod transport;
 pub mod trusted;
 pub mod verbs;
 pub mod wc;
+pub mod worker;
 
 pub use buf::{Buf, BufError, BufMut, Chunks, Exposed, Leases, Part, RingBuf};
 pub use error::{Error, Result};
@@ -56,7 +57,7 @@ pub use nic::{
     Access, ConnectAttr, Endpoint, Gid, GidEntry, Nic, PortInfo, QpCaps, RemoteBuf, WrOp,
 };
 pub use pd::{Context, Pd};
-pub use qp::{QueuePair, Request};
 pub use ring::Seq;
 pub use transport::{RC, Reliable, Transport, UC};
 pub use wc::{Opcode, Status, Wc};
+pub use worker::{Completion, QpKey, Queue, Request, Worker};

@@ -142,7 +142,7 @@ fn batch_is_one_request() {
     block_on(async {
         let dst = pd.alloc::<u8>(128 * 64).unwrap().expose().unwrap();
         let src = filled(&pd, 64, 5);
-        let posted = a.with(|qp| qp.send_ring().posted());
+        let posted = a.with(|w, qp| w.send_ring(qp).posted());
         let wc = a
             .batch(|b| {
                 for i in 0..128 {
@@ -153,7 +153,7 @@ fn batch_is_one_request() {
             .unwrap();
         assert_eq!(wc.opcode, Opcode::RDMA_WRITE);
         assert_eq!(
-            a.with(|qp| qp.send_ring().posted()) - posted,
+            a.with(|w, qp| w.send_ring(qp).posted()) - posted,
             1,
             "one request"
         );
@@ -377,7 +377,7 @@ fn uc_drops_messages_without_a_receive() {
 #[test]
 fn shared_qp_across_threads() {
     let (_m, pd, a, b) = pair::<RC>(14, 64);
-    let a = a.into_shared();
+    let a = a.into_shared().ok().expect("alone on its worker");
     let dst = pd.alloc::<u8>(4 * 64).unwrap().expose().unwrap();
     let remote = dst.remote();
     std::thread::scope(|s| {
@@ -559,8 +559,8 @@ fn random_operations_return_every_buffer_once() {
                     }
                 }
             }
-            assert!(a.with(|q| q.send_ring().invariant() && q.recv_ring().invariant()));
-            assert!(b.with(|q| q.send_ring().invariant() && q.recv_ring().invariant()));
+            assert!(a.with(|w, q| w.send_ring(q).invariant() && w.recv_ring(q).invariant()));
+            assert!(b.with(|w, q| w.send_ring(q).invariant() && w.recv_ring(q).invariant()));
         }
         // Settle: force both QPs into error so everything retires (RC
         // SENDs without a receive would wait forever otherwise).

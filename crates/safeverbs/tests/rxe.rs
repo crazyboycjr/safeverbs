@@ -168,7 +168,7 @@ fn batch_of_writes_is_one_request() {
     let (pd, a, _b) = pair::<RC>(&ctx, 256);
     let dst = pd.alloc::<u8>(128 * 64).unwrap().expose().unwrap();
     let src = filled(&pd, 64, 4);
-    let before = a.with(|qp| qp.send_ring().posted());
+    let before = a.with(|w, qp| w.send_ring(qp).posted());
     let wc = wait(a.batch(|b| {
         for i in 0..128 {
             b.write(src.slice(..), dst.remote().offset(i * 64));
@@ -176,7 +176,7 @@ fn batch_of_writes_is_one_request() {
     }))
     .unwrap();
     assert_eq!(wc.opcode, Opcode::RDMA_WRITE);
-    assert_eq!(a.with(|qp| qp.send_ring().posted()) - before, 1);
+    assert_eq!(a.with(|w, qp| w.send_ring(qp).posted()) - before, 1);
     let back = dst.reclaim();
     assert!(back[..].chunks(64).all(|c| c == &src[..]));
     assert!(src.try_thaw().is_ok(), "the batch released its lease");
@@ -318,7 +318,7 @@ fn uc_forced_error_flushes_sends() {
 fn shared_qp_from_threads() {
     let Some(ctx) = device() else { return };
     let (pd, a, _b) = pair::<RC>(&ctx, 64);
-    let a = a.into_shared();
+    let a = a.into_shared().ok().expect("alone on its worker");
     let dst = pd.alloc::<u8>(4 * 64).unwrap().expose().unwrap();
     let remote = dst.remote();
     std::thread::scope(|s| {

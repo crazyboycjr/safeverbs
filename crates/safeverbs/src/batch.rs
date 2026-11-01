@@ -1,6 +1,6 @@
 //! Batches: several SENDs and WRITEs posted as one request.
 
-use safeverbs_core::qp::Request;
+use safeverbs_core::Request;
 use safeverbs_core::{Buf, Error, Leases, Nic, Part, RemoteBuf, Transport, WrOp};
 use zerocopy::{Immutable, IntoBytes};
 
