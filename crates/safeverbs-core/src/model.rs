@@ -15,7 +15,12 @@
 //!
 //! The model panics where hardware would silently misbehave and safeverbs
 //! promises it never happens: a send or receive queue overflow, a CQ
-//! overrun, a doorbell rung for nothing started.
+//! overrun, a doorbell rung for nothing started. It also checks the
+//! preconditions of the NIC model M (`safeverbs_spec::nic`) that the
+//! library must meet: work is posted only on a QP that left RESET, a QP is
+//! destroyed only when every WQE posted on it was retired by a polled
+//! completion (its own or a later one of its queue, as M's `poll_cq`
+//! retires them), and a CQ only when no QP is attached to it.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -27,8 +32,6 @@ use crate::nic::{
 };
 use crate::wc::{Opcode, Status, Wc};
 
-/// Linux's `ENOMEM`, for a queue posted past its depth.
-const ENOMEM: i32 = 12;
 /// Linux's `EINVAL`.
 const EINVAL: i32 = 22;
 /// Linux's `EAGAIN`, for an injected refusal.
@@ -73,6 +76,11 @@ struct QpRec {
     rq: VecDeque<RecvWqe>,
     /// Errors to inject into the next WQEs this QP processes.
     inject: VecDeque<Status>,
+    /// The `wr_id`s of the send WQEs posted and not retired by a polled
+    /// completion, oldest first: what M's send queue holds.
+    unretired_send: VecDeque<u64>,
+    /// The same for the receive queue.
+    unretired_recv: VecDeque<u64>,
     /// Doorbells to refuse next.
     refuse: u32,
 }
@@ -86,7 +94,13 @@ struct MrRec {
 
 struct CqRec {
     capacity: usize,
-    entries: VecDeque<Wc>,
+    entries: VecDeque<Cqe>,
+}
+
+/// A completion waiting in a CQ, with the queue it completes.
+struct Cqe {
+    wc: Wc,
+    recv: bool,
 }
 
 struct Fabric {
@@ -99,6 +113,8 @@ struct Fabric {
     delay_permille: u32,
     /// The most steps one poll carries out.
     burst: u32,
+    /// The device carries out nothing, not even flushes.
+    halted: bool,
 }
 
 impl Model {
@@ -113,6 +129,7 @@ impl Model {
                 qps: BTreeMap::new(),
                 delay_permille: 0,
                 burst: 4,
+                halted: false,
             })),
         }
     }
@@ -127,6 +144,12 @@ impl Model {
         let mut f = self.lock();
         f.delay_permille = delay_permille.min(999);
         f.burst = burst.max(1);
+    }
+
+    /// Halts the device (or lets it go on): halted, it carries out no work
+    /// request and flushes nothing, as a device that hung would.
+    pub fn halt(&self, halted: bool) {
+        self.lock().halted = halted;
     }
 
     /// Makes the next WQE QP `qp_num` processes fail with `status`, which
@@ -194,10 +217,38 @@ impl Fabric {
         id
     }
 
-    fn push_cqe(&mut self, cq: u32, wc: Wc) {
+    /// Queues `wc`, a completion of QP `wc.qp_num`'s receive queue if
+    /// `recv`, else of its send queue.
+    fn push_cqe(&mut self, cq: u32, wc: Wc, recv: bool) {
         if let Some(cq) = self.cqs.get_mut(&cq) {
             assert!(cq.entries.len() < cq.capacity, "model: CQ overrun");
-            cq.entries.push_back(wc);
+            cq.entries.push_back(Cqe { wc, recv });
+        }
+    }
+
+    /// Polling `cqe` retires its WQE and, on a send queue, every earlier
+    /// one (unsignaled WQEs that succeeded), as M's `poll_cq` does.
+    fn retire(&mut self, cqe: &Cqe) {
+        let num = cqe.wc.qp_num;
+        let qp = self
+            .qps
+            .get_mut(&num)
+            .unwrap_or_else(|| panic!("model: a completion of QP {num}, destroyed"));
+        if cqe.recv {
+            let oldest = qp.unretired_recv.pop_front();
+            assert_eq!(
+                oldest,
+                Some(cqe.wc.wr_id),
+                "model: a receive completes out of order"
+            );
+        } else {
+            loop {
+                match qp.unretired_send.pop_front() {
+                    Some(id) if id == cqe.wc.wr_id => break,
+                    Some(_) => {}
+                    None => panic!("model: a completion of no posted send WQE"),
+                }
+            }
         }
     }
 
@@ -232,6 +283,9 @@ impl Fabric {
 
     /// Carries out one WQE of a random QP that can progress.
     fn step(&mut self) -> bool {
+        if self.halted {
+            return false;
+        }
         let mut ready = Vec::new();
         for &num in self.qps.keys() {
             if self.ready(num) {
@@ -279,10 +333,10 @@ impl Fabric {
         }
     }
 
-    fn fail(&mut self, num: u32, cq: u32, wr_id: u64, status: Status) {
+    fn fail(&mut self, num: u32, cq: u32, wr_id: u64, status: Status, recv: bool) {
         let qp = self.qps.get_mut(&num).expect("model: QP");
         qp.state = QpState::Error;
-        self.push_cqe(cq, error_wc(wr_id, status, num));
+        self.push_cqe(cq, error_wc(wr_id, status, num), recv);
     }
 
     fn process(&mut self, num: u32) {
@@ -291,16 +345,24 @@ impl Fabric {
             (qp.send_cq, qp.recv_cq, qp.pd, qp.qp_type, qp.remote);
         if qp.state == QpState::Error {
             if let Some(wqe) = qp.sq.pop_front() {
-                self.push_cqe(send_cq, error_wc(wqe.wr_id, Status::WR_FLUSH_ERR, num));
+                self.push_cqe(
+                    send_cq,
+                    error_wc(wqe.wr_id, Status::WR_FLUSH_ERR, num),
+                    false,
+                );
             } else if let Some(wqe) = qp.rq.pop_front() {
-                self.push_cqe(recv_cq, error_wc(wqe.wr_id, Status::WR_FLUSH_ERR, num));
+                self.push_cqe(
+                    recv_cq,
+                    error_wc(wqe.wr_id, Status::WR_FLUSH_ERR, num),
+                    true,
+                );
             }
             return;
         }
         let injected = qp.inject.pop_front();
         let wqe = qp.sq.pop_front().expect("model: a ready QP has a WQE");
         if let Some(status) = injected {
-            self.fail(num, send_cq, wqe.wr_id, status);
+            self.fail(num, send_cq, wqe.wr_id, status, false);
             return;
         }
         let local_write = matches!(
@@ -308,7 +370,7 @@ impl Fabric {
             WrOp::Read(_) | WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. }
         );
         let Some(len) = self.check_local(pd, &wqe.sges, local_write) else {
-            self.fail(num, send_cq, wqe.wr_id, Status::LOC_PROT_ERR);
+            self.fail(num, send_cq, wqe.wr_id, Status::LOC_PROT_ERR, false);
             return;
         };
         let peer = match self.qps.get(&remote) {
@@ -320,7 +382,7 @@ impl Fabric {
         let Some((peer_pd, peer_cq, peer_access)) = peer else {
             // Nobody answers: RC runs out of retries, UC loses the message.
             if qp_type == QpType::Rc {
-                self.fail(num, send_cq, wqe.wr_id, Status::RETRY_EXC_ERR);
+                self.fail(num, send_cq, wqe.wr_id, Status::RETRY_EXC_ERR, false);
             } else {
                 self.done(num, send_cq, &wqe, len);
             }
@@ -348,21 +410,25 @@ impl Fabric {
                     Some(room) if room >= len => {
                         let data = self.gather(&wqe.sges, len);
                         self.scatter(&recv.sges, &data);
-                        self.push_cqe(peer_cq, recv_wc(recv.wr_id, Opcode::RECV, len, imm, remote));
+                        self.push_cqe(
+                            peer_cq,
+                            recv_wc(recv.wr_id, Opcode::RECV, len, imm, remote),
+                            true,
+                        );
                         self.done(num, send_cq, &wqe, len);
                     }
                     Some(_) => {
-                        self.fail(remote, peer_cq, recv.wr_id, Status::LOC_LEN_ERR);
+                        self.fail(remote, peer_cq, recv.wr_id, Status::LOC_LEN_ERR, true);
                         if reliable {
-                            self.fail(num, send_cq, wqe.wr_id, Status::REM_INV_REQ_ERR);
+                            self.fail(num, send_cq, wqe.wr_id, Status::REM_INV_REQ_ERR, false);
                         } else {
                             self.done(num, send_cq, &wqe, len);
                         }
                     }
                     None => {
-                        self.fail(remote, peer_cq, recv.wr_id, Status::LOC_PROT_ERR);
+                        self.fail(remote, peer_cq, recv.wr_id, Status::LOC_PROT_ERR, true);
                         if reliable {
-                            self.fail(num, send_cq, wqe.wr_id, Status::REM_OP_ERR);
+                            self.fail(num, send_cq, wqe.wr_id, Status::REM_OP_ERR, false);
                         } else {
                             self.done(num, send_cq, &wqe, len);
                         }
@@ -374,7 +440,7 @@ impl Fabric {
                     && self.check_remote(peer_pd, r.rkey, r.addr, len, Access::REMOTE_WRITE);
                 if !ok {
                     if reliable {
-                        self.fail(num, send_cq, wqe.wr_id, Status::REM_ACCESS_ERR);
+                        self.fail(num, send_cq, wqe.wr_id, Status::REM_ACCESS_ERR, false);
                     } else {
                         self.done(num, send_cq, &wqe, len);
                     }
@@ -412,6 +478,7 @@ impl Fabric {
                             Some(imm),
                             remote,
                         ),
+                        true,
                     );
                 }
                 self.done(num, send_cq, &wqe, len);
@@ -420,7 +487,7 @@ impl Fabric {
                 let ok = peer_access.contains(Access::REMOTE_READ)
                     && self.check_remote(peer_pd, r.rkey, r.addr, len, Access::REMOTE_READ);
                 if !ok {
-                    self.fail(num, send_cq, wqe.wr_id, Status::REM_ACCESS_ERR);
+                    self.fail(num, send_cq, wqe.wr_id, Status::REM_ACCESS_ERR, false);
                     return;
                 }
                 let mut data = vec![0u8; len];
@@ -435,7 +502,7 @@ impl Fabric {
                     && peer_access.contains(Access::REMOTE_ATOMIC)
                     && self.check_remote(peer_pd, r.rkey, r.addr, 8, Access::REMOTE_ATOMIC);
                 if !ok {
-                    self.fail(num, send_cq, wqe.wr_id, Status::REM_ACCESS_ERR);
+                    self.fail(num, send_cq, wqe.wr_id, Status::REM_ACCESS_ERR, false);
                     return;
                 }
                 let target = r.addr as usize as *mut u64;
@@ -473,7 +540,7 @@ impl Fabric {
             let mut wc = Wc::success(opcode, len as u32);
             wc.wr_id = wqe.wr_id;
             wc.qp_num = num;
-            self.push_cqe(cq, wc);
+            self.push_cqe(cq, wc, false);
         }
     }
 
@@ -559,7 +626,15 @@ pub struct ModelCq {
 impl Drop for ModelCq {
     fn drop(&mut self) {
         let mut f = self.fabric.lock().unwrap_or_else(|e| e.into_inner());
-        f.cqs.remove(&self.id);
+        let id = self.id;
+        let attached = f
+            .qps
+            .values()
+            .any(|qp| qp.send_cq == id || qp.recv_cq == id);
+        f.cqs.remove(&id);
+        drop(f);
+        // M's `destroy_cq`.
+        assert!(!attached, "model: a CQ destroyed with QPs attached");
     }
 }
 
@@ -573,12 +648,13 @@ impl NicCq for ModelCq {
                 i += 1;
             }
         }
-        let cq = f.cqs.get_mut(&self.id).expect("model: CQ");
         let mut n = 0;
         while n < out.len() {
+            let cq = f.cqs.get_mut(&self.id).expect("model: CQ");
             match cq.entries.pop_front() {
-                Some(wc) => {
-                    out[n] = wc;
+                Some(cqe) => {
+                    f.retire(&cqe);
+                    out[n] = cqe.wc;
                     n += 1;
                 }
                 None => break,
@@ -605,7 +681,17 @@ impl ModelQp {
 impl Drop for ModelQp {
     fn drop(&mut self) {
         let num = self.num;
-        self.lock().qps.remove(&num);
+        let qp = self.lock().qps.remove(&num);
+        // M's `destroy_qp`: the NIC holds no buffer of the QP, and no
+        // completion of it is left.
+        if let Some(qp) = qp {
+            assert!(
+                qp.unretired_send.is_empty() && qp.unretired_recv.is_empty(),
+                "model: QP {num} destroyed with {} send and {} receive WQEs not retired",
+                qp.unretired_send.len(),
+                qp.unretired_recv.len()
+            );
+        }
     }
 }
 
@@ -659,16 +745,16 @@ impl NicQp for ModelQp {
         let mut f = self.lock();
         let qp = f.qps.get_mut(&num).expect("model: QP");
         assert!(
-            qp.sq.len() + staged.len() <= qp.caps.max_send_wr as usize,
+            qp.unretired_send.len() + staged.len() <= qp.caps.max_send_wr as usize,
             "model: send queue overflow"
         );
-        if qp.state == QpState::Reset {
-            return Err(Error::Os(EINVAL));
-        }
+        // M's `post_send` needs RTS or ERR.
+        assert!(qp.state != QpState::Reset, "model: a doorbell in RESET");
         if qp.refuse > 0 {
             qp.refuse -= 1;
             return Err(Error::Os(EAGAIN));
         }
+        qp.unretired_send.extend(staged.iter().map(|wqe| wqe.wr_id));
         qp.sq.extend(staged);
         Ok(())
     }
@@ -681,9 +767,16 @@ impl NicQp for ModelQp {
         let num = self.num;
         let mut f = self.lock();
         let qp = f.qps.get_mut(&num).expect("model: QP");
-        if qp.rq.len() >= qp.caps.max_recv_wr as usize {
-            return Err(Error::Os(ENOMEM));
-        }
+        // M's `post_recv` needs a QP out of RESET, and room.
+        assert!(
+            qp.state != QpState::Reset,
+            "model: a receive posted in RESET"
+        );
+        assert!(
+            qp.unretired_recv.len() < qp.caps.max_recv_wr as usize,
+            "model: receive queue overflow"
+        );
+        qp.unretired_recv.push_back(wr_id);
         qp.rq.push_back(RecvWqe {
             wr_id,
             sges: sges.to_vec(),
@@ -805,6 +898,8 @@ impl Nic for Model {
                 sq: VecDeque::new(),
                 rq: VecDeque::new(),
                 inject: VecDeque::new(),
+                unretired_send: VecDeque::new(),
+                unretired_recv: VecDeque::new(),
                 refuse: 0,
             },
         );

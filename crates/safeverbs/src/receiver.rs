@@ -19,7 +19,8 @@ use crate::qp::QueueAccess;
 /// buffers back too; once the QP has failed, [`Receiver::repost`] refuses
 /// and the stream ends when every receive is back. Dropping the receiver
 /// leaves its receives posted: their buffers come back to the QP and are
-/// released when they complete or the QP is destroyed.
+/// released when they complete (at the latest when the QP is removed,
+/// which flushes them first).
 pub struct Receiver<'q, Q: QueueAccess, U> {
     q: &'q Q,
     /// Receives posted by this receiver, oldest first.

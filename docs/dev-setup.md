@@ -160,12 +160,17 @@ cargo test --workspace
   invariant after every step (a run-time cross-check of what Verus proves,
   `scripts/verify.sh`) and that every lease is released exactly once; of
   the worker (`worker.rs`): `wr_id` routing, CQ reservations, a refused
-  doorbell; and (`crates/safeverbs-core/tests/worker.rs`) pairs of QPs on
+  doorbell, removing QPs and dropping a worker with work in flight (the
+  drain before the destroy) and a device that never flushes; and
+  (`crates/safeverbs-core/tests/worker.rs`) QPs removed and workers dropped
+  at random moments with work in flight, and pairs of QPs on
   one worker, whose CQ is exactly as large as they reserve, driven by the
   event loop through random operations, dropped requests, injected errors,
   flushes and refused doorbells, checking that every completion reaches
   its own QP and request once, with its own buffer, and that the simulated
-  NIC's CQ is never overrun.
+  NIC's CQ is never overrun. The simulated NIC also checks M's rules the
+  library must follow: no QP destroyed with a WQE not retired by a polled
+  completion, no CQ destroyed with a QP attached, no work posted in RESET.
 - `safeverbs` (`crates/safeverbs/tests/model.rs`): the public API on the
   simulated NIC (`Model`), which needs no device: every operation, the sink
   and the stream, dropped futures, errors and flushes, QPs sharing one
@@ -173,8 +178,10 @@ cargo test --workspace
   one worker, with refused doorbells too) with injected errors after which
   every buffer is back or released once and nothing stays registered.
 - `safeverbs` (`crates/safeverbs/tests/rxe.rs`): one test per feature on a
-  real device, two QPs of it connected to each other; and four QPs on one
-  worker, connected pairwise, driven by the event loop and by futures.
+  real device, two QPs of it connected to each other; four QPs on one
+  worker, connected pairwise, driven by the event loop and by futures; and
+  QPs removed, and a worker dropped, with work in flight, among it
+  unsignaled WQEs that only the drain WQE retires.
 - The crate documentation of `safeverbs` runs its example on the model
   and has `compile_fail` tests for what the types rule out.
 

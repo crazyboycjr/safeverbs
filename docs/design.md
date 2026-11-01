@@ -318,8 +318,32 @@ Where that fails (rxe) they are plain queue pairs. A worker belongs to one prote
 send and receive depths, when it is created, and one that does not fit in what is left is
 refused (`Error::CqFull`). The rings never let more WQEs be in flight than the queues hold,
 and each WQE produces at most one completion, so the CQ cannot overrun. This is the rule of
-M's `create_qp`, under which M proves that no CQ overflows. Removing a queue pair polls the
-CQ until its last completions are out before its reservation, or its index, can be reused.
+M's `create_qp`, under which M proves that no CQ overflows.
+
+**Removal.** M's `destroy_qp` allows destroying a queue pair only with empty queues: until a
+WQE is retired the NIC may still use its buffers. Removing a queue pair (`remove_qp`, and
+dropping the worker, for all of them at once) therefore drains it first: the WQEs written
+since the last doorbell are discarded, every request is detached, and if anything is in
+flight the queue pair moves to the error state, where the NIC completes every WQE left with
+a flush error. That does not reach an unsignaled WQE that succeeded before the error: it has
+no completion of its own and only a later one of its queue retires it. So the worker also
+posts a *drain WQE*, a signaled SEND of nothing, which the error state flushes after all the
+others (the kernel's `ib_drain_sq` does the same); it goes through the ring as a request
+without an owner, so its number follows the others. The CQ is polled, the other queue pairs'
+completions going to their rings, until neither ring has anything in flight. Only then is the
+queue pair destroyed and its buffers released; no completion of it is left in the CQ, so
+another queue pair may take its index and its reservation at once. A device that never
+flushes is a fatal error that never frees memory the NIC may use: after `DRAIN_TIMEOUT` (one
+second) without a completion, `remove_qp` fails with `Error::NotFlushed` and keeps the queue
+pair, its buffers, its index and its reservation; dropping the worker tries once more and
+otherwise leaks them, with the CQ and the thread domain (destroying those needs the queue pair
+gone). The cost is waiting for the NIC's flush when a queue pair or a worker is dropped.
+
+**State.** M accepts work only on a queue pair in RTS or ERR, and a connection starts from
+RESET. The worker records what it knows: a queue pair takes work once `connect` succeeded or
+`to_error` moved it to the error state, and connects once, from RESET. A doorbell on a queue
+pair that takes no work is refused as a device would refuse it (`Error::NotConnected`: its
+requests retire with a flush error), and so is a receive.
 
 **Routing.** One CQ serves all the queue pairs, so each completion must find its queue pair
 and queue. The `wr_id` the library gives a WQE holds the queue pair's index in the worker (16
@@ -399,10 +423,6 @@ async style of the API carry over.
 - Which thread owns a CQ shared by several queue pairs is answered by the worker (section
   10): a group that owns the CQ and the queue pairs attached to it, reserves each queue pair's
   depths on attach, routes completions by `wr_id` and moves between threads as one unit.
-- A queue pair is destroyed with work in flight, and its buffers released after: M's
-  `destroy_qp` asks for empty queues first. Draining before destroying (to the error state,
-  then polling until every request retired) would match M, at the price of waiting for the
-  NIC when a queue pair or worker is dropped.
 - Theorem 1 for the worker: M is one state for the whole device, while each worker is one
   thread's. The proof needs each worker's share of M (a tokenized M, or a token per worker
   over its CQ and queue pairs), next to the lease tokens of the buffers.

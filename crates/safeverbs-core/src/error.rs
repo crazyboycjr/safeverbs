@@ -43,6 +43,14 @@ pub enum Error {
     Clogged,
     /// The QP is in the error state: work requests would only be flushed.
     QpFailed,
+    /// The QP takes no work: it is not connected (nor moved to the error
+    /// state), so the device would not accept its work requests.
+    NotConnected,
+    /// The device did not flush a QP being removed: no completion came
+    /// while it still had work in flight. The QP is kept with the buffers
+    /// its work requests name, never destroyed or freed (a leak, not a use
+    /// after free).
+    NotFlushed,
     /// The device does not support this.
     Unsupported(&'static str),
     /// An argument out of range.
@@ -82,6 +90,10 @@ impl fmt::Display for Error {
             }
             Error::Clogged => f.write_str("every slot holds a result nobody took"),
             Error::QpFailed => f.write_str("the queue pair is in the error state"),
+            Error::NotConnected => f.write_str("the queue pair is not connected"),
+            Error::NotFlushed => {
+                f.write_str("the device did not flush the queue pair; it is kept with its buffers")
+            }
             Error::Unsupported(what) => write!(f, "not supported: {what}"),
             Error::Invalid(what) => write!(f, "invalid argument: {what}"),
             Error::NoDevice => f.write_str("no RDMA device"),

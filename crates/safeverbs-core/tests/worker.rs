@@ -379,3 +379,102 @@ fn event_loop_on_several_qps() {
     );
     assert!(delivered > 2000 && failed > 100 && refused > 20);
 }
+
+/// Workers and QPs removed or dropped at random moments, with work in
+/// flight: sends signaled or not, batches, READs, receives, dropped
+/// requests, errors, flushes and refused doorbells. The model panics if a
+/// QP is destroyed with a WQE not retired by a polled completion (M's
+/// `destroy_qp`) or a CQ with a QP attached (M's `destroy_cq`); afterwards
+/// every buffer is back and nothing stays registered.
+#[test]
+fn removing_busy_qps_and_dropping_busy_workers() {
+    let mut removed = 0;
+    for seed in 1..120u64 {
+        let model = Model::new(seed);
+        model.set_pace((seed * 53 % 900) as u32, 1 + (seed % 5) as u32);
+        let pd = Context::new(model.clone()).alloc_pd().unwrap();
+        let pairs = 1 + (seed % 3) as usize;
+        let depth = 2 + (seed % 7) as u32;
+        let (mut w, qps) = worker(&pd, pairs, depth);
+        let mut live: Vec<QpKey<RC>> = qps.clone();
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let dst = pd.alloc::<u8>(4096).unwrap().expose().unwrap();
+        let frozen = pd.alloc::<u8>(512).unwrap().freeze();
+        let steps = rng.below(300);
+        for _ in 0..steps {
+            if live.is_empty() {
+                break;
+            }
+            let q = live[rng.below(live.len() as u64) as usize];
+            match rng.below(14) {
+                0..=3 => {
+                    // Only what fits now: waiting for room could wait for
+                    // a receive the peer never posts.
+                    let ring = w.send_ring(q);
+                    let n = 1 + rng.below(ring.max_wqes() as u64) as u32;
+                    if !ring.can_post() || ring.depth() - ring.in_flight_wqes() < n {
+                        continue;
+                    }
+                    let mut req = w.request(q);
+                    for _ in 0..n {
+                        let len = 1 + rng.below(200) as usize;
+                        let op = if rng.below(2) == 0 {
+                            WrOp::Send
+                        } else {
+                            WrOp::Write(dst.remote().offset(rng.below(3000)))
+                        };
+                        if req.push(op, frozen.slice(..len).into_part()).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = req.finish(rng.below(3) == 0, rng.below(2) == 0);
+                    if rng.below(2) == 0 {
+                        let _ = w.commit(q);
+                    }
+                }
+                4 => {
+                    if !w.send_ring(q).can_post() {
+                        continue;
+                    }
+                    let buf = pd.alloc::<u8>(64).unwrap();
+                    let mut req = w.request(q);
+                    req.push(WrOp::Read(dst.remote().slice(..64)), buf.into_part())
+                        .unwrap();
+                    let _ = req.finish(rng.below(2) == 0, rng.below(2) == 0);
+                }
+                5..=7 => {
+                    let buf = pd.alloc::<u8>(256).unwrap();
+                    let _ = w.post_recv(q, buf.into_part(), rng.below(2) == 0);
+                }
+                8 => match rng.below(10) {
+                    0 => model.inject_error(w.qp_num(q), Status::REM_OP_ERR),
+                    1 => model.force_error(w.qp_num(q)),
+                    2..=4 => model.refuse_doorbells(w.qp_num(q), 1),
+                    _ => {}
+                },
+                9 => {
+                    let _ = w.commit(q);
+                }
+                10 => {
+                    if rng.below(8) == 0 {
+                        w.remove_qp(q).unwrap();
+                        live.retain(|&k| k != q);
+                        removed += 1;
+                    }
+                }
+                _ => {
+                    w.poll(|_, c| drop(c));
+                }
+            }
+        }
+        // Drop the worker as it is, with whatever is in flight or written.
+        drop(w);
+        assert!(
+            frozen.try_thaw().is_ok(),
+            "seed {seed}: a frozen buffer still held"
+        );
+        drop((dst, pd));
+        assert_eq!(model.registered(), 0, "seed {seed}: a region leaked");
+    }
+    assert!(removed > 20, "{removed} QPs removed");
+}

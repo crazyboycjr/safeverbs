@@ -205,7 +205,8 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
         let endpoint = match w.endpoint(key, self.port, gid_index) {
             Ok(e) => e,
             Err(e) => {
-                w.remove_qp(key);
+                // Nothing was posted: nothing to flush.
+                let _ = w.remove_qp(key);
                 return Err(e);
             }
         };

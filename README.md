@@ -150,7 +150,7 @@ __Data Path__
 __Control Path__
 - __Typestate Pattern__: connection setup uses the typestate pattern, so a queue pair posts only once connected, and RC-only settings and operations exist only for RC.
 - __Builder Pattern__: sensible defaults for reliable connections (RC) and unreliable connections (UC), with setters for the rest.
-- __Resource Dependency Management__: resources are reference counted and released in the right order, without lifetime annotations; a queue pair is destroyed before any buffer it still holds is released.
+- __Resource Dependency Management__: resources are reference counted and released in the right order, without lifetime annotations; a queue pair is drained (moved to the error state, its flushed work requests polled) and destroyed before any buffer it held is released.
 - __Checked capacities__: queue depths, scatter/gather counts and CQ sizes are checked against the device when objects are created, not on every post; a queue pair that does not fit in its worker's CQ is refused.
 
 ## License

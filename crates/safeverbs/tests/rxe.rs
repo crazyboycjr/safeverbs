@@ -610,3 +610,79 @@ fn futures_on_four_qps_of_one_worker() {
         assert_eq!(&back[i * 4096..(i + 1) * 4096], &filled(&pd, 4096, 19)[..]);
     }
 }
+
+/// Removing QPs and dropping a worker with work in flight drains each QP
+/// before destroying it: receives that never match, WRITEs whose last WQE
+/// is unsignaled (it succeeds with no completion of its own, so only the
+/// drain WQE retires it), and READs the peer answers. Every removal
+/// succeeds (the device flushed within the bound) and every buffer comes
+/// back.
+#[test]
+fn removing_and_dropping_busy_qps_drains_them() {
+    let Some(ctx) = device() else { return };
+    let pd = ctx.alloc_pd().unwrap();
+    let depth = 16;
+    let caps = QpCaps {
+        max_send_wr: depth,
+        max_recv_wr: depth,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: 0,
+    };
+    let src = filled(&pd, 4096, 3);
+    let dst = pd.alloc::<u8>(4096).unwrap().expose().unwrap();
+    for drop_worker in [false, true] {
+        let mut w = Worker::new(&pd, 4 * 2 * depth).unwrap();
+        // Requests of one WQE, so that up to `depth - 1` may go unsignaled.
+        let qps: Vec<QpKey<RC>> = (0..4).map(|_| w.create_qp(caps, 1).unwrap()).collect();
+        let attr = connect_attr(&ctx);
+        let gid = gid_index(&ctx);
+        for pair in qps.chunks(2) {
+            let ea = w.endpoint(pair[0], 1, gid).unwrap();
+            let eb = w.endpoint(pair[1], 1, gid).unwrap();
+            w.connect(pair[0], &attr, &eb).unwrap();
+            w.connect(pair[1], &attr, &ea).unwrap();
+        }
+        for &qp in &qps {
+            for _ in 0..4 {
+                w.post_recv(qp, pd.alloc::<u8>(256).unwrap().into_part(), false)
+                    .unwrap();
+            }
+            // A signaled WRITE, then unsignaled ones.
+            for i in 0..4 {
+                let mut req = w.request(qp);
+                req.push(WrOp::Write(dst.remote()), src.slice(..512).into_part())
+                    .unwrap();
+                req.finish(i == 0, false).unwrap();
+            }
+            let mut req = w.request(qp);
+            req.push(
+                WrOp::Read(dst.remote().slice(..256)),
+                pd.alloc::<u8>(256).unwrap().into_part(),
+            )
+            .unwrap();
+            req.finish(false, true).unwrap();
+            w.commit(qp).unwrap();
+        }
+        // Let the WRITEs and READs run, so that the unsignaled ones succeed
+        // without completions.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(200) {
+            w.progress();
+        }
+        assert!(
+            qps.iter().all(|&qp| w.send_ring(qp).in_flight_wqes() > 0),
+            "unsignaled WQEs wait for a later completion"
+        );
+        if drop_worker {
+            drop(w);
+        } else {
+            for &qp in &qps {
+                w.remove_qp(qp).expect("the device flushes");
+            }
+            assert_eq!(w.reserved(), 0);
+            drop(w);
+        }
+    }
+    assert!(src.try_thaw().is_ok(), "every request released the buffer");
+}

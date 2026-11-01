@@ -70,7 +70,9 @@ impl<N: Nic> State<N> {
     /// Destroys a QP of the worker, then drops the work and results the
     /// futures left with it.
     pub(crate) fn remove_qp<T: Transport>(&mut self, key: QpKey<T>) {
-        self.worker.remove_qp(key);
+        // A QP the device does not flush stays in the worker with its
+        // buffers (`Error::NotFlushed`): nothing more to do here.
+        let _ = self.worker.remove_qp(key);
         if let Some(q) = self.queues.get_mut(key.index()) {
             *q = None;
         }
@@ -252,8 +254,8 @@ pub trait QueueAccess: sealed::Sealed {
     }
 }
 
-/// A QP of a worker, removed from it (destroyed, its buffers released)
-/// when dropped.
+/// A QP of a worker, removed from it when dropped (drained, destroyed,
+/// then its buffers released).
 pub(crate) struct QpGuard<T: Transport, N: Nic> {
     /// The worker; `None` once handed on.
     state: Option<Rc<RefCell<State<N>>>>,
@@ -292,8 +294,10 @@ impl<T: Transport, N: Nic> Drop for QpGuard<T, N> {
 /// it polls the worker's CQ, which retires the requests of every QP of the
 /// worker and wakes their futures. Dropping a future never cancels a posted
 /// work request: the buffers stay with the QP until it completes. Dropping
-/// the QP destroys the hardware QP before releasing any buffer still in
-/// flight.
+/// the QP drains it (moves it to the error state and waits until the NIC
+/// has flushed every work request left) before destroying the hardware QP
+/// and releasing the buffers; see
+/// [`Worker::remove_qp`](safeverbs_core::Worker::remove_qp).
 pub struct LocalQp<T: Transport, N: Nic = Verbs> {
     guard: QpGuard<T, N>,
     endpoint: Endpoint,

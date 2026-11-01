@@ -28,8 +28,9 @@
 //! therefore holds leases of the memory it names, and those leases live in
 //! the request's ring slot until the request retires (a completion for it
 //! or a later request of the same in-order queue, including error and flush
-//! completions) or the hardware QP is destroyed; nothing else can release
-//! them. Memory the NIC writes is lent as a unique buffer (moved into the
+//! completions); a QP is destroyed only once it is drained (moved to the
+//! error state and polled until the NIC has flushed every work request);
+//! nothing else can release them. Memory the NIC writes is lent as a unique buffer (moved into the
 //! slot, unreachable until it comes back); memory it reads is lent as a
 //! shared frozen buffer (read only until every handle is gone); memory a
 //! peer may write is never readable as Rust values. Rings never let more

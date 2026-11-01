@@ -116,7 +116,9 @@ proved; they are the interface the worker and its queue pairs are to be verified
   - calling the trusted verbs with their preconditions (S2), including M's `create_qp`
     reservation, which the worker checks when it attaches a queue pair to its CQ (the sum of
     the depths within the CQ's size), and `destroy_qp`, which M allows only with empty queues
-    while the worker destroys a queue pair with work in flight;
+    (the worker drains a queue pair before destroying it, `design.md` section 10, which the
+    simulated NIC checks at run time: it panics on a queue pair destroyed with a WQE not
+    retired, and on work posted in RESET);
   - the map from requests to WQEs that couples A and M: the `wr_id` the worker builds from
     the queue pair's index, the queue and the low bits of the ring's WQE number, and its
     recovery from a completion (`wqe_of`), which must name the WQE M's `poll_cq` retired, for
