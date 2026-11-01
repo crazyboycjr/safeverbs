@@ -8,3 +8,19 @@ crates/safeverbs-core/src/ring.rs ExWaker
 crates/safeverbs-core/src/ring.rs wake
 crates/safeverbs-core/src/ring.rs will_wake
 crates/safeverbs-core/src/ring.rs clone_waker
+
+# The exec types the verbs' contracts read: their definitions, as written (Error opaque).
+crates/safeverbs-core/src/trusted.rs ExSge
+crates/safeverbs-core/src/trusted.rs ExRemoteBuf
+crates/safeverbs-core/src/trusted.rs ExWrOp
+crates/safeverbs-core/src/trusted.rs ExError
+# The NIC traits, declared without specifications (the wrappers carry them).
+crates/safeverbs-core/src/trusted.rs ExNicQp
+crates/safeverbs-core/src/trusted.rs ExNicCq
+# The verbs of the data path, each with its contract from M; their bodies call the NIC.
+crates/safeverbs-core/src/trusted.rs start
+crates/safeverbs-core/src/trusted.rs post
+crates/safeverbs-core/src/trusted.rs doorbell
+crates/safeverbs-core/src/trusted.rs abort
+crates/safeverbs-core/src/trusted.rs post_recv
+crates/safeverbs-core/src/trusted.rs poll

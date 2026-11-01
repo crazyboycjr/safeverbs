@@ -14,6 +14,8 @@
 //! - [`ring`]: the completion ring of a work queue, pure bookkeeping
 //!   without FFI or `unsafe`, verified with Verus; [`refine`] proves that
 //!   it refines the abstract machine of `safeverbs-spec`;
+//! - [`trusted`]: the verbs of the data path with their contracts from the
+//!   NIC model, the interface the queue pair is to be verified against;
 //! - [`qp`]: a connected queue pair driven synchronously ([`QueuePair`]):
 //!   post requests into the ring and the hardware queue, commit them with
 //!   one doorbell, poll, and take each request's completion and buffers
@@ -44,6 +46,7 @@ pub mod qp;
 pub mod refine;
 pub mod ring;
 pub mod transport;
+pub mod trusted;
 pub mod verbs;
 pub mod wc;
 
