@@ -9,8 +9,9 @@
 //! buffers, and the NIC's checks are modeled: keys, protection domains,
 //! bounds and access rights, receive buffers too small, receivers not ready
 //! (RC waits, UC drops), the error state flushing every outstanding WQE
-//! (signaled or not) with its own completion. Errors and flushes can be
-//! injected ([`Model::inject_error`], [`Model::force_error`]).
+//! (signaled or not) with its own completion. Errors, flushes and refused
+//! doorbells can be injected ([`Model::inject_error`],
+//! [`Model::force_error`], [`Model::refuse_doorbells`]).
 //!
 //! The model panics where hardware would silently misbehave and safeverbs
 //! promises it never happens: a send or receive queue overflow, a CQ
@@ -30,6 +31,8 @@ use crate::wc::{Opcode, Status, Wc};
 const ENOMEM: i32 = 12;
 /// Linux's `EINVAL`.
 const EINVAL: i32 = 22;
+/// Linux's `EAGAIN`, for an injected refusal.
+const EAGAIN: i32 = 11;
 
 /// A simulated RDMA device on a simulated fabric.
 #[derive(Clone)]
@@ -70,6 +73,8 @@ struct QpRec {
     rq: VecDeque<RecvWqe>,
     /// Errors to inject into the next WQEs this QP processes.
     inject: VecDeque<Status>,
+    /// Doorbells to refuse next.
+    refuse: u32,
 }
 
 struct MrRec {
@@ -129,6 +134,15 @@ impl Model {
     pub fn inject_error(&self, qp_num: u32, status: Status) {
         if let Some(qp) = self.lock().qps.get_mut(&qp_num) {
             qp.inject.push_back(status);
+        }
+    }
+
+    /// Makes the device refuse the next `n` doorbells of QP `qp_num`
+    /// (`ibv_wr_complete` failing): the WQEs written since the start are
+    /// not posted.
+    pub fn refuse_doorbells(&self, qp_num: u32, n: u32) {
+        if let Some(qp) = self.lock().qps.get_mut(&qp_num) {
+            qp.refuse += n;
         }
     }
 
@@ -651,6 +665,10 @@ impl NicQp for ModelQp {
         if qp.state == QpState::Reset {
             return Err(Error::Os(EINVAL));
         }
+        if qp.refuse > 0 {
+            qp.refuse -= 1;
+            return Err(Error::Os(EAGAIN));
+        }
         qp.sq.extend(staged);
         Ok(())
     }
@@ -787,6 +805,7 @@ impl Nic for Model {
                 sq: VecDeque::new(),
                 rq: VecDeque::new(),
                 inject: VecDeque::new(),
+                refuse: 0,
             },
         );
         Ok(ModelQp {

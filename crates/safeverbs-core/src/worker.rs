@@ -137,7 +137,7 @@ impl<T: Transport> core::fmt::Debug for QpKey<T> {
 }
 
 /// One of a QP's two work queues.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Queue {
     /// The send queue: SENDs, WRITEs, READs, atomics.
     Send,
@@ -181,6 +181,9 @@ struct Entry<N: Nic> {
     /// Whether the QP is in the worker's list of QPs with requests to hand
     /// out.
     dirty: bool,
+    /// Whether a doorbell was refused since [`Worker::poll`] last looked:
+    /// refused requests may wait among the ones in flight.
+    refused: bool,
 }
 
 impl<N: Nic> Drop for Entry<N> {
@@ -331,6 +334,7 @@ impl<N: Nic> Worker<N> {
             send_cursor: 0,
             recv_cursor: 0,
             dirty: false,
+            refused: false,
         };
         if index == self.qps.len() {
             self.qps.push(Some(entry));
@@ -428,9 +432,10 @@ impl<N: Nic> Worker<N> {
         }
     }
 
-    /// Lists QP `index` as having requests to hand out.
-    fn mark_dirty(&mut self, index: usize) {
+    /// Lists QP `index` as having refused requests to hand out.
+    fn mark_refused(&mut self, index: usize) {
         let qp = self.entry_mut(index);
+        qp.refused = true;
         if !qp.dirty {
             qp.dirty = true;
             self.dirty.push(index as u16);
@@ -439,24 +444,68 @@ impl<N: Nic> Worker<N> {
 
     /// The event loop's poll: polls the CQ once and hands every request
     /// that retired with an owner (and was not taken otherwise) to `f`, with
-    /// the worker, in each queue's order; returns the number of completions
-    /// polled. `f` may post new work, take or detach requests, even remove
-    /// QPs. Nothing is allocated.
+    /// the worker, in each queue's order, and every request refused with its
+    /// doorbell at once; returns the number of completions polled. `f` may
+    /// post new work, take or detach requests, even remove QPs. Nothing is
+    /// allocated.
     ///
     /// Requests without an owner (detached) release their buffers when they
     /// retire; their first error is reported by [`Worker::take_send_error`].
+    /// An unsignaled request retires with the next signaled one of its
+    /// queue: a loop that posts unsignaled requests also posts signaled
+    /// ones.
     pub fn poll<F: FnMut(&mut Worker<N>, Completion<N>)>(&mut self, mut f: F) -> usize {
         let n = self.progress();
         while let Some(index) = self.dirty.pop() {
             let index = index as usize;
-            match self.qps.get_mut(index) {
-                Some(Some(qp)) => qp.dirty = false,
+            let refused = match self.qps.get_mut(index) {
+                Some(Some(qp)) => {
+                    qp.dirty = false;
+                    core::mem::replace(&mut qp.refused, false)
+                }
                 _ => continue,
-            }
+            };
             self.deliver(index, Queue::Send, &mut f);
             self.deliver(index, Queue::Recv, &mut f);
+            if refused {
+                self.deliver_refused(index, &mut f);
+            }
         }
         n
+    }
+
+    /// Hands the refused requests among the ones in flight of QP `index`'s
+    /// send queue to `f` (refusals are rare: the scan is too).
+    fn deliver_refused<F: FnMut(&mut Worker<N>, Completion<N>)>(
+        &mut self,
+        index: usize,
+        f: &mut F,
+    ) {
+        let (from, to) = {
+            let ring = &self.entry(index).send;
+            (ring.retired(), ring.committed())
+        };
+        let mut seq = from;
+        while seq < to {
+            let Some(Some(qp)) = self.qps.get_mut(index) else {
+                return;
+            };
+            if qp.send.state(seq) == crate::ring::State::Refused
+                && let Some((wc, leases)) = qp.send.take(seq)
+            {
+                f(
+                    self,
+                    Completion {
+                        qp: index,
+                        queue: Queue::Send,
+                        seq,
+                        wc,
+                        leases,
+                    },
+                );
+            }
+            seq += 1;
+        }
     }
 
     /// Hands the retired requests of one queue to `f`, in order.
@@ -611,7 +660,7 @@ impl<N: Nic> Worker<N> {
             }
             Err(e) => {
                 qp.send.abort();
-                self.mark_dirty(index);
+                self.mark_refused(index);
                 Err(e)
             }
         }
@@ -639,7 +688,7 @@ impl<N: Nic> Worker<N> {
             }
             Err(e) => {
                 let back = entry.send.abort_keeping(seq).unwrap_or_default();
-                self.mark_dirty(index);
+                self.mark_refused(index);
                 Err((e, back))
             }
         }

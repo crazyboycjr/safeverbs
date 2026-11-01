@@ -13,8 +13,8 @@ use futures::executor::block_on;
 use futures::task::noop_waker;
 use futures::{SinkExt, StreamExt};
 use safeverbs::{
-    Buf, BufMut, Context, Error, LocalQp, Model, Opcode, Pd, QueuePairBuilder, RC, Status,
-    Transport, UC, WriteOp,
+    Buf, BufMut, Context, Error, LocalQp, LocalWorker, Model, Opcode, Pd, QueuePairBuilder, RC,
+    Status, Transport, UC, WriteOp,
 };
 
 type Qp<T> = LocalQp<T, Model>;
@@ -593,6 +593,264 @@ fn random_operations_return_every_buffer_once() {
             );
         }
         drop((free, dst, a, b));
+        assert_eq!(m.registered(), 0, "seed {seed}: a region leaked");
+    }
+}
+
+/// `pairs` pairs of RC QPs on one worker, each connected to the other QP of
+/// its pair; the worker's CQ holds exactly their queues.
+fn pairs_on_worker(
+    seed: u64,
+    pairs: usize,
+    depth: u32,
+) -> (Model, Pd<Model>, LocalWorker<Model>, Vec<Qp<RC>>) {
+    let model = Model::new(seed);
+    let pd = Context::new(model.clone()).alloc_pd().unwrap();
+    let worker = LocalWorker::new(&pd, 4 * pairs as u32 * depth).unwrap();
+    let mut qps = Vec::new();
+    for _ in 0..pairs {
+        let build = || {
+            QueuePairBuilder::<RC, Model>::new(&pd)
+                .set_send_depth(depth)
+                .set_recv_depth(depth)
+                .build_on(&worker)
+                .unwrap()
+        };
+        let (a, b) = (build(), build());
+        let (ea, eb) = (a.endpoint(), b.endpoint());
+        qps.push(a.handshake(eb).unwrap());
+        qps.push(b.handshake(ea).unwrap());
+    }
+    // Full: another QP does not fit.
+    let e = QueuePairBuilder::<RC, Model>::new(&pd)
+        .set_send_depth(1)
+        .set_recv_depth(1)
+        .build_on(&worker)
+        .err();
+    assert_eq!(e, Some(Error::CqFull { need: 2, free: 0 }));
+    (model, pd, worker, qps)
+}
+
+#[test]
+fn qps_of_one_worker_share_its_cq() {
+    let (_m, pd, worker, qps) = pairs_on_worker(21, 2, 16);
+    assert!(
+        qps.iter()
+            .all(|q| q.worker().with(|w| w.cq_size()) == 4 * 2 * 16)
+    );
+    block_on(async {
+        // Receives on every QP, sends on every QP: one CQ retires them all.
+        let recvs: Vec<_> = qps
+            .iter()
+            .map(|q| q.recv(pd.alloc::<u8>(64).unwrap()))
+            .collect();
+        let src = filled(&pd, 64, 9);
+        for (i, q) in qps.iter().enumerate() {
+            let wc = q.send(src.slice(..1 + i)).await.unwrap();
+            assert_eq!(wc.byte_len as usize, 1 + i);
+        }
+        for (i, r) in recvs.into_iter().enumerate() {
+            let (wc, got) = r.await.unwrap();
+            // QP i receives what its peer (i ^ 1) sent.
+            assert_eq!(wc.byte_len as usize, 1 + (i ^ 1));
+            assert_eq!(&got[..1 + (i ^ 1)], &src[..1 + (i ^ 1)]);
+        }
+    });
+    // Dropped QPs leave the others working, and their share of the CQ.
+    let mut qps = qps;
+    qps.truncate(2);
+    assert_eq!(worker.with(|w| w.reserved()), 2 * 2 * 16);
+    let recv = qps[1].recv(pd.alloc::<u8>(8).unwrap());
+    block_on(qps[0].send(filled(&pd, 8, 1))).unwrap();
+    assert_eq!(block_on(recv).unwrap().0.byte_len, 8);
+    drop(qps);
+    assert_eq!(worker.with(|w| w.reserved()), 0);
+}
+
+#[test]
+fn shared_qp_needs_a_worker_of_its_own() {
+    let (_m, _pd, _worker, mut qps) = pairs_on_worker(22, 1, 8);
+    let q = qps.pop().unwrap();
+    assert!(q.into_shared().is_err(), "its worker has another QP");
+}
+
+/// Random operations on several QPs of one worker: futures (some dropped),
+/// polls with random delays, injected errors, forced flushes and refused
+/// doorbells. Throughout, the rings' invariants hold and the CQ, exactly as
+/// large as the QPs reserve, is never overrun (the model would panic); each
+/// future gets its own request's outcome and buffer, and a buffer handed
+/// back is never one already in hand; at the end every frozen buffer thaws
+/// and nothing stays registered.
+#[test]
+fn random_operations_on_qps_of_one_worker() {
+    for seed in 1..60u64 {
+        let pairs = 1 + (seed % 3) as usize;
+        let (m, pd, worker, qps) = pairs_on_worker(100 + seed, pairs, 2 + seed as u32 % 9);
+        m.set_pace((seed * 37 % 500) as u32, 1 + (seed % 5) as u32);
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let dst = pd.alloc::<u8>(1024).unwrap().expose().unwrap();
+        let frozen: Vec<Buf<u8, Model>> = (0..3).map(|i| filled(&pd, 256, i)).collect();
+        let mut free: Vec<BufMut<u8, Model>> =
+            (0..16).map(|_| pd.alloc::<u8>(256).unwrap()).collect();
+        let mut in_hand: HashSet<usize> = free.iter().map(|b| b.as_ptr() as usize).collect();
+        let total = free.len();
+        let mut lost = 0;
+        let mut sends = Vec::new();
+        let mut reads = Vec::new();
+        let mut recvs = Vec::new();
+        let give_back =
+            |buf: BufMut<u8, Model>, free: &mut Vec<_>, in_hand: &mut HashSet<usize>| {
+                assert!(
+                    in_hand.insert(buf.as_ptr() as usize),
+                    "seed {seed}: a buffer came back twice"
+                );
+                free.push(buf);
+            };
+        for _ in 0..300 {
+            let q = &qps[rng.below(qps.len() as u64) as usize];
+            match rng.below(11) {
+                0 | 1 => {
+                    let f = &frozen[rng.below(3) as usize];
+                    let len = 1 + rng.below(56) as usize;
+                    let s = rng.below(200) as usize;
+                    sends.push((q.send(f.slice(s..s + len)), Some(len)));
+                }
+                2 => {
+                    let f = &frozen[rng.below(3) as usize];
+                    let w = q.write(f.slice(..64), dst.remote().offset(rng.below(900)));
+                    sends.push((w, Some(64)));
+                }
+                3 => {
+                    // At most one request's worth: a longer batch would
+                    // wait (polling) for room, and an RC SEND ahead of it may
+                    // wait for a receive this thread has not posted yet.
+                    let f = &frozen[rng.below(3) as usize];
+                    let max = q.with(|w, k| w.send_ring(k).max_wqes()) as u64;
+                    let n = 1 + rng.below(max.min(6));
+                    let b = q.batch(|b| {
+                        for i in 0..n {
+                            b.write(f.slice(..8), dst.remote().offset(i * 8));
+                        }
+                    });
+                    sends.push((b, None));
+                }
+                4 => {
+                    if let Some(buf) = free.pop() {
+                        let ptr = buf.as_ptr() as usize;
+                        in_hand.remove(&ptr);
+                        reads.push((q.read(buf, dst.remote().slice(..256)), ptr));
+                    }
+                }
+                5 => {
+                    if let Some(buf) = free.pop() {
+                        let ptr = buf.as_ptr() as usize;
+                        in_hand.remove(&ptr);
+                        recvs.push((q.recv(buf), ptr));
+                    }
+                }
+                6 => {
+                    // Drop a random future: its work request goes on.
+                    let k = rng.below(3);
+                    if k == 0 && !sends.is_empty() {
+                        let i = rng.below(sends.len() as u64) as usize;
+                        drop(sends.swap_remove(i));
+                    } else if k == 1 && !reads.is_empty() {
+                        let i = rng.below(reads.len() as u64) as usize;
+                        drop(reads.swap_remove(i));
+                        lost += 1;
+                    } else if k == 2 && !recvs.is_empty() {
+                        let i = rng.below(recvs.len() as u64) as usize;
+                        drop(recvs.swap_remove(i));
+                        lost += 1;
+                    }
+                }
+                7 => match rng.below(60) {
+                    0 => m.inject_error(q.qp_num(), Status::REM_OP_ERR),
+                    1 => m.force_error(q.qp_num()),
+                    2..=9 => m.refuse_doorbells(q.qp_num(), 1),
+                    _ => {}
+                },
+                8 => {
+                    worker.poll();
+                }
+                _ => {
+                    // Poll every future once.
+                    sends.retain_mut(|(s, len)| match poll_once(s) {
+                        Poll::Ready(Ok(wc)) => {
+                            if let Some(len) = len {
+                                assert_eq!(wc.byte_len as usize, *len, "seed {seed}");
+                            }
+                            false
+                        }
+                        Poll::Ready(Err(_)) => false,
+                        Poll::Pending => true,
+                    });
+                    let mut i = 0;
+                    while i < reads.len() {
+                        let ptr = reads[i].1;
+                        let buf = match poll_once(&mut reads[i].0) {
+                            Poll::Ready(Ok(buf)) => buf,
+                            Poll::Ready(Err(e)) => e.buf,
+                            Poll::Pending => {
+                                i += 1;
+                                continue;
+                            }
+                        };
+                        assert_eq!(buf.as_ptr() as usize, ptr, "seed {seed}: another buffer");
+                        give_back(buf, &mut free, &mut in_hand);
+                        drop(reads.swap_remove(i));
+                    }
+                    let mut i = 0;
+                    while i < recvs.len() {
+                        let ptr = recvs[i].1;
+                        let buf = match poll_once(&mut recvs[i].0) {
+                            Poll::Ready(Ok((_, buf))) => buf,
+                            Poll::Ready(Err(e)) => e.buf,
+                            Poll::Pending => {
+                                i += 1;
+                                continue;
+                            }
+                        };
+                        assert_eq!(buf.as_ptr() as usize, ptr, "seed {seed}: another buffer");
+                        give_back(buf, &mut free, &mut in_hand);
+                        drop(recvs.swap_remove(i));
+                    }
+                }
+            }
+            for q in &qps {
+                assert!(q.with(|w, k| w.send_ring(k).invariant() && w.recv_ring(k).invariant()));
+            }
+        }
+        // Settle: every QP in error flushes what it holds.
+        for q in &qps {
+            q.force_error().unwrap();
+        }
+        m.set_pace(0, 8);
+        for (s, _) in sends {
+            let _ = block_on(s);
+        }
+        for (r, _) in reads {
+            match block_on(r) {
+                Ok(buf) => give_back(buf, &mut free, &mut in_hand),
+                Err(e) => give_back(e.buf, &mut free, &mut in_hand),
+            }
+        }
+        for (r, _) in recvs {
+            match block_on(r) {
+                Ok((_, buf)) => give_back(buf, &mut free, &mut in_hand),
+                Err(e) => give_back(e.buf, &mut free, &mut in_hand),
+            }
+        }
+        m.run();
+        worker.poll();
+        assert_eq!(free.len() + lost, total, "seed {seed}");
+        drop((free, dst, qps, worker));
+        for f in frozen {
+            assert!(
+                f.try_thaw().is_ok(),
+                "seed {seed}: a frozen buffer still held"
+            );
+        }
         assert_eq!(m.registered(), 0, "seed {seed}: a region leaked");
     }
 }
