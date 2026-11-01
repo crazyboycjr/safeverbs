@@ -2605,7 +2605,7 @@ impl<L> Ring<L> {
                 Some((outcome, leases)) => old(self).req(seq as int) == Some(
                     ReqView { phase: Phase::Complete(outcome.outcome()), waker: None, detached: false, leases },
                 ) || (old(self).req(seq as int) is None && old(self).refused(seq as int) == Some(leases)
-                    && outcome.status == crate::wc::Status::WR_FLUSH_ERR),
+                    && outcome.spec_status() == crate::wc::Status::WR_FLUSH_ERR),
                 None => !(old(self).req(seq as int) is Some && old(self).req(
                     seq as int,
                 )->0.phase is Complete) && old(self).refused(seq as int) is None,
@@ -2642,6 +2642,11 @@ impl<L> Ring<L> {
         let slot = &mut self.slots[i];
         let outcome = slot.outcome.take();
         let leases = slot.leases.take();
+        proof {
+            if outcome is Some {
+                outcome->0.lemma_spec_status();
+            }
+        }
         slot.state = State::Free;
         proof {
             self.lemma_free(&pre, seq as int);

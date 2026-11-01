@@ -210,9 +210,19 @@ pub open spec fn recv_wr(wr_id: u64, sges: Seq<Sge>) -> RecvWr {
 
 /// A work completion reports CQE `e` of queue pair `qp`: its `wr_id` and its
 /// outcome.
-pub open spec fn reports(wc: Wc, e: Cqe) -> bool {
+pub closed spec fn reports(wc: Wc, e: Cqe) -> bool {
     &&& wc.wr_id == e.wr_id
     &&& wc.outcome() == e.outcome
+}
+
+/// Unpack a completion report inside the core without exporting raw Wc representation.
+pub(crate) proof fn lemma_reports(wc: Wc, e: Cqe)
+    requires
+        reports(wc, e),
+    ensures
+        wc.wr_id == e.wr_id,
+        wc.outcome() == e.outcome,
+{
 }
 
 /// The transport M sees for a QP type.

@@ -1503,7 +1503,7 @@ impl<N: Device> Hw<N> {
 pub const POLL_BATCH: usize = 16;
 
 /// A placeholder completion.
-pub const EMPTY_WC: Wc = Wc {
+pub(crate) const EMPTY_WC: Wc = Wc {
     wr_id: 0,
     status: crate::wc::Status(0),
     opcode: Opcode(0),
@@ -1606,6 +1606,7 @@ impl<N: Device> Hw<N> {
         let ghost start = *self;
         let ghost e = before.cqs[c].entries[0];
         proof {
+            lemma_reports(*wc, e);
             safeverbs_spec::nic_proofs::lemma_head_is_first(before, c);
             lemma_poll(before, after, c);
             assert(share_wf(before, sh));
