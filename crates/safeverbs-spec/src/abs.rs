@@ -2,7 +2,7 @@
 //!
 //! A knows nothing about queues, doorbells, CQEs or ring slots. It sees *leases*: a set of
 //! bytes held by someone. The program holds leases (a `BufMut` is a unique lease, every `Buf`
-//! view a shared one), a posted request holds the lease of the buffer it was given, and a
+//! view a shared one). A posted request holds an ordered group of those resources, and a
 //! region registered for remote access is held by the peer. Every client action of the
 //! library is a transition of A that moves leases between holders; the NIC's only move is
 //! `complete`, which gives a request its outcome.
@@ -20,7 +20,7 @@ use vstd::prelude::*;
 
 verus! {
 
-/// Names leases (and so requests). Never reused: every new lease takes `next_id`.
+/// Names resource members and group handles (including requests). Fresh names take `next_id`.
 pub type Id = nat;
 
 /// Names a `core::task::Waker` (two wakers of the same task may share a name).
@@ -42,84 +42,172 @@ pub enum Phase {
     Complete(Outcome),
 }
 
-/// A request posted to a queue pair: one future (or one entry of a stream).
+/// One outcome and one waker for the whole resource group. Access directions are indexed
+/// by member, so a READ destination and a shared SEND source can belong to one request.
 pub struct Req {
     pub qp: QpId,
-    pub dir: Dir,
+    pub dirs: Seq<Dir>,
     pub phase: Phase,
-    /// The waker the future registered when it last returned `Pending`.
     pub waker: Option<WakerId>,
-    /// The future was dropped. Dropping never cancels: the request stays in flight and its
-    /// lease is released when it completes.
     pub detached: bool,
 }
 
-/// Who holds a lease.
 pub enum Holder {
-    /// The program: through a `BufMut` (if the lease is unique) or one `Buf` view.
     Program,
-    /// A request holds it until the client takes the outcome (or, if detached, until it completes).
     Request { req: Req },
-    /// The peer may access it by rkey: read it, and write it too if `remote_write`.
     Exposed { remote_write: bool },
 }
 
-/// A set of bytes, held by one holder.
+/// One named resource. Identity survives grouping, posting and taking. A shared clone
+/// receives a fresh identity even when it covers exactly the same bytes.
 pub struct Lease {
+    pub id: Id,
     pub mem: ISet<int>,
-    /// No other lease overlaps it (a `BufMut`, or what one became).
     pub unique: bool,
-    /// The element type accepts every bit pattern (`zerocopy::FromBytes`), so the NIC may
-    /// write anything into it.
     pub any_bytes: bool,
+}
+
+/// An ordered resource group held by the program, one request, or the peer. There is no
+/// group-wide uniqueness flag: each member retains its own permissions.
+pub struct Group {
+    pub members: Seq<Lease>,
     pub holder: Holder,
 }
 
-impl Lease {
-    pub open spec fn is_program(self) -> bool {
-        self.holder is Program
+impl Group {
+    pub open spec fn singleton(id: Id, mem: ISet<int>, unique: bool, any_bytes: bool) -> Group {
+        Group { members: seq![Lease { id, mem, unique, any_bytes }], holder: Holder::Program }
     }
 
-    pub open spec fn is_request(self) -> bool {
-        self.holder is Request
-    }
-
+    pub open spec fn is_program(self) -> bool { self.holder is Program }
+    pub open spec fn is_request(self) -> bool { self.holder is Request }
     pub open spec fn in_flight(self) -> bool {
-        self.holder is Request && self.holder->req.phase is InFlight
+        self.is_request() && self.holder->req.phase is InFlight
     }
-
-    /// The NIC (for a request in flight) or the peer (for an exposed region) may read `mem`.
-    pub open spec fn nic_may_read(self) -> bool {
-        self.in_flight() || self.holder is Exposed
+    pub open spec fn contains(self, x: int) -> bool {
+        exists|k: int| 0 <= k < self.members.len() && (#[trigger] self.members[k]).mem.contains(x)
     }
-
-    /// The NIC or the peer may write `mem`.
-    pub open spec fn nic_may_write(self) -> bool {
-        (self.in_flight() && self.holder->req.dir is In) || (self.holder is Exposed
-            && self.holder->remote_write)
+    pub open spec fn writes_program(self, x: int) -> bool {
+        self.is_program() && exists|k: int| 0 <= k < self.members.len()
+            && (#[trigger] self.members[k]).unique && self.members[k].mem.contains(x)
     }
-
-    pub open spec fn with_holder(self, holder: Holder) -> Lease {
-        Lease { mem: self.mem, unique: self.unique, any_bytes: self.any_bytes, holder }
+    pub open spec fn nic_may_read(self, x: int) -> bool {
+        (self.in_flight() || self.holder is Exposed) && self.contains(x)
     }
-
-    pub open spec fn with_req(self, req: Req) -> Lease {
+    pub open spec fn nic_may_write(self, x: int) -> bool {
+        exists|k: int| 0 <= k < self.members.len()
+            && (#[trigger] self.members[k]).mem.contains(x) && self.write_member(k)
+    }
+    pub open spec fn write_member(self, k: int) -> bool {
+        (self.in_flight() && self.holder->req.dirs[k] is In)
+            || (self.holder is Exposed && self.holder->remote_write)
+    }
+    pub open spec fn allows(self, dirs: Seq<Dir>) -> bool {
+        &&& dirs.len() == self.members.len()
+        &&& forall|k: int| 0 <= k < dirs.len() && #[trigger] dirs[k] is In
+            ==> self.members[k].unique && self.members[k].any_bytes
+    }
+    pub open spec fn all_writable(self) -> bool {
+        forall|k: int| 0 <= k < self.members.len()
+            ==> (#[trigger] self.members[k]).unique && self.members[k].any_bytes
+    }
+    pub open spec fn with_holder(self, holder: Holder) -> Group {
+        Group { members: self.members, holder }
+    }
+    pub open spec fn with_req(self, req: Req) -> Group {
         self.with_holder(Holder::Request { req })
+    }
+    /// Distinct resource identities, and disjoint bytes whenever either member is unique.
+    pub open spec fn compatible(self, other: Group) -> bool {
+        forall|k: int, l: int| #![trigger self.members[k], other.members[l]]
+            0 <= k < self.members.len() && 0 <= l < other.members.len() ==> {
+                &&& self.members[k].id != other.members[l].id
+                &&& self.members[k].unique || other.members[l].unique
+                    ==> self.members[k].mem.disjoint(other.members[l].mem)
+            }
+    }
+    pub open spec fn wf(self) -> bool {
+        forall|k: int, l: int| #![trigger self.members[k], self.members[l]]
+            0 <= k < self.members.len() && 0 <= l < self.members.len() && k != l ==> {
+                &&& self.members[k].id != self.members[l].id
+                &&& self.members[k].unique || self.members[l].unique
+                    ==> self.members[k].mem.disjoint(self.members[l].mem)
+            }
     }
 }
 
 impl Req {
     pub open spec fn completed(self, o: Outcome) -> Req {
-        Req { qp: self.qp, dir: self.dir, phase: Phase::Complete(o), waker: None, detached: self.detached }
+        Req { phase: Phase::Complete(o), waker: None, ..self }
     }
-
     pub open spec fn with_waker(self, w: WakerId) -> Req {
-        Req { qp: self.qp, dir: self.dir, phase: self.phase, waker: Some(w), detached: self.detached }
+        Req { waker: Some(w), ..self }
     }
-
     pub open spec fn detach(self) -> Req {
-        Req { qp: self.qp, dir: self.dir, phase: self.phase, waker: None, detached: true }
+        Req { waker: None, detached: true, ..self }
     }
+}
+
+/// Concatenation preserves distinct identities and per-member exclusive permissions.
+pub proof fn lemma_join_permissions(left: Group, right: Group)
+    requires
+        left.wf(), right.wf(), left.compatible(right),
+    ensures
+        (Group { members: left.members + right.members, holder: Holder::Program }).wf(),
+{
+    let joined = left.members + right.members;
+    assert forall|k: int, l: int| #![trigger joined[k], joined[l]]
+        0 <= k < joined.len() && 0 <= l < joined.len() && k != l implies {
+            &&& joined[k].id != joined[l].id
+            &&& joined[k].unique || joined[l].unique ==> joined[k].mem.disjoint(joined[l].mem)
+        } by {
+        if k < left.members.len() {
+            assert(joined[k] == left.members[k]);
+            if l < left.members.len() {
+                assert(joined[l] == left.members[l]);
+            } else {
+                assert(joined[l] == right.members[l - left.members.len()]);
+            }
+        } else {
+            assert(joined[k] == right.members[k - left.members.len()]);
+            if l < left.members.len() {
+                assert(joined[l] == left.members[l]);
+            } else {
+                assert(joined[l] == right.members[l - left.members.len()]);
+            }
+        }
+    }
+}
+
+/// Separating a group neither duplicates identities nor loses member permissions.
+pub proof fn lemma_separate_permissions(group: Group, at: int)
+    requires
+        group.wf(), 0 <= at <= group.members.len(),
+    ensures
+        (Group { members: group.members.take(at), holder: Holder::Program }).wf(),
+        (Group { members: group.members.skip(at), holder: Holder::Program }).wf(),
+        (Group { members: group.members.take(at), holder: Holder::Program }).compatible(
+            Group { members: group.members.skip(at), holder: Holder::Program }),
+        group.members.take(at) + group.members.skip(at) == group.members,
+{
+    let left = group.members.take(at);
+    let right = group.members.skip(at);
+    assert forall|k: int, l: int| #![trigger left[k], left[l]]
+        0 <= k < left.len() && 0 <= l < left.len() && k != l implies {
+            &&& left[k].id != left[l].id
+            &&& left[k].unique || left[l].unique ==> left[k].mem.disjoint(left[l].mem)
+        } by { assert(left[k] == group.members[k] && left[l] == group.members[l]); }
+    assert forall|k: int, l: int| #![trigger right[k], right[l]]
+        0 <= k < right.len() && 0 <= l < right.len() && k != l implies {
+            &&& right[k].id != right[l].id
+            &&& right[k].unique || right[l].unique ==> right[k].mem.disjoint(right[l].mem)
+        } by { assert(right[k] == group.members[k + at] && right[l] == group.members[l + at]); }
+    assert forall|k: int, l: int| #![trigger left[k], right[l]]
+        0 <= k < left.len() && 0 <= l < right.len() implies {
+            &&& left[k].id != right[l].id
+            &&& left[k].unique || right[l].unique ==> left[k].mem.disjoint(right[l].mem)
+        } by { assert(left[k] == group.members[k] && right[l] == group.members[l + at]); }
+    assert(left + right =~= group.members);
 }
 
 } // verus!
@@ -129,14 +217,14 @@ state_machine! {
         fields {
             /// Queue pairs that exist.
             pub qps: Set<QpId>,
-            /// Every lease that exists, by id.
-            pub leases: Map<Id, Lease>,
+            /// Every owned resource group, by its current handle.
+            pub groups: Map<Id, Group>,
             /// The next fresh id.
             pub next_id: Id,
             /// Every outcome ever produced, by request: written once (F1).
             pub outcomes: Map<Id, Outcome>,
-            /// The bytes each request was posted with (F1: they come back with its outcome).
-            pub posted: Map<Id, ISet<int>>,
+            /// The exact ordered resources each request was posted with, including identities and permissions.
+            pub posted: Map<Id, Seq<Lease>>,
             /// Every waker invocation, in order (L1).
             pub wakes: Seq<WakerId>,
         }
@@ -145,51 +233,49 @@ state_machine! {
         // Helpers
 
         pub open spec fn is_program(self, i: Id) -> bool {
-            self.leases.contains_key(i) && self.leases[i].is_program()
+            self.groups.contains_key(i) && self.groups[i].is_program()
         }
 
         pub open spec fn is_request(self, i: Id) -> bool {
-            self.leases.contains_key(i) && self.leases[i].is_request()
+            self.groups.contains_key(i) && self.groups[i].is_request()
         }
 
         pub open spec fn in_flight(self, i: Id) -> bool {
-            self.leases.contains_key(i) && self.leases[i].in_flight()
+            self.groups.contains_key(i) && self.groups[i].in_flight()
         }
 
         pub open spec fn req(self, i: Id) -> Req {
-            self.leases[i].holder->req
+            self.groups[i].holder->req
         }
 
         /// `mem` overlaps no lease but (possibly) lease `except`.
         pub open spec fn free_except(self, mem: ISet<int>, except: Option<Id>) -> bool {
-            forall|j: Id| #[trigger] self.leases.contains_key(j) && except != Some(j)
-                ==> self.leases[j].mem.disjoint(mem)
+            forall|j: Id| #[trigger] self.groups.contains_key(j) && except != Some(j)
+                ==> forall|k: int| 0 <= k < self.groups[j].members.len() ==> (#[trigger] self.groups[j].members[k]).mem.disjoint(mem)
         }
 
         // Who may touch byte `a` (what S1 is about).
 
         /// The program may read byte `a` (through a `BufMut` or a `Buf`).
         pub open spec fn program_reads(self, a: int) -> bool {
-            exists|i: Id| #[trigger] self.leases.contains_key(i) && self.leases[i].is_program()
-                && self.leases[i].mem.contains(a)
+            exists|i: Id| #[trigger] self.groups.contains_key(i) && self.groups[i].is_program()
+                && self.groups[i].contains(a)
         }
 
         /// The program may write byte `a` (through a `BufMut`).
         pub open spec fn program_writes(self, a: int) -> bool {
-            exists|i: Id| #[trigger] self.leases.contains_key(i) && self.leases[i].is_program()
-                && self.leases[i].unique && self.leases[i].mem.contains(a)
+            exists|i: Id| #[trigger] self.groups.contains_key(i) && self.groups[i].is_program()
+                && self.groups[i].writes_program(a)
         }
 
         /// The NIC or the peer may read byte `a`.
         pub open spec fn nic_reads(self, a: int) -> bool {
-            exists|i: Id| #[trigger] self.leases.contains_key(i) && self.leases[i].nic_may_read()
-                && self.leases[i].mem.contains(a)
+            exists|i: Id| #[trigger] self.groups.contains_key(i) && self.groups[i].nic_may_read(a)
         }
 
         /// The NIC or the peer may write byte `a`.
         pub open spec fn nic_writes(self, a: int) -> bool {
-            exists|i: Id| #[trigger] self.leases.contains_key(i) && self.leases[i].nic_may_write()
-                && self.leases[i].mem.contains(a)
+            exists|i: Id| #[trigger] self.groups.contains_key(i) && self.groups[i].nic_may_write(a)
         }
 
         // ---------------------------------------------------------------------------------
@@ -198,7 +284,7 @@ state_machine! {
         init! {
             start() {
                 init qps = Set::empty();
-                init leases = Map::empty();
+                init groups = Map::empty();
                 init next_id = 0;
                 init outcomes = Map::empty();
                 init posted = Map::empty();
@@ -223,7 +309,7 @@ state_machine! {
         transition! {
             drop_qp(q: QpId) {
                 require pre.qps.contains(q);
-                require forall|i: Id| #[trigger] pre.leases.contains_key(i) && pre.leases[i].is_request() ==> pre.req(i).qp != q;
+                require forall|i: Id| #[trigger] pre.groups.contains_key(i) && pre.groups[i].is_request() ==> pre.req(i).qp != q;
                 update qps = pre.qps.remove(q);
             }
         }
@@ -231,12 +317,44 @@ state_machine! {
         // ---------------------------------------------------------------------------------
         // Buffers
 
+        /// An empty resource group for a request with no local buffers. This is ghost
+        /// bookkeeping, not a runtime allocation.
+        transition! {
+            empty() {
+                update groups = pre.groups.insert(pre.next_id,
+                    Group { members: Seq::empty(), holder: Holder::Program });
+                update next_id = pre.next_id + 1;
+            }
+        }
+
+        /// Assemble program resources in order without copying any member permission.
+        transition! {
+            join(i: Id, j: Id) {
+                require i != j && pre.is_program(i) && pre.is_program(j);
+                update groups = pre.groups.remove(i).remove(j).insert(pre.next_id,
+                    Group { members: pre.groups[i].members + pre.groups[j].members, holder: Holder::Program });
+                update next_id = pre.next_id + 1;
+            }
+        }
+
+        /// Recover individual resources from a returned or unposted group. Member IDs
+        /// and permissions survive; only the program's group handles are fresh.
+        transition! {
+            separate(i: Id, at: int) {
+                require pre.is_program(i) && 0 <= at <= pre.groups[i].members.len();
+                update groups = pre.groups.remove(i)
+                    .insert(pre.next_id, Group { members: pre.groups[i].members.take(at), holder: Holder::Program })
+                    .insert(pre.next_id + 1, Group { members: pre.groups[i].members.skip(at), holder: Holder::Program });
+                update next_id = pre.next_id + 2;
+            }
+        }
+
         /// `pd.alloc::<T>(n)`: fresh memory becomes a `BufMut<T>`.
         transition! {
             alloc(mem: ISet<int>, any_bytes: bool) {
                 require pre.free_except(mem, None);
-                update leases = pre.leases.insert(pre.next_id,
-                    Lease { mem, unique: true, any_bytes, holder: Holder::Program });
+                update groups = pre.groups.insert(pre.next_id,
+                    Group::singleton(pre.next_id, mem, true, any_bytes));
                 update next_id = pre.next_id + 1;
             }
         }
@@ -244,12 +362,12 @@ state_machine! {
         /// `BufMut::split_at` (and `chunks`): one unique lease becomes two.
         transition! {
             split(i: Id, left: ISet<int>) {
-                require pre.is_program(i) && pre.leases[i].unique;
-                require left.subset_of(pre.leases[i].mem);
-                let l = pre.leases[i];
-                update leases = pre.leases.remove(i)
-                    .insert(pre.next_id, Lease { mem: left, unique: true, any_bytes: l.any_bytes, holder: Holder::Program })
-                    .insert(pre.next_id + 1, Lease { mem: l.mem.difference(left), unique: true, any_bytes: l.any_bytes, holder: Holder::Program });
+                require pre.is_program(i) && pre.groups[i].members.len() == 1 && pre.groups[i].members[0].unique;
+                require left.subset_of(pre.groups[i].members[0].mem);
+                let l = pre.groups[i];
+                update groups = pre.groups.remove(i)
+                    .insert(pre.next_id, Group::singleton(pre.next_id, left, true, l.members[0].any_bytes))
+                    .insert(pre.next_id + 1, Group::singleton(pre.next_id + 1, l.members[0].mem.difference(left), true, l.members[0].any_bytes));
                 update next_id = pre.next_id + 2;
             }
         }
@@ -257,21 +375,21 @@ state_machine! {
         /// `BufMut::freeze`: the buffer becomes shared and read-only.
         transition! {
             freeze(i: Id) {
-                require pre.is_program(i) && pre.leases[i].unique;
-                let l = pre.leases[i];
-                update leases = pre.leases.insert(i,
-                    Lease { mem: l.mem, unique: false, any_bytes: l.any_bytes, holder: Holder::Program });
+                require pre.is_program(i) && pre.groups[i].members.len() == 1 && pre.groups[i].members[0].unique;
+                let l = pre.groups[i];
+                update groups = pre.groups.insert(i,
+                    Group::singleton(l.members[0].id, l.members[0].mem, false, l.members[0].any_bytes));
             }
         }
 
         /// `Buf::clone` and `Buf::slice`: another read-only view of (part of) a shared buffer.
         transition! {
             share(i: Id, sub: ISet<int>) {
-                require pre.is_program(i) && !pre.leases[i].unique;
-                require sub.subset_of(pre.leases[i].mem);
-                let l = pre.leases[i];
-                update leases = pre.leases.insert(pre.next_id,
-                    Lease { mem: sub, unique: false, any_bytes: l.any_bytes, holder: Holder::Program });
+                require pre.is_program(i) && pre.groups[i].members.len() == 1 && !pre.groups[i].members[0].unique;
+                require sub.subset_of(pre.groups[i].members[0].mem);
+                let l = pre.groups[i];
+                update groups = pre.groups.insert(pre.next_id,
+                    Group::singleton(pre.next_id, sub, false, l.members[0].any_bytes));
                 update next_id = pre.next_id + 1;
             }
         }
@@ -279,11 +397,11 @@ state_machine! {
         /// `Buf::try_thaw` succeeds: no other view and no request or exposure holds the bytes.
         transition! {
             thaw(i: Id) {
-                require pre.is_program(i) && !pre.leases[i].unique;
-                require pre.free_except(pre.leases[i].mem, Some(i));
-                let l = pre.leases[i];
-                update leases = pre.leases.insert(i,
-                    Lease { mem: l.mem, unique: true, any_bytes: l.any_bytes, holder: Holder::Program });
+                require pre.is_program(i) && pre.groups[i].members.len() == 1 && !pre.groups[i].members[0].unique;
+                require pre.free_except(pre.groups[i].members[0].mem, Some(i));
+                let l = pre.groups[i];
+                update groups = pre.groups.insert(i,
+                    Group::singleton(l.members[0].id, l.members[0].mem, true, l.members[0].any_bytes));
             }
         }
 
@@ -291,25 +409,24 @@ state_machine! {
         transition! {
             drop(i: Id) {
                 require pre.is_program(i);
-                update leases = pre.leases.remove(i);
+                update groups = pre.groups.remove(i);
             }
         }
 
         // ---------------------------------------------------------------------------------
         // Requests
 
-        /// Posting a request (a send, write, receive or read; one entry of a batch, sink or
-        /// stream). The buffer's lease moves into the request; the NIC may only write into
-        /// a unique buffer whose type accepts any bytes.
+        /// Post a whole resource group with one lifecycle. Each member has its own access
+        /// direction; only destinations must be unique and accept arbitrary bytes.
         transition! {
-            post_request(i: Id, q: QpId, dir: Dir) {
+            post_request(i: Id, q: QpId, dirs: Seq<Dir>) {
                 require pre.is_program(i) && pre.qps.contains(q);
-                let l = pre.leases[i];
-                require dir is In ==> l.unique && l.any_bytes;
+                let l = pre.groups[i];
+                require l.allows(dirs);
                 let r = pre.next_id;
-                let req = Req { qp: q, dir, phase: Phase::InFlight, waker: None, detached: false };
-                update leases = pre.leases.remove(i).insert(r, l.with_req(req));
-                update posted = pre.posted.insert(r, l.mem);
+                let req = Req { qp: q, dirs, phase: Phase::InFlight, waker: None, detached: false };
+                update groups = pre.groups.remove(i).insert(r, l.with_req(req));
+                update posted = pre.posted.insert(r, l.members);
                 update next_id = r + 1;
             }
         }
@@ -320,12 +437,12 @@ state_machine! {
         transition! {
             complete(r: Id, o: Outcome) {
                 require pre.in_flight(r);
-                let l = pre.leases[r];
+                let l = pre.groups[r];
                 let req = pre.req(r);
                 update outcomes = pre.outcomes.insert(r, o);
                 update wakes = if req.waker is Some { pre.wakes.push(req.waker->0) } else { pre.wakes };
-                update leases = if req.detached { pre.leases.remove(r) }
-                    else { pre.leases.insert(r, l.with_req(req.completed(o))) };
+                update groups = if req.detached { pre.groups.remove(r) }
+                    else { pre.groups.insert(r, l.with_req(req.completed(o))) };
             }
         }
 
@@ -333,7 +450,7 @@ state_machine! {
         transition! {
             register(r: Id, w: WakerId) {
                 require pre.in_flight(r) && !pre.req(r).detached;
-                update leases = pre.leases.insert(r, pre.leases[r].with_req(pre.req(r).with_waker(w)));
+                update groups = pre.groups.insert(r, pre.groups[r].with_req(pre.req(r).with_waker(w)));
             }
         }
 
@@ -343,8 +460,8 @@ state_machine! {
             take(r: Id, o: Outcome) {
                 require pre.is_request(r) && !pre.req(r).detached;
                 require pre.req(r).phase == Phase::Complete(o);
-                update leases = pre.leases.remove(r).insert(pre.next_id,
-                    pre.leases[r].with_holder(Holder::Program));
+                update groups = pre.groups.remove(r).insert(pre.next_id,
+                    pre.groups[r].with_holder(Holder::Program));
                 update next_id = pre.next_id + 1;
             }
         }
@@ -354,8 +471,8 @@ state_machine! {
         transition! {
             detach(r: Id) {
                 require pre.is_request(r) && !pre.req(r).detached;
-                update leases = if pre.req(r).phase is Complete { pre.leases.remove(r) }
-                    else { pre.leases.insert(r, pre.leases[r].with_req(pre.req(r).detach())) };
+                update groups = if pre.req(r).phase is Complete { pre.groups.remove(r) }
+                    else { pre.groups.insert(r, pre.groups[r].with_req(pre.req(r).detach())) };
             }
         }
 
@@ -367,64 +484,67 @@ state_machine! {
         transition! {
             expose(i: Id, remote_write: bool) {
                 require pre.is_program(i);
-                require remote_write ==> pre.leases[i].unique && pre.leases[i].any_bytes;
-                update leases = pre.leases.insert(i, pre.leases[i].with_holder(Holder::Exposed { remote_write }));
+                require remote_write ==> pre.groups[i].all_writable();
+                update groups = pre.groups.insert(i, pre.groups[i].with_holder(Holder::Exposed { remote_write }));
             }
         }
 
         /// Deregistering it (the rkey stops working): the program gets the buffer back.
         transition! {
             unexpose(i: Id) {
-                require pre.leases.contains_key(i) && pre.leases[i].holder is Exposed;
-                update leases = pre.leases.insert(i, pre.leases[i].with_holder(Holder::Program));
+                require pre.groups.contains_key(i) && pre.groups[i].holder is Exposed;
+                update groups = pre.groups.insert(i, pre.groups[i].with_holder(Holder::Program));
             }
         }
 
         // ---------------------------------------------------------------------------------
         // Invariants
 
-        /// Ids below `next_id` only.
+        /// Group IDs, member identities and outcome IDs are globally fresh.
         #[invariant]
         pub fn inv_ids(&self) -> bool {
-            &&& forall|i: Id| #[trigger] self.leases.contains_key(i) ==> i < self.next_id
+            &&& forall|i: Id| #[trigger] self.groups.contains_key(i) ==> {
+                &&& i < self.next_id
+                &&& forall|k: int| 0 <= k < self.groups[i].members.len()
+                    ==> (#[trigger] self.groups[i].members[k]).id < self.next_id
+            }
             &&& forall|i: Id| #[trigger] self.outcomes.contains_key(i) ==> i < self.next_id
         }
 
-        /// The heart of S1: a unique lease overlaps no other lease.
+        /// Per-member uniqueness, inside each group and between different groups.
         #[invariant]
         pub fn inv_unique(&self) -> bool {
-            forall|i: Id, j: Id| #![trigger self.leases[i], self.leases[j]]
-                self.leases.contains_key(i) && self.leases.contains_key(j) && i != j
-                    && self.leases[i].unique ==> self.leases[i].mem.disjoint(self.leases[j].mem)
+            &&& forall|i: Id| #[trigger] self.groups.contains_key(i) ==> self.groups[i].wf()
+            &&& forall|i: Id, j: Id| #![trigger self.groups[i], self.groups[j]]
+                self.groups.contains_key(i) && self.groups.contains_key(j) && i != j
+                    ==> self.groups[i].compatible(self.groups[j])
         }
 
-        /// Memory the NIC may write is held uniquely and accepts any bytes.
+        /// Only the members written by the NIC need unique, arbitrary-byte permissions.
         #[invariant]
         pub fn inv_nic_writes(&self) -> bool {
-            forall|i: Id| #[trigger] self.leases.contains_key(i) ==> {
-                let l = self.leases[i];
-                (l.is_request() && l.holder->req.dir is In) || (l.holder is Exposed && l.holder->remote_write)
-                    ==> l.unique && l.any_bytes
+            forall|i: Id| #[trigger] self.groups.contains_key(i) ==> {
+                let g = self.groups[i];
+                &&& g.is_request() ==> g.allows(g.holder->req.dirs)
+                &&& g.holder is Exposed && g.holder->remote_write ==> g.all_writable()
             }
         }
 
-        /// A request keeps the bytes it was posted with, lives on a queue pair that exists,
-        /// and has an outcome exactly when it is complete (the one recorded).
+        /// A request owns exactly its original ordered members, under one lifecycle.
         #[invariant]
         pub fn inv_requests(&self) -> bool {
-            forall|r: Id| #[trigger] self.leases.contains_key(r) && self.leases[r].is_request() ==> {
+            forall|r: Id| #[trigger] self.groups.contains_key(r) && self.groups[r].is_request() ==> {
                 let req = self.req(r);
-                &&& self.posted.contains_key(r) && self.posted[r] == self.leases[r].mem
+                &&& self.posted.contains_key(r) && self.posted[r] == self.groups[r].members
                 &&& self.qps.contains(req.qp)
                 &&& req.phase is InFlight <==> !self.outcomes.contains_key(r)
                 &&& req.phase is Complete ==> self.outcomes[r] == req.phase->0
             }
         }
 
-        /// The heart of L1: a complete or detached request holds no waker.
         #[invariant]
         pub fn inv_wakers(&self) -> bool {
-            forall|r: Id| #[trigger] self.leases.contains_key(r) && self.leases[r].is_request() ==> {
+            forall|r: Id| #[trigger] self.groups.contains_key(r) && self.groups[r].is_request() ==> {
                 let req = self.req(r);
                 (req.phase is Complete || req.detached) ==> req.waker is None
             }
@@ -432,6 +552,19 @@ state_machine! {
 
         // ---------------------------------------------------------------------------------
         // Inductiveness
+
+        #[inductive(empty)]
+        pub fn empty_inductive(pre: Self, post: Self) {}
+
+        #[inductive(join)]
+        pub fn join_inductive(pre: Self, post: Self, i: Id, j: Id) {
+            lemma_join_permissions(pre.groups[i], pre.groups[j]);
+        }
+
+        #[inductive(separate)]
+        pub fn separate_inductive(pre: Self, post: Self, i: Id, at: int) {
+            lemma_separate_permissions(pre.groups[i], at);
+        }
 
         #[inductive(start)]
         pub fn start_inductive(post: Self) {}
@@ -461,7 +594,7 @@ state_machine! {
         pub fn drop_inductive(pre: Self, post: Self, i: Id) {}
 
         #[inductive(post_request)]
-        pub fn post_request_inductive(pre: Self, post: Self, i: Id, q: QpId, dir: Dir) {}
+        pub fn post_request_inductive(pre: Self, post: Self, i: Id, q: QpId, dirs: Seq<Dir>) {}
 
         #[inductive(complete)]
         pub fn complete_inductive(pre: Self, post: Self, r: Id, o: Outcome) {}
@@ -511,6 +644,9 @@ pub open spec fn abs_next(pre: Abs::State, post: Abs::State) -> bool {
 /// `post` follows from `pre` by `step`.
 pub open spec fn abs_step(pre: Abs::State, post: Abs::State, step: Abs::Step) -> bool {
     match step {
+        Abs::Step::empty() => Abs::State::empty(pre, post),
+        Abs::Step::join(i, j) => Abs::State::join(pre, post, i, j),
+        Abs::Step::separate(i, at) => Abs::State::separate(pre, post, i, at),
         Abs::Step::create_qp(q) => Abs::State::create_qp(pre, post, q),
         Abs::Step::drop_qp(q) => Abs::State::drop_qp(pre, post, q),
         Abs::Step::alloc(mem, any_bytes) => Abs::State::alloc(pre, post, mem, any_bytes),
@@ -519,7 +655,7 @@ pub open spec fn abs_step(pre: Abs::State, post: Abs::State, step: Abs::Step) ->
         Abs::Step::share(i, sub) => Abs::State::share(pre, post, i, sub),
         Abs::Step::thaw(i) => Abs::State::thaw(pre, post, i),
         Abs::Step::drop(i) => Abs::State::drop(pre, post, i),
-        Abs::Step::post_request(i, q, dir) => Abs::State::post_request(pre, post, i, q, dir),
+        Abs::Step::post_request(i, q, dirs) => Abs::State::post_request(pre, post, i, q, dirs),
         Abs::Step::complete(r, o) => Abs::State::complete(pre, post, r, o),
         Abs::Step::register(r, w) => Abs::State::register(pre, post, r, w),
         Abs::Step::take(r, o) => Abs::State::take(pre, post, r, o),
@@ -554,6 +690,9 @@ pub proof fn lemma_step_keeps_invariant(pre: Abs::State, post: Abs::State)
     reveal(Abs::State::next_by);
     let step = choose|step: Abs::Step| Abs::State::next_by(pre, post, step);
     match step {
+        Abs::Step::empty() => Abs::State::empty_inductive(pre, post),
+        Abs::Step::join(i, j) => Abs::State::join_inductive(pre, post, i, j),
+        Abs::Step::separate(i, at) => Abs::State::separate_inductive(pre, post, i, at),
         Abs::Step::create_qp(q) => Abs::State::create_qp_inductive(pre, post, q),
         Abs::Step::drop_qp(q) => Abs::State::drop_qp_inductive(pre, post, q),
         Abs::Step::alloc(mem, any_bytes) => Abs::State::alloc_inductive(pre, post, mem, any_bytes),
@@ -562,7 +701,7 @@ pub proof fn lemma_step_keeps_invariant(pre: Abs::State, post: Abs::State)
         Abs::Step::share(i, sub) => Abs::State::share_inductive(pre, post, i, sub),
         Abs::Step::thaw(i) => Abs::State::thaw_inductive(pre, post, i),
         Abs::Step::drop(i) => Abs::State::drop_inductive(pre, post, i),
-        Abs::Step::post_request(i, q, dir) => Abs::State::post_request_inductive(pre, post, i, q, dir),
+        Abs::Step::post_request(i, q, dirs) => Abs::State::post_request_inductive(pre, post, i, q, dirs),
         Abs::Step::complete(r, o) => Abs::State::complete_inductive(pre, post, r, o),
         Abs::Step::register(r, w) => Abs::State::register_inductive(pre, post, r, w),
         Abs::Step::take(r, o) => Abs::State::take_inductive(pre, post, r, o),

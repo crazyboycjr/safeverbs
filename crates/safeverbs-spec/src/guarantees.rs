@@ -28,38 +28,44 @@ pub proof fn lemma_s1_no_conflict(s: Abs::State, a: int)
         !(s.program_reads(a) && s.nic_writes(a)),
 {
     if s.program_writes(a) && (s.nic_reads(a) || s.nic_writes(a)) {
-        let i = choose|i: Id| #[trigger] s.leases.contains_key(i) && s.leases[i].is_program()
-            && s.leases[i].unique && s.leases[i].mem.contains(a);
-        let j = if s.nic_reads(a) {
-            choose|j: Id| #[trigger] s.leases.contains_key(j) && s.leases[j].nic_may_read()
-                && s.leases[j].mem.contains(a)
-        } else {
-            choose|j: Id| #[trigger] s.leases.contains_key(j) && s.leases[j].nic_may_write()
-                && s.leases[j].mem.contains(a)
-        };
-        assert(s.leases[i].mem.disjoint(s.leases[j].mem));
+        let i = choose|i: Id| s.groups.contains_key(i) && s.groups[i].writes_program(a);
+        let k = choose|k: int| 0 <= k < s.groups[i].members.len()
+            && s.groups[i].members[k].unique && s.groups[i].members[k].mem.contains(a);
+        let j = choose|j: Id| s.groups.contains_key(j)
+            && (s.groups[j].nic_may_read(a) || s.groups[j].nic_may_write(a));
+        assert(s.groups[j].contains(a));
+        let l = choose|l: int| 0 <= l < s.groups[j].members.len()
+            && s.groups[j].members[l].mem.contains(a);
+        assert(i != j);
+        assert(s.groups[i].compatible(s.groups[j]));
+        assert(s.groups[i].members[k].mem.disjoint(s.groups[j].members[l].mem));
     }
     if s.program_reads(a) && s.nic_writes(a) {
-        let i = choose|i: Id| #[trigger] s.leases.contains_key(i) && s.leases[i].is_program()
-            && s.leases[i].mem.contains(a);
-        let j = choose|j: Id| #[trigger] s.leases.contains_key(j) && s.leases[j].nic_may_write()
-            && s.leases[j].mem.contains(a);
-        assert(s.leases[j].mem.disjoint(s.leases[i].mem));
+        let i = choose|i: Id| s.groups.contains_key(i) && s.groups[i].is_program()
+            && s.groups[i].contains(a);
+        let k = choose|k: int| 0 <= k < s.groups[i].members.len()
+            && s.groups[i].members[k].mem.contains(a);
+        let j = choose|j: Id| s.groups.contains_key(j) && s.groups[j].nic_may_write(a);
+        let l = choose|l: int| 0 <= l < s.groups[j].members.len()
+            && s.groups[j].members[l].mem.contains(a) && s.groups[j].write_member(l);
+        lemma_s1_nic_writes_any_bytes(s, j, l);
+        assert(i != j);
+        assert(s.groups[j].compatible(s.groups[i]));
+        assert(s.groups[j].members[l].mem.disjoint(s.groups[i].members[k].mem));
     }
 }
 
-/// **S1, types.** The NIC and the peer only write into memory whose element type accepts
-/// every bit pattern (`zerocopy::FromBytes`), and that memory reaches the program again only
-/// as such a type. Turning bytes into a type with invalid bit patterns goes through
-/// `TryFromBytes`, which checks them; that check is ordinary safe Rust, outside this model.
-pub proof fn lemma_s1_nic_writes_any_bytes(s: Abs::State, i: Id)
+/// **S1, types.** Every member written by the NIC or peer is individually unique and
+/// accepts arbitrary bytes. Other members of the same request may be shared sources.
+pub proof fn lemma_s1_nic_writes_any_bytes(s: Abs::State, i: Id, k: int)
     requires
         s.invariant(),
-        s.leases.contains_key(i),
-        s.leases[i].nic_may_write(),
+        s.groups.contains_key(i),
+        0 <= k < s.groups[i].members.len(),
+        s.groups[i].write_member(k),
     ensures
-        s.leases[i].any_bytes,
-        s.leases[i].unique,
+        s.groups[i].members[k].any_bytes,
+        s.groups[i].members[k].unique,
 {
 }
 
@@ -92,7 +98,7 @@ pub proof fn lemma_f1_take(pre: Abs::State, post: Abs::State, r: Id, o: Outcome)
     ensures
         o == pre.outcomes[r],
         post.is_program(pre.next_id),
-        post.leases[pre.next_id].mem == pre.posted[r],
+        post.groups[pre.next_id].members == pre.posted[r],
 {
 }
 
@@ -124,7 +130,7 @@ pub proof fn lemma_r1_kept_while_in_flight(pre: Abs::State, post: Abs::State, r:
         Abs::State::next(pre, post),
         pre.in_flight(r),
     ensures
-        post.in_flight(r) ==> post.leases[r].mem == pre.leases[r].mem,
+        post.in_flight(r) ==> post.groups[r].members == pre.groups[r].members,
         !post.in_flight(r) ==> post.outcomes.contains_key(r),
 {
     reveal(Abs::State::next);
@@ -149,9 +155,9 @@ pub proof fn lemma_r1_released_once(pre: Abs::State, post: Abs::State, i: Id)
         pre.invariant(),
         Abs::State::next(pre, post),
         i < pre.next_id,
-        !pre.leases.contains_key(i),
+        !pre.groups.contains_key(i),
     ensures
-        !post.leases.contains_key(i),
+        !post.groups.contains_key(i),
 {
     reveal(Abs::State::next);
     reveal(Abs::State::next_by);

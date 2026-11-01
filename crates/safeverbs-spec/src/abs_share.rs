@@ -15,11 +15,9 @@
 //! leave a local lease unchanged while invalidating its `thaw` precondition. Each worker
 //! must establish A's current preconditions when taking its own next step.
 //!
-//! A currently gives each request one lease and one `Dir`. A synchronous concrete request
-//! can group READ destinations with shared SEND sources, so its leases need not be all
-//! unique or all read-only. This foundation supplies no abstraction for that group and
-//! restricts no concrete API. A grouped-request model with per-lease access directions
-//! and uniqueness is still needed before proving the concrete worker refines A.
+//! A request now owns an ordered group of separately named leases with per-member access
+//! directions. Framing preserves that whole group without imposing uniform permissions.
+//! Connecting those ghost resources to concrete buffer permissions is still an obligation.
 #![allow(unused_imports)]
 
 use crate::abs::*;
@@ -51,7 +49,7 @@ impl Share {
 /// before creation. This adds no condition about the byte ranges of different shares.
 pub open spec fn share_wf(a: Abs::State, sh: Share) -> bool {
     &&& forall|i: Id| #[trigger] sh.ids.contains(i) ==> i < a.next_id
-    &&& forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request()
+    &&& forall|r: Id| #[trigger] a.groups.contains_key(r) && a.groups[r].is_request()
         ==> (sh.ids.contains(r) <==> sh.qps.contains(a.req(r).qp))
 }
 
@@ -61,6 +59,9 @@ pub open spec fn share_wf(a: Abs::State, sh: Share) -> bool {
 /// govern every step, including uniqueness, allocation and exposure rules.
 pub open spec fn foreign(sh: Share, step: Abs::Step) -> bool {
     match step {
+        Abs::Step::empty() => true,
+        Abs::Step::join(i, j) => !sh.ids.contains(i) && !sh.ids.contains(j),
+        Abs::Step::separate(i, _) => !sh.ids.contains(i),
         Abs::Step::create_qp(q) => !sh.qps.contains(q),
         Abs::Step::drop_qp(q) => !sh.qps.contains(q),
         Abs::Step::alloc(_, _) => true,
@@ -85,6 +86,9 @@ pub open spec fn foreign(sh: Share, step: Abs::Step) -> bool {
 /// not establish that share update or a concrete API call's simulation.
 pub open spec fn mine(sh: Share, step: Abs::Step) -> bool {
     match step {
+        Abs::Step::empty() => true,
+        Abs::Step::join(i, j) => sh.ids.contains(i) && sh.ids.contains(j),
+        Abs::Step::separate(i, _) => sh.ids.contains(i),
         Abs::Step::create_qp(q) => sh.qps.contains(q),
         Abs::Step::drop_qp(q) => sh.qps.contains(q),
         Abs::Step::alloc(_, _) => true,
@@ -107,8 +111,8 @@ pub open spec fn mine(sh: Share, step: Abs::Step) -> bool {
 /// Preserve both presence and absence, and the entire lease (including its phase,
 /// registered waker and detached flag), outcome and posted-byte record at one ID.
 pub open spec fn id_framed(pre: Abs::State, post: Abs::State, i: Id) -> bool {
-    &&& post.leases.contains_key(i) <==> pre.leases.contains_key(i)
-    &&& pre.leases.contains_key(i) ==> post.leases[i] == pre.leases[i]
+    &&& post.groups.contains_key(i) <==> pre.groups.contains_key(i)
+    &&& pre.groups.contains_key(i) ==> post.groups[i] == pre.groups[i]
     &&& post.outcomes.contains_key(i) <==> pre.outcomes.contains_key(i)
     &&& pre.outcomes.contains_key(i) ==> post.outcomes[i] == pre.outcomes[i]
     &&& post.posted.contains_key(i) <==> pre.posted.contains_key(i)
@@ -142,6 +146,9 @@ proof fn lemma_foreign_id(sh: Share, pre: Abs::State, post: Abs::State, step: Ab
 {
     assert(i < pre.next_id);
     match step {
+        Abs::Step::empty() => {},
+        Abs::Step::join(j, k) => { assert(i != j && i != k); },
+        Abs::Step::separate(j, _) => { assert(i != j && i != pre.next_id + 1); },
         Abs::Step::create_qp(_) => {},
         Abs::Step::drop_qp(_) => {},
         Abs::Step::alloc(_, _) => {},
@@ -178,6 +185,9 @@ proof fn lemma_foreign_request(
         sh.ids.contains(r) <==> sh.qps.contains(post.req(r).qp),
 {
     match step {
+        Abs::Step::empty() => { assert(r != pre.next_id); },
+        Abs::Step::join(_, _) => { assert(r != pre.next_id); },
+        Abs::Step::separate(_, _) => { assert(r != pre.next_id && r != pre.next_id + 1); },
         Abs::Step::create_qp(_) => {},
         Abs::Step::drop_qp(_) => {},
         Abs::Step::alloc(_, _) => { assert(r != pre.next_id); },
@@ -202,7 +212,7 @@ proof fn lemma_foreign_request(
     }
 }
 
-/// All fifteen real transition variants preserve A's invariant, the share, and its frame.
+/// All eighteen real transition variants preserve A's invariant, the share, and its frame.
 /// The restrictions classify interference; no transition or invariant of A is changed.
 pub proof fn lemma_foreign_step(sh: Share, pre: Abs::State, post: Abs::State, step: Abs::Step)
     requires
@@ -220,11 +230,14 @@ pub proof fn lemma_foreign_step(sh: Share, pre: Abs::State, post: Abs::State, st
     assert forall|i: Id| #[trigger] sh.ids.contains(i) implies id_framed(pre, post, i) by {
         lemma_foreign_id(sh, pre, post, step, i);
     }
-    assert forall|r: Id| #[trigger] post.leases.contains_key(r) && post.leases[r].is_request()
+    assert forall|r: Id| #[trigger] post.groups.contains_key(r) && post.groups[r].is_request()
         implies (sh.ids.contains(r) <==> sh.qps.contains(post.req(r).qp)) by {
         lemma_foreign_request(sh, pre, post, step, r);
     }
     match step {
+        Abs::Step::empty() => {},
+        Abs::Step::join(_, _) => {},
+        Abs::Step::separate(_, _) => {},
         Abs::Step::create_qp(q) => { assert(!sh.qps.contains(q)); },
         Abs::Step::drop_qp(q) => { assert(!sh.qps.contains(q)); },
         Abs::Step::alloc(_, _) => {},
@@ -254,6 +267,9 @@ pub proof fn lemma_mine_is_foreign(left: Share, right: Share, step: Abs::Step)
         foreign(right, step),
 {
     match step {
+        Abs::Step::empty() => {},
+        Abs::Step::join(i, j) => { assert(!right.ids.contains(i) && !right.ids.contains(j)); },
+        Abs::Step::separate(i, _) => { assert(!right.ids.contains(i)); },
         Abs::Step::create_qp(q) => { assert(!right.qps.contains(q)); },
         Abs::Step::drop_qp(q) => { assert(!right.qps.contains(q)); },
         Abs::Step::alloc(_, _) => {},
@@ -384,7 +400,7 @@ pub proof fn lemma_rely_inflight(sh: Share, pre: Abs::State, post: Abs::State, r
         rely_reaches(sh, pre, post),
     ensures
         post.in_flight(r),
-        post.leases[r] == pre.leases[r],
+        post.groups[r] == pre.groups[r],
         post.req(r) == pre.req(r),
         !post.outcomes.contains_key(r),
         post.posted[r] == pre.posted[r],
@@ -434,17 +450,17 @@ pub proof fn lemma_transfer(
         forall|i: Id| #[trigger] moved.contains(i)
             ==> !from_after.ids.contains(i) && to_after.ids.contains(i),
 {
-    assert forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request()
+    assert forall|r: Id| #[trigger] a.groups.contains_key(r) && a.groups[r].is_request()
         implies !moved.contains(r) by {
         if moved.contains(r) {
             assert(a.is_program(r));
         }
     }
-    assert forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request()
+    assert forall|r: Id| #[trigger] a.groups.contains_key(r) && a.groups[r].is_request()
         implies (from_after.ids.contains(r) <==> from_after.qps.contains(a.req(r).qp)) by {
         assert(!moved.contains(r));
     }
-    assert forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request()
+    assert forall|r: Id| #[trigger] a.groups.contains_key(r) && a.groups[r].is_request()
         implies (to_after.ids.contains(r) <==> to_after.qps.contains(a.req(r).qp)) by {
         assert(!moved.contains(r));
     }
@@ -463,7 +479,7 @@ pub proof fn example_two_workers() {
     let fresh = Span { start: 128, len: 64 }.bytes();
     let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
     let a0 = Abs::State {
-        qps: Set::empty(), leases: Map::empty(), next_id: 0,
+        qps: Set::empty(), groups: Map::empty(), next_id: 0,
         outcomes: Map::empty(), posted: Map::empty(), wakes: Seq::empty(),
     };
     assert(Abs::State::start(a0));
@@ -474,62 +490,63 @@ pub proof fn example_two_workers() {
     let a2 = Abs::State { qps: a1.qps.insert(8), ..a1 };
     assert(Abs::State::create_qp(a1, a2, 8));
     Abs::State::create_qp_inductive(a1, a2, 8);
-    let unique = Lease { mem, unique: true, any_bytes: true, holder: Holder::Program };
-    let a3 = Abs::State { leases: a2.leases.insert(0, unique), next_id: 1, ..a2 };
+    let unique = Group::singleton(0, mem, true, true);
+    let a3 = Abs::State { groups: a2.groups.insert(0, unique), next_id: 1, ..a2 };
     assert(Abs::State::alloc(a2, a3, mem, true));
     Abs::State::alloc_inductive(a2, a3, mem, true);
-    let frozen = Lease { unique: false, ..unique };
-    let a4 = Abs::State { leases: a3.leases.insert(0, frozen), ..a3 };
+    let frozen = Group::singleton(0, mem, false, true);
+    let a4 = Abs::State { groups: a3.groups.insert(0, frozen), ..a3 };
     assert(Abs::State::freeze(a3, a4, 0));
     Abs::State::freeze_inductive(a3, a4, 0);
-    let a5 = Abs::State { leases: a4.leases.insert(1, frozen), next_id: 2, ..a4 };
+    let a5 = Abs::State { groups: a4.groups.insert(1, Group::singleton(1, mem, false, true)), next_id: 2, ..a4 };
     assert(Abs::State::share(a4, a5, 0, mem));
     Abs::State::share_inductive(a4, a5, 0, mem);
-    let local_req = Req { qp: 7, dir: Dir::Out, phase: Phase::InFlight, waker: None, detached: false };
+    let local_req = Req { qp: 7, dirs: seq![Dir::Out], phase: Phase::InFlight, waker: None, detached: false };
     let other_req = Req { qp: 8, ..local_req };
+    let clone = Group::singleton(1, mem, false, true);
     let a6 = Abs::State {
-        leases: a5.leases.remove(0).insert(2, frozen.with_req(local_req)),
-        posted: a5.posted.insert(2, mem), next_id: 3, ..a5
+        groups: a5.groups.remove(0).insert(2, frozen.with_req(local_req)),
+        posted: a5.posted.insert(2, frozen.members), next_id: 3, ..a5
     };
-    assert(Abs::State::post_request(a5, a6, 0, 7, Dir::Out));
-    Abs::State::post_request_inductive(a5, a6, 0, 7, Dir::Out);
+    assert(Abs::State::post_request(a5, a6, 0, 7, seq![Dir::Out]));
+    Abs::State::post_request_inductive(a5, a6, 0, 7, seq![Dir::Out]);
     let a7 = Abs::State {
-        leases: a6.leases.remove(1).insert(3, frozen.with_req(other_req)),
-        posted: a6.posted.insert(3, mem), next_id: 4, ..a6
+        groups: a6.groups.remove(1).insert(3, clone.with_req(other_req)),
+        posted: a6.posted.insert(3, clone.members), next_id: 4, ..a6
     };
-    assert(Abs::State::post_request(a6, a7, 1, 8, Dir::Out));
-    Abs::State::post_request_inductive(a6, a7, 1, 8, Dir::Out);
-    let a8 = Abs::State { leases: a7.leases.insert(2, frozen.with_req(local_req.with_waker(9))), ..a7 };
+    assert(Abs::State::post_request(a6, a7, 1, 8, seq![Dir::Out]));
+    Abs::State::post_request_inductive(a6, a7, 1, 8, seq![Dir::Out]);
+    let a8 = Abs::State { groups: a7.groups.insert(2, frozen.with_req(local_req.with_waker(9))), ..a7 };
     assert(Abs::State::register(a7, a8, 2, 9));
     Abs::State::register_inductive(a7, a8, 2, 9);
-    let a9 = Abs::State { leases: a8.leases.insert(3, frozen.with_req(other_req.with_waker(11))), ..a8 };
+    let a9 = Abs::State { groups: a8.groups.insert(3, clone.with_req(other_req.with_waker(11))), ..a8 };
     assert(Abs::State::register(a8, a9, 3, 11));
     Abs::State::register_inductive(a8, a9, 3, 11);
     let local = Share { qps: ISet::empty().insert(7), ids: ISet::empty().insert(2) };
     let other = Share { qps: ISet::empty().insert(8), ids: ISet::empty().insert(3) };
     assert(local.disjoint(other));
     assert(share_wf(a9, local) && share_wf(a9, other));
-    assert(a9.leases[2].mem.contains(0) && a9.leases[3].mem.contains(0));
+    assert(a9.groups[2].members[0].mem.contains(0) && a9.groups[3].members[0].mem.contains(0));
 
     let b1 = Abs::State {
-        leases: a9.leases.insert(4, Lease { mem: fresh, ..unique }), next_id: 5, ..a9
+        groups: a9.groups.insert(4, Group::singleton(4, fresh, true, true)), next_id: 5, ..a9
     };
     assert(abs_step(a9, b1, Abs::Step::alloc(fresh, true)));
     lemma_foreign_step(local, a9, b1, Abs::Step::alloc(fresh, true));
     // Acquisition of the freshly allocated ID is explicit in the other worker's share.
     let other1 = other.with_ids(other.ids.insert(4));
     assert(share_wf(b1, other1) && local.disjoint(other1));
-    let b2 = Abs::State { leases: b1.leases.insert(3, frozen.with_req(other_req.with_waker(12))), ..b1 };
+    let b2 = Abs::State { groups: b1.groups.insert(3, clone.with_req(other_req.with_waker(12))), ..b1 };
     assert(abs_step(b1, b2, Abs::Step::register(3, 12)));
     lemma_mine_is_foreign(other1, local, Abs::Step::register(3, 12));
     lemma_foreign_step(local, b1, b2, Abs::Step::register(3, 12));
     let b3 = Abs::State {
-        leases: b2.leases.insert(3, frozen.with_req(other_req.completed(ok))),
+        groups: b2.groups.insert(3, clone.with_req(other_req.completed(ok))),
         outcomes: b2.outcomes.insert(3, ok), wakes: b2.wakes.push(12), ..b2
     };
     assert(abs_step(b2, b3, Abs::Step::complete(3, ok)));
     lemma_foreign_step(local, b2, b3, Abs::Step::complete(3, ok));
-    let b4 = Abs::State { leases: b3.leases.remove(3).insert(5, frozen), next_id: 6, ..b3 };
+    let b4 = Abs::State { groups: b3.groups.remove(3).insert(5, clone), next_id: 6, ..b3 };
     assert(abs_step(b3, b4, Abs::Step::take(3, ok)));
     lemma_foreign_step(local, b3, b4, Abs::Step::take(3, ok));
     let other2 = other1.with_ids(other1.ids.insert(5));
@@ -547,38 +564,38 @@ pub proof fn example_two_workers() {
     lemma_rely_inflight(local, a9, b4, 2);
     assert(b4.req(2).waker == Some(9));
     assert(!b4.outcomes.contains_key(2));
-    assert(b4.leases[2].mem == mem);
+    assert(b4.groups[2].members[0].mem == mem);
     assert(b4.next_id == 6 && b4.wakes == seq![12nat]);
 
     // The local worker completes its own request. Foreign work may append more wakes,
     // but cannot replace the completed local lease or its historical outcome.
     let c0 = Abs::State {
-        leases: b4.leases.insert(2, frozen.with_req(local_req.completed(ok))),
+        groups: b4.groups.insert(2, frozen.with_req(local_req.completed(ok))),
         outcomes: b4.outcomes.insert(2, ok), wakes: b4.wakes.push(9), ..b4
     };
     assert(Abs::State::complete(b4, c0, 2, ok));
     Abs::State::complete_inductive(b4, c0, 2, ok);
     assert(share_wf(c0, local));
     let c1 = Abs::State {
-        leases: c0.leases.remove(5).insert(6, frozen.with_req(other_req)),
-        posted: c0.posted.insert(6, mem), next_id: 7, ..c0
+        groups: c0.groups.remove(5).insert(6, clone.with_req(other_req)),
+        posted: c0.posted.insert(6, clone.members), next_id: 7, ..c0
     };
-    assert(abs_step(c0, c1, Abs::Step::post_request(5, 8, Dir::Out)));
-    lemma_foreign_step(local, c0, c1, Abs::Step::post_request(5, 8, Dir::Out));
+    assert(abs_step(c0, c1, Abs::Step::post_request(5, 8, seq![Dir::Out])));
+    lemma_foreign_step(local, c0, c1, Abs::Step::post_request(5, 8, seq![Dir::Out]));
     let other3 = other2.with_ids(other2.ids.insert(6));
     assert(share_wf(c1, other3) && local.disjoint(other3));
-    let c2 = Abs::State { leases: c1.leases.insert(6, frozen.with_req(other_req.with_waker(13))), ..c1 };
+    let c2 = Abs::State { groups: c1.groups.insert(6, clone.with_req(other_req.with_waker(13))), ..c1 };
     assert(abs_step(c1, c2, Abs::Step::register(6, 13)));
     lemma_foreign_step(local, c1, c2, Abs::Step::register(6, 13));
     let c3 = Abs::State {
-        leases: c2.leases.insert(6, frozen.with_req(other_req.completed(ok))),
+        groups: c2.groups.insert(6, clone.with_req(other_req.completed(ok))),
         outcomes: c2.outcomes.insert(6, ok), wakes: c2.wakes.push(13), ..c2
     };
     assert(abs_step(c2, c3, Abs::Step::complete(6, ok)));
     lemma_foreign_step(local, c2, c3, Abs::Step::complete(6, ok));
     lemma_framed_trans(local, c0, c1, c2);
     lemma_framed_trans(local, c0, c2, c3);
-    assert(c3.leases[2] == c0.leases[2]);
+    assert(c3.groups[2] == c0.groups[2]);
     assert(c3.outcomes[2] == ok && c3.req(2).waker is None);
     assert(c3.wakes == seq![12nat, 9nat, 13nat]);
 }
@@ -588,16 +605,16 @@ pub proof fn example_two_workers() {
 #[verifier::spinoff_prover]
 pub proof fn example_clone_transfer() {
     let mem = Span { start: 0, len: 64 }.bytes();
-    let frozen = Lease { mem, unique: false, any_bytes: true, holder: Holder::Program };
+    let frozen = Group::singleton(0, mem, false, true);
     let a0 = Abs::State {
-        qps: Set::empty().insert(7).insert(8), leases: Map::empty().insert(0, frozen),
+        qps: Set::empty().insert(7).insert(8), groups: Map::empty().insert(0, frozen),
         next_id: 1, outcomes: Map::empty(), posted: Map::empty(), wakes: Seq::empty(),
     };
     assert(abs_inv(a0));
     let left = Share { qps: ISet::empty().insert(7), ids: ISet::empty().insert(0) };
     let right = Share { qps: ISet::empty().insert(8), ids: ISet::empty() };
     assert(share_wf(a0, left) && share_wf(a0, right) && left.disjoint(right));
-    let a1 = Abs::State { leases: a0.leases.insert(1, frozen), next_id: 2, ..a0 };
+    let a1 = Abs::State { groups: a0.groups.insert(1, Group::singleton(1, mem, false, true)), next_id: 2, ..a0 };
     assert(abs_step(a0, a1, Abs::Step::share(0, mem)));
     // Cloning is nonmutating interference even when the source ID is locally owned.
     lemma_foreign_step(left, a0, a1, Abs::Step::share(0, mem));
@@ -611,15 +628,16 @@ pub proof fn example_clone_transfer() {
     lemma_transfer(a1, acquired, right, moved, left_after, right_after);
     assert(left_after.ids.contains(0) && !left_after.ids.contains(1));
     assert(right_after.ids.contains(1) && !right_after.ids.contains(0));
-    assert(a1.leases[0].mem.contains(0) && a1.leases[1].mem.contains(0));
-    assert(!a1.leases[0].mem.disjoint(a1.leases[1].mem));
-    assert(a1.leases[0] == a0.leases[0]);
-    let req = Req { qp: 8, dir: Dir::Out, phase: Phase::InFlight, waker: None, detached: false };
+    assert(a1.groups[0].members[0].mem.contains(0) && a1.groups[1].members[0].mem.contains(0));
+    assert(!a1.groups[0].members[0].mem.disjoint(a1.groups[1].members[0].mem));
+    assert(a1.groups[0] == a0.groups[0]);
+    let clone = Group::singleton(1, mem, false, true);
+    let req = Req { qp: 8, dirs: seq![Dir::Out], phase: Phase::InFlight, waker: None, detached: false };
     let a2 = Abs::State {
-        leases: a1.leases.remove(1).insert(2, frozen.with_req(req)),
-        posted: a1.posted.insert(2, mem), next_id: 3, ..a1
+        groups: a1.groups.remove(1).insert(2, clone.with_req(req)),
+        posted: a1.posted.insert(2, clone.members), next_id: 3, ..a1
     };
-    let step = Abs::Step::post_request(1, 8, Dir::Out);
+    let step = Abs::Step::post_request(1, 8, seq![Dir::Out]);
     assert(mine(right_after, step));
     assert(abs_step(a1, a2, step));
     lemma_mine_is_foreign(right_after, left_after, step);
@@ -627,8 +645,8 @@ pub proof fn example_clone_transfer() {
     // The request's fresh ID is acquired separately from the transferred clone's ID.
     let right_posted = right_after.with_ids(right_after.ids.insert(2));
     assert(share_wf(a2, right_posted) && left_after.disjoint(right_posted));
-    assert(a2.leases[0] == a0.leases[0] && a2.in_flight(2));
-    assert(a2.leases[0].mem.contains(0) && a2.leases[2].mem.contains(0));
+    assert(a2.groups[0] == a0.groups[0] && a2.in_flight(2));
+    assert(a2.groups[0].members[0].mem.contains(0) && a2.groups[2].members[0].mem.contains(0));
     assert(!foreign(left_after, Abs::Step::drop(0)));
 }
 

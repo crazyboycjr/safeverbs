@@ -395,14 +395,14 @@ pub proof fn lemma_poll_prefix_pending(
 /// - **S1 against M:** every byte M lets the NIC (or the peer) read or write is one A gives
 ///   to the NIC for that kind of access.
 pub open spec fn coupled(a: Abs::State, m: Nic::State, ranges: Map<Id, WqeRange>) -> bool {
-    &&& forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request()
+    &&& forall|r: Id| #[trigger] a.groups.contains_key(r) && a.groups[r].is_request()
         ==> ranges.contains_key(r) && ranges[r].qp == a.req(r).qp
     &&& forall|r: Id| #[trigger] a.outcomes.contains_key(r) ==> ranges.contains_key(r)
     &&& forall|r: Id| #[trigger] ranges.contains_key(r) ==> ranges[r].wf()
     &&& forall|r1: Id, r2: Id| #![trigger ranges[r1], ranges[r2]]
         ranges.contains_key(r1) && ranges.contains_key(r2) && r1 != r2
             ==> ranges[r1].disjoint(ranges[r2])
-    &&& forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].in_flight()
+    &&& forall|r: Id| #[trigger] a.groups.contains_key(r) && a.groups[r].in_flight()
         ==> ranges[r].pending(m)
     &&& forall|r: Id| #[trigger] a.outcomes.contains_key(r)
         ==> ranges[r].all_retired(m.retired) && ranges[r].aggregate(m.retired) == a.outcomes[r]
@@ -635,7 +635,7 @@ pub proof fn corollary_inflight(
         !m.retired.contains_key(ranges[r].last()),
         !ranges[r].all_retired(m.retired),
         !a.outcomes.contains_key(r),
-        a.leases[r].mem == a.posted[r],
+        a.groups[r].members == a.posted[r],
 {
     lemma_pending_last(ranges[r], m);
 }
