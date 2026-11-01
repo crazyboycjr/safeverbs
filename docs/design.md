@@ -314,6 +314,11 @@ the `ibv_start_poll` family. Where the device has thread domains, the worker all
 locks and gives the worker's queue pairs a doorbell page of their own, which they share.
 Where that fails (rxe) they are plain queue pairs. A worker belongs to one protection domain.
 
+**Verified hardware side.** Everything of a worker that M sees (the CQ, the queue pairs'
+hardware handles and rings, the WQE a request holds back with its buffers, the worker's
+share of M) lives in `hw::Hw`, inside `verus!`; the `Worker` is an unverified shell around it
+(keys, the event loop's cursors, the drain's clock). `verification.md` says what is proved.
+
 **Capacity.** Each queue pair reserves a CQ entry for every completion it may produce, its
 send and receive depths, when it is created, and one that does not fit in what is left is
 refused (`Error::CqFull`). The rings never let more WQEs be in flight than the queues hold,
@@ -423,14 +428,15 @@ async style of the API carry over.
 - Which thread owns a CQ shared by several queue pairs is answered by the worker (section
   10): a group that owns the CQ and the queue pairs attached to it, reserves each queue pair's
   depths on attach, routes completions by `wr_id` and moves between threads as one unit.
-- Theorem 1 for the worker: M is one state for the whole device, while each worker is one
-  thread's. The proof needs each worker's share of M (a tokenized M, or a token per worker
-  over its CQ and queue pairs), next to the lease tokens of the buffers.
+- Theorem 1 for the worker: each worker's share of M is settled by rely and guarantee
+  (`safeverbs-spec/src/share.rs`), and M's side of the refinement is proved for the worker's
+  hardware side (`safeverbs-core/src/hw.rs`). Open: A's side for the worker (the map from
+  its requests to A's leases), the buffers as linear ghost permissions, and whether a
+  successful send's reported length should be fixed in M so that an unsignaled request's
+  implied outcome is exactly M's (see `verification.md`).
 - Whether a request should say who takes its result (the event loop or its owner), so that
   futures and the event loop can share a worker.
 - Out-of-order transports and SRQs need their own completion rules in M before the core
   supports them.
-- How much of the ring's state the trusted wrappers expose: the less they know, the smaller
-  the trusted base.
 - What the model implementation of the NIC trait looks like, so that the same tests run
   against it and against hardware.

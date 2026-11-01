@@ -26,10 +26,10 @@
 //! checked in the state the worker last saw, still holds when the verb
 //! happens (`safeverbs_spec::share::lemma_rely_keeps_enabled`): that is why
 //! the contracts below are consistent. Between two calls the other workers
-//! deregister no region the worker's written WRs name ([`pinned`]): those
+//! deregister no region the worker's written WRs name (`pinned`): those
 //! are held by leases, which keep their regions registered ([`registered`]
 //! is where the core learns it). The worker's hardware side
-//! (`crate::hw`) is verified against these contracts.
+//! ([`crate::hw`]) is verified against these contracts.
 //
 // The imports are used by ghost code too.
 #![allow(unused_imports)]

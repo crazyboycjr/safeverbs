@@ -46,6 +46,22 @@ stay registered. On top of them:
   precondition, so the library may check preconditions against the state it last saw.
 - `lemma_nic_touches_registered`: the NIC only touches memory that is registered right now.
 
+**Each worker's share of M** (`share.rs`). M is one state for the whole device, while the
+library drives it from several threads: each worker owns one CQ and the queue pairs it creates
+there, and the protection domain with its regions is shared through the control path. M is
+unchanged; `share.rs` states, from M's definition, what the threads rely on and guarantee each
+other. A worker's share (`Share`) is its CQ and a set of QP names no other worker uses;
+`share_wf` says a state respects it (its QPs attached to its CQ only, no other QP attached
+there). Between two calls of a worker, M moves by the NIC's own steps and by verbs of the
+others on their own CQs and QPs, which deregister no region the worker's next verb names
+(`rely_reaches` with the `pins`). Proved: such steps keep the share well formed and leave it as
+the NIC alone would (`framed`, `lemma_rely_frame`); every verb of the worker's own
+(`mine`) that was enabled in the state it last saw is still enabled
+(`lemma_rely_keeps_enabled`, which generalizes `lemma_nic_steps_keep_verbs_enabled`); every
+rely run is a run of M (`lemma_rely_is_nic_run`); and a worker's own verbs are foreign steps
+for every disjoint share (`lemma_mine_is_foreign`, the guarantee) and keep its own share well
+formed (`lemma_mine_keeps_share_wf`).
+
 **The refinement theorem's composition** (`refinement.rs`). `theorem_1` proves that for any
 implementation meeting the obligations of the `Refines` trait, along any execution, A's and
 M's invariants hold, every verb met its precondition (S2), and A and M stay coupled.
@@ -100,39 +116,90 @@ moved out of a clogged ring is covered as well (`with_side`): moving a result th
 step, taking it is A's `take` with the outcome and leases the ring gave (no step for a
 refused one). This is the ring's share of the obligations of `Refines`.
 
-**The trusted verbs** (`trusted.rs`). The data path's calls into the NIC (`start`, `post`,
-`doorbell`, `abort`, `post_recv`, `poll`) have contracts taken from M: each requires M's
-precondition and ensures the NIC's own steps followed by the verb's (`doorbell` posts the WRs
-written since `start` as one `post_send`; `poll` reports the CQE each `poll_cq` step pops).
-The NIC's state is a ghost token (`NicToken`) nothing else can make. These are trusted, not
-proved; they are the interface the worker and its queue pairs are to be verified against.
+The ring also states its WQE accounting (`spec_wqe_retired`, `spec_wqe_committed`,
+`spec_wqe_posted`, `lemma_wqes`): `push_wqe` hands out the next number, `commit` commits every
+number handed out, an abort takes the uncommitted ones back, `complete` retires no WQE past the
+one completed, and the other operations leave the numbers alone. The worker needs this to
+relate a ring to its queue in M.
+
+**The `wr_id`** (`wr_id.rs`). `wr_id` packs a QP's index, the queue and the low 47 bits of a
+WQE number; `index_of`, `is_recv` and `wqe_of` are proved to recover them, `wqe_of` for every
+WQE at most 2^47 after the oldest in flight (`lemma_wr_id_fields`, `lemma_low_bits_determine`,
+bit-vector proofs).
+
+**The worker's hardware side** (`hw.rs`). Everything of a worker that M sees lives in `Hw`: its
+CQ, each QP's hardware handle with the rings of its two queues, the WQE a request holds back
+with its parts, and the worker's token (`NicToken`: M's state as the worker last saw it and its
+share of M). The unverified `Worker` (`worker.rs`) drives it through its public methods only,
+each of which requires and keeps the invariant `Hw::inv`:
+
+- every call into the NIC goes through a trusted verb of `trusted.rs` whose precondition is
+  M's, so Verus checks S2 at each call: `create_qp` (M's reservation: the CQ's reserved count
+  in M is exactly `Hw::reserved`, and a QP is created only if its depths fit, so no CQ can
+  overrun), `connect` (from `Reset` only), `to_error`, the doorbell (only on a QP M sees in
+  `Rts` or `Err`, with room in the queue from the ring's accounting and every WR M accepts:
+  its scatter/gather count, operation, length and registered regions), `post_recv`, `poll`,
+  `destroy_qp` and `destroy_cq`;
+- the coupling: QP `i` of the table is M's QP `id`, M's queue holds the ring's WQEs from at or
+  after the oldest in flight to the last committed, and the `k`-th has the `wr_id` of index
+  `i`, its queue and number `head + k`; the phase the worker knows is M's state;
+- routing (`progress`, `dispatch`): each completion `ibv_poll_cq` reports is the CQE M's
+  `poll_cq` pops (`lemma_poll_steps` takes a poll apart), which names a live QP of the
+  worker's share; its `wr_id` decodes to exactly that QP's index, queue and WQE, which the ring
+  retires while M retires it too: the request a completion reaches is that WQE's;
+- teardown: `start_drain` moves a QP with work in flight to `Err`, `post_drain` writes the
+  drain WQE (a signaled SEND of nothing, which M accepts in `Err`), and `destroy` destroys a QP
+  only when neither ring has a WQE in flight, which the coupling turns into M's empty queues,
+  `destroy_qp`'s precondition; `finish` destroys the CQ only with no QP left;
+- under rely, the invariant survives whatever the NIC and the other workers do between two
+  calls (`lemma_rely`).
+
+**The trusted verbs** (`trusted.rs`). The core's calls into the NIC have contracts taken from
+M: each requires M's precondition, on the token's own share, and ensures that M moved by rely
+steps and then by the verb's step (`doorbell` posts the WRs written since `start` as one
+`post_send`; `poll` reports the CQE each `poll_cq` step pops; `connect` is three `modify_qp`
+steps). The token is one worker's and only these wrappers make or change it: `create_cq` makes
+a token over a fresh share. These are trusted, not proved.
 
 ### Stated, not yet proved
 
 - **Theorem 1 for the real library.** The obligations of `Refines` (start states; every API
   call is zero or more steps of A and of M; the invariant couples A and M) are what
-  `safeverbs-core` must prove. The ring discharges its share against A (above); what remains
-  is the worker and its queue pairs (`worker.rs`, still outside `verus!`):
-  - calling the trusted verbs with their preconditions (S2), including M's `create_qp`
-    reservation, which the worker checks when it attaches a queue pair to its CQ (the sum of
-    the depths within the CQ's size), and `destroy_qp`, which M allows only with empty queues
-    (the worker drains a queue pair before destroying it, `design.md` section 10, which the
-    simulated NIC checks at run time: it panics on a queue pair destroyed with a WQE not
-    retired, and on work posted in RESET);
-  - the map from requests to WQEs that couples A and M: the `wr_id` the worker builds from
-    the queue pair's index, the queue and the low bits of the ring's WQE number, and its
-    recovery from a completion (`wqe_of`), which must name the WQE M's `poll_cq` retired, for
-    the right queue pair even after another took a removed one's index (the worker drains
-    the CQ first);
-  - the lease tokens: the buffers (`buf.rs`), whose allocation, splitting, freezing and
-    exposure are A's buffer transitions, as linear ghost permissions (below);
-  - the worker's share of M: M is one state for the whole device, while each worker, with its
-    CQ and queue pairs, belongs to one thread and moves between threads alone, so the token
-    the trusted verbs take must be split per worker (a tokenized M, or one token per worker
-    over its CQ and queue pairs).
+  `safeverbs-core` must prove. Today:
+  - **M's side is proved for the worker** (`hw.rs`): every verb the worker calls meets M's
+    precondition (S2) in the state the worker last saw, which under rely means it does when it
+    happens; M stays in states its invariants hold in; and the rings stay coupled to M's
+    queues, so the completion routed to a request is its own WQE's (F1's routing half) and the
+    reservation keeps the CQ from overrunning. This holds for every operation of the
+    synchronous worker, the event loop's and the futures' alike, since both go through `Hw`.
+  - **A's side is proved for the ring** (`refine.rs`), not yet for the worker: the worker has
+    no ghost map from its rings' requests to A's leases (`ids`, `dirs` of `placed`), and so no
+    `impl Refines`. What that needs: the ghost state of A (which leases the program holds) in
+    the worker, which only the buffers can supply (next point); and the A-side counterpart of
+    rely, since A, too, is one state for every thread.
+  - **Buffers.** `buf.rs` is outside `verus!`: a part's range, domain and uniqueness, and the
+    registration of its region while its lease lives, are a trusted boundary
+    (`registered`, `registered_all`, the part accessors). Lease memory as linear ghost
+    permissions (vstd `PointsToRaw` or a token of our own) moving into the NIC's share on
+    commit and back on retire would turn S1 into a byte-level fact against M and supply A's
+    leases; this is not done.
+  - **Composition.** Each worker's view is coupled to M under rely, and every worker verb is a
+    foreign step for the others (`lemma_mine_is_foreign`); that the interleaving of all
+    threads' steps is a run of M follows, but is argued, not a theorem in Verus (the tokens are
+    not split from one global token: `create_cq` makes each). The control path (allocating
+    PDs, registering and deregistering regions in `buf.rs` and `pd.rs`) is not verified; rely
+    assumes it deregisters no region a worker's written WR names, which leases ensure.
+  - **One gap in the coupling of outcomes.** M lets the NIC choose any outcome for a successful
+    send (status, length), and records it when a later completion retires the WR; the ring
+    gives an unsignaled request the outcome it implied at posting (success with the posted
+    length). Their statuses agree (M proves an unsignaled retired WR succeeded) but their
+    lengths need not, so the F1 coupling `outcomes[r] == retired[wqe[r]]` cannot hold for
+    unsignaled requests as stated. Either M fixes a successful send's reported length to its
+    WR's total length (a change to the trusted model) or the coupling compares statuses for
+    unsignaled requests; this is left open.
 
-  Until then Theorem 1 holds for any implementation that discharges the obligations, and for
-  the ring's part of SafeVerbs.
+  Until then Theorem 1 holds for any implementation that discharges the obligations; the core
+  discharges M's side for the worker and A's side for the ring.
 - **Theorem 2**, two SafeVerbs endpoints under assume-guarantee (no receiver-not-ready or
   remote access errors; every error completion due to a fault). It is stated in
   `refinement.rs` and `design.md` only.
@@ -158,21 +225,40 @@ exists. Each of them, and why it is trusted:
 | `ring.rs` `wake` | `Waker::wake` wakes the task (no contract: the ring logs the waker's name itself) |
 | `ring.rs` `will_wake` | `Waker::will_wake`: when it says two wakers wake the same task, they share a name in A (`waker_id`) |
 | `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name |
-| `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp` | the definitions of these plain data types, as written in `nic.rs` |
-| `trusted.rs` `ExError` | `Error` is an opaque type |
-| `trusted.rs` `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
+| `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
+| `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExPd`, `ExPart`, `ExLeases` | these types are opaque (only the device or `buf.rs` reads them) |
+| `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
+| `trusted.rs` `device_caps` | the device's limits as the library reads them are M's (`caps_model`) |
+| `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a name never used, after whatever happened before, in a state where M's invariants hold; the new worker's share is that CQ and QP names nobody uses (this is where tokens come from) |
+| `trusted.rs` `alloc_domain` | thread domains change which locks the driver takes, not what the NIC does (no contract) |
+| `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these verbs are M's `create_qp` (with the attributes `qp_attr` says), three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or (on error) nothing, after rely steps |
+| `trusted.rs` `qp_num_of`, `qp_lock_free` | facts of no meaning in M (no contract) |
+| `trusted.rs` `no_qp` | panics: a key that names no QP never returns |
+| `trusted.rs` `pd_id_of`, `part_sge_of`, `part_pd_of`, `part_writable_of` | read the fields of a buffer part and its PD (`buf.rs`, `pd.rs`) |
+| `trusted.rs` `registered`, `registered_all` | a part's lease promises its region is registered in its domain (writable if the part is unique) and stays so while the lease lives (`buf.rs`'s `Region`); learning it moves the view to the present |
+| `trusted.rs` `no_leases`, `keep_lease` | `Leases::default` and `Leases::push` keep the leases they are given |
 | `trusted.rs` `start`, `post`, `abort` | `ibv_wr_start`, `ibv_wr_*`, `ibv_wr_abort`: writing WRs changes nothing in M until the doorbell; an abort discards them |
-| `trusted.rs` `doorbell` | `ibv_wr_complete` is M's `post_send` of the WRs written since the start (after the NIC's own steps), or nothing on error |
+| `trusted.rs` `doorbell` | `ibv_wr_complete` is M's `post_send` of the WRs written since the start (after rely steps), or nothing on error |
 | `trusted.rs` `post_recv` | `ibv_post_recv` of one WR is M's `post_recv`, or nothing on error |
 | `trusted.rs` `poll` | each CQE `ibv_poll_cq` returns is the one M's `poll_cq` pops, with its `wr_id` and outcome |
 
-Two modelling choices sit in these contracts: M has no atomics, and the contracts treat a
-fetch-and-add or compare-and-swap as an RDMA READ (locally both have the NIC write the local
-buffer); and a `Wc`'s status maps to M's six statuses as `Status::model` says.
+Every wrapper's rely pins the regions the worker's written WRs name (`pinned`): their leases
+are held (by the hardware side, for the WQE a request holds back and its parts), so no other
+thread deregisters them meanwhile.
 
-`Waker::wake` and the verbs' bodies are the only code the proofs call without checking it.
+Modelling choices sit in these contracts: M has no atomics, and the contracts treat a
+fetch-and-add or compare-and-swap as an RDMA READ (locally both have the NIC write the local
+buffer); a `Wc`'s status maps to M's six statuses as `Status::model` says; M has one limit of
+scatter/gather elements per QP, the smaller of the QP's send and receive limits (the worker
+holds every WQE to it); and safeverbs posts no inline data, so M sees a QP's inline limit as
+zero.
+
+`Waker::wake` and the wrappers' bodies are the only code the proofs call without checking it.
 The rest of `safeverbs-core` (`buf.rs`, `worker.rs`, `verbs.rs`, `model.rs`, `pd.rs`) is
-outside `verus!`: not trusted by the proofs, but not verified either (see above).
+outside `verus!`: not trusted by the proofs, but not verified either. `worker.rs` holds no
+state M sees (keys, the event loop's cursors, the drain's clock): it cannot break the coupling,
+only misuse the API, which `Hw` handles. The futures layer (`safeverbs`) is safe Rust on top
+of the worker, outside Verus.
 
 Liveness is outside the claim: that every request eventually completes needs the NIC to
 make progress, the executor to poll woken tasks and someone to poll the CQ.
@@ -194,8 +280,8 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 115 verified, 0 errors
-safeverbs-core: verification results:: 136 verified, 0 errors
+safeverbs-spec: verification results:: 131 verified, 0 errors
+safeverbs-core: verification results:: 228 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only
@@ -286,54 +372,58 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_k
 ## How the core connects to the model
 
 The core's state carries ghost state that the abstraction function reads: a tracked token
-whose view is M's state, the map from requests to WRs, and the leases of A. Three pieces
-connect it to the specification crate. The first two exist (`trusted.rs`, `refine.rs`); the
-third waits for the queue pair to move into `verus!`.
+whose view is M's state, the map from requests to WRs, and the leases of A. Four pieces
+connect it to the specification crate. The first three exist (`trusted.rs`, `hw.rs`,
+`refine.rs`); the fourth, the leases as permissions, does not yet.
 
 **Trusted verbs wrappers** (`trusted.rs`). Each verb is one small function with an
 `external_body` and a contract taken from M. The precondition is checked by Verus at every
-call site, which is S2; the postcondition says the verb happened after whatever the NIC did
-meanwhile, which `lemma_nic_env_keeps_enabled` shows is consistent. The sketch below was the
-plan; the module follows it, with the WRs written since `start` kept in the token and
-posted together by the doorbell:
+call site, which is S2; the postcondition says the verb happened after rely steps (the NIC's
+own, and the other workers' on their own shares), which `share::lemma_rely_keeps_enabled`
+shows is consistent. The WRs written since `start` are kept in the token and posted together
+by the doorbell:
 
 ```rust
-verus! {
-#[verifier::external_body]
-fn post_send(qp: &RawQp, wrs: &WrList, Tracked(nic): Tracked<&mut NicToken>)
+pub fn doorbell<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracked<&mut NicToken>)
+    -> (r: Result<()>)
     requires
-        nic_inv(nic.view()),
-        nic_enabled(nic.view(), Nic::Step::post_send(qp.id(), wrs.view())),
+        qp_of(*old(qp)) == q,
+        old(token).started(q),
+        nic_inv(old(token).nic()),
+        share_wf(old(token).nic(), old(token).share()),
+        old(token).share().owns.contains(q),
+        nic_enabled(old(token).nic(), Nic::Step::post_send(q, old(token).written(q))),
     ensures
-        exists|mid: Nic::State| nic_env_reaches(old(nic).view(), mid)
-            && nic_step(mid, final(nic).view(), Nic::Step::post_send(qp.id(), wrs.view())),
-{
-    // ibv_post_send(qp.raw, wrs.head, &mut bad)
-}
-}
+        r is Ok ==> exists|mid: Nic::State|
+            rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid)
+                && nic_step(mid, final(token).nic(), Nic::Step::post_send(q, old(token).written(q))),
+        // ...
 ```
 
-Polling is the same with `Nic::Step::poll_cq`, and returns the CQE that M's `poll_cq` pops.
+**The hardware side** (`hw.rs`). A ghost token cannot cross unverified code (a caller
+outside `verus!` cannot pass a `Tracked` argument without assuming it), so the token lives
+inside `Hw`, a verified struct with private fields, next to everything the token describes:
+the CQ, the QPs' handles and rings, the held WQE and its parts. Its public methods require and
+keep `Hw::inv`; nothing outside the module can touch its fields, so the invariant holds
+whenever the unverified worker calls in.
 
 **Leases.** The ring tracks each request's leases as the value itself: the `L` A sees a
 request hold is the one `end` moved into its slot, and `take` or `abort_keeping` hands back
-that value (`refine.rs`); the ghost maps from sequence numbers to A's lease ids and
-directions belong to the queue pair. The plan for the buffers is linear ghost permissions,
-below. A ghost token cannot cross unverified code (a caller outside `verus!` cannot pass a
-`Tracked` argument without assuming it), so the permissions come with the queue pair's move
-into `verus!`; and since M is one state for the whole device while each worker moves
-between threads alone, the worker will need its own share of M (a tokenized M, or one
-token per worker over M's state of its CQ and queue pairs).
+that value (`refine.rs`). The ghost maps from sequence numbers to A's lease ids and
+directions would belong to the QP entries of `Hw`; they wait for the buffers.
 
-**Memory as linear ghost permissions.** The core holds vstd's `PointsToRaw` permission for
-every byte of every buffer. A `BufMut` or `Buf` carries the permissions for its bytes (a
-`Buf` shares them read-only). Posting moves the permissions of the WR's bytes into the NIC
-token, and the trusted poll wrapper hands back the permissions of the WRs a CQE retires; the
-token's contract keeps the permissions it holds in step with what M says the NIC may access
-(`nic_may_read`, `nic_may_write`). Ordinary Verus ownership checking then gives S1 for the
-implementation, and turning bytes into a `T` goes through `FromBytes` or `TryFromBytes`.
+**Memory as linear ghost permissions (not done).** The core would hold vstd's `PointsToRaw`
+permission for every byte of every buffer. A `BufMut` or `Buf` carries the permissions for its
+bytes (a `Buf` shares them read-only). Posting moves the permissions of the WR's bytes into
+the worker's share of the NIC, and the poll hands back the permissions of the WRs a CQE
+retires; the token's contract keeps the permissions it holds in step with what M says the NIC
+may access (`nic_may_read`, `nic_may_write`). Ordinary Verus ownership checking then gives S1
+for the implementation, and turning bytes into a `T` goes through `FromBytes` or
+`TryFromBytes`. This needs `buf.rs` inside `verus!`, so that the permissions originate in
+verified code; today `registered` stands in for the part of it the doorbell needs.
 
-**The `Refines` implementation.** The core implements `refinement::Refines` for its state,
-relates each public function's postcondition to `step`, and proves the three obligations;
-`theorem_1` does the rest. The ring's lemmas in `refine.rs` (`lemma_ring_*`) are the steps of
-A for its part of each call.
+**The `Refines` implementation (not done).** The core would implement `refinement::Refines`
+for a worker's state (its `Hw`, with A's state as the worker last saw it), relate each public
+function's postcondition to `step`, and prove the three obligations; `theorem_1` does the
+rest. The M obligations are what `Hw`'s methods prove; the ring's lemmas in `refine.rs`
+(`lemma_ring_*`) are the steps of A for each call's ring part.

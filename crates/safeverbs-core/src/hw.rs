@@ -6,7 +6,7 @@
 //! (`crate::trusted::NicToken`: M's state as the worker last saw it, and its
 //! share of M). Every call into the NIC goes through the trusted verbs of
 //! `crate::trusted`, whose preconditions are M's, so Verus checks S2 at each
-//! call. The invariant ([`Hw::inv`]) couples the rings to M:
+//! call. The invariant (`Hw::inv`) couples the rings to M:
 //!
 //! - **Routing.** QP `i` of the table is M's QP `id`; the WQEs M holds in
 //!   its send queue are the ring's WQEs from (at or after) the ring's oldest
@@ -3558,7 +3558,8 @@ impl<N: Device> Hw<N> {
     }
 
     /// Waits until a new send request of at least one WQE fits on QP
-    /// `index` ([`Hw::make_send_room`]).
+    /// `index`: rings its doorbell for what is written and polls the CQ until
+    /// a slot and a WQE are free.
     pub fn make_room(&mut self, index: usize) -> (r: Result<()>)
         requires
             old(self).inv(),

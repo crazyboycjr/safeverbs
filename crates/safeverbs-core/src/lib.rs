@@ -14,8 +14,13 @@
 //! - [`ring`]: the completion ring of a work queue, pure bookkeeping
 //!   without FFI or `unsafe`, verified with Verus; [`refine`] proves that
 //!   it refines the abstract machine of `safeverbs-spec`;
-//! - [`trusted`]: the verbs of the data path with their contracts from the
-//!   NIC model, the interface the queue pairs are to be verified against;
+//! - [`trusted`]: the verbs with their contracts from the NIC model;
+//! - [`wr_id`]: the `wr_id` of a WQE and how a completion is routed back by
+//!   it, verified;
+//! - [`hw`]: the hardware side of a worker (its CQ, its QPs' queues and
+//!   rings, its share of the NIC model), verified against the trusted verbs:
+//!   every verb meets the model's precondition, the rings stay coupled to the
+//!   model's queues, and QPs are destroyed only once drained;
 //! - [`worker`]: a completion queue and the queue pairs attached to it,
 //!   driven synchronously ([`Worker`]): post requests into the rings and the
 //!   hardware queues, commit them with one doorbell, poll the CQ, and get
