@@ -476,7 +476,7 @@ impl<N: Device> Hw<N> {
     proof fn lemma_inv_fields(&self, other: &Self, t: NicToken, m: Nic::State)
         requires
             other.inv_with(t, m),
-            self.cq == other.cq,
+            cq_of(self.cq) == cq_of(other.cq),
             self.pd == other.pd,
             self.caps == other.caps,
             self.qps@ == other.qps@,
@@ -1383,6 +1383,374 @@ impl<N: Device> Hw<N> {
             }
         }
         r
+    }
+}
+
+// =============================================================================
+// Completions
+
+/// Completions taken from the CQ per poll.
+pub const POLL_BATCH: usize = 16;
+
+/// A placeholder completion.
+pub const EMPTY_WC: Wc = Wc {
+    wr_id: 0,
+    status: crate::wc::Status(0),
+    opcode: Opcode(0),
+    byte_len: 0,
+    imm: None,
+    vendor_err: 0,
+    qp_num: 0,
+};
+
+/// The steps of a poll that gave `wcs`, in order: for each completion, the
+/// state before its `poll_cq` step and the state after it; steps that do
+/// not touch the share come before the first and between the others.
+pub open spec fn poll_steps(
+    sh: Share,
+    pins: ISet<Key>,
+    m: Nic::State,
+    m2: Nic::State,
+    wcs: Seq<Wc>,
+    befores: Seq<Nic::State>,
+    afters: Seq<Nic::State>,
+) -> bool {
+    &&& befores.len() == wcs.len()
+    &&& afters.len() == wcs.len()
+    &&& forall|j: int|
+        0 <= j < wcs.len() ==> nic_step(#[trigger] befores[j], afters[j], Nic::Step::poll_cq(sh.cq))
+            && reports(wcs[j], befores[j].cqs[sh.cq].entries[0])
+    &&& wcs.len() == 0 ==> rely_reaches(sh, pins, m, m2)
+    &&& wcs.len() > 0 ==> rely_reaches(sh, pins, m, befores[0]) && afters.last() == m2
+    &&& forall|j: int| 1 <= j < wcs.len() ==> rely_reaches(sh, pins, #[trigger] afters[j - 1], befores[j])
+}
+
+/// A poll's steps, in order.
+proof fn lemma_poll_steps(sh: Share, pins: ISet<Key>, m: Nic::State, m2: Nic::State, wcs: Seq<Wc>) -> (r: (
+    Seq<Nic::State>,
+    Seq<Nic::State>,
+))
+    requires
+        polled(sh, pins, m, m2, wcs),
+    ensures
+        poll_steps(sh, pins, m, m2, wcs, r.0, r.1),
+    decreases wcs.len(),
+{
+    if wcs.len() == 0 {
+        (Seq::empty(), Seq::empty())
+    } else {
+        let (mid, before) = choose|mid: Nic::State, before: Nic::State|
+            {
+                &&& polled(sh, pins, m, mid, wcs.drop_last())
+                &&& rely_reaches(sh, pins, mid, before)
+                &&& nic_step(before, m2, Nic::Step::poll_cq(sh.cq))
+                &&& reports(wcs.last(), before.cqs[sh.cq].entries[0])
+            };
+        let (b, a) = lemma_poll_steps(sh, pins, m, mid, wcs.drop_last());
+        let befores = b.push(before);
+        let afters = a.push(m2);
+        let k = wcs.len() - 1;
+        assert forall|j: int| 0 <= j < wcs.len() implies nic_step(#[trigger] befores[j], afters[j], Nic::Step::poll_cq(sh.cq))
+            && reports(wcs[j], befores[j].cqs[sh.cq].entries[0]) by {
+            if j < k {
+                assert(befores[j] == b[j] && afters[j] == a[j] && wcs[j] == wcs.drop_last()[j]);
+            } else {
+                assert(wcs[j] == wcs.last());
+            }
+        }
+        if k == 0 {
+            lemma_rely_trans(sh, pins, m, mid, before);
+        } else {
+            assert(rely_reaches(sh, pins, m, b[0]));
+            assert(befores[0] == b[0]);
+        }
+        assert forall|j: int| 1 <= j < wcs.len() implies rely_reaches(sh, pins, #[trigger] afters[j - 1], befores[j]) by {
+            if j < k {
+                assert(afters[j - 1] == a[j - 1] && befores[j] == b[j]);
+            } else {
+                assert(afters[j - 1] == a.last());
+            }
+        }
+        (befores, afters)
+    }
+}
+
+impl<N: Device> Hw<N> {
+    /// Routes one completion, the one `before`'s `poll_cq` step reports, to
+    /// its QP's ring: its `wr_id` names the QP's index, the queue and the
+    /// WQE, which the ring retires (with every earlier request it ends).
+    fn dispatch(&mut self, wc: &Wc, Ghost(t): Ghost<NicToken>, Ghost(before): Ghost<Nic::State>, Ghost(after): Ghost<Nic::State>)
+        requires
+            old(self).inv_with(t, before),
+            nic_step(before, after, Nic::Step::poll_cq(t.share().cq)),
+            reports(*wc, before.cqs[t.share().cq].entries[0]),
+        ensures
+            final(self).inv_with(t, after),
+            final(self).token == old(self).token,
+            final(self).qps@.len() == old(self).qps@.len(),
+    {
+        let ghost sh = t.share();
+        let ghost c = sh.cq;
+        let ghost start = *self;
+        let ghost e = before.cqs[c].entries[0];
+        proof {
+            safeverbs_spec::nic_proofs::lemma_head_is_first(before, c);
+            lemma_poll(before, after, c);
+            assert(share_wf(before, sh));
+            assert(sh.owns.contains(e.qp));
+        }
+        let ghost i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == e.qp;
+        let ghost qp = before.qps[e.qp];
+        proof {
+            assert(start.entry_ok(i, t, before));
+            lemma_wr_id_fields(i as u16, e.queue is Recv, e.seq as u64);
+            if e.queue is Send {
+                assert(qp.sq[e.seq - qp.sq_head].wr.wr_id == spec_wr_id(i as u16, false, e.seq as u64));
+            } else {
+                assert(qp.rq[e.seq - qp.rq_head].wr.wr_id == spec_wr_id(i as u16, true, e.seq as u64));
+            }
+        }
+        let index = index_of(wc.wr_id);
+        let recv = is_recv(wc.wr_id);
+        proof {
+            assert(index == i);
+            assert(recv == (e.queue is Recv));
+        }
+        if index >= self.qps.len() {
+            return;
+        }
+        match &mut self.qps[index] {
+            Some(qp_entry) => {
+                let ghost e0 = *qp_entry;
+                let retired;
+                let changed;
+                if recv {
+                    let ghost send0 = qp_entry.send;
+                    retired = qp_entry.recv.retired();
+                    proof {
+                        e0.recv.lemma_wqes();
+                        lemma_low_bits_determine(e.seq as u64, e.seq as u64, e0.recv.spec_wqe_retired());
+                    }
+                    let wqe = wqe_of(wc.wr_id, qp_entry.recv.wqe_retired());
+                    proof {
+                        assert(wqe == e.seq);
+                    }
+                    let known = qp_entry.recv.complete(wqe, *wc);
+                    changed = qp_entry.recv.retired() != retired;
+                    proof {
+                        assert(qp_entry.send == e0.send);
+                    }
+                } else {
+                    retired = qp_entry.send.retired();
+                    proof {
+                        e0.send.lemma_wqes();
+                    }
+                    let wqe = wqe_of(wc.wr_id, qp_entry.send.wqe_retired());
+                    proof {
+                        assert(wqe == e.seq);
+                    }
+                    let known = qp_entry.send.complete(wqe, *wc);
+                    changed = qp_entry.send.retired() != retired;
+                    proof {
+                        assert(qp_entry.recv == e0.recv);
+                    }
+                }
+                if changed && !qp_entry.dirty && !qp_entry.removed {
+                    qp_entry.dirty = true;
+                    self.dirty.push(index as u16);
+                }
+            },
+            None => {},
+        }
+        proof {
+            let q = e.qp;
+            let qp2 = after.qps[q];
+            let en = self.qps@[i]->0;
+            let e0 = start.qps@[i]->0;
+            let nn = (e.seq + 1 - (if e.queue is Send { qp.sq_head } else { qp.rq_head })) as int;
+            lemma_nic_step_is_next(before, after, Nic::Step::poll_cq(c));
+            lemma_step_keeps_invariant(before, after);
+            lemma_mine_keeps_share_wf(sh, ISet::empty(), before, after, Nic::Step::poll_cq(c));
+            if e.queue is Send {
+                assert forall|k: int| 0 <= k < qp2.sq.len() implies (#[trigger] qp2.sq[k]).wr.wr_id == spec_wr_id(
+                    i as u16,
+                    false,
+                    (qp2.sq_head + k) as u64,
+                ) by {
+                    assert(qp2.sq[k] == qp.sq[k + nn]);
+                }
+                assert(sq_linked(en.send, i as u16, qp2));
+                assert(rq_linked(en.recv, i as u16, qp2));
+            } else {
+                assert forall|k: int| 0 <= k < qp2.rq.len() implies (#[trigger] qp2.rq[k]).wr.wr_id == spec_wr_id(
+                    i as u16,
+                    true,
+                    (qp2.rq_head + k) as u64,
+                ) by {
+                    assert(qp2.rq[k] == qp.rq[k + nn]);
+                }
+                assert(sq_linked(en.send, i as u16, qp2));
+                assert(rq_linked(en.recv, i as u16, qp2));
+            }
+            let written = t.written(q);
+            assert forall|j: int| 0 <= j < written.len() implies after.send_wr_ok(qp2.attr, #[trigger] written[j]) by {
+                assert(before.send_wr_ok(qp.attr, written[j]));
+            }
+            assert(self.entry_ok(i, t, after));
+            // `poll_cq` changed only QP `q` and the CQ's entries.
+            assert(after.cqs[c].reserved == before.cqs[c].reserved);
+            assert forall|w: WqeRef| #[trigger] after.retired.contains_key(w) implies before.retired.contains_key(w) || w.qp == q by {
+                reveal(retires);
+            }
+            self.lemma_poll_one(&start, t, before, after, i);
+        }
+    }
+
+    /// After a `poll_cq` step that changed only entry `index`'s QP and
+    /// retired WQEs of it (and a change of that entry), the invariant holds
+    /// again.
+    proof fn lemma_poll_one(&self, start: &Self, t: NicToken, mid: Nic::State, n: Nic::State, index: int)
+        requires
+            start.inv_with(t, mid),
+            nic_inv(n),
+            share_wf(n, t.share()),
+            0 <= index < start.qps@.len(),
+            start.qps@[index] is Some,
+            self.qps@.len() == start.qps@.len(),
+            forall|i: int| 0 <= i < self.qps@.len() && i != index ==> #[trigger] self.qps@[i] == start.qps@[i],
+            self.qps@[index] is Some,
+            self.qps@[index]->0.id() == start.qps@[index]->0.id(),
+            self.entry_ok(index, t, n),
+            self.cq == start.cq,
+            self.pd == start.pd,
+            self.caps == start.caps,
+            self.cq_size == start.cq_size,
+            self.reserved == start.reserved,
+            self.next_name == start.next_name,
+            n.qps.dom() =~= mid.qps.dom(),
+            forall|p: QpId| #[trigger] mid.qps.contains_key(p) && p != start.qps@[index]->0.id() ==> n.qps[p] == mid.qps[p],
+            n.caps == mid.caps,
+            n.mrs == mid.mrs,
+            n.pds == mid.pds,
+            forall|w: WqeRef| #[trigger] n.retired.contains_key(w) ==> mid.retired.contains_key(w) || w.qp == start.qps@[index]->0.id(),
+            n.cqs[t.share().cq].cap == mid.cqs[t.share().cq].cap,
+            n.cqs[t.share().cq].reserved == mid.cqs[t.share().cq].reserved,
+        ensures
+            self.inv_with(t, n),
+    {
+        let q = start.qps@[index]->0.id();
+        assert(start.entry_ok(index, t, mid));
+        assert forall|i: int| 0 <= i < self.qps@.len() implies #[trigger] self.entry_ok(i, t, n) by {
+            if i != index {
+                assert(start.entry_ok(i, t, mid));
+                if let Some(e) = self.qps@[i] {
+                    assert(e.id() != q);
+                    lemma_ok_same(e, i as u16, mid, n, t.share(), t.pd(), t.started(e.id()), t.written(e.id()));
+                }
+            }
+        }
+        assert forall|i: int, j: int|
+            #![trigger self.qps@[i], self.qps@[j]]
+            0 <= i < self.qps@.len() && 0 <= j < self.qps@.len() && i != j && self.qps@[i] is Some
+                && self.qps@[j] is Some implies self.qps@[i]->0.id() != self.qps@[j]->0.id() by {
+            if i != index && j != index {
+                assert(self.qps@[i] == start.qps@[i] && self.qps@[j] == start.qps@[j]);
+            } else if i == index {
+                assert(self.qps@[j] == start.qps@[j]);
+            } else {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|p: QpId| #[trigger] n.qps.contains_key(p) && t.share().owns.contains(p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            assert(mid.qps.contains_key(p));
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            if i != index {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|p: QpId| #[trigger] writes(t, p) implies exists|i: int|
+            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
+            if i != index {
+                assert(self.qps@[i] == start.qps@[i]);
+            }
+        }
+        assert forall|k: nat| k >= self.next_name@ implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
+            assert(!mid.qps.contains_key(t.name(k)));
+        }
+        assert forall|k: nat, w: WqeRef| k >= self.next_name@ && #[trigger] n.retired.contains_key(w)
+            implies w.qp != #[trigger] t.name(k) by {
+            assert(mid.qps.contains_key(q));
+            assert(!mid.qps.contains_key(t.name(k)));
+        }
+    }
+
+    /// Polls the CQ once, retiring what completed in the rings of its QPs
+    /// (and waking the wakers registered there); returns the number of
+    /// completions.
+    pub fn progress(&mut self) -> (n: usize)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+    {
+        let mut wcs = [EMPTY_WC; POLL_BATCH];
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        let ghost sh = t0.share();
+        let ghost start = *self;
+        let n = poll(&mut self.cq, &mut wcs, Tracked(self.token.borrow_mut()));
+        let ghost t = self.token@;
+        let ghost m2 = t.nic();
+        let ghost done = wcs@.take(n as int);
+        let ghost (befores, afters) = lemma_poll_steps(sh, pinned(t0), m0, m2, done);
+        proof {
+            self.lemma_inv_fields(&start, t0, m0);
+            assert(done.len() == n);
+        }
+        let mut i = 0;
+        while i < n
+            invariant
+                0 <= i <= n,
+                sh == t0.share(),
+                n <= wcs@.len(),
+                done == wcs@.take(n as int),
+                done.len() == n,
+                poll_steps(sh, pinned(t0), m0, m2, done, befores, afters),
+                self.token@ == t,
+                t.same_worker(&t0),
+                t.same_writings(&t0),
+                self.qps@.len() == start.qps@.len(),
+                self.inv_with(t0, if i == 0 { m0 } else { afters[i - 1] }),
+            decreases n - i,
+        {
+            proof {
+                assert(0 <= i < done.len());
+                assert(done[i as int] == wcs@[i as int]);
+                if i == 0 {
+                    assert(rely_reaches(sh, pinned(t0), m0, befores[0]));
+                    self.lemma_rely(t0, m0, befores[0]);
+                } else {
+                    let j = i as int;
+                    assert(rely_reaches(sh, pinned(t0), afters[j - 1], befores[j]));
+                    self.lemma_rely(t0, afters[j - 1], befores[j]);
+                }
+                assert(nic_step(befores[i as int], afters[i as int], Nic::Step::poll_cq(t0.share().cq)));
+                assert(reports(wcs@[i as int], befores[i as int].cqs[t0.share().cq].entries[0]));
+            }
+            self.dispatch(&wcs[i], Ghost(t0), Ghost(befores[i as int]), Ghost(afters[i as int]));
+            i += 1;
+        }
+        proof {
+            if n == 0 {
+                self.lemma_rely(t0, m0, m2);
+            } else {
+                assert(afters[n - 1] == afters.last());
+            }
+            self.lemma_same_token(t0, t, m2);
+        }
+        n
     }
 }
 

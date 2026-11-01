@@ -2119,6 +2119,7 @@ impl<L> Ring<L> {
             final(self).spec_depth() == old(self).spec_depth(),
             old(self).spec_wqe_retired() <= final(self).spec_wqe_retired(),
             wqe >= old(self).spec_wqe_retired() ==> final(self).spec_wqe_retired() <= wqe + 1,
+            final(self).spec_is_open() == old(self).spec_is_open(),
     {
         if wqe >= self.wqe_committed {
             return false;
@@ -2146,6 +2147,7 @@ impl<L> Ring<L> {
                 self.wqe_committed == pre.wqe_committed,
                 self.wqe_posted == pre.wqe_posted,
                 self.depth == pre.depth,
+                self.open == pre.open,
                 pre.wqe_retired <= self.wqe_retired <= wqe + 1,
                 wqe < self.wqe_committed,
                 pre.retired <= self.retired,
@@ -2306,6 +2308,7 @@ impl<L> Ring<L> {
             final(self).wqe_posted == old(self).wqe_posted,
             final(self).depth == old(self).depth,
             final(self).wqe_retired == old(self).slot(old(self).retired as int).end_wqe,
+            final(self).open == old(self).open,
             forall|s: int|
                 #[trigger] final(self).req(s) == if s == old(self).retired {
                     old(self).retired_view(s, outcome)
