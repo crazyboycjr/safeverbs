@@ -48,7 +48,7 @@ pub open spec fn share_wf(a: Abs::State, sh: Share) -> bool {
 /// Permitted interference with a fixed share. A shared clone only reads its source and
 /// allocates a distinct ID, so its source may be local. All mutations of existing leases
 /// require a foreign ID. Posting also requires a foreign QP. A's own preconditions still
-/// govern every step, including uniqueness, allocation, exposure and quiescence rules.
+/// govern every step, including uniqueness, allocation and exposure rules.
 pub open spec fn foreign(sh: Share, step: Abs::Step) -> bool {
     match step {
         Abs::Step::create_qp(q) => !sh.qps.contains(q),
@@ -361,6 +361,83 @@ pub proof fn lemma_rely_frame(sh: Share, pre: Abs::State, post: Abs::State)
         rely_run(sh, run, steps) && run[0] == pre && run.last() == post;
     lemma_rely_run(sh, run, steps);
     lemma_rely_is_abs_run(sh, run, steps);
+}
+
+/// In particular, foreign work preserves a local in-flight lease, its registered waker,
+/// and the absence of an outcome. Global wake-log growth does not consume that waker.
+pub proof fn lemma_rely_inflight(sh: Share, pre: Abs::State, post: Abs::State, r: Id)
+    requires
+        abs_inv(pre),
+        share_wf(pre, sh),
+        sh.ids.contains(r),
+        pre.in_flight(r),
+        rely_reaches(sh, pre, post),
+    ensures
+        post.in_flight(r),
+        post.leases[r] == pre.leases[r],
+        post.req(r) == pre.req(r),
+        !post.outcomes.contains_key(r),
+        post.posted[r] == pre.posted[r],
+{
+    lemma_rely_frame(sh, pre, post);
+}
+
+// =========================================================================================
+// Explicit ownership transfer, with no change to A
+
+/// Transfer live program leases between two disjoint owners. QP names do not move here,
+/// and request/exposed leases cannot be transferred by this operation. A separate protocol
+/// is needed to transfer a QP or its requests. The abstract state itself does not change.
+pub open spec fn transfer(
+    a: Abs::State,
+    from: Share,
+    to: Share,
+    moved: ISet<Id>,
+    from_after: Share,
+    to_after: Share,
+) -> bool {
+    &&& from.disjoint(to)
+    &&& moved.subset_of(from.ids)
+    &&& forall|i: Id| #[trigger] moved.contains(i) ==> a.is_program(i)
+    &&& from_after == from.with_ids(from.ids.difference(moved))
+    &&& to_after == to.with_ids(to.ids.union(moved))
+}
+
+/// Moving program-lease IDs preserves both well-formed shares and disjoint ownership,
+/// without requiring their read-only bytes to be disjoint.
+pub proof fn lemma_transfer(
+    a: Abs::State,
+    from: Share,
+    to: Share,
+    moved: ISet<Id>,
+    from_after: Share,
+    to_after: Share,
+)
+    requires
+        share_wf(a, from),
+        share_wf(a, to),
+        transfer(a, from, to, moved, from_after, to_after),
+    ensures
+        share_wf(a, from_after),
+        share_wf(a, to_after),
+        from_after.disjoint(to_after),
+        forall|i: Id| #[trigger] moved.contains(i)
+            ==> !from_after.ids.contains(i) && to_after.ids.contains(i),
+{
+    assert forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request()
+        implies !moved.contains(r) by {
+        if moved.contains(r) {
+            assert(a.is_program(r));
+        }
+    }
+    assert forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request()
+        implies (from_after.ids.contains(r) <==> from_after.qps.contains(a.req(r).qp)) by {
+        assert(!moved.contains(r));
+    }
+    assert forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request()
+        implies (to_after.ids.contains(r) <==> to_after.qps.contains(a.req(r).qp)) by {
+        assert(!moved.contains(r));
+    }
 }
 
 } // verus!
