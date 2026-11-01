@@ -3007,6 +3007,206 @@ impl<N: Device> Hw<N> {
     }
 }
 
+// =============================================================================
+// Removing QPs, and the worker
+
+impl<N: Device> Hw<N> {
+    /// Starts removing QP `index` (see `crate::worker`, "Removing QPs"):
+    /// discards the request being written and the WQEs written since the
+    /// last doorbell, gives up every request (each releases its buffers once
+    /// the NIC is done with it) and, if anything is in flight, moves the QP
+    /// to the error state, so that the NIC flushes it, and asks for a drain
+    /// WQE. From then on the index names no QP for the caller.
+    #[verifier::spinoff_prover]
+    pub fn start_drain(&mut self, index: usize)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        if index >= self.qps.len() {
+            return;
+        }
+        let ghost start = *self;
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        proof {
+            assert(start.entry_ok(index as int, t0, m0));
+        }
+        let live = match &self.qps[index] {
+            Some(e) => !e.removed,
+            None => false,
+        };
+        if !live {
+            return;
+        }
+        let busy = self.discard(index);
+        let ghost s1 = *self;
+        if busy {
+            // ERR is reachable from every state (M's `modify_qp`). A device
+            // that refuses it is left to the timeout: the QP is then kept.
+            if self.to_error(index).is_ok() {
+                let ghost s2 = *self;
+                self.set_flags(index, true, false);
+                proof {
+                    lemma_same_table_trans(self, &s2, &s1);
+                }
+            }
+        }
+        let ghost s3 = *self;
+        self.set_flags(index, false, true);
+        proof {
+            lemma_same_table_trans(&s3, &s1, &start);
+            lemma_same_table_trans(self, &s3, &start);
+        }
+    }
+
+    /// Marks QP `index` as waiting to post its drain WQE (if `drain`: when
+    /// its send queue has WQEs in flight), or as removed (if `removed`).
+    #[verifier::spinoff_prover]
+    fn set_flags(&mut self, index: usize, drain: bool, removed: bool)
+        requires
+            old(self).inv(),
+            old(self).has_qp(index as int),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        let ghost start = *self;
+        let ghost t = self.token@;
+        let ghost m = t.nic();
+        proof {
+            assert(start.entry_ok(index as int, t, m));
+        }
+        match &mut self.qps[index] {
+            Some(e) => {
+                if drain {
+                    e.drain_pending = e.send.in_flight_wqes() > 0;
+                }
+                if removed {
+                    e.removed = true;
+                    e.dirty = false;
+                    e.refused = false;
+                }
+            },
+            None => {},
+        }
+        proof {
+            assert(self.entry_ok(index as int, t, m));
+            self.lemma_touch_one(&start, t, m, m, index as int);
+        }
+    }
+
+    /// The first part of [`Hw::start_drain`]: discards what QP `index` was
+    /// writing and gives up its requests; whether anything is in flight.
+    #[verifier::spinoff_prover]
+    fn discard(&mut self, index: usize) -> (busy: bool)
+        requires
+            old(self).inv(),
+            old(self).has_qp(index as int),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        let ghost start = *self;
+        let ghost t0 = self.token@;
+        let ghost m0 = t0.nic();
+        proof {
+            assert(start.entry_ok(index as int, t0, m0));
+        }
+        let busy = match &mut self.qps[index] {
+            Some(e) => {
+                let ghost q = e.id@;
+                let open = e.send.is_open();
+                if open {
+                    e.held = None;
+                    while e.held_parts.len() > 0
+                        decreases e.held_parts@.len(),
+                    {
+                        e.held_parts.pop();
+                    }
+                    let mut leases = no_leases();
+                    core::mem::swap(&mut leases, &mut e.open_leases);
+                    e.open_bytes = 0;
+                }
+                if e.started {
+                    e.started = false;
+                    abort(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                }
+                // Nothing staged or open is posted: refused (their owners are
+                // gone too).
+                e.send.abort();
+                let ghost s1 = e.send;
+                let mut seq = e.send.head();
+                while seq < e.send.posted()
+                    invariant
+                        e.send.inv(),
+                        e.send.same_wqes(&s1),
+                        e.send.same_open(&s1),
+                        e.send.spec_posted() == s1.spec_posted(),
+                    decreases e.send.spec_posted() - seq,
+                {
+                    e.send.detach(seq);
+                    seq += 1;
+                }
+                let ghost r1 = e.recv;
+                let mut seq = e.recv.head();
+                while seq < e.recv.posted()
+                    invariant
+                        e.recv.inv(),
+                        e.recv.same_wqes(&r1),
+                        e.recv.same_open(&r1),
+                        e.recv.spec_posted() == r1.spec_posted(),
+                    decreases e.recv.spec_posted() - seq,
+                {
+                    e.recv.detach(seq);
+                    seq += 1;
+                }
+                e.send.in_flight_wqes() > 0 || e.recv.in_flight_wqes() > 0
+            },
+            None => false,
+        };
+        proof {
+            let t = self.token@;
+            let n = t.nic();
+            let e0 = start.qps@[index as int]->0;
+            let q = e0.id();
+            let e = self.qps@[index as int]->0;
+            if e0.started {
+                start.lemma_rely(t0, m0, n);
+            } else {
+                assert(t == t0);
+                start.lemma_inv_fields(&start, t0, m0);
+            }
+            assert(start.inv_with(t0, n));
+            assert(start.entry_ok(index as int, t0, n));
+            assert(self.entry_ok(index as int, t, n));
+            self.lemma_commit_frame(&start, t0, t, n, n, index as int);
+        }
+        busy
+    }
+
+    /// Whether QP `index`, being removed, still has work in flight (or its
+    /// drain WQE to post).
+    pub fn draining(&self, index: usize) -> bool
+        requires
+            self.inv(),
+    {
+        if index >= self.qps.len() {
+            return false;
+        }
+        proof {
+            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+        }
+        match &self.qps[index] {
+            Some(e) => e.removed && (e.drain_pending || e.send.in_flight_wqes() > 0
+                || e.recv.in_flight_wqes() > 0),
+            None => false,
+        }
+    }
+}
+
 /// The opcode a successful completion of `op` reports.
 fn opcode_of(op: &WrOp) -> Opcode {
     match op {

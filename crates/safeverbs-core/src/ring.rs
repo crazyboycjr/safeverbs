@@ -2840,6 +2840,7 @@ impl<L> Ring<L> {
             final(self).woken() == old(self).woken(),
             final(self).same_wqes(old(self)),
             final(self).same_open(old(self)),
+            final(self).spec_posted() == old(self).spec_posted(),
     {
         proof {
             self.lemma_state_views(seq as int);
