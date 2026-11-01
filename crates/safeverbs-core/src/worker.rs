@@ -83,6 +83,7 @@ use crate::ring::{Ring, Seq};
 use crate::transport::Transport;
 use crate::verbs::Verbs;
 use crate::wc::{Opcode, Wc};
+use crate::wr_id::{index_of, is_recv, wqe_of, wr_id};
 
 /// The most scatter/gather elements of one WQE (they are kept on the
 /// stack).
@@ -95,14 +96,6 @@ pub const MAX_QPS: usize = 1 << 16;
 /// Completions taken from the CQ per poll.
 const POLL_BATCH: usize = 16;
 
-/// Bits of a `wr_id` that hold the WQE's number.
-const WQE_BITS: u32 = 47;
-const WQE_MASK: u64 = (1 << WQE_BITS) - 1;
-/// The bit of a `wr_id` that marks a receive.
-const RECV_BIT: u64 = 1 << WQE_BITS;
-/// Where the QP's index starts in a `wr_id`.
-const INDEX_SHIFT: u32 = WQE_BITS + 1;
-
 const EMPTY_WC: Wc = Wc::success(Opcode(0), 0);
 
 /// How long removing a QP waits for a completion while the device flushes
@@ -112,21 +105,6 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Empty polls of the CQ between two looks at the clock while draining.
 const DRAIN_SPINS: u32 = 1024;
-
-/// The `wr_id` of WQE `wqe` of QP `index`'s send or receive queue.
-#[inline]
-fn wr_id(index: usize, recv: bool, wqe: u64) -> u64 {
-    ((index as u64) << INDEX_SHIFT) | if recv { RECV_BIT } else { 0 } | (wqe & WQE_MASK)
-}
-
-/// The ring's number of the WQE a completion names, from its low bits and
-/// the oldest WQE in flight (`retired`): the one at or after `retired` with
-/// those bits. A WQE before `retired` maps far ahead, where the ring ignores
-/// it.
-#[inline]
-fn wqe_of(wr_id: u64, retired: u64) -> u64 {
-    retired.wrapping_add((wr_id & WQE_MASK).wrapping_sub(retired) & WQE_MASK)
-}
 
 /// A QP of a worker: its index there, typed by its transport. Cheap to copy.
 ///
@@ -521,7 +499,7 @@ impl<N: Nic> Worker<N> {
         let posted = unsafe {
             qp.hw.start();
             qp.hw
-                .post(wr_id(index, false, wqe), signaled, &WrOp::Send, &[]);
+                .post(wr_id(index as u16, false, wqe), signaled, &WrOp::Send, &[]);
             qp.hw.complete()
         };
         match posted {
@@ -621,12 +599,12 @@ impl<N: Nic> Worker<N> {
     /// Routes one completion to its QP's ring.
     #[inline]
     fn dispatch(&mut self, wc: &Wc) {
-        let index = (wc.wr_id >> INDEX_SHIFT) as usize;
+        let index = index_of(wc.wr_id);
         // A completion of a QP removed since: dropped.
         let Some(Some(qp)) = self.qps.get_mut(index) else {
             return;
         };
-        let ring = if wc.wr_id & RECV_BIT != 0 {
+        let ring = if is_recv(wc.wr_id) {
             &mut qp.recv
         } else {
             &mut qp.send
@@ -1029,7 +1007,7 @@ impl<N: Nic> Worker<N> {
         // below, which keeps it until the receive retires (the QP is
         // drained before it is destroyed); `can_post` checked the queue's
         // room; the QP takes work (connected, or in the error state).
-        match unsafe { qp.hw.post_recv(wr_id(index, true, wqe), &[part.sge]) } {
+        match unsafe { qp.hw.post_recv(wr_id(index as u16, true, wqe), &[part.sge]) } {
             Ok(()) => {
                 let implied = Wc::success(Opcode::RECV, part.sge.length);
                 let mut leases = Leases::default();
@@ -1297,7 +1275,7 @@ impl<T: Transport, N: Nic> Request<'_, T, N> {
             .push_wqe()
             .expect("room for a WQE");
         let mut held = Held {
-            wr_id: wr_id(self.index, false, wqe),
+            wr_id: wr_id(self.index as u16, false, wqe),
             op,
             sges: [Sge::default(); MAX_SGES],
             n: sges.len(),
@@ -1390,6 +1368,7 @@ mod tests {
     use crate::pd::Context;
     use crate::transport::RC;
     use crate::wc::Status;
+    use crate::wr_id::WQE_MASK;
 
     fn caps(depth: u32) -> QpCaps {
         QpCaps {
@@ -1404,13 +1383,13 @@ mod tests {
     #[test]
     fn wr_ids_round_trip() {
         for &(index, recv, wqe) in &[
-            (0usize, false, 0u64),
+            (0u16, false, 0u64),
             (65535, true, WQE_MASK),
             (7, false, (1 << 50) + 3),
         ] {
             let id = wr_id(index, recv, wqe);
-            assert_eq!((id >> INDEX_SHIFT) as usize, index);
-            assert_eq!(id & RECV_BIT != 0, recv);
+            assert_eq!(index_of(id), index as usize);
+            assert_eq!(is_recv(id), recv);
             // Any WQE at most 2^47 after the oldest in flight comes back.
             for retired in [wqe, wqe.saturating_sub(1), wqe.saturating_sub(4096)] {
                 assert_eq!(wqe_of(id, retired), wqe);
@@ -1440,7 +1419,7 @@ mod tests {
                     x ^= x >> 7;
                     x ^= x << 17;
                     let q = (x as usize) % qps;
-                    (wr_id(q, x & 1 == 0, i), 0x100 + 7 * q as u32)
+                    (wr_id(q as u16, x & 1 == 0, i), 0x100 + 7 * q as u32)
                 })
                 .collect();
             let nums: Vec<u32> = (0..qps).map(|q| 0x100 + 7 * q as u32).collect();
@@ -1456,18 +1435,18 @@ mod tests {
                 start.elapsed().as_nanos() as f64 / N as f64
             };
             let by_wr_id = time(&|id, _| {
-                let index = id >> INDEX_SHIFT;
-                let recv = id & RECV_BIT != 0;
+                let index = index_of(id) as u64;
+                let recv = is_recv(id);
                 index * 2 + recv as u64 + wqe_of(id, 0)
             });
             let by_scan = time(&|id, num| {
                 let index = nums.iter().position(|&n| n == num).unwrap_or(0) as u64;
-                let recv = id & RECV_BIT != 0;
+                let recv = is_recv(id);
                 index * 2 + recv as u64 + wqe_of(id, 0)
             });
             let by_map = time(&|id, num| {
                 let index = map.get(&num).copied().unwrap_or(0) as u64;
-                let recv = id & RECV_BIT != 0;
+                let recv = is_recv(id);
                 index * 2 + recv as u64 + wqe_of(id, 0)
             });
             println!(

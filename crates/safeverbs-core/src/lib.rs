@@ -51,6 +51,7 @@ pub mod trusted;
 pub mod verbs;
 pub mod wc;
 pub mod worker;
+pub mod wr_id;
 
 pub use buf::{Buf, BufError, BufMut, Chunks, Exposed, Leases, Part, RingBuf};
 pub use error::{Error, Result};
