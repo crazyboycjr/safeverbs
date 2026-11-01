@@ -1,10 +1,17 @@
 //! The refinement theorem: under M, for any peer, the library behaves like A.
 //!
 //! The library's trusted core (`safeverbs-core`) will be verified against this module. Its
-//! state, rings, buffers and ghost state included, implements [`Refines`]: an invariant, an
-//! abstraction function to A, its view of the NIC in M, and which WQE carries each request.
+//! state, rings, buffers and ghost state included, must implement [`Refines`]: an invariant,
+//! an abstraction function to A, its view of the NIC in M, and each request's WQE interval.
 //! The core proves the three obligations of the trait; [`theorem_1`] then gives the
 //! guarantees along every execution.
+//!
+//! A batch owns a nonempty interval on one QP and queue. Retiring a proper prefix leaves
+//! the request in flight with its leases; completion waits for the last WQE. Its outcome
+//! is the first failing WQE's outcome, or the last WQE's success if none failed. This is
+//! an obligation on the implementation, not a restriction added to M. No concrete worker
+//! implements this trait yet; these lemmas do not establish that missing refinement or
+//! the byte-permission and inter-worker composition proofs.
 //!
 //! **Why `nic()` is honest.** The core's view of the NIC is a ghost token that only the
 //! trusted verbs wrappers change. Each wrapper's contract is M: it *requires* the verb's
@@ -80,22 +87,263 @@ pub open spec fn posted(m: Nic::State, w: WqeRef) -> bool {
     }
 }
 
+/// A request's WQEs on one QP and queue, in posting order: `[first, end)`.
+pub struct WqeRange {
+    pub qp: QpId,
+    pub queue: Queue,
+    pub first: nat,
+    pub end: nat,
+}
+
+impl WqeRange {
+    /// Empty intervals cannot carry a request or supply its final outcome.
+    pub open spec fn wf(self) -> bool {
+        self.first < self.end
+    }
+
+    pub open spec fn at(self, seq: nat) -> WqeRef {
+        WqeRef { qp: self.qp, queue: self.queue, seq }
+    }
+
+    pub open spec fn last(self) -> WqeRef {
+        self.at((self.end - 1) as nat)
+    }
+
+    pub open spec fn contains(self, w: WqeRef) -> bool {
+        w.qp == self.qp && w.queue == self.queue && self.first <= w.seq < self.end
+    }
+
+    /// Adjacent intervals are disjoint; equal sequence numbers on different queues or
+    /// QPs name different WQEs.
+    pub open spec fn disjoint(self, other: WqeRange) -> bool {
+        self.qp != other.qp || self.queue != other.queue
+            || self.end <= other.first || other.end <= self.first
+    }
+
+    pub open spec fn singleton(w: WqeRef) -> WqeRange {
+        WqeRange { qp: w.qp, queue: w.queue, first: w.seq, end: w.seq + 1 }
+    }
+
+    pub open spec fn all_retired(self, retired: IMap<WqeRef, Outcome>) -> bool {
+        forall|s: nat| self.first <= s < self.end ==> retired.contains_key(#[trigger] self.at(s))
+    }
+
+    /// The aggregate is used only for a well-formed, fully retired interval. Scanning
+    /// in posting order keeps the first error, including its defined metadata; if all
+    /// WQEs succeeded, the final WQE supplies the success (no byte counts are summed).
+    pub open spec fn aggregate(self, retired: IMap<WqeRef, Outcome>) -> Outcome
+        recommends self.wf(), self.all_retired(retired),
+        decreases self.end - self.first,
+    {
+        let first = retired[self.at(self.first)];
+        if self.end <= self.first + 1 || first.status.is_err() {
+            first
+        } else {
+            WqeRange { first: self.first + 1, ..self }.aggregate(retired)
+        }
+    }
+
+    pub open spec fn first_error(self, retired: IMap<WqeRef, Outcome>, s: nat) -> bool {
+        &&& self.first <= s < self.end
+        &&& retired[self.at(s)].status.is_err()
+        &&& forall|j: nat| self.first <= j < s ==> (#[trigger] retired[self.at(j)]).status is Success
+    }
+
+    /// At an API boundary the retired prefix ends at `cut`, and the entire remaining
+    /// suffix is still posted. In particular, the last WQE has not retired. A prefix
+    /// may already contain an error without making the request complete in A.
+    pub open spec fn pending_at(self, m: Nic::State, cut: nat) -> bool {
+        &&& self.wf()
+        &&& self.first <= cut < self.end
+        &&& forall|s: nat| self.first <= s < cut ==> {
+            let w = #[trigger] self.at(s);
+            m.retired.contains_key(w) && !posted(m, w)
+        }
+        &&& forall|s: nat| cut <= s < self.end ==> {
+            let w = #[trigger] self.at(s);
+            posted(m, w) && !m.retired.contains_key(w)
+        }
+    }
+
+    pub open spec fn pending(self, m: Nic::State) -> bool {
+        exists|cut: nat| self.pending_at(m, cut)
+    }
+}
+
+/// Disjoint ownership rules out a shared WQE, rather than merely different endpoints.
+pub proof fn lemma_disjoint_wqe(left: WqeRange, right: WqeRange, w: WqeRef)
+    requires
+        left.disjoint(right),
+    ensures
+        !(left.contains(w) && right.contains(w)),
+{
+}
+
+/// The aggregate selects the earliest failure in posting order, or the final success.
+pub proof fn lemma_aggregate(range: WqeRange, retired: IMap<WqeRef, Outcome>)
+    requires
+        range.wf(),
+        range.all_retired(retired),
+    ensures
+        range.aggregate(retired).status.is_err() ==> exists|s: nat|
+            range.first_error(retired, s) && range.aggregate(retired) == retired[range.at(s)],
+        !range.aggregate(retired).status.is_err() ==> {
+            &&& forall|s: nat| range.first <= s < range.end
+                ==> (#[trigger] retired[range.at(s)]).status is Success
+            &&& range.aggregate(retired) == retired[range.last()]
+        },
+    decreases range.end - range.first,
+{
+    let first = retired[range.at(range.first)];
+    if first.status.is_err() {
+        assert(range.first_error(retired, range.first));
+    } else if range.end == range.first + 1 {
+        assert forall|s: nat| range.first <= s < range.end
+            implies (#[trigger] retired[range.at(s)]).status is Success by {
+            assert(s == range.first);
+        }
+    } else {
+        let tail = WqeRange { first: range.first + 1, ..range };
+        assert forall|s: nat| tail.first <= s < tail.end
+            implies retired.contains_key(#[trigger] tail.at(s)) by {
+            assert(tail.at(s) == range.at(s));
+        }
+        lemma_aggregate(tail, retired);
+        if tail.aggregate(retired).status.is_err() {
+            let s = choose|s: nat| tail.first_error(retired, s)
+                && tail.aggregate(retired) == retired[tail.at(s)];
+            assert forall|j: nat| range.first <= j < s
+                implies (#[trigger] retired[range.at(j)]).status is Success by {
+                if j != range.first {
+                    assert(tail.first <= j < s);
+                    assert(tail.at(j) == range.at(j));
+                }
+            }
+            assert(range.first_error(retired, s));
+        } else {
+            assert forall|s: nat| range.first <= s < range.end
+                implies (#[trigger] retired[range.at(s)]).status is Success by {
+                if s != range.first {
+                    assert(tail.first <= s < tail.end);
+                    assert(tail.at(s) == range.at(s));
+                }
+            }
+            assert(tail.last() == range.last());
+        }
+    }
+}
+
+/// Later completions, including flush errors, cannot overwrite the first failure.
+pub proof fn lemma_aggregate_first_error(
+    range: WqeRange,
+    retired: IMap<WqeRef, Outcome>,
+    first_error: nat,
+)
+    requires
+        range.wf(),
+        range.all_retired(retired),
+        range.first_error(retired, first_error),
+    ensures
+        range.aggregate(retired) == retired[range.at(first_error)],
+    decreases range.end - range.first,
+{
+    if first_error > range.first {
+        assert(retired[range.at(range.first)].status is Success);
+        let tail = WqeRange { first: range.first + 1, ..range };
+        assert forall|s: nat| tail.first <= s < tail.end
+            implies retired.contains_key(#[trigger] tail.at(s)) by {
+            assert(tail.at(s) == range.at(s));
+        }
+        assert forall|s: nat| tail.first <= s < first_error
+            implies (#[trigger] retired[tail.at(s)]).status is Success by {
+            assert(tail.at(s) == range.at(s));
+        }
+        lemma_aggregate_first_error(tail, retired, first_error);
+    }
+}
+
+/// With no error, preserve the final success and its operation-defined metadata.
+pub proof fn lemma_aggregate_success(range: WqeRange, retired: IMap<WqeRef, Outcome>)
+    requires
+        range.wf(),
+        range.all_retired(retired),
+        forall|s: nat| range.first <= s < range.end
+            ==> (#[trigger] retired[range.at(s)]).status is Success,
+    ensures
+        range.aggregate(retired) == retired[range.last()],
+        range.aggregate(retired).status is Success,
+{
+    lemma_aggregate(range, retired);
+    if range.aggregate(retired).status.is_err() {
+        let s = choose|s: nat| range.first_error(retired, s)
+            && range.aggregate(retired) == retired[range.at(s)];
+        assert(retired[range.at(s)].status is Success);
+    }
+}
+
+/// A single WQE has exactly the former outcome and outstanding-WQE semantics.
+pub proof fn lemma_singleton(m: Nic::State, w: WqeRef)
+    ensures
+        WqeRange::singleton(w).wf(),
+        WqeRange::singleton(w).last() == w,
+        WqeRange::singleton(w).all_retired(m.retired) <==> m.retired.contains_key(w),
+        m.retired.contains_key(w) ==> WqeRange::singleton(w).aggregate(m.retired) == m.retired[w],
+        WqeRange::singleton(w).pending(m) <==> posted(m, w) && !m.retired.contains_key(w),
+{
+    let range = WqeRange::singleton(w);
+    if m.retired.contains_key(w) {
+        assert forall|s: nat| range.first <= s < range.end
+            implies m.retired.contains_key(#[trigger] range.at(s)) by {
+            assert(s == w.seq);
+        }
+    }
+    if posted(m, w) && !m.retired.contains_key(w) {
+        assert(range.pending_at(m, w.seq));
+    }
+    if range.pending(m) {
+        let cut = choose|cut: nat| range.pending_at(m, cut);
+        assert(cut == w.seq);
+    }
+}
+
+/// An in-flight batch still owns its leases even if a proper prefix has retired.
+pub proof fn lemma_pending_last(range: WqeRange, m: Nic::State)
+    requires
+        range.pending(m),
+    ensures
+        range.wf(),
+        posted(m, range.last()),
+        !m.retired.contains_key(range.last()),
+        !range.all_retired(m.retired),
+        forall|s: nat| range.first <= s < range.end ==> {
+            let w = #[trigger] range.at(s);
+            posted(m, w) || m.retired.contains_key(w)
+        },
+{
+    let cut = choose|cut: nat| range.pending_at(m, cut);
+    assert(cut <= (range.end - 1) as nat < range.end);
+}
+
 /// The coupling between A and M that the core's invariant must imply.
 ///
-/// - **F1 against M:** every request has its own WQE (`wqe`, injective); while the request
-///   is in flight its WQE is posted and not retired; once it has an outcome in A, that is
-///   exactly the outcome M recorded when it retired the WQE.
+/// - **F1 against M:** every request owns a nonempty WQE interval. Distinct requests own
+///   disjoint intervals, including after their outcomes are taken. While in flight, a
+///   retired prefix is allowed but the final WQE is outstanding. Completion requires
+///   every WQE retired and preserves the first error, or the final success.
 /// - **S1 against M:** every byte M lets the NIC (or the peer) read or write is one A gives
 ///   to the NIC for that kind of access.
-pub open spec fn coupled(a: Abs::State, m: Nic::State, wqe: Map<Id, WqeRef>) -> bool {
-    &&& forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request() ==> wqe.contains_key(r)
-    &&& forall|r: Id| #[trigger] a.outcomes.contains_key(r) ==> wqe.contains_key(r)
-    &&& forall|r1: Id, r2: Id| #![trigger wqe[r1], wqe[r2]]
-        wqe.contains_key(r1) && wqe.contains_key(r2) && r1 != r2 ==> wqe[r1] != wqe[r2]
+pub open spec fn coupled(a: Abs::State, m: Nic::State, ranges: Map<Id, WqeRange>) -> bool {
+    &&& forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].is_request()
+        ==> ranges.contains_key(r) && ranges[r].qp == a.req(r).qp
+    &&& forall|r: Id| #[trigger] a.outcomes.contains_key(r) ==> ranges.contains_key(r)
+    &&& forall|r: Id| #[trigger] ranges.contains_key(r) ==> ranges[r].wf()
+    &&& forall|r1: Id, r2: Id| #![trigger ranges[r1], ranges[r2]]
+        ranges.contains_key(r1) && ranges.contains_key(r2) && r1 != r2
+            ==> ranges[r1].disjoint(ranges[r2])
     &&& forall|r: Id| #[trigger] a.leases.contains_key(r) && a.leases[r].in_flight()
-        ==> posted(m, wqe[r]) && !m.retired.contains_key(wqe[r])
+        ==> ranges[r].pending(m)
     &&& forall|r: Id| #[trigger] a.outcomes.contains_key(r)
-        ==> m.retired.contains_key(wqe[r]) && m.retired[wqe[r]] == a.outcomes[r]
+        ==> ranges[r].all_retired(m.retired) && ranges[r].aggregate(m.retired) == a.outcomes[r]
     &&& forall|x: int| #[trigger] m.nic_may_read(x) ==> a.nic_reads(x)
     &&& forall|x: int| #[trigger] m.nic_may_write(x) ==> a.nic_writes(x)
 }
@@ -115,8 +363,8 @@ pub trait Refines: Sized {
     /// The NIC's state in M, as the core's ghost token holds it.
     spec fn nic(&self) -> Nic::State;
 
-    /// The WQE that carries each request (ghost).
-    spec fn wqe(&self) -> Map<Id, WqeRef>;
+    /// The nonempty WQE interval owned by each request (ghost, retained with its outcome).
+    spec fn ranges(&self) -> Map<Id, WqeRange>;
 
     /// A start state: the device just opened, nothing created yet.
     spec fn init(&self) -> bool;
@@ -152,7 +400,7 @@ pub trait Refines: Sized {
         requires
             c.inv(),
         ensures
-            coupled(c.abs(), c.nic(), c.wqe()),
+            coupled(c.abs(), c.nic(), c.ranges()),
     ;
 }
 
@@ -167,8 +415,9 @@ pub trait Refines: Sized {
 /// - the NIC is in a state M reaches from its start by legal steps only: every verb the
 ///   library called met its precondition (**S2**), and M's own invariants hold (no CQ
 ///   overflow, every CQE names its WQE);
-/// - A and M are coupled ([`coupled`]): each request's outcome is the one M produced for its
-///   WQE, and the NIC touches only memory A gives it ([`corollary_s1`], [`corollary_f1`]).
+/// - A and M are coupled ([`coupled`]): each request owns a disjoint WQE interval, its
+///   outcome aggregates M's outcomes only after all its WQEs retire, and the NIC touches
+///   only memory A gives it ([`corollary_s1`], [`corollary_f1`]).
 pub proof fn theorem_1<C: Refines>(run: Seq<C>)
     requires
         run.len() > 0,
@@ -182,7 +431,7 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
             &&& c.inv()
             &&& abs_reaches(run[0].abs(), c.abs()) && abs_inv(c.abs())
             &&& nic_reaches(run[0].nic(), c.nic()) && nic_inv(c.nic())
-            &&& coupled(c.abs(), c.nic(), c.wqe())
+            &&& coupled(c.abs(), c.nic(), c.ranges())
         },
     decreases run.len(),
 {
@@ -219,7 +468,7 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
             &&& c.inv()
             &&& abs_reaches(a0, c.abs()) && abs_inv(c.abs())
             &&& nic_reaches(m0, c.nic()) && nic_inv(c.nic())
-            &&& coupled(c.abs(), c.nic(), c.wqe())
+            &&& coupled(c.abs(), c.nic(), c.ranges())
         } by {
             if i < n {
                 assert(run[i] == prefix[i]);
@@ -230,10 +479,10 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
 
 /// **S1 against M.** In a coupled state, nothing the program may write is touched by the NIC
 /// or the peer as M defines their reach, and nothing the program may read is written by them.
-pub proof fn corollary_s1(a: Abs::State, m: Nic::State, wqe: Map<Id, WqeRef>, x: int)
+pub proof fn corollary_s1(a: Abs::State, m: Nic::State, ranges: Map<Id, WqeRange>, x: int)
     requires
         abs_inv(a),
-        coupled(a, m, wqe),
+        coupled(a, m, ranges),
     ensures
         !(a.program_writes(x) && (m.nic_may_read(x) || m.nic_may_write(x))),
         !(a.program_reads(x) && m.nic_may_write(x)),
@@ -241,27 +490,92 @@ pub proof fn corollary_s1(a: Abs::State, m: Nic::State, wqe: Map<Id, WqeRef>, x:
     crate::guarantees::lemma_s1_no_conflict(a, x);
 }
 
-/// **F1 against M.** The outcome the client takes for request `r` is the outcome M recorded
-/// for `r`'s own WQE, and no other request has that WQE.
+/// **F1 against M.** The client takes the aggregate of its own fully retired interval.
+/// No other request owns any WQE of that interval. An error is the first one in posting
+/// order; success carries the final WQE's defined metadata.
 pub proof fn corollary_f1(
     a: Abs::State,
     a2: Abs::State,
     m: Nic::State,
-    wqe: Map<Id, WqeRef>,
+    ranges: Map<Id, WqeRange>,
     r: Id,
     o: Outcome,
 )
     requires
         abs_inv(a),
-        coupled(a, m, wqe),
+        coupled(a, m, ranges),
         Abs::State::take(a, a2, r, o),
     ensures
-        wqe.contains_key(r),
-        m.retired.contains_key(wqe[r]) && o == m.retired[wqe[r]],
-        forall|r2: Id| #[trigger] wqe.contains_key(r2) && r2 != r ==> wqe[r2] != wqe[r],
+        ranges.contains_key(r),
+        ranges[r].wf(),
+        ranges[r].all_retired(m.retired),
+        o == ranges[r].aggregate(m.retired),
+        forall|r2: Id| #[trigger] ranges.contains_key(r2) && r2 != r
+            ==> ranges[r2].disjoint(ranges[r]),
+        o.status.is_err() ==> exists|s: nat|
+            ranges[r].first_error(m.retired, s) && o == m.retired[ranges[r].at(s)],
+        !o.status.is_err() ==> {
+            &&& forall|s: nat| ranges[r].first <= s < ranges[r].end
+                ==> (#[trigger] m.retired[ranges[r].at(s)]).status is Success
+            &&& o == m.retired[ranges[r].last()]
+        },
 {
     crate::guarantees::lemma_f1_take(a, a2, r, o);
     assert(a.outcomes.contains_key(r));
+    lemma_aggregate(ranges[r], m.retired);
+}
+
+/// The former single-WQE completion correspondence is the singleton specialization.
+pub proof fn corollary_f1_singleton(
+    a: Abs::State,
+    a2: Abs::State,
+    m: Nic::State,
+    ranges: Map<Id, WqeRange>,
+    r: Id,
+    w: WqeRef,
+    o: Outcome,
+)
+    requires
+        abs_inv(a),
+        coupled(a, m, ranges),
+        ranges.contains_key(r),
+        ranges[r] == WqeRange::singleton(w),
+        Abs::State::take(a, a2, r, o),
+    ensures
+        m.retired.contains_key(w),
+        o == m.retired[w],
+        forall|r2: Id| #[trigger] ranges.contains_key(r2) && r2 != r
+            ==> !ranges[r2].contains(w),
+{
+    corollary_f1(a, a2, m, ranges, r, o);
+    lemma_singleton(m, w);
+    assert forall|r2: Id| #[trigger] ranges.contains_key(r2) && r2 != r
+        implies !ranges[r2].contains(w) by {
+        lemma_disjoint_wqe(ranges[r2], ranges[r], w);
+    }
+}
+
+/// **R1 against M.** Prefix retirement cannot return or release an in-flight request's
+/// lease: its last WQE is outstanding and A has not recorded an outcome.
+pub proof fn corollary_inflight(
+    a: Abs::State,
+    m: Nic::State,
+    ranges: Map<Id, WqeRange>,
+    r: Id,
+)
+    requires
+        abs_inv(a),
+        coupled(a, m, ranges),
+        a.in_flight(r),
+    ensures
+        ranges.contains_key(r),
+        posted(m, ranges[r].last()),
+        !m.retired.contains_key(ranges[r].last()),
+        !ranges[r].all_retired(m.retired),
+        !a.outcomes.contains_key(r),
+        a.leases[r].mem == a.posted[r],
+{
+    lemma_pending_last(ranges[r], m);
 }
 
 // =========================================================================================
