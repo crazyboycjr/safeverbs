@@ -41,6 +41,7 @@
 
 pub mod buf;
 pub mod error;
+pub mod hw;
 pub mod model;
 pub mod nic;
 pub mod pd;

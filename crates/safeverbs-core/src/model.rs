@@ -803,6 +803,7 @@ impl Nic for Model {
             max_cqe: 1 << 16,
             max_qp_rd_atom: 16,
             atomics: true,
+            max_msg: 1 << 31,
         }
     }
 

@@ -110,12 +110,23 @@ impl Verbs {
                 ffi::ibv_close_device(ctx);
                 return Err(Error::Os(rc));
             }
+            // The longest message every port carries.
+            let mut max_msg = u32::MAX;
+            let mut port = 1;
+            while port <= attr.phys_port_cnt {
+                let mut pattr: ffi::ibv_port_attr = zeroed();
+                if ffi::___ibv_query_port(ctx, port, &mut pattr) == 0 {
+                    max_msg = max_msg.min(pattr.max_msg_sz);
+                }
+                port += 1;
+            }
             let caps = DeviceCaps {
                 max_qp_wr: attr.max_qp_wr.max(0) as u32,
                 max_sge: attr.max_sge.max(0) as u32,
                 max_cqe: attr.max_cqe.max(0) as u32,
                 max_qp_rd_atom: attr.max_qp_rd_atom.max(0) as u32,
                 atomics: attr.atomic_cap != ffi::IBV_ATOMIC_NONE,
+                max_msg,
             };
             Ok(Verbs {
                 ctx,

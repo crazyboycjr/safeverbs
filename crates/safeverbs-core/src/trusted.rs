@@ -1,16 +1,16 @@
-//! The trusted verbs: each call of the data path into the NIC, with its
-//! contract taken from the NIC model M (`safeverbs_spec::nic`).
+//! The trusted verbs: each call of the core into the NIC, with its contract
+//! taken from the NIC model M (`safeverbs_spec::nic`).
 //!
 //! A verb's precondition is M's (`nic_enabled`): Verus checks it at every
 //! call site, which is S2. Its postcondition says that M moved by steps that
 //! do not touch the caller's share (`rely_reaches`: the NIC's own steps,
 //! executions and faults, and the verbs of other workers on their own CQs
 //! and QPs) and then by the verb's step (`nic_step`), or, when the device
-//! refuses, only by such steps. The
-//! bodies are the calls of [`NicQp`] and [`NicCq`] and are not verified:
-//! together with M they are the assumption. Every item of this module that
-//! Verus trusts is listed in `scripts/trusted.txt`, and the trusted computing
-//! base in `docs/verification.md` says why.
+//! refuses, only by such steps. The bodies are the calls of [`Device`],
+//! [`NicQp`] and [`NicCq`] and are not verified: together with M they are
+//! the assumption. Every item of this module that Verus trusts is listed in
+//! `scripts/trusted.txt`, and the trusted computing base in
+//! `docs/verification.md` says why.
 //!
 //! M posts a list of send WRs at once (`post_send`); the hardware's
 //! `ibv_wr_start`, `ibv_wr_*` and `ibv_wr_complete` write them one by one
@@ -18,17 +18,18 @@
 //! the start, and the doorbell posts that list.
 //!
 //! The NIC's state is a ghost token, [`NicToken`], that only these wrappers
-//! change and that nothing else can make. A token is one worker's: it holds
-//! M's state as that worker last saw it and the worker's share of M
-//! (`safeverbs_spec::share`: its CQ and the names of its QPs). Each verb is
-//! on the token's own share (`mine`), so it is within what the other
-//! workers rely on, and its precondition, checked in the state the worker
-//! last saw, still holds when the verb happens
-//! (`safeverbs_spec::share::lemma_rely_keeps_enabled`): that is why the
-//! contracts below are consistent. The worker and its queue pairs are not
-//! verified yet, so nothing calls them so far: they are the interface those
-//! will be verified against (see `docs/verification.md`, "Stated, not yet
-//! proved").
+//! make and change. A token is one worker's: it holds M's state as that
+//! worker last saw it, the worker's share of M (`safeverbs_spec::share`: its
+//! CQ and the names of its QPs), the protection domain of its QPs and the
+//! names it gives new QPs. Each verb is on the token's own share (`mine`),
+//! so it is within what the other workers rely on, and its precondition,
+//! checked in the state the worker last saw, still holds when the verb
+//! happens (`safeverbs_spec::share::lemma_rely_keeps_enabled`): that is why
+//! the contracts below are consistent. Between two calls the other workers
+//! deregister no region the worker's written WRs name ([`pinned`]): those
+//! are held by leases, which keep their regions registered ([`registered`]
+//! is where the core learns it). The worker's hardware side
+//! (`crate::hw`) is verified against these contracts.
 //
 // The imports are used by ghost code too.
 #![allow(unused_imports)]
@@ -38,11 +39,17 @@
 use safeverbs_spec::nic::*;
 use safeverbs_spec::refinement::*;
 use safeverbs_spec::share::*;
-use safeverbs_spec::types::{CqId, Key, QpId};
+use safeverbs_spec::types::{CqId, Key, PdId, QpId};
 use vstd::prelude::*;
 
+use crate::buf::{Leases, Part};
 use crate::error::{Error, Result};
-use crate::nic::{NicCq, NicQp, RemoteBuf, Sge, WrOp};
+// The device trait as `Device`: `Nic` names M's state machine here.
+use crate::nic::{
+    ConnectAttr, DeviceCaps, Endpoint, Nic as Device, NicCq, NicQp, QpCaps, QpType, RemoteBuf, Sge,
+    WrOp,
+};
+use crate::pd::Pd;
 use crate::wc::Wc;
 
 verus! {
@@ -65,11 +72,81 @@ pub struct ExRemoteBuf(RemoteBuf);
 #[verifier::external_type_specification]
 pub struct ExWrOp(WrOp);
 
-/// [`Error`], opaque.
+/// [`QpCaps`], as defined.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+pub struct ExQpCaps(QpCaps);
+
+/// [`DeviceCaps`], as defined.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+pub struct ExDeviceCaps(DeviceCaps);
+
+/// [`QpType`], as defined.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+pub struct ExQpType(QpType);
+
+/// [`Error`], as defined.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+pub struct ExError(Error);
+
+/// [`ConnectAttr`], opaque (only the device reads it).
 #[cfg(verus_keep_ghost)]
 #[verifier::external_type_specification]
 #[verifier::external_body]
-pub struct ExError(Error);
+pub struct ExConnectAttr(ConnectAttr);
+
+/// [`Endpoint`], opaque (only the device reads it).
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExEndpoint(Endpoint);
+
+/// [`Pd`], opaque.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[verifier::reject_recursive_types(N)]
+pub struct ExPd<N: Device>(Pd<N>);
+
+/// [`Part`], opaque: a buffer's range with its lease.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[verifier::reject_recursive_types(N)]
+pub struct ExPart<N: Device>(Part<N>);
+
+/// [`Leases`], opaque.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[verifier::reject_recursive_types(N)]
+pub struct ExLeases<N: Device>(Leases<N>);
+
+/// [`Nic`], without specifications of its own (the wrappers carry them).
+#[cfg(verus_keep_ghost)]
+#[verifier::external_trait_specification]
+pub trait ExNic: Send + Sync + Sized + 'static {
+    /// The trait specified.
+    type ExternalTraitSpecificationFor: Device;
+
+    /// A protection domain.
+    type Pd: Send + Sync + 'static;
+
+    /// A registered memory region.
+    type Mr: Send + Sync + 'static;
+
+    /// A completion queue.
+    type Cq: NicCq + 'static;
+
+    /// A queue pair.
+    type Qp: NicQp + 'static;
+
+    /// A thread domain.
+    type Domain: Send + 'static;
+}
 
 /// [`NicQp`], without specifications of its own (the wrappers carry them).
 #[cfg(verus_keep_ghost)]
@@ -132,18 +209,81 @@ pub open spec fn reports(wc: Wc, e: Cqe) -> bool {
     &&& wc.outcome() == e.outcome
 }
 
+/// The transport M sees for a QP type.
+pub open spec fn transport_model(t: QpType) -> Transport {
+    match t {
+        QpType::Rc => Transport::Rc,
+        QpType::Uc => Transport::Uc,
+    }
+}
+
+/// The attributes M sees for a QP the worker creates in protection domain
+/// `pd` with both queues on CQ `cq`. M has one limit of scatter/gather
+/// elements for both queues: the smaller of the two (the worker checks
+/// every WQE against it). safeverbs posts no inline data, so M sees none.
+pub open spec fn qp_attr(pd: PdId, qp_type: QpType, cq: CqId, caps: QpCaps) -> QpAttr {
+    QpAttr {
+        pd,
+        transport: transport_model(qp_type),
+        send_cq: cq,
+        recv_cq: cq,
+        sq_depth: caps.max_send_wr as nat,
+        rq_depth: caps.max_recv_wr as nat,
+        max_sge: if caps.max_send_sge <= caps.max_recv_sge {
+            caps.max_send_sge as nat
+        } else {
+            caps.max_recv_sge as nat
+        },
+        max_inline: 0,
+    }
+}
+
+/// The device's limits `d`, as the library reads them, are M's.
+pub open spec fn caps_model(c: Caps, d: DeviceCaps) -> bool {
+    &&& c.max_qp_wr == d.max_qp_wr as nat
+    &&& c.max_sge == d.max_sge as nat
+    &&& c.max_cqe == d.max_cqe as nat
+    &&& c.max_msg == d.max_msg as nat
+}
+
+/// The name M gives the hardware QP `qp`.
+pub uninterp spec fn qp_of<Q>(qp: Q) -> QpId;
+
+/// The name M gives the hardware CQ `cq`.
+pub uninterp spec fn cq_of<C>(cq: C) -> CqId;
+
+/// The name M gives protection domain `pd` (its clones share it).
+pub uninterp spec fn pd_of<N: Device>(pd: Pd<N>) -> PdId;
+
+/// [`Pd::id`], as a specification.
+pub uninterp spec fn pd_id<N: Device>(pd: Pd<N>) -> u64;
+
+/// The range of a buffer part, as a specification.
+pub uninterp spec fn part_sge<N: Device>(part: Part<N>) -> Sge;
+
+/// The protection domain a buffer part is registered in ([`Pd::id`]), as a
+/// specification.
+pub uninterp spec fn part_pd<N: Device>(part: Part<N>) -> u64;
+
+/// Whether a buffer part is unique (the NIC may write it), as a
+/// specification.
+pub uninterp spec fn part_writable<N: Device>(part: Part<N>) -> bool;
+
 // =============================================================================
 // The token
 
 /// What one worker knows of the NIC: M's state as it last saw it, its share
-/// of M, and for each of its queue pairs the send WRs written since its last
-/// start. Only the trusted wrappers make or change one: its fields are
-/// private, so no other code can forge one.
+/// of M, the protection domain of its QPs, the names it gives new QPs, and
+/// for each of its queue pairs the send WRs written since its last start.
+/// Only the trusted wrappers make or change one: its fields are private, so
+/// no other code can forge one.
 // The fields are ghost: only the proofs read them.
 #[allow(dead_code)]
 pub tracked struct NicToken {
     ghost nic: Nic::State,
     ghost share: Share,
+    ghost pd: PdId,
+    ghost name: spec_fn(nat) -> QpId,
     ghost started: Set<QpId>,
     ghost written: Map<QpId, Seq<SendWr>>,
 }
@@ -159,9 +299,23 @@ impl NicToken {
         self.share
     }
 
-    /// `self` is `other` after calls of the same worker: the same share.
-    pub open spec fn same_share(&self, other: &NicToken) -> bool {
-        self.share() == other.share()
+    /// The protection domain of the worker's QPs.
+    pub closed spec fn pd(&self) -> PdId {
+        self.pd
+    }
+
+    /// The name of the worker's `n`-th QP: names it owns, all different,
+    /// none used before the worker was made.
+    pub closed spec fn name(&self, n: nat) -> QpId {
+        (self.name)(n)
+    }
+
+    /// `self` is `other` after calls of the same worker: the same share,
+    /// protection domain and names.
+    pub open spec fn same_worker(&self, other: &NicToken) -> bool {
+        &&& self.share() == other.share()
+        &&& self.pd() == other.pd()
+        &&& forall|n: nat| #[trigger] self.name(n) == other.name(n)
     }
 
     /// Queue pair `q` is writing send WRs (between start and the doorbell).
@@ -189,44 +343,397 @@ impl NicToken {
         forall|p: QpId| p != q ==> #[trigger] self.started(p) == other.started(p) && self.written(p)
             == other.written(p)
     }
+
+    /// `self` and `other` agree on the writing of every queue pair.
+    pub open spec fn same_writings(&self, other: &NicToken) -> bool {
+        forall|p: QpId| #[trigger] self.started(p) == other.started(p) && self.written(p)
+            == other.written(p)
+    }
 }
 
-/// No region pinned: what the others may do between two calls that name no
-/// memory.
-pub open spec fn no_pins() -> ISet<Key> {
-    ISet::empty()
+/// The regions the worker's written WRs name: their leases keep them
+/// registered, so no other worker deregisters one meanwhile.
+pub open spec fn pinned(t: NicToken) -> ISet<Key> {
+    ISet::new(|k: Key| exists|q: QpId| #[trigger] send_keys(t.written(q)).contains(k))
 }
 
-/// `polled(sh, m, m2, wcs)`: polling the CQ of share `sh` took M from `m` to
-/// `m2` and gave `wcs`: one `poll_cq` step for each, in order, each reporting
-/// the CQE it popped, with steps that do not touch the share around them.
-pub open spec fn polled(sh: Share, m: Nic::State, m2: Nic::State, wcs: Seq<Wc>) -> bool
+/// `polled(sh, pins, m, m2, wcs)`: polling the CQ of share `sh` took M from
+/// `m` to `m2` and gave `wcs`: one `poll_cq` step for each, in order, each
+/// reporting the CQE it popped, with steps that do not touch the share (nor
+/// `pins`) around them.
+pub open spec fn polled(sh: Share, pins: ISet<Key>, m: Nic::State, m2: Nic::State, wcs: Seq<Wc>) -> bool
     decreases wcs.len(),
 {
     if wcs.len() == 0 {
-        rely_reaches(sh, no_pins(), m, m2)
+        rely_reaches(sh, pins, m, m2)
     } else {
         exists|mid: Nic::State, before: Nic::State|
             {
-                &&& polled(sh, m, mid, wcs.drop_last())
-                &&& rely_reaches(sh, no_pins(), mid, before)
+                &&& polled(sh, pins, m, mid, wcs.drop_last())
+                &&& rely_reaches(sh, pins, mid, before)
                 &&& nic_step(before, m2, Nic::Step::poll_cq(sh.cq))
                 &&& reports(wcs.last(), before.cqs[sh.cq].entries[0])
             }
     }
 }
 
+/// `modified(sh, pins, m, m2, q, tos)`: queue pair `q` was moved to each
+/// state of `tos` in turn (M's `modify_qp`), with steps that do not touch
+/// the share around them.
+pub open spec fn modified(
+    sh: Share,
+    pins: ISet<Key>,
+    m: Nic::State,
+    m2: Nic::State,
+    q: QpId,
+    tos: Seq<QpState>,
+) -> bool
+    decreases tos.len(),
+{
+    if tos.len() == 0 {
+        rely_reaches(sh, pins, m, m2)
+    } else {
+        exists|mid: Nic::State, before: Nic::State|
+            {
+                &&& modified(sh, pins, m, mid, q, tos.drop_last())
+                &&& rely_reaches(sh, pins, mid, before)
+                &&& nic_step(before, m2, Nic::Step::modify_qp(q, tos.last()))
+            }
+    }
+}
+
+/// The states `connect` moves a queue pair through.
+pub open spec fn connect_states() -> Seq<QpState> {
+    seq![QpState::Init, QpState::Rtr, QpState::Rts]
+}
+
+/// A fresh worker: its names are its own, all different, and none is used
+/// yet; it has no QP and writes nothing.
+pub open spec fn fresh_worker(t: NicToken) -> bool {
+    &&& forall|n: nat| #[trigger] t.share().owns.contains(t.name(n))
+    &&& forall|a: nat, b: nat| #[trigger] t.name(a) == #[trigger] t.name(b) ==> a == b
+    &&& forall|q: QpId| #[trigger] t.share().owns.contains(q) ==> !t.nic().qps.contains_key(q)
+    &&& forall|n: nat| !(#[trigger] t.nic().qps.contains_key(t.name(n)))
+    &&& forall|n: nat, w: WqeRef| #[trigger] t.nic().retired.contains_key(w) ==> w.qp != #[trigger] t.name(n)
+    &&& forall|q: QpId| !(#[trigger] t.started(q)) && t.written(q) == Seq::<SendWr>::empty()
+}
+
 // =============================================================================
-// The verbs
+// Creating and destroying a worker's objects (the control path)
+
+/// The device's limits (`ibv_query_device`, and the ports' message size),
+/// as a specification.
+pub uninterp spec fn spec_device_caps<N: Device>(pd: Pd<N>) -> DeviceCaps;
+
+/// The limits of the device of `pd`.
+#[verifier::external_body]
+pub fn device_caps<N: Device>(pd: &Pd<N>) -> (caps: DeviceCaps)
+    ensures
+        caps == spec_device_caps(*pd),
+{
+    pd.context().nic().caps()
+}
+
+/// `ibv_create_cq_ex` (single-threaded) on the device of `pd`: a worker's CQ
+/// of `entries` entries, and its token, with the device's limits as M has
+/// them. M's `create_cq` with a name never used, after whatever the device
+/// went through before; the worker's share is that CQ and QP names no other
+/// worker has, none used before. This is where tokens come from.
+#[verifier::external_body]
+pub fn create_cq<N: Device>(pd: &Pd<N>, entries: u32) -> (r: Result<
+    (N::Cq, DeviceCaps, Tracked<NicToken>),
+>)
+    requires
+        1 <= entries <= spec_device_caps(*pd).max_cqe,
+    ensures
+        r matches Ok((cq, caps, t)) ==> {
+            let m = t@.nic();
+            let sh = t@.share();
+            &&& nic_inv(m)
+            &&& share_wf(m, sh)
+            &&& cq_of(cq) == sh.cq
+            &&& m.cqs[sh.cq].cap == entries
+            &&& m.cqs[sh.cq].reserved.len() == 0
+            &&& t@.pd() == pd_of(*pd)
+            &&& m.pds.contains(t@.pd())
+            &&& caps == spec_device_caps(*pd)
+            &&& caps_model(m.caps, caps)
+            &&& fresh_worker(t@)
+        },
+{
+    let nic = pd.context().nic();
+    let caps = nic.caps();
+    let cq = nic.create_cq(entries, true)?;
+    Ok((cq, caps, Tracked::assume_new()))
+}
+
+/// `ibv_alloc_td` and `ibv_alloc_parent_domain` over `pd`, where the device
+/// has them. M does not model thread domains: they change which locks the
+/// driver takes, not what the NIC does.
+#[verifier::external_body]
+pub fn alloc_domain<N: Device>(pd: &Pd<N>) -> Option<N::Domain> {
+    pd.context().nic().alloc_domain(pd.raw())
+}
+
+/// The QP number the device gave a hardware QP (no meaning in M).
+#[verifier::external_body]
+pub fn qp_num_of<Q: NicQp>(qp: &Q) -> u32 {
+    qp.qp_num()
+}
+
+/// Whether a hardware QP was created without the driver's locks (no
+/// meaning in M).
+#[verifier::external_body]
+pub fn qp_lock_free<Q: NicQp>(qp: &Q) -> bool {
+    qp.is_lock_free()
+}
+
+/// Panics: a QP key that names no QP of the worker (a logic error of the
+/// caller, not a memory-safety one). Never returns.
+#[verifier::external_body]
+pub fn no_qp(index: usize)
+    ensures
+        false,
+{
+    panic!("no QP {index} in this worker")
+}
+
+/// `ibv_create_qp_ex` on the worker's CQ and protection domain (on its
+/// thread domain if any): M's `create_qp` of `q`, or nothing on error.
+#[verifier::external_body]
+pub fn create_qp<N: Device>(
+    pd: &Pd<N>,
+    domain: Option<&N::Domain>,
+    cq: &N::Cq,
+    qp_type: QpType,
+    caps: &QpCaps,
+    Ghost(q): Ghost<QpId>,
+    Tracked(token): Tracked<&mut NicToken>,
+) -> (r: Result<N::Qp>)
+    requires
+        cq_of(*cq) == old(token).share().cq,
+        pd_of(*pd) == old(token).pd(),
+        nic_inv(old(token).nic()),
+        share_wf(old(token).nic(), old(token).share()),
+        old(token).share().owns.contains(q),
+        nic_enabled(
+            old(token).nic(),
+            Nic::Step::create_qp(q, qp_attr(old(token).pd(), qp_type, old(token).share().cq, *caps)),
+        ),
+    ensures
+        final(token).same_worker(old(token)),
+        final(token).same_writings(old(token)),
+        r matches Ok(qp) ==> qp_of(qp) == q && exists|mid: Nic::State|
+            rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid)
+                && nic_step(
+                mid,
+                final(token).nic(),
+                Nic::Step::create_qp(
+                    q,
+                    qp_attr(old(token).pd(), qp_type, old(token).share().cq, *caps),
+                ),
+            ),
+        r is Err ==> rely_reaches(
+            old(token).share(),
+            pinned(*old(token)),
+            old(token).nic(),
+            final(token).nic(),
+        ),
+{
+    pd.context().nic().create_qp(pd.raw(), domain, cq, cq, qp_type, caps)
+}
+
+/// `ibv_modify_qp` to INIT, RTR and RTS: M's three `modify_qp` steps, or on
+/// error the first ones.
+#[verifier::external_body]
+pub fn connect<Q: NicQp>(
+    qp: &mut Q,
+    attr: &ConnectAttr,
+    remote: &Endpoint,
+    Ghost(q): Ghost<QpId>,
+    Tracked(token): Tracked<&mut NicToken>,
+) -> (r: Result<()>)
+    requires
+        qp_of(*old(qp)) == q,
+        nic_inv(old(token).nic()),
+        share_wf(old(token).nic(), old(token).share()),
+        old(token).share().owns.contains(q),
+        old(token).nic().qps.contains_key(q),
+        old(token).nic().qps[q].state is Reset,
+    ensures
+        qp_of(*final(qp)) == q,
+        final(token).same_worker(old(token)),
+        final(token).same_writings(old(token)),
+        r is Ok ==> modified(
+            old(token).share(),
+            pinned(*old(token)),
+            old(token).nic(),
+            final(token).nic(),
+            q,
+            connect_states(),
+        ),
+        r is Err ==> exists|k: int|
+            0 <= k < 3 && modified(
+                old(token).share(),
+                pinned(*old(token)),
+                old(token).nic(),
+                final(token).nic(),
+                q,
+                connect_states().take(k),
+            ),
+{
+    qp.connect(attr, remote)
+}
+
+/// `ibv_modify_qp` to ERR: M's `modify_qp` of `q` to `Err`, or nothing on
+/// error.
+#[verifier::external_body]
+pub fn to_error<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracked<&mut NicToken>) -> (r:
+    Result<()>)
+    requires
+        qp_of(*old(qp)) == q,
+        nic_inv(old(token).nic()),
+        share_wf(old(token).nic(), old(token).share()),
+        old(token).share().owns.contains(q),
+        nic_enabled(old(token).nic(), Nic::Step::modify_qp(q, QpState::Err)),
+    ensures
+        qp_of(*final(qp)) == q,
+        final(token).same_worker(old(token)),
+        final(token).same_writings(old(token)),
+        r is Ok ==> exists|mid: Nic::State|
+            rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid)
+                && nic_step(mid, final(token).nic(), Nic::Step::modify_qp(q, QpState::Err)),
+        r is Err ==> rely_reaches(
+            old(token).share(),
+            pinned(*old(token)),
+            old(token).nic(),
+            final(token).nic(),
+        ),
+{
+    qp.to_error()
+}
+
+/// `ibv_destroy_qp`: M's `destroy_qp`, which needs its queues empty.
+#[verifier::external_body]
+pub fn destroy_qp<Q: NicQp>(qp: Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracked<&mut NicToken>)
+    requires
+        qp_of(qp) == q,
+        nic_inv(old(token).nic()),
+        share_wf(old(token).nic(), old(token).share()),
+        old(token).share().owns.contains(q),
+        nic_enabled(old(token).nic(), Nic::Step::destroy_qp(q)),
+    ensures
+        final(token).same_worker(old(token)),
+        final(token).same_writings(old(token)),
+        exists|mid: Nic::State|
+            rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid) && nic_step(
+                mid,
+                final(token).nic(),
+                Nic::Step::destroy_qp(q),
+            ),
+{
+    drop(qp)
+}
+
+/// `ibv_destroy_cq` of the worker's CQ: M's `destroy_cq`, which needs no QP
+/// attached. The token goes with it.
+#[verifier::external_body]
+pub fn destroy_cq<C: NicCq>(cq: C, Tracked(token): Tracked<NicToken>)
+    requires
+        cq_of(cq) == token.share().cq,
+        nic_inv(token.nic()),
+        share_wf(token.nic(), token.share()),
+        nic_enabled(token.nic(), Nic::Step::destroy_cq(token.share().cq)),
+{
+    drop(cq)
+}
+
+// =============================================================================
+// Buffers (`buf.rs`, not verified yet)
+
+/// [`Pd::id`].
+#[verifier::external_body]
+pub fn pd_id_of<N: Device>(pd: &Pd<N>) -> (id: u64)
+    ensures
+        id == pd_id(*pd),
+{
+    pd.id()
+}
+
+/// A part's range of registered memory.
+#[verifier::external_body]
+pub fn part_sge_of<N: Device>(part: &Part<N>) -> (sge: Sge)
+    ensures
+        sge == part_sge(*part),
+{
+    part.sge
+}
+
+/// A part's protection domain ([`Pd::id`]).
+#[verifier::external_body]
+pub fn part_pd_of<N: Device>(part: &Part<N>) -> (pd: u64)
+    ensures
+        pd == part_pd(*part),
+{
+    part.pd
+}
+
+/// Whether a part is unique, so that the NIC may write it.
+#[verifier::external_body]
+pub fn part_writable_of<N: Device>(part: &Part<N>) -> (writable: bool)
+    ensures
+        writable == part_writable(*part),
+{
+    part.is_writable()
+}
+
+/// What a buffer's lease promises (`buf.rs`): its bytes lie in a region
+/// registered in its protection domain, locally writable if the buffer is
+/// unique, and the region stays registered while the lease lives. Learning
+/// it moves the token's view to the present, since the region may be newer
+/// than what the worker last saw.
+#[verifier::external_body]
+pub fn registered<N: Device>(_part: &Part<N>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
+    requires
+        part_pd(*_part) == pd_id(*_pd),
+        pd_of(*_pd) == old(token).pd(),
+    ensures
+        final(token).same_worker(old(token)),
+        final(token).same_writings(old(token)),
+        rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
+        final(token).nic().registered(
+            final(token).pd(),
+            sge_model(part_sge(*_part)),
+            part_writable(*_part),
+        ),
+{
+}
+
+/// No leases (`Leases::default`).
+#[verifier::external_body]
+pub fn no_leases<N: Device>() -> Leases<N> {
+    Leases::default()
+}
+
+/// Keeps a part's lease among `leases` (`Leases::push`).
+#[verifier::external_body]
+pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>) {
+    leases.push(part.lease)
+}
+
+// =============================================================================
+// The verbs of the data path
 
 /// `ibv_wr_start`: queue pair `q` starts writing send WRs.
 #[verifier::external_body]
 pub fn start<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracked<&mut NicToken>)
     requires
+        qp_of(*old(qp)) == q,
         !old(token).started(q),
     ensures
+        qp_of(*final(qp)) == q,
         final(token).nic() == old(token).nic(),
-        final(token).same_share(old(token)),
+        final(token).same_worker(old(token)),
         final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
@@ -247,10 +754,12 @@ pub fn post<Q: NicQp>(
     Tracked(token): Tracked<&mut NicToken>,
 )
     requires
+        qp_of(*old(qp)) == q,
         old(token).started(q),
     ensures
+        qp_of(*final(qp)) == q,
         final(token).nic() == old(token).nic(),
-        final(token).same_share(old(token)),
+        final(token).same_worker(old(token)),
         final(token).started(q),
         final(token).written(q) == old(token).written(q).push(send_wr(wr_id, signaled, *op, sges@)),
         final(token).same_writing_but(old(token), q),
@@ -270,30 +779,27 @@ pub fn doorbell<Q: NicQp>(
     Tracked(token): Tracked<&mut NicToken>,
 ) -> (r: Result<()>)
     requires
+        qp_of(*old(qp)) == q,
         old(token).started(q),
         nic_inv(old(token).nic()),
         share_wf(old(token).nic(), old(token).share()),
-        mine(
-            old(token).share(),
-            send_keys(old(token).written(q)),
-            Nic::Step::post_send(q, old(token).written(q)),
-        ),
+        old(token).share().owns.contains(q),
         nic_enabled(old(token).nic(), Nic::Step::post_send(q, old(token).written(q))),
     ensures
-        final(token).same_share(old(token)),
+        qp_of(*final(qp)) == q,
+        final(token).same_worker(old(token)),
         !final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
         r is Ok ==> exists|mid: Nic::State|
-            rely_reaches(old(token).share(), send_keys(old(token).written(q)), old(token).nic(), mid)
-                && nic_step(
+            rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid) && nic_step(
                 mid,
                 final(token).nic(),
                 Nic::Step::post_send(q, old(token).written(q)),
             ),
         r is Err ==> rely_reaches(
             old(token).share(),
-            send_keys(old(token).written(q)),
+            pinned(*old(token)),
             old(token).nic(),
             final(token).nic(),
         ),
@@ -306,13 +812,15 @@ pub fn doorbell<Q: NicQp>(
 #[verifier::external_body]
 pub fn abort<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracked<&mut NicToken>)
     requires
+        qp_of(*old(qp)) == q,
         old(token).started(q),
     ensures
-        final(token).same_share(old(token)),
+        qp_of(*final(qp)) == q,
+        final(token).same_worker(old(token)),
         !final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
-        rely_reaches(old(token).share(), no_pins(), old(token).nic(), final(token).nic()),
+        rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
 {
     // SAFETY: started (the precondition).
     unsafe { qp.abort() }
@@ -329,22 +837,19 @@ pub fn post_recv<Q: NicQp>(
     Tracked(token): Tracked<&mut NicToken>,
 ) -> (r: Result<()>)
     requires
+        qp_of(*old(qp)) == q,
         nic_inv(old(token).nic()),
         share_wf(old(token).nic(), old(token).share()),
-        mine(
-            old(token).share(),
-            recv_keys(seq![recv_wr(wr_id, sges@)]),
-            Nic::Step::post_recv(q, seq![recv_wr(wr_id, sges@)]),
-        ),
+        old(token).share().owns.contains(q),
         nic_enabled(old(token).nic(), Nic::Step::post_recv(q, seq![recv_wr(wr_id, sges@)])),
     ensures
-        final(token).same_share(old(token)),
-        forall|p: QpId| #[trigger] final(token).started(p) == old(token).started(p),
-        forall|p: QpId| #[trigger] final(token).written(p) == old(token).written(p),
+        qp_of(*final(qp)) == q,
+        final(token).same_worker(old(token)),
+        final(token).same_writings(old(token)),
         r is Ok ==> exists|mid: Nic::State|
             rely_reaches(
                 old(token).share(),
-                recv_keys(seq![recv_wr(wr_id, sges@)]),
+                pinned(*old(token)).union(recv_keys(seq![recv_wr(wr_id, sges@)])),
                 old(token).nic(),
                 mid,
             ) && nic_step(
@@ -354,7 +859,7 @@ pub fn post_recv<Q: NicQp>(
             ),
         r is Err ==> rely_reaches(
             old(token).share(),
-            recv_keys(seq![recv_wr(wr_id, sges@)]),
+            pinned(*old(token)),
             old(token).nic(),
             final(token).nic(),
         ),
@@ -370,13 +875,21 @@ pub fn post_recv<Q: NicQp>(
 #[verifier::external_body]
 pub fn poll<C: NicCq>(cq: &mut C, out: &mut [Wc], Tracked(token): Tracked<&mut NicToken>) -> (n:
     usize)
+    requires
+        cq_of(*old(cq)) == old(token).share().cq,
     ensures
+        cq_of(*final(cq)) == cq_of(*old(cq)),
         n <= old(out)@.len(),
         final(out)@.len() == old(out)@.len(),
-        final(token).same_share(old(token)),
-        polled(old(token).share(), old(token).nic(), final(token).nic(), final(out)@.take(n as int)),
-        forall|q: QpId| #[trigger] final(token).started(q) == old(token).started(q),
-        forall|q: QpId| #[trigger] final(token).written(q) == old(token).written(q),
+        final(token).same_worker(old(token)),
+        final(token).same_writings(old(token)),
+        polled(
+            old(token).share(),
+            pinned(*old(token)),
+            old(token).nic(),
+            final(token).nic(),
+            final(out)@.take(n as int),
+        ),
 {
     cq.poll(out)
 }

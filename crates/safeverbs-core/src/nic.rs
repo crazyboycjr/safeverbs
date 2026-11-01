@@ -195,6 +195,9 @@ pub struct DeviceCaps {
     pub max_qp_rd_atom: u32,
     /// Whether atomics are supported.
     pub atomics: bool,
+    /// Bytes of one message, at most (the least `max_msg_sz` of its
+    /// ports).
+    pub max_msg: u32,
 }
 
 /// A port's attributes (from `ibv_query_port`).
