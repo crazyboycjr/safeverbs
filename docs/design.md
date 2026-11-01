@@ -84,8 +84,9 @@ Verus in `crates/safeverbs-spec`:
 
 > **Theorem 1.** Under M, for any behaviour of the peer and the network, every execution of
 > SafeVerbs corresponds to an execution of A, every verb the library issues satisfies its
-> precondition in M, and A and M stay coupled: each request's outcome is the one M produced
-> for its WR, and the NIC touches only memory A gives it.
+> precondition in M, and A and M stay coupled: each request owns a disjoint interval of
+> WQEs, its outcome aggregates that interval's retired outcomes, and the NIC touches only
+> memory A gives it.
 
 Users need to read only M, A and this theorem. The properties below are invariants and
 lemmas of A, proved once and for all; they hold for the library because it refines A.
@@ -114,15 +115,17 @@ connected queue pair to the error state at any moment without telling anyone, so
 allowed in `Rts` *or* `Err`. M also proves that no step the NIC takes on its own invalidates
 a precondition the library checked earlier (`lemma_nic_steps_keep_verbs_enabled`).
 
-**F1, completion correspondence.** Each request gets exactly one outcome, the one M produced
-for its WR (status and only operation-defined metadata), and it is returned together with the
+**F1, completion correspondence.** Each request gets at most one outcome, aggregating M
+over its own WQE interval (status and only operation-defined metadata), and it is returned together with the
 request's own buffers. For an unsignaled WR the outcome is "success": M's in-order rule
 implies that a WR retired by a later CQE executed without error, and M proves it
 (`lemma_poll`). In A: an outcome, once produced, never changes (`lemma_f1_outcome_fixed`);
 taking it returns exactly that outcome and the bytes the request was posted with
 (`lemma_f1_take`); ids are never reused, so nothing is taken twice (`lemma_f1_taken_once`).
-Against M: the outcome is the one M recorded when it retired the request's own WR, and no
-other request shares that WR (`corollary_f1`).
+Against M: all of the request's WQEs have retired before its outcome exists; it keeps the
+first error in posting order, or the final success if none failed. No other request owns
+any WQE in that interval (`corollary_f1`). A proper prefix may retire, including with an
+error, while the batch still holds its buffers. Eventual completion requires progress.
 
 **R1, no leak by the library.** Every buffer handed to the library is returned or dropped
 at most once, never before the NIC is done with it. Return or release is eventual only
@@ -188,7 +191,7 @@ with every observed completion checked against the transitions M allows.
 
 **Theorem 1 (now)** is the single-ended theorem above. `refinement.rs` states it as the
 interface the core must prove: a trait `Refines` with the core's invariant, its abstraction
-function to A, its ghost view of the NIC in M and the map from requests to WRs, and three
+function to A, its ghost view of the NIC in M and the map from requests to disjoint WQE intervals, and three
 obligations (start states, every API call is zero or more steps of A and of M, the invariant
 couples A and M). `theorem_1` proves, for every implementation meeting the obligations, that
 along any execution A's and M's invariants hold, every verb met its precondition, and A and

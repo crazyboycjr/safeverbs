@@ -510,7 +510,7 @@ impl<N: Nic> Worker<N> {
     /// on is flushed too.
     pub fn to_error<T: Transport>(&mut self, qp: QpKey<T>) -> Result<()> {
         self.check(qp.index());
-        self.hw.to_error(qp.index())
+        self.hw.set_error(qp.index())
     }
 
     /// Starts a request on the QP's send queue. Its WQEs go out at the next

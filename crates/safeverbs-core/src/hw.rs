@@ -1057,7 +1057,7 @@ impl<N: Device> Hw<N> {
     /// completes with a flush error. Work posted from then on is flushed
     /// too.
     #[verifier::spinoff_prover]
-    pub fn to_error(&mut self, index: usize) -> (r: Result<()>)
+    pub fn set_error(&mut self, index: usize) -> (r: Result<()>)
         requires
             old(self).inv(),
         ensures
@@ -3056,7 +3056,7 @@ impl<N: Device> Hw<N> {
         if busy {
             // ERR is reachable from every state (M's `modify_qp`). A device
             // that refuses it is left to the timeout: the QP is then kept.
-            if self.to_error(index).is_ok() {
+            if self.set_error(index).is_ok() {
                 let ghost s2 = *self;
                 self.set_flags(index, Some(true), false);
                 proof {

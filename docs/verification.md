@@ -68,7 +68,13 @@ formed (`lemma_mine_keeps_share_wf`).
 implementation meeting the obligations of the `Refines` trait, along any execution, A's and
 M's invariants hold, every verb met its precondition (S2), and A and M stay coupled.
 `corollary_s1` and `corollary_f1` restate S1 and F1 against M: the NIC touches only memory A
-gives it, and the outcome a client takes is the one M recorded for that request's own WR.
+gives it, and the outcome a client takes aggregates only its own fully retired WQE
+interval. `WqeRange` enforces nonempty, disjoint intervals. `lemma_aggregate` proves that
+aggregation keeps the earliest error or the final success, `lemma_singleton` preserves
+the single-WQE case, and `lemma_poll_prefix_pending` proves that retiring a proper prefix
+keeps the batch in flight. Concrete traces include a remote error followed by a flush;
+the batch returns the remote error only after both WQEs retire. These are specification
+results; the real worker still needs to discharge `Refines`.
 
 **Worked examples** (`examples.rs`) are concrete executions checked step by step; they show
 that the transitions can happen, so no lemma above is vacuous.
@@ -198,7 +204,6 @@ a token over a fresh share. These are trusted, not proved.
     SGEs; WRITE_WITH_IMM notifications are not. This resolves that particular obstruction,
     but does not construct the missing worker-to-A map or discharge `impl Refines`.
 
-
   Until then Theorem 1 holds for any implementation that discharges the obligations; the core
   discharges M's side for the worker and A's side for the ring.
 - **Theorem 2**, two SafeVerbs endpoints under assume-guarantee (no receiver-not-ready or
@@ -281,8 +286,8 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 131 verified, 0 errors
-safeverbs-core: verification results:: 228 verified, 0 errors
+safeverbs-spec: verification results:: 147 verified, 0 errors
+safeverbs-core: verification results:: 237 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only
@@ -372,10 +377,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_k
 
 ## How the core connects to the model
 
-The core's state carries ghost state that the abstraction function reads: a tracked token
-whose view is M's state, the map from requests to WRs, and the leases of A. Four pieces
-connect it to the specification crate. The first three exist (`trusted.rs`, `hw.rs`,
-`refine.rs`); the fourth, the leases as permissions, does not yet.
+The completed refinement needs a tracked token whose view is M's state, a map from
+requests to WQE intervals, and A's lease permissions. The token and separate component
+proofs exist (`trusted.rs`, `hw.rs`, `refine.rs`); the worker-level request map, permission
+integration and `impl Refines` remain to be constructed. Proof-only hardware entry points
+are crate-private, so ordinary Rust callers cannot bypass their verified preconditions.
 
 **Trusted verbs wrappers** (`trusted.rs`). Each verb is one small function with an
 `external_body` and a contract taken from M. The precondition is checked by Verus at every

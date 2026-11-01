@@ -324,7 +324,7 @@ pub proof fn lemma_pending_last(range: WqeRange, m: Nic::State)
         },
 {
     let cut = choose|cut: nat| range.pending_at(m, cut);
-    assert(cut <= (range.end - 1) as nat < range.end);
+    assert(cut <= ((range.end - 1) as nat) < range.end);
 }
 
 /// Polling a CQE inside a proper prefix advances the retirement cut without completing
