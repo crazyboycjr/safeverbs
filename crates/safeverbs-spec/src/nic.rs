@@ -269,6 +269,15 @@ pub struct Cq {
     pub used: Multiset<QpId>,
 }
 
+/// The CQEs of each queue appear in posting order. (Opaque: proofs about order reveal it.)
+#[verifier::opaque]
+pub open spec fn in_posting_order(entries: Seq<Cqe>) -> bool {
+    forall|m1: int, m2: int| #![trigger entries[m1], entries[m2]]
+        0 <= m1 < m2 < entries.len() && entries[m1].qp == entries[m2].qp
+            && entries[m1].queue == entries[m2].queue
+        ==> entries[m1].seq < entries[m2].seq
+}
+
 /// `n` copies of `q`.
 pub open spec fn copies(q: QpId, n: nat) -> Multiset<QpId>
     decreases n,
@@ -572,14 +581,16 @@ state_machine! {
 
         /// The NIC executes the oldest unexecuted send WQE. In `Rts` any outcome but
         /// `FlushErr` may happen (the peer may refuse, vanish, never post a receive); an
-        /// error moves the queue pair to `Err`. In `Err` it completes with `FlushErr`. A CQE
-        /// appears if the WQE was signaled or failed; the CQ always has room.
+        /// error moves the queue pair to `Err`. In `Err` it completes with an error,
+        /// normally `FlushErr`. A CQE appears if the WQE was signaled or failed; the CQ
+        /// always has room.
         transition! {
             execute_send(q: QpId, o: Outcome) {
                 require pre.qps.contains_key(q);
                 let qp = pre.qps[q];
                 require qp.sq_done < qp.sq.len();
-                require (qp.state is Err) == (o.status is FlushErr);
+                require qp.state is Err ==> o.status.is_err();
+                require o.status is FlushErr ==> qp.state is Err;
                 let slot = qp.sq[qp.sq_done as int];
                 let done = SendSlot { wr: slot.wr, outcome: Some(o) };
                 update qps = pre.qps.insert(q, Qp {
@@ -601,14 +612,16 @@ state_machine! {
         }
 
         /// The NIC executes the oldest unexecuted receive WQE: a message arrived (its length
-        /// fits the buffers if it succeeded) or, in `Err`, it is flushed. Always a CQE.
+        /// fits the buffers if it succeeded) or, in `Err`, it completes with an error,
+        /// normally `FlushErr`. Always a CQE.
         transition! {
             execute_recv(q: QpId, o: Outcome) {
                 require pre.qps.contains_key(q);
                 let qp = pre.qps[q];
                 require qp.rq_done < qp.rq.len();
                 require qp.state is Rtr || qp.state is Rts || qp.state is Err;
-                require (qp.state is Err) == (o.status is FlushErr);
+                require qp.state is Err ==> o.status.is_err();
+                require o.status is FlushErr ==> qp.state is Err;
                 let slot = qp.rq[qp.rq_done as int];
                 require o.status is Success ==> o.byte_len <= total_len(slot.wr.sges);
                 let c = qp.attr.recv_cq;
@@ -713,10 +726,7 @@ state_machine! {
             &&& forall|q: QpId| #[trigger] cq.used.count(q) == self.pending(c, q)
             &&& forall|q: QpId| #[trigger] cq.reserved.count(q) == self.reserved_by(c, q)
             &&& forall|m: int| 0 <= m < cq.entries.len() ==> self.cqe_wf(c, #[trigger] cq.entries[m])
-            &&& forall|m1: int, m2: int| #![trigger cq.entries[m1], cq.entries[m2]]
-                0 <= m1 < m2 < cq.entries.len() && cq.entries[m1].qp == cq.entries[m2].qp
-                    && cq.entries[m1].queue == cq.entries[m2].queue
-                ==> cq.entries[m1].seq < cq.entries[m2].seq
+            &&& in_posting_order(cq.entries)
         }
 
         pub open spec fn cqes_present(self, q: QpId) -> bool {

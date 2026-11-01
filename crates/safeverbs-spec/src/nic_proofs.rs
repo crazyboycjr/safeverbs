@@ -223,6 +223,9 @@ pub proof fn lemma_create_cq(pre: Nic::State, post: Nic::State, c: CqId, cap: na
         if c2 != c {
             lemma_cq_unchanged(pre, post, c2);
         } else {
+            assert(in_posting_order(post.cqs[c].entries)) by {
+                reveal(in_posting_order);
+            }
             assert forall|q: QpId| #[trigger] post.cqs[c].used.count(q) == post.pending(c, q) by {
                 if post.qps.contains_key(q) {
                     assert(pre.qp_wf(pre.qps[q]));
@@ -414,6 +417,7 @@ pub proof fn lemma_head_is_first(pre: Nic::State, c: CqId)
     let e = cq.entries[0];
     assert(pre.cq_wf(c));
     assert(pre.cqe_wf(c, e));
+    reveal(in_posting_order);
     let q = e.qp;
     let qp = pre.qps[q];
     assert(pre.cqes_present(q));
@@ -578,9 +582,7 @@ proof fn lemma_poll_cq_entries(pre: Nic::State, post: Nic::State, c: CqId, c2: C
         ({
             let es = post.cqs[c2].entries;
             &&& forall|m: int| 0 <= m < es.len() ==> post.cqe_wf(c2, #[trigger] es[m])
-            &&& forall|m1: int, m2: int| #![trigger es[m1], es[m2]]
-                0 <= m1 < m2 < es.len() && es[m1].qp == es[m2].qp && es[m1].queue == es[m2].queue
-                ==> es[m1].seq < es[m2].seq
+            &&& in_posting_order(es)
         }),
 {
     lemma_head_is_first(pre, c);
@@ -607,7 +609,9 @@ proof fn lemma_poll_cq_entries(pre: Nic::State, post: Nic::State, c: CqId, c2: C
             assert(es[m] == e2);
             assert(pre.cqe_wf(c2, e2));
             if e2.qp == q && e2.queue == e.queue {
-                assert(cq.entries[0].seq < cq.entries[m + 1].seq);
+                assert(cq.entries[0].seq < cq.entries[m + 1].seq) by {
+                    reveal(in_posting_order);
+                }
                 if e.queue is Send {
                     assert(qp2.sq[e2.seq - qp2.sq_head] == qp.sq[e2.seq - qp.sq_head]);
                 } else {
@@ -615,10 +619,13 @@ proof fn lemma_poll_cq_entries(pre: Nic::State, post: Nic::State, c: CqId, c2: C
                 }
             }
         }
-        assert forall|m1: int, m2: int| #![trigger es[m1], es[m2]]
-            0 <= m1 < m2 < es.len() && es[m1].qp == es[m2].qp && es[m1].queue == es[m2].queue
-            implies es[m1].seq < es[m2].seq by {
-            assert(es[m1] == cq.entries[m1 + 1] && es[m2] == cq.entries[m2 + 1]);
+        assert(in_posting_order(es)) by {
+            reveal(in_posting_order);
+            assert forall|m1: int, m2: int| #![trigger es[m1], es[m2]]
+                0 <= m1 < m2 < es.len() && es[m1].qp == es[m2].qp && es[m1].queue == es[m2].queue
+                implies es[m1].seq < es[m2].seq by {
+                assert(es[m1] == cq.entries[m1 + 1] && es[m2] == cq.entries[m2 + 1]);
+            }
         }
     }
 }
@@ -792,13 +799,16 @@ pub proof fn lemma_execute_send(pre: Nic::State, post: Nic::State, q: QpId, o: O
                     assert(pre.cqe_wf(c2, cq.entries[m]));
                 }
             }
-            assert forall|m1: int, m2: int| #![trigger es[m1], es[m2]]
-                0 <= m1 < m2 < es.len() && es[m1].qp == es[m2].qp && es[m1].queue == es[m2].queue
-                implies es[m1].seq < es[m2].seq by {
-                if m2 == cq.entries.len() {
-                    assert(pre.cqe_wf(c2, cq.entries[m1]));
-                } else {
-                    assert(es[m1] == cq.entries[m1] && es[m2] == cq.entries[m2]);
+            assert(in_posting_order(es)) by {
+                reveal(in_posting_order);
+                assert forall|m1: int, m2: int| #![trigger es[m1], es[m2]]
+                    0 <= m1 < m2 < es.len() && es[m1].qp == es[m2].qp && es[m1].queue == es[m2].queue
+                    implies es[m1].seq < es[m2].seq by {
+                    if m2 == cq.entries.len() {
+                        assert(pre.cqe_wf(c2, cq.entries[m1]));
+                    } else {
+                        assert(es[m1] == cq.entries[m1] && es[m2] == cq.entries[m2]);
+                    }
                 }
             }
         }
@@ -906,13 +916,16 @@ pub proof fn lemma_execute_recv(pre: Nic::State, post: Nic::State, q: QpId, o: O
                     assert(pre.cqe_wf(c2, cq.entries[m]));
                 }
             }
-            assert forall|m1: int, m2: int| #![trigger es[m1], es[m2]]
-                0 <= m1 < m2 < es.len() && es[m1].qp == es[m2].qp && es[m1].queue == es[m2].queue
-                implies es[m1].seq < es[m2].seq by {
-                if m2 == cq.entries.len() {
-                    assert(pre.cqe_wf(c2, cq.entries[m1]));
-                } else {
-                    assert(es[m1] == cq.entries[m1] && es[m2] == cq.entries[m2]);
+            assert(in_posting_order(es)) by {
+                reveal(in_posting_order);
+                assert forall|m1: int, m2: int| #![trigger es[m1], es[m2]]
+                    0 <= m1 < m2 < es.len() && es[m1].qp == es[m2].qp && es[m1].queue == es[m2].queue
+                    implies es[m1].seq < es[m2].seq by {
+                    if m2 == cq.entries.len() {
+                        assert(pre.cqe_wf(c2, cq.entries[m1]));
+                    } else {
+                        assert(es[m1] == cq.entries[m1] && es[m2] == cq.entries[m2]);
+                    }
                 }
             }
         }
