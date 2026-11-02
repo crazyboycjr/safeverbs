@@ -120,6 +120,37 @@ pub proof fn lemma_f1_taken_once(pre: Abs::State, post: Abs::State, r: Id)
 // =========================================================================================
 // R1: no leak, no early release.
 
+/// Whether a member identity is still held anywhere, independently of its group handle.
+pub open spec fn member_live(s: Abs::State, member: Id) -> bool {
+    exists|i: Id, k: int| #![trigger s.groups[i].members[k]]
+        s.groups.contains_key(i) && 0 <= k < s.groups[i].members.len()
+            && s.groups[i].members[k].id == member
+}
+
+/// **R1, member identities.** A previously allocated member that no group holds cannot
+/// reappear. Taking or separating a group does not release its members; dropping the
+/// last group containing a member does. Fresh members always receive fresh identities.
+pub proof fn lemma_r1_member_released_once(pre: Abs::State, post: Abs::State, member: Id)
+    requires
+        pre.invariant(),
+        Abs::State::next(pre, post),
+        member < pre.next_id,
+        !member_live(pre, member),
+    ensures
+        !member_live(post, member),
+{
+    reveal(Abs::State::next);
+    reveal(Abs::State::next_by);
+    if member_live(post, member) {
+        let (i, k) = choose|i: Id, k: int| post.groups.contains_key(i)
+            && 0 <= k < post.groups[i].members.len()
+            && post.groups[i].members[k].id == member;
+        assert forall|j: Id, l: int| #![trigger pre.groups[j].members[l]]
+            pre.groups.contains_key(j) && 0 <= l < pre.groups[j].members.len()
+                implies pre.groups[j].members[l].id != member by {}
+    }
+}
+
 /// Every live member identity has exactly one position in exactly one group. Shared
 /// clones may overlap bytes, but cloning never duplicates a resource identity.
 pub proof fn lemma_member_owned_once(s: Abs::State, i: Id, j: Id, k: int, l: int)

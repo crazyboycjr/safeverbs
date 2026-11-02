@@ -36,6 +36,7 @@ with no runtime allocation or interval lookup.
 | F1 | `lemma_f1_take` | taking a request's outcome returns that outcome and its exact ordered member identities, ranges and permissions |
 | F1 | `lemma_f1_taken_once` | a request no longer held never comes back (ids are not reused) |
 | R1 | `lemma_member_owned_once` | each live member identity occupies exactly one position in one group |
+| R1 | `lemma_r1_member_released_once` | once an allocated member identity disappears from all groups, no later step resurrects it |
 | R1 | `lemma_r1_kept_while_in_flight` | an in-flight request keeps its members, unchanged, until its outcome exists |
 | R1 | `lemma_r1_requests_on_live_qps` | no request outlives its queue pair |
 | R1 | `lemma_r1_released_once` | a retired group handle never comes back; its members may survive under fresh handles |
