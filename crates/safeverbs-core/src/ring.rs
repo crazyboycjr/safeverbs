@@ -691,10 +691,26 @@ impl<L> Ring<L> {
                 && self.req(s)->0.leases == self.dma(s, w)->0)
                 || (self.staged(s) is Some && self.staged(s)->0.leases == self.dma(s, w)->0),
             self.refused(s) is None,
+            w < self.spec_wqe_committed() ==> self.req(s) is Some
+                && self.req(s)->0.phase is InFlight && self.req(s)->0.leases == self.dma(s, w)->0,
+            self.spec_wqe_committed() <= w ==> self.staged(s) is Some
+                && self.staged(s)->0.leases == self.dma(s, w)->0,
     {
         reveal(Ring::inv_slots);
         if s < self.retired { assert(self.done_ok(s)); }
         assert(self.live_ok(s));
+    }
+
+    /// Two live requests cannot authorize the same WQE number. This is
+    /// independent of wr_id encoding and excludes historical refused ledgers.
+    pub proof fn lemma_dma_unique(&self, s: int, t: int, w: int)
+        requires self.inv(), self.dma(s, w) is Some, self.dma(t, w) is Some,
+        ensures s == t,
+    {
+        self.lemma_dma(s, w);
+        self.lemma_dma(t, w);
+        if s < t { self.lemma_ordered(s, t); }
+        if t < s { self.lemma_ordered(t, s); }
     }
 
     /// The names of the wakers the ring has woken, in order.
@@ -1399,6 +1415,7 @@ impl<L> Ring<L> {
                     && old(self).spec_closed_end() <= w < old(self).spec_wqe_posted() {
                     Some(leases)
                 } else { old(self).dma(s, w) },
+            final(self).keeps_dma(old(self)),
     {
         assert!(self.open && self.open_wqes >= 1, "no open request with a WQE");
         let signaled = want_signal || self.must_signal();

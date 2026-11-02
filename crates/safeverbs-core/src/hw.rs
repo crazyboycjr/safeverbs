@@ -15,6 +15,12 @@
 //!   (`crate::wr_id::spec_wr_id`); the same for the receive queue. So the
 //!   completion M's `poll_cq` pops names the QP, the queue and the WQE that
 //!   [`Hw::progress`] routes it to.
+//! - **Local memory.** Every actual SQ/RQ WQE matches its live native
+//!   request interval's exact opcode and SGE ledger. Written WRs retain
+//!   their guards in staged requests or the open ledger; the final held
+//!   WQE retains its parts directly. Refused results never authorize DMA,
+//!   even when their WQE numbers are reused. The byte lemmas expose the
+//!   corresponding source/destination loan and physical lifetime guard.
 //! - **Capacity.** The CQ's entries reserved in M are exactly what the
 //!   worker counts ([`Hw::reserved`]); a QP is created only if its depths fit
 //!   ([`Hw::create_qp`]), and each ring keeps at most its depth of WQEs in
@@ -122,8 +128,8 @@ pub struct HwQp<N: Device> {
     building: Vec<Part<N>>,
     /// The leases of the open request's WQEs written so far.
     open_leases: Leases<N>,
-    /// The bytes of the open request.
-    open_bytes: u64,
+    /// The local byte count of the final held WQE, for inferred success.
+    held_bytes: u64,
 }
 
 /// A WQE held back: its `wr_id`, operation and scatter/gather list.
@@ -310,6 +316,145 @@ pub(crate) open spec fn request_resources_ok<N: Device>(leases: Leases<N>) -> bo
     leases.inv() && leases.fully_recorded()
 }
 
+/// Exact native opcode and SGE metadata in the request's checked ledger.
+pub(crate) open spec fn ledger_has<N: Device>(
+    leases: Leases<N>, id: u64, op: Option<safeverbs_spec::nic::Opcode>,
+    sges: Seq<safeverbs_spec::nic::Sge>,
+) -> bool {
+    exists|j: int| 0 <= j < leases.wqes().len() && {
+        let entry = #[trigger] leases.wqes()[j];
+        &&& entry.wr_id == id
+        &&& entry.opcode == op
+        &&& entry.sges.map_values(|s: Sge| sge_model(s)) == sges
+    }
+}
+
+/// The native record at this index is an explicit witness for its metadata.
+proof fn lemma_ledger_entry<N: Device>(leases: Leases<N>, j: int)
+    requires 0 <= j < leases.wqes().len(),
+    ensures ledger_has(leases, leases.wqes()[j].wr_id, leases.wqes()[j].opcode,
+        leases.wqes()[j].sges.map_values(|s: Sge| sge_model(s))),
+{
+    assert(leases.wqes()[j] == leases.wqes()[j]);
+}
+
+/// A WQE is retained by its actual live request interval, never by a refused
+/// result whose historical WQE number happens to match.
+pub(crate) open spec fn ring_backed<N: Device>(
+    r: Ring<Leases<N>>, w: int, id: u64,
+    op: Option<safeverbs_spec::nic::Opcode>, sges: Seq<safeverbs_spec::nic::Sge>,
+) -> bool {
+    exists|s: int| #[trigger] r.dma(s, w) is Some
+        && ledger_has(r.dma(s, w)->0, id, op, sges)
+}
+
+proof fn lemma_backed_kept<N: Device>(
+    pre: Ring<Leases<N>>, post: Ring<Leases<N>>, w: int, id: u64,
+    op: Option<safeverbs_spec::nic::Opcode>, sges: Seq<safeverbs_spec::nic::Sge>,
+)
+    requires post.keeps_dma(&pre), post.spec_wqe_retired() <= w < post.spec_closed_end(),
+        ring_backed(pre, w, id, op, sges),
+    ensures ring_backed(post, w, id, op, sges),
+{
+    let s = choose|s: int| pre.dma(s, w) is Some
+        && ledger_has(pre.dma(s, w)->0, id, op, sges);
+    assert(post.dma(s, w) == pre.dma(s, w));
+}
+
+/// The operation-specific local role, including receive destinations.
+pub(crate) open spec fn local_role(op: Option<safeverbs_spec::nic::Opcode>) -> safeverbs_spec::abs::Dir {
+    match op {
+        Some(op) => if op.writes_local() { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out },
+        None => safeverbs_spec::abs::Dir::In,
+    }
+}
+
+/// One exact native SGE is retained by a logical input and a physical guard.
+/// This does not invent allocation authority or arbitrary-byte type validity.
+pub(crate) open spec fn retained_sge<N: Device>(
+    leases: Leases<N>, dir: safeverbs_spec::abs::Dir, sge: safeverbs_spec::nic::Sge,
+) -> bool {
+    exists|l: int, g: int| 0 <= l < leases.loans().len() && 0 <= g < leases.view().len() && {
+        let loan = #[trigger] leases.loans()[l];
+        &&& sge_model(loan.part.spec_sge()) == sge
+        &&& loan.access == Some(dir)
+        &&& (#[trigger] leases.view()[g]).same_backing(loan.part.resource())
+        &&& dir is In ==> loan.part.spec_writable()
+    }
+}
+
+/// Byte containment uses the exact native address and byte length.
+pub(crate) open spec fn retained_byte<N: Device>(
+    leases: Leases<N>, dir: safeverbs_spec::abs::Dir, a: int,
+) -> bool {
+    exists|sge: safeverbs_spec::nic::Sge| #[trigger] retained_sge(leases, dir, sge)
+        && sge.span().contains(a)
+}
+
+proof fn lemma_covered_guard<N: Device>(
+    leases: Leases<N>, dir: safeverbs_spec::abs::Dir,
+    sges: Seq<safeverbs_spec::nic::Sge>, a: int,
+)
+    requires covers(sges, a), forall|i: int| 0 <= i < sges.len()
+        ==> retained_sge(leases, dir, #[trigger] sges[i]),
+    ensures retained_byte(leases, dir, a),
+{
+    let i = choose|i: int| 0 <= i < sges.len() && sges[i].span().contains(a);
+    assert(retained_sge(leases, dir, sges[i]));
+}
+
+/// Every SGE of an exact ledger entry has its operation's source/destination
+/// keeper, including logical shared inputs deduplicated by the native collector.
+pub(crate) proof fn lemma_ledger_guards<N: Device>(
+    leases: Leases<N>, id: u64, op: Option<safeverbs_spec::nic::Opcode>,
+    sges: Seq<safeverbs_spec::nic::Sge>,
+)
+    requires leases.inv(), ledger_has(leases, id, op, sges),
+    ensures forall|i: int| 0 <= i < sges.len()
+        ==> retained_sge(leases, local_role(op), #[trigger] sges[i]),
+{
+    leases.lemma_wqes();
+    leases.lemma_loans();
+    let j = choose|j: int| 0 <= j < leases.wqes().len() && {
+        let entry = #[trigger] leases.wqes()[j];
+        &&& entry.wr_id == id && entry.opcode == op
+        &&& entry.sges.map_values(|s: Sge| sge_model(s)) == sges
+    };
+    let entry = leases.wqes()[j];
+    assert(entry.matches(leases.loans()));
+    assert forall|i: int| 0 <= i < sges.len()
+        implies retained_sge(leases, local_role(op), #[trigger] sges[i]) by {
+        let l = entry.end() - 1 - i;
+        let loan = leases.loans()[l];
+        assert(loan.part.spec_sge() == entry.sges[i]);
+        assert(sge_model(loan.part.spec_sge()) == sges[i]);
+        let g = choose|g: int| 0 <= g < leases.view().len()
+            && leases.view()[g].same_backing(loan.part.resource());
+        assert(leases.view()[g].same_backing(loan.part.resource()));
+    }
+}
+
+/// Resolve a real WQE to its live request sequence and exact retained guards.
+/// Refused results cannot be selected, even if they have equal WQE metadata.
+pub(crate) proof fn lemma_ring_guards<N: Device>(
+    r: Ring<Leases<N>>, w: int, id: u64,
+    op: Option<safeverbs_spec::nic::Opcode>, sges: Seq<safeverbs_spec::nic::Sge>,
+) -> (s: int)
+    requires r.inv(), ring_resources_ok(r), ring_backed(r, w, id, op, sges),
+    ensures r.dma(s, w) is Some, request_resources_ok(r.dma(s, w)->0),
+        r.refused(s) is None,
+        (r.req(s) is Some && r.req(s)->0.phase is InFlight
+            && r.req(s)->0.leases == r.dma(s, w)->0)
+            || (r.staged(s) is Some && r.staged(s)->0.leases == r.dma(s, w)->0),
+        forall|i: int| 0 <= i < sges.len()
+            ==> retained_sge(r.dma(s, w)->0, local_role(op), #[trigger] sges[i]),
+{
+    let s = choose|s: int| r.dma(s, w) is Some && ledger_has(r.dma(s, w)->0, id, op, sges);
+    r.lemma_dma(s, w);
+    lemma_ledger_guards(r.dma(s, w)->0, id, op, sges);
+    s
+}
+
 /// A resource at a sequence keeps its identity across the three ring views.
 pub(crate) open spec fn resource_at<N: Device>(r: Ring<Leases<N>>, s: int, l: Leases<N>) -> bool {
     ||| r.req(s) is Some && r.req(s)->0.leases == l
@@ -405,6 +550,97 @@ pub open spec fn writes(t: NicToken, q: QpId) -> bool {
     t.started(q) || t.written(q).len() > 0
 }
 
+/// The local byte footprint of each actual M WQE has a concrete keeper.
+spec fn queues_backed<N: Device>(e: HwQp<N>, qp: Qp) -> bool {
+    &&& forall|k: int| 0 <= k < qp.sq.len() ==> {
+        let wr = (#[trigger] qp.sq[k]).wr;
+        &&& !wr.inline
+        &&& ring_backed(e.send, qp.sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges)
+    }
+    &&& forall|k: int| 0 <= k < qp.rq.len() ==> {
+        let wr = (#[trigger] qp.rq[k]).wr;
+        ring_backed(e.recv, qp.rq_head + k, wr.wr_id, None, wr.sges)
+    }
+}
+
+proof fn lemma_queues_kept<N: Device>(pre: HwQp<N>, post: HwQp<N>, qp: Qp)
+    requires queues_backed(pre, qp),
+        post.send.keeps_dma(&pre.send), post.recv.keeps_dma(&pre.recv),
+        post.send.spec_wqe_retired() <= qp.sq_head,
+        qp.sq_head + qp.sq.len() <= post.send.spec_wqe_committed(),
+        post.recv.spec_wqe_retired() <= qp.rq_head,
+        qp.rq_head + qp.rq.len() <= post.recv.spec_wqe_committed(),
+        post.send.inv(), post.recv.inv(),
+    ensures queues_backed(post, qp),
+{
+    post.send.lemma_wqes();
+    post.recv.lemma_wqes();
+    assert forall|k: int| 0 <= k < qp.sq.len() implies {
+        let wr = (#[trigger] qp.sq[k]).wr;
+        &&& !wr.inline
+        &&& ring_backed(post.send, qp.sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges)
+    } by {
+        let wr = qp.sq[k].wr;
+        lemma_backed_kept(pre.send, post.send, qp.sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges);
+    }
+    assert forall|k: int| 0 <= k < qp.rq.len() implies {
+        let wr = (#[trigger] qp.rq[k]).wr;
+        ring_backed(post.recv, qp.rq_head + k, wr.wr_id, None, wr.sges)
+    } by {
+        let wr = qp.rq[k].wr;
+        lemma_backed_kept(pre.recv, post.recv, qp.rq_head + k, wr.wr_id, None, wr.sges);
+    }
+}
+
+/// Written WQEs belong either to a closed staged request or to the open
+/// request's ledger. The final held WQE is backed separately by held_parts.
+spec fn written_backed<N: Device>(e: HwQp<N>, w: int, wr: SendWr) -> bool {
+    &&& !wr.inline
+    &&& (ring_backed(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges)
+        || (e.send.spec_is_open()
+            && e.send.spec_closed_end() <= w < e.send.spec_wqe_posted()
+            && ledger_has(e.open_leases, wr.wr_id, Some(wr.opcode), wr.sges)))
+}
+
+/// Extending a ledger preserves the exact metadata of all its prior WQEs.
+proof fn lemma_ledger_extended<N: Device>(
+    pre: Leases<N>, post: Leases<N>, id: u64,
+    op: Option<safeverbs_spec::nic::Opcode>, sges: Seq<safeverbs_spec::nic::Sge>,
+)
+    requires ledger_has(pre, id, op, sges), pre.wqes().len() <= post.wqes().len(),
+        forall|j: int| 0 <= j < pre.wqes().len()
+            ==> #[trigger] post.wqes()[j] == pre.wqes()[j],
+    ensures ledger_has(post, id, op, sges),
+{
+    let j = choose|j: int| 0 <= j < pre.wqes().len() && {
+        let entry = #[trigger] pre.wqes()[j];
+        &&& entry.wr_id == id && entry.opcode == op
+        &&& entry.sges.map_values(|s: Sge| sge_model(s)) == sges
+    };
+    assert(post.wqes()[j] == pre.wqes()[j]);
+}
+
+proof fn lemma_written_kept<N: Device>(pre: HwQp<N>, post: HwQp<N>, w: int, wr: SendWr)
+    requires written_backed(pre, w, wr), pre.send.inv(), post.send.inv(),
+        post.send.keeps_dma(&pre.send), post.send.spec_wqe_retired() <= w,
+        post.send.spec_closed_end() == pre.send.spec_closed_end(),
+        pre.send.spec_wqe_posted() <= post.send.spec_wqe_posted(),
+        pre.send.spec_is_open() ==> post.send.spec_is_open(),
+        pre.open_leases.wqes().len() <= post.open_leases.wqes().len(),
+        forall|j: int| 0 <= j < pre.open_leases.wqes().len()
+            ==> #[trigger] post.open_leases.wqes()[j] == pre.open_leases.wqes()[j],
+    ensures written_backed(post, w, wr),
+{
+    if ring_backed(pre.send, w, wr.wr_id, Some(wr.opcode), wr.sges) {
+        let s = choose|s: int| pre.send.dma(s, w) is Some
+            && ledger_has(pre.send.dma(s, w)->0, wr.wr_id, Some(wr.opcode), wr.sges);
+        pre.send.lemma_dma(s, w);
+        lemma_backed_kept(pre.send, post.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
+    } else {
+        lemma_ledger_extended(pre.open_leases, post.open_leases, wr.wr_id, Some(wr.opcode), wr.sges);
+    }
+}
+
 impl<N: Device> HwQp<N> {
     /// M's name of the QP.
     pub closed spec fn id(&self) -> QpId {
@@ -433,6 +669,9 @@ impl<N: Device> HwQp<N> {
         &&& rq_linked(self.recv, index, qp)
         &&& ring_resources_ok(self.send)
         &&& ring_resources_ok(self.recv)
+        &&& queues_backed(*self, qp)
+        &&& forall|j: int| 0 <= j < written.len()
+            ==> written_backed(*self, self.send.spec_wqe_committed() + j, #[trigger] written[j])
         &&& phase_ok(self.phase, qp.state)
         &&& self.phase != Phase::Ready ==> qp.sq.len() == 0 && qp.rq.len() == 0
             && self.send.spec_wqe_committed() == self.send.spec_wqe_retired()
@@ -442,6 +681,9 @@ impl<N: Device> HwQp<N> {
         &&& self.held is Some <==> self.send.spec_is_open()
         &&& self.held is Some ==> self.send.spec_open_wqes() >= 1
         &&& self.held is None ==> self.held_parts@.len() == 0
+        &&& self.held is None ==> self.held_bytes == 0
+        &&& self.held matches Some(h) ==> self.held_bytes == sges_len(h.sges@.take(h.n as int))
+            && self.held_bytes <= u32::MAX
         &&& self.held matches Some(h) ==> held_ok(
             h,
             self.held_parts@,
@@ -655,6 +897,131 @@ impl<N: Device> Hw<N> {
             }
         }
     }
+}
+
+impl<N: Device> Hw<N> {
+    /// An actual local WQE in this worker's M state can access byte `a`.
+    /// Remote-rkey access belongs to the separate registration authority.
+    pub(crate) closed spec fn local_access(&self, index: int, recv: bool, k: int, a: int) -> bool {
+        self.has_qp(index) && {
+            let e = self.qps@[index]->0;
+            let qp = self.nic().qps[e.id()];
+            if recv { 0 <= k < qp.rq.len() && covers(qp.rq[k].wr.sges, a) }
+            else { 0 <= k < qp.sq.len() && covers(qp.sq[k].wr.sges, a) }
+        }
+    }
+
+    /// The actual live request `s`, its retained keeper and the operation's
+    /// local role back this byte of the actual WQE in M.
+    pub(crate) closed spec fn local_guarded(&self, index: int, recv: bool, k: int, a: int, s: int) -> bool {
+        let e = self.qps@[index]->0;
+        let qp = self.nic().qps[e.id()];
+        let r = if recv { e.recv } else { e.send };
+        let w = if recv { qp.rq_head + k } else { qp.sq_head + k };
+        let dir = if recv { local_role(None) } else { local_role(Some(qp.sq[k].wr.opcode)) };
+        &&& r.dma(s, w) is Some
+        &&& r.req(s) is Some && r.req(s)->0.phase is InFlight
+        &&& r.req(s)->0.leases == r.dma(s, w)->0
+        &&& r.refused(s) is None
+        &&& retained_byte(r.dma(s, w)->0, dir, a)
+    }
+
+    /// Every NIC access through this worker's actual SQ/RQ WQEs has a
+    /// retained source/destination guard in its unique live request interval.
+    pub(crate) proof fn lemma_local_guard(&self, index: int, recv: bool, k: int, a: int) -> (s: int)
+        requires self.inv(), self.local_access(index, recv, k, a),
+        ensures self.local_guarded(index, recv, k, a, s),
+    {
+        assert(self.entry_ok(index, self.token@, self.nic()));
+        let e = self.qps@[index]->0;
+        let qp = self.nic().qps[e.id()];
+        if recv {
+            let wr = qp.rq[k].wr;
+            let w = qp.rq_head + k;
+            let s = lemma_ring_guards(e.recv, w, wr.wr_id, None, wr.sges);
+            e.recv.lemma_dma(s, w);
+            lemma_covered_guard(e.recv.dma(s, w)->0, local_role(None), wr.sges, a);
+            s
+        } else {
+            let wr = qp.sq[k].wr;
+            let w = qp.sq_head + k;
+            let s = lemma_ring_guards(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
+            e.send.lemma_dma(s, w);
+            lemma_covered_guard(e.send.dma(s, w)->0, local_role(Some(wr.opcode)), wr.sges, a);
+            s
+        }
+    }
+
+    /// A WR already written to the provider, with local bytes in its SGEs.
+    pub(crate) closed spec fn written_access(&self, index: int, j: int, a: int) -> bool {
+        self.has_qp(index) && {
+            let e = self.qps@[index]->0;
+            let written = self.token@.written(e.id());
+            0 <= j < written.len() && covers(written[j].sges, a)
+        }
+    }
+
+    /// A written WR retains its byte either in a staged native request or in
+    /// the open request at the ring's actual next request sequence number.
+    pub(crate) closed spec fn written_guarded(&self, index: int, j: int, a: int, s: int) -> bool {
+        let e = self.qps@[index]->0;
+        let wr = self.token@.written(e.id())[j];
+        let w = e.send.spec_wqe_committed() + j;
+        let dir = local_role(Some(wr.opcode));
+        ||| e.send.dma(s, w) is Some && e.send.staged(s) is Some
+            && e.send.staged(s)->0.leases == e.send.dma(s, w)->0
+            && retained_byte(e.send.dma(s, w)->0, dir, a)
+        ||| s == e.send.spec_posted() && e.send.spec_is_open()
+            && e.send.spec_closed_end() <= w < e.send.spec_wqe_posted()
+            && retained_byte(e.open_leases, dir, a)
+    }
+
+    /// Staging before a doorbell retains exactly the same native-byte guards
+    /// as posting. No request or byte authority is synthesized here.
+    pub(crate) proof fn lemma_written_guard(&self, index: int, j: int, a: int) -> (s: int)
+        requires self.inv(), self.written_access(index, j, a),
+        ensures self.written_guarded(index, j, a, s),
+    {
+        assert(self.entry_ok(index, self.token@, self.nic()));
+        let e = self.qps@[index]->0;
+        let wr = self.token@.written(e.id())[j];
+        let w = e.send.spec_wqe_committed() + j;
+        if ring_backed(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges) {
+            let s = lemma_ring_guards(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
+            e.send.lemma_dma(s, w);
+            lemma_covered_guard(e.send.dma(s, w)->0, local_role(Some(wr.opcode)), wr.sges, a);
+            s
+        } else {
+            lemma_ledger_guards(e.open_leases, wr.wr_id, Some(wr.opcode), wr.sges);
+            lemma_covered_guard(e.open_leases, local_role(Some(wr.opcode)), wr.sges, a);
+            e.send.spec_posted() as int
+        }
+    }
+
+    /// An SGE of the final WQE still held back from the provider.
+    pub(crate) closed spec fn held_index(&self, index: int, i: int) -> bool {
+        self.has_qp(index) && self.qps@[index]->0.held is Some
+            && 0 <= i < self.qps@[index]->0.held->0.n
+    }
+
+    /// The held SGE's native metadata and required destination role agree
+    /// with the part retained directly by the worker.
+    pub(crate) closed spec fn held_guarded(&self, index: int, i: int) -> bool {
+        let e = self.qps@[index]->0;
+        &&& 0 <= i < e.held_parts@.len()
+        &&& e.held_parts@[i].spec_sge() == e.held->0.sges@[i]
+        &&& local_role(Some(opcode_model(e.held->0.op))) is In
+            ==> e.held_parts@[i].spec_writable()
+    }
+
+    /// The final unsubmitted WQE retains its parts directly, in SGE order.
+    pub(crate) proof fn lemma_held_guard(&self, index: int, i: int)
+        requires self.inv(), self.held_index(index, i),
+        ensures self.held_guarded(index, i),
+    {
+        assert(self.entry_ok(index, self.token@, self.nic()));
+    }
+
 }
 
 // =============================================================================
@@ -949,7 +1316,7 @@ impl<N: Device> Hw<N> {
             held_parts: Vec::with_capacity(MAX_SGES),
             building: Vec::with_capacity(MAX_SGES),
             open_leases: no_leases(),
-            open_bytes: 0,
+            held_bytes: 0,
         };
         let ghost before = *self;
         if index == self.qps.len() {
@@ -1596,13 +1963,29 @@ impl<N: Device> Hw<N> {
                             wr_id: id, opcode: None, sges: sges@, first: 0,
                         }));
                         let ghost resource = leases;
+                        proof { lemma_ledger_entry(leases, 0); }
                         let ghost before_end = e.recv;
                         proof { lemma_resources_kept(e1.recv, e.recv); }
                         e.recv.end(true, detached, implied, leases);
                         proof { lemma_resources_added(before_end, e.recv, seq as int, resource); }
                         let ghost staged = e.recv;
+                        proof {
+                            staged.lemma_wqes();
+                            assert(before_end.same_dma(&e1.recv));
+                            assert(staged.keeps_dma(&e1.recv));
+                        }
                         e.recv.commit();
-                        proof { lemma_resources_kept(staged, e.recv); }
+                        proof {
+                            lemma_resources_kept(staged, e.recv);
+                            e.recv.lemma_wqes();
+                            assert(e.recv.keeps_dma(&e1.recv));
+                        }
+                        proof {
+                            let wr = recv_wr(id, sges@);
+                            assert(e.recv.dma(seq as int, wqe as int) == Some(resource));
+                            assert(ledger_has(resource, id, None, wr.sges));
+                            assert(ring_backed(e.recv, wqe as int, id, None, wr.sges));
+                        }
                         Ok(seq)
                     },
                     Err(error) => {
@@ -1634,6 +2017,7 @@ impl<N: Device> Hw<N> {
                 lemma_mine_keeps_share_wf(sh, pins, mid, n, Nic::Step::post_recv(q, seq![wr]));
                 assert(mid1.entry_ok(index as int, t1, mid));
                 let (a, b) = (mid.qps[q], n.qps[q]);
+                e.recv.lemma_wqes();
                 assert forall|k: int| 0 <= k < b.rq.len() implies (#[trigger] b.rq[k]).wr.wr_id == spec_wr_id(
                     index as u16,
                     true,
@@ -1644,9 +2028,27 @@ impl<N: Device> Hw<N> {
                     }
                 }
                 assert(rq_linked(e.recv, index as u16, b));
+                assert forall|k: int| 0 <= k < b.rq.len() implies
+                    ring_backed(e.recv, b.rq_head + k, (#[trigger] b.rq[k]).wr.wr_id,
+                        None, b.rq[k].wr.sges) by {
+                    if k < a.rq.len() {
+                        lemma_backed_kept(e1.recv, e.recv, b.rq_head + k,
+                            b.rq[k].wr.wr_id, None, b.rq[k].wr.sges);
+                    } else {
+                        let s = e1.recv.spec_posted() as int;
+                        assert(e.recv.dma(s, b.rq_head + k) is Some);
+                        assert(ledger_has(e.recv.dma(s, b.rq_head + k)->0, wr.wr_id, None, wr.sges));
+                    }
+                }
                 let written = t1.written(q);
                 assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(b.attr, #[trigger] written[j]) by {
                     assert(mid.send_wr_ok(a.attr, written[j]));
+                }
+                e.send.lemma_wqes();
+                e.recv.lemma_wqes();
+                assert forall|j: int| 0 <= j < t1.written(q).len() implies
+                    written_backed(e, e.send.spec_wqe_committed() + j, #[trigger] t1.written(q)[j]) by {
+                    lemma_written_kept(e1, e, e1.send.spec_wqe_committed() + j, t1.written(q)[j]);
                 }
                 assert(self.entry_ok(index as int, t1, n));
                 self.lemma_touch_one(&mid1, t1, mid, n, index as int);
@@ -1655,6 +2057,13 @@ impl<N: Device> Hw<N> {
                 mid1.lemma_rely(t1, m1, n);
                 assert(mid1.entry_ok(index as int, t1, n));
                 assert(rq_linked(e.recv, index as u16, n.qps[q]));
+                lemma_queues_kept(e1, e, n.qps[q]);
+                e.send.lemma_wqes();
+                e.recv.lemma_wqes();
+                assert forall|j: int| 0 <= j < t1.written(q).len() implies
+                    written_backed(e, e.send.spec_wqe_committed() + j, #[trigger] t1.written(q)[j]) by {
+                    lemma_written_kept(e1, e, e1.send.spec_wqe_committed() + j, t1.written(q)[j]);
+                }
                 assert(self.entry_ok(index as int, t1, n));
                 self.lemma_touch_one(&mid1, t1, n, n, index as int);
                 self.lemma_same_token(t1, t, n);
@@ -1875,7 +2284,32 @@ impl<N: Device> Hw<N> {
                 assert(sq_linked(en.send, i as u16, qp2));
                 assert(rq_linked(en.recv, i as u16, qp2));
             }
+            en.send.lemma_wqes();
+            en.recv.lemma_wqes();
+            assert forall|k: int| 0 <= k < qp2.sq.len() implies {
+                let wr = (#[trigger] qp2.sq[k]).wr;
+                &&& !wr.inline
+                &&& ring_backed(en.send, qp2.sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges)
+            } by {
+                let old_k = if e.queue is Send { k + nn } else { k };
+                assert(qp2.sq[k].wr == qp.sq[old_k].wr);
+                let wr = qp2.sq[k].wr;
+                lemma_backed_kept(e0.send, en.send, qp2.sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges);
+            }
+            assert forall|k: int| 0 <= k < qp2.rq.len() implies {
+                let wr = (#[trigger] qp2.rq[k]).wr;
+                ring_backed(en.recv, qp2.rq_head + k, wr.wr_id, None, wr.sges)
+            } by {
+                let old_k = if e.queue is Recv { k + nn } else { k };
+                assert(qp2.rq[k].wr == qp.rq[old_k].wr);
+                let wr = qp2.rq[k].wr;
+                lemma_backed_kept(e0.recv, en.recv, qp2.rq_head + k, wr.wr_id, None, wr.sges);
+            }
             let written = t.written(q);
+            assert forall|j: int| 0 <= j < written.len() implies
+                written_backed(en, en.send.spec_wqe_committed() + j, #[trigger] written[j]) by {
+                lemma_written_kept(e0, en, en.send.spec_wqe_committed() + j, written[j]);
+            }
             assert forall|j: int| 0 <= j < written.len() implies after.send_wr_ok(qp2.attr, #[trigger] written[j]) by {
                 assert(before.send_wr_ok(qp.attr, written[j]));
             }
@@ -2151,6 +2585,24 @@ impl<N: Device> Hw<N> {
                 lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::post_send(q, wrs));
                 assert(start.entry_ok(index as int, t0, mid));
                 let (a, b) = (mid.qps[q], n.qps[q]);
+                e.send.lemma_wqes();
+                lemma_queues_kept(e0, e, a);
+                assert forall|k: int| 0 <= k < b.sq.len() implies {
+                    let wr = (#[trigger] b.sq[k]).wr;
+                    &&& !wr.inline
+                    &&& ring_backed(e.send, b.sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges)
+                } by {
+                    if k < a.sq.len() {
+                        assert(b.sq[k] == a.sq[k]);
+                    } else {
+                        let j = k - a.sq.len();
+                        assert(b.sq[k].wr == wrs[j]);
+                        assert(written_backed(e0, e0.send.spec_wqe_committed() + j, wrs[j]));
+                        assert(!e0.send.spec_is_open());
+                        lemma_backed_kept(e0.send, e.send, b.sq_head + k,
+                            wrs[j].wr_id, Some(wrs[j].opcode), wrs[j].sges);
+                    }
+                }
                 assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
                     index as u16,
                     false,
@@ -2169,6 +2621,7 @@ impl<N: Device> Hw<N> {
                 start.lemma_rely(t0, m0, n);
                 assert(start.entry_ok(index as int, t0, n));
                 assert(sq_linked(e.send, index as u16, n.qps[q]));
+                lemma_queues_kept(e0, e, n.qps[q]);
                 assert(self.entry_ok(index as int, t, n));
                 self.lemma_commit_frame(&start, t0, t, n, n, index as int);
             }
@@ -2385,13 +2838,12 @@ impl<N: Device> Hw<N> {
                 keep_parts(&mut e.open_leases, &mut e.held_parts, Ghost(footprint));
                 let mut leases = no_leases();
                 core::mem::swap(&mut leases, &mut e.open_leases);
-                let bytes = if e.open_bytes > u32::MAX as u64 {
-                    u32::MAX
-                } else {
-                    e.open_bytes as u32
-                };
+                let bytes = e.held_bytes as u32;
                 let implied = Wc::success(opcode_of(&h.op), bytes);
                 proof {
+                    assert(implied.spec_byte_len() == if opcode_model(h.op).writes_local() {
+                        Some(sges_len(h.sges@.take(h.n as int)) as u32)
+                    } else { None });
                     e1.send.lemma_wqes();
                 }
                 let ghost resource = leases;
@@ -2404,10 +2856,35 @@ impl<N: Device> Hw<N> {
                 let sges = vstd::slice::slice_subrange(h.sges.as_slice(), 0, h.n);
                 post(&mut e.hw, h.wr_id, signaled, &h.op, sges, Ghost(q), Tracked(self.token.borrow_mut()));
                 e.held = None;
-                e.open_bytes = 0;
+                e.held_bytes = 0;
                 proof {
                     assert(sges@ == h.sges@.take(h.n as int));
                     lemma_held_wr_ok(h, e1.held_parts@, index as u16, e1.send.spec_wqe_committed() + t1.written(q).len(), m1, m1.qps[q].attr, e1.pd_id@, signaled);
+                }
+                proof {
+                    e.send.lemma_wqes();
+                    lemma_queues_kept(e1, *e, m1.qps[q]);
+                    let written = self.token@.written(q);
+                    assert forall|j: int| 0 <= j < written.len() implies
+                        written_backed(*e, e.send.spec_wqe_committed() + j, #[trigger] written[j]) by {
+                        let w = e.send.spec_wqe_committed() + j;
+                        let wr = written[j];
+                        if j < t1.written(q).len() {
+                            assert(wr == t1.written(q)[j]);
+                            assert(written_backed(e1, w, wr));
+                            if ring_backed(e1.send, w, wr.wr_id, Some(wr.opcode), wr.sges) {
+                                lemma_backed_kept(e1.send, e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
+                            } else {
+                                lemma_ledger_extended(e1.open_leases, resource, wr.wr_id, Some(wr.opcode), wr.sges);
+                                assert(e.send.dma(seq as int, w) == Some(resource));
+                            }
+                        } else {
+                            assert(wr == held_wr(h, signaled));
+                            assert(e.send.dma(seq as int, w) == Some(resource));
+                            assert(resource.wqes().last() == footprint);
+                            assert(ledger_has(resource, wr.wr_id, Some(wr.opcode), wr.sges));
+                        }
+                    }
                 }
                 Some(seq)
             },
@@ -2877,11 +3354,7 @@ impl<N: Device> Hw<N> {
                 e.held = Some(Held { wr_id: wr_id(index as u16, false, wqe), op, sges, n });
                 core::mem::swap(&mut e.held_parts, &mut parts);
                 core::mem::swap(&mut e.building, &mut parts);
-                e.open_bytes = if e.open_bytes <= u64::MAX - total {
-                    e.open_bytes + total
-                } else {
-                    u64::MAX
-                };
+                e.held_bytes = total;
             },
             None => {},
         }
@@ -2899,6 +3372,24 @@ impl<N: Device> Hw<N> {
                 }
             }
             assert(writing_ok(e.send, index as u16, m3, attr, t4.started(q), written, true));
+            e.send.lemma_wqes();
+            lemma_queues_kept(e3, e, m3.qps[q]);
+            assert forall|j: int| 0 <= j < written.len() implies
+                written_backed(e, e.send.spec_wqe_committed() + j, #[trigger] written[j]) by {
+                let w = e.send.spec_wqe_committed() + j;
+                let wr = written[j];
+                if j < t3.written(q).len() {
+                    assert(wr == t3.written(q)[j]);
+                    lemma_written_kept(e3, e, w, wr);
+                } else {
+                    let h = e3.held->0;
+                    assert(wr == held_wr(h, false));
+                    assert(e.open_leases.wqes().last().wr_id == wr.wr_id);
+                    assert(e.open_leases.wqes().last().opcode == Some(wr.opcode));
+                    assert(e.open_leases.wqes().last().sges.map_values(|s: Sge| sge_model(s)) == wr.sges);
+                    assert(ledger_has(e.open_leases, wr.wr_id, Some(wr.opcode), wr.sges));
+                }
+            }
             assert(opcode_model(op).allowed_on(attr.transport));
             assert(e.held->0.sges == sges && e.held->0.n == n);
             assert(total == sges_len(sges@.take(n as int)));
@@ -3018,6 +3509,15 @@ impl<N: Device> Hw<N> {
                 let e = self.qps@[index as int]->0;
                 lemma_resources_kept(old_e.send, e.send);
                 lemma_resources_kept(old_e.recv, e.recv);
+                let pre = start.qps@[index as int]->0;
+                let post = self.qps@[index as int]->0;
+                lemma_queues_kept(pre, post, m.qps[pre.id()]);
+                post.send.lemma_wqes();
+                assert forall|j: int| 0 <= j < t.written(pre.id()).len()
+                    implies written_backed(post, post.send.spec_wqe_committed() + j,
+                        #[trigger] t.written(pre.id())[j]) by {
+                    lemma_written_kept(pre, post, pre.send.spec_wqe_committed() + j, t.written(pre.id())[j]);
+                }
                 assert(self.entry_ok(index as int, t, m));
                 self.lemma_touch_one(&start, t, m, m, index as int);
             } else {
@@ -3056,6 +3556,15 @@ impl<N: Device> Hw<N> {
         }
         proof {
             if start.qps@[index as int] is Some {
+                let pre = start.qps@[index as int]->0;
+                let post = self.qps@[index as int]->0;
+                lemma_queues_kept(pre, post, m.qps[pre.id()]);
+                post.send.lemma_wqes();
+                assert forall|j: int| 0 <= j < t.written(pre.id()).len()
+                    implies written_backed(post, post.send.spec_wqe_committed() + j,
+                        #[trigger] t.written(pre.id())[j]) by {
+                    lemma_written_kept(pre, post, pre.send.spec_wqe_committed() + j, t.written(pre.id())[j]);
+                }
                 assert(self.entry_ok(index as int, t, m));
                 self.lemma_touch_one(&start, t, m, m, index as int);
             } else {
@@ -3101,6 +3610,15 @@ impl<N: Device> Hw<N> {
         }
         proof {
             if start.qps@[index as int] is Some {
+                let pre = start.qps@[index as int]->0;
+                let post = self.qps@[index as int]->0;
+                lemma_queues_kept(pre, post, m.qps[pre.id()]);
+                post.send.lemma_wqes();
+                assert forall|j: int| 0 <= j < t.written(pre.id()).len()
+                    implies written_backed(post, post.send.spec_wqe_committed() + j,
+                        #[trigger] t.written(pre.id())[j]) by {
+                    lemma_written_kept(pre, post, pre.send.spec_wqe_committed() + j, t.written(pre.id())[j]);
+                }
                 assert(self.entry_ok(index as int, t, m));
                 self.lemma_touch_one(&start, t, m, m, index as int);
             } else {
@@ -3135,6 +3653,15 @@ impl<N: Device> Hw<N> {
         };
         proof {
             if start.qps@[index as int] is Some {
+                let pre = start.qps@[index as int]->0;
+                let post = self.qps@[index as int]->0;
+                lemma_queues_kept(pre, post, m.qps[pre.id()]);
+                post.send.lemma_wqes();
+                assert forall|j: int| 0 <= j < t.written(pre.id()).len()
+                    implies written_backed(post, post.send.spec_wqe_committed() + j,
+                        #[trigger] t.written(pre.id())[j]) by {
+                    lemma_written_kept(pre, post, pre.send.spec_wqe_committed() + j, t.written(pre.id())[j]);
+                }
                 assert(self.entry_ok(index as int, t, m));
                 self.lemma_touch_one(&start, t, m, m, index as int);
             } else {
@@ -3320,7 +3847,7 @@ impl<N: Device> Hw<N> {
                     }
                     let mut leases = no_leases();
                     core::mem::swap(&mut leases, &mut e.open_leases);
-                    e.open_bytes = 0;
+                    e.held_bytes = 0;
                 }
                 if e.started {
                     e.started = false;
@@ -3338,6 +3865,7 @@ impl<N: Device> Hw<N> {
                         e.send.inv(),
                         ring_resources_ok(e.send),
                         e.send.same_wqes(&s1),
+                        e.send.same_dma(&s1),
                         e.send.same_open(&s1),
                         e.send.spec_posted() == s1.spec_posted(),
                     decreases e.send.spec_posted() - seq,
@@ -3354,6 +3882,7 @@ impl<N: Device> Hw<N> {
                         e.recv.inv(),
                         ring_resources_ok(e.recv),
                         e.recv.same_wqes(&r1),
+                        e.recv.same_dma(&r1),
                         e.recv.same_open(&r1),
                         e.recv.spec_posted() == r1.spec_posted(),
                     decreases e.recv.spec_posted() - seq,
@@ -3381,6 +3910,7 @@ impl<N: Device> Hw<N> {
             }
             assert(start.inv_with(t0, n));
             assert(start.entry_ok(index as int, t0, n));
+            lemma_queues_kept(e0, e, n.qps[q]);
             assert(self.entry_ok(index as int, t, n));
             self.lemma_commit_frame(&start, t0, t, n, n, index as int);
         }
@@ -3467,6 +3997,10 @@ impl<N: Device> Hw<N> {
                     sges: Seq::empty(), first: 0,
                 }));
                 let ghost resource = leases;
+                proof {
+                    lemma_ledger_entry(leases, 0);
+                    assert(leases.wqes()[0].sges.map_values(|s: Sge| sge_model(s)) =~= Seq::empty());
+                }
                 let ghost before_end = e.send;
                 proof { lemma_resources_kept(e0.send, e.send); }
                 let (_seq, signaled) = e.send.end(true, true, implied, leases);
@@ -3483,6 +4017,10 @@ impl<N: Device> Hw<N> {
                     let wr = send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@);
                     assert(wr.sges =~= Seq::<safeverbs_spec::nic::Sge>::empty());
                     assert(m0.send_wr_ok(m0.qps[q].attr, wr));
+                    let w = e0.send.spec_wqe_posted() as int;
+                    assert(e.send.dma(_seq as int, w) == Some(resource));
+                    assert(ledger_has(resource, wr.wr_id, Some(wr.opcode), wr.sges));
+                    assert(ring_backed(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges));
                 }
             },
             None => {},
@@ -3497,6 +4035,19 @@ impl<N: Device> Hw<N> {
             assert forall|j: int| 0 <= j < written.len() implies m0.send_wr_ok(attr, #[trigger] written[j]) by {
                 if j < t0.written(q).len() {
                     assert(written[j] == t0.written(q)[j]);
+                }
+            }
+            e.send.lemma_wqes();
+            lemma_queues_kept(e0, e, m0.qps[q]);
+            assert forall|j: int| 0 <= j < written.len() implies
+                written_backed(e, e.send.spec_wqe_committed() + j, #[trigger] written[j]) by {
+                let w = e.send.spec_wqe_committed() + j;
+                let wr = written[j];
+                if j < t0.written(q).len() {
+                    assert(wr == t0.written(q)[j]);
+                    assert(written_backed(e0, w, wr));
+                    assert(!e0.send.spec_is_open());
+                    lemma_backed_kept(e0.send, e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
                 }
             }
             assert(self.entry_ok(index as int, t, m0));
@@ -3773,7 +4324,15 @@ impl<N: Device> Hw<N> {
 }
 
 /// The opcode a successful completion of `op` reports.
-fn opcode_of(op: &WrOp) -> Opcode {
+fn opcode_of(op: &WrOp) -> (opcode: Opcode)
+    ensures opcode == match *op {
+        WrOp::Send | WrOp::SendImm(_) => Opcode::SEND,
+        WrOp::Write(_) | WrOp::WriteImm(..) => Opcode::RDMA_WRITE,
+        WrOp::Read(_) => Opcode::RDMA_READ,
+        WrOp::FetchAdd { .. } => Opcode::FETCH_ADD,
+        WrOp::CompareSwap { .. } => Opcode::COMP_SWAP,
+    },
+{
     match op {
         WrOp::Send | WrOp::SendImm(_) => Opcode::SEND,
         WrOp::Write(_) | WrOp::WriteImm(..) => Opcode::RDMA_WRITE,
