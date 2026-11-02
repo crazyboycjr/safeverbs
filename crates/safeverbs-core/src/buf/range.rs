@@ -233,6 +233,7 @@ impl ElementRange {
         ensures
             r is Some <==> start <= end && end <= self.spec_len(),
             r is Some ==> r->0.inv() && r->0.spec_width() == width
+                && r->0.spec_bytes().spec_capacity() == self.spec_bytes().spec_capacity()
                 && r->0.spec_offset() == self.spec_offset() + start * width
                 && r->0.spec_len() == end - start
                 && r->0.spec_bytes().span(0).within(self.spec_bytes().span(0)),

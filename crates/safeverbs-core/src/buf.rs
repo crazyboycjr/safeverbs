@@ -33,11 +33,13 @@ use crate::pd::Pd;
 use crate::verbs::Verbs;
 
 mod range;
-use range::{ByteRange, ElementRange};
+use range::ByteRange;
 mod memory;
 mod permissions;
+mod view;
 pub(crate) use memory::{Frozen, RawMut};
 use memory::{OwnedRange, PermissionPool};
+pub use view::Buf;
 mod lease;
 pub mod projection;
 pub(crate) use lease::Lease;
@@ -168,23 +170,9 @@ pub struct BufMut<T, N: Nic = Verbs> {
     _t: PhantomData<T>,
 }
 
-/// A shared, read-only buffer of registered memory, cheap to clone and to
-/// slice (like `bytes::Bytes`): send it, or any part of it, as many times
-/// as wanted, at once.
-pub struct Buf<T, N: Nic = Verbs> {
-    frozen: Arc<Frozen<N>>,
-    /// Byte offset and element count, with erased byte geometry.
-    view: ElementRange,
-    _t: PhantomData<Arc<[T]>>,
-}
-
 impl<T, N: Nic> Clone for Buf<T, N> {
     fn clone(&self) -> Self {
-        Buf {
-            frozen: self.frozen.clone(),
-            view: self.view,
-            _t: PhantomData,
-        }
+        self.clone_view()
     }
 }
 
@@ -288,12 +276,7 @@ impl<T, N: Nic> BufMut<T, N> {
     where
         T: Immutable,
     {
-        let view = ElementRange::from_bytes(ByteRange::whole(self.raw.range.len()), size_of::<T>());
-        Buf {
-            frozen: self.raw.freeze(),
-            view,
-            _t: PhantomData,
-        }
+        Buf::from_frozen(self.raw.freeze())
     }
 
     /// Exposes it to peers for RDMA WRITE, READ and atomics: registers it
@@ -424,16 +407,6 @@ impl<T, N: Nic> Iterator for Chunks<T, N> {
 }
 
 impl<T, N: Nic> Buf<T, N> {
-    /// The number of elements.
-    pub fn len(&self) -> usize {
-        self.view.len()
-    }
-
-    /// Whether it has no elements.
-    pub fn is_empty(&self) -> bool {
-        self.view.len() == 0
-    }
-
     /// The protection domain it is registered in.
     pub fn pd_id(&self) -> u64 {
         self.frozen.raw.pd().id()
@@ -455,15 +428,8 @@ impl<T, N: Nic> Buf<T, N> {
             Bound::Excluded(&e) => e,
             Bound::Unbounded => self.len(),
         };
-        let view = self
-            .view
-            .slice(start, end, size_of::<T>())
-            .unwrap_or_else(|| panic!("range {start}..{end} of a buffer of {}", self.len()));
-        Buf {
-            frozen: self.frozen.clone(),
-            view,
-            _t: PhantomData,
-        }
+        self.slice_elements(start, end)
+            .unwrap_or_else(|| panic!("range {start}..{end} of a buffer of {}", self.len()))
     }
 
     /// Whether no other `Buf` and no request holds the frozen buffer.
@@ -475,14 +441,9 @@ impl<T, N: Nic> Buf<T, N> {
     /// other `Buf` (of any part of it) and no request in flight holds it;
     /// else gives it back unchanged.
     pub fn try_thaw(self) -> Result<BufMut<T, N>, Buf<T, N>> {
-        let Buf { frozen, view, .. } = self;
-        match memory::thaw(frozen) {
+        match self.try_thaw_raw() {
             Ok(raw) => Ok(BufMut::from_raw(raw)),
-            Err(frozen) => Err(Buf {
-                frozen,
-                view,
-                _t: PhantomData,
-            }),
+            Err(same) => Err(same),
         }
     }
 
@@ -499,13 +460,7 @@ impl<T, N: Nic> Buf<T, N> {
     {
         let lkey = self.frozen.raw.region.lkey;
         let pd = self.pd_id();
-        Part::shared(
-            self.frozen,
-            self.view.offset(),
-            self.view.byte_len(size_of::<T>()),
-            lkey,
-            pd,
-        )
+        self.part_with_keys(lkey, pd)
     }
 
     /// Its bytes.

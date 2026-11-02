@@ -378,7 +378,9 @@ pub(crate) open spec fn retained_sge<N: Device>(
         let loan = #[trigger] leases.loans()[l];
         &&& sge_model(loan.part.spec_sge()) == sge
         &&& loan.access == Some(dir)
+        &&& loan.part.inv()
         &&& (#[trigger] leases.view()[g]).same_backing(loan.part.resource())
+        &&& loan.part.byte_domain().subset_of(leases.view()[g].byte_domain())
         &&& dir is In ==> loan.part.spec_writable()
     }
 }
@@ -391,16 +393,43 @@ pub(crate) open spec fn retained_byte<N: Device>(
         && sge.span().contains(a)
 }
 
+/// The byte lies in the linear permission of a keeper retained by this request.
+pub(crate) open spec fn byte_backed<N: Device>(leases: Leases<N>, a: int) -> bool {
+    exists|g: int| 0 <= g < leases.view().len()
+        && (#[trigger] leases.view()[g]).byte_domain().contains(a)
+}
+
+proof fn lemma_retained_permission<N: Device>(leases: Leases<N>, dir: safeverbs_spec::abs::Dir, a: int)
+    requires retained_byte(leases, dir, a),
+    ensures byte_backed(leases, a),
+{
+    let sge = choose|sge: safeverbs_spec::nic::Sge| retained_sge(leases, dir, sge)
+        && sge.span().contains(a);
+    let (l, g) = choose|l: int, g: int| 0 <= l < leases.loans().len() && 0 <= g < leases.view().len() && {
+        let loan = #[trigger] leases.loans()[l];
+        &&& sge_model(loan.part.spec_sge()) == sge
+        &&& loan.access == Some(dir)
+        &&& loan.part.inv()
+        &&& (#[trigger] leases.view()[g]).same_backing(loan.part.resource())
+        &&& loan.part.byte_domain().subset_of(leases.view()[g].byte_domain())
+        &&& dir is In ==> loan.part.spec_writable()
+    };
+    leases.loans()[l].part.lemma_byte_backing();
+    assert(leases.loans()[l].part.byte_domain().contains(a));
+    assert(leases.view()[g].byte_domain().contains(a));
+}
+
 proof fn lemma_covered_guard<N: Device>(
     leases: Leases<N>, dir: safeverbs_spec::abs::Dir,
     sges: Seq<safeverbs_spec::nic::Sge>, a: int,
 )
     requires covers(sges, a), forall|i: int| 0 <= i < sges.len()
         ==> retained_sge(leases, dir, #[trigger] sges[i]),
-    ensures retained_byte(leases, dir, a),
+    ensures retained_byte(leases, dir, a), byte_backed(leases, a),
 {
     let i = choose|i: int| 0 <= i < sges.len() && sges[i].span().contains(a);
     assert(retained_sge(leases, dir, sges[i]));
+    lemma_retained_permission(leases, dir, a);
 }
 
 /// Every SGE of an exact ledger entry has its operation's source/destination
@@ -415,6 +444,7 @@ pub(crate) proof fn lemma_ledger_guards<N: Device>(
 {
     leases.lemma_wqes();
     leases.lemma_loans();
+    leases.lemma_byte_backing();
     let j = choose|j: int| 0 <= j < leases.wqes().len() && {
         let entry = #[trigger] leases.wqes()[j];
         &&& entry.wr_id == id && entry.opcode == op
@@ -429,7 +459,8 @@ pub(crate) proof fn lemma_ledger_guards<N: Device>(
         assert(loan.part.spec_sge() == entry.sges[i]);
         assert(sge_model(loan.part.spec_sge()) == sges[i]);
         let g = choose|g: int| 0 <= g < leases.view().len()
-            && leases.view()[g].same_backing(loan.part.resource());
+            && leases.view()[g].same_backing(loan.part.resource())
+            && loan.part.byte_domain().subset_of(leases.view()[g].byte_domain());
         assert(leases.view()[g].same_backing(loan.part.resource()));
     }
 }
@@ -924,6 +955,7 @@ impl<N: Device> Hw<N> {
         &&& r.req(s)->0.leases == r.dma(s, w)->0
         &&& r.refused(s) is None
         &&& retained_byte(r.dma(s, w)->0, dir, a)
+        &&& byte_backed(r.dma(s, w)->0, a)
     }
 
     /// Every NIC access through this worker's actual SQ/RQ WQEs has a
@@ -971,9 +1003,11 @@ impl<N: Device> Hw<N> {
         ||| e.send.dma(s, w) is Some && e.send.staged(s) is Some
             && e.send.staged(s)->0.leases == e.send.dma(s, w)->0
             && retained_byte(e.send.dma(s, w)->0, dir, a)
+            && byte_backed(e.send.dma(s, w)->0, a)
         ||| s == e.send.spec_posted() && e.send.spec_is_open()
             && e.send.spec_closed_end() <= w < e.send.spec_wqe_posted()
             && retained_byte(e.open_leases, dir, a)
+            && byte_backed(e.open_leases, a)
     }
 
     /// Staging before a doorbell retains exactly the same native-byte guards

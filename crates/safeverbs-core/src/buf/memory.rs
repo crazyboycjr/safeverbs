@@ -184,6 +184,13 @@ impl<N: Nic> RawMut<N> {
         self.range.permission().provenance()
     }
 
+    /// Geometry required by a typed view, separately from initialized contents.
+    pub(super) open spec fn fits_type<T>(self) -> bool {
+        &&& vstd::layout::size_of::<T>() > 0
+        &&& self.pointer().addr() as nat % vstd::layout::align_of::<T>() == 0
+        &&& self.byte_len() as nat % vstd::layout::size_of::<T>() == 0
+    }
+
     #[inline]
     pub(super) fn ptr(&self) -> (r: *mut u8)
         ensures r == self.pointer(),
@@ -197,9 +204,7 @@ impl<N: Nic> RawMut<N> {
     /// Checked geometry for reconstructing a typed slice, including wide alignments.
     #[inline]
     pub(super) fn fits<T>(&self) -> (r: bool)
-        ensures r == (vstd::layout::size_of::<T>() > 0
-            && self.pointer().addr() as nat % vstd::layout::align_of::<T>() == 0
-            && self.byte_len() as nat % vstd::layout::size_of::<T>() == 0),
+        ensures r == self.fits_type::<T>(),
     {
         vstd::layout::layout_for_type_is_valid::<T>();
         self.range.fits(core::mem::size_of::<T>(), core::mem::align_of::<T>())
@@ -432,3 +437,6 @@ unsafe impl Sync for OwnedRange {}
 
 const _: () = assert!(core::mem::size_of::<OwnedRange>() == 2 * core::mem::size_of::<usize>());
 const _: () = assert!(core::mem::size_of::<PermissionPool>() == 0);
+const _: () = assert!(
+    core::mem::size_of::<RawMut<crate::verbs::Verbs>>() == 3 * core::mem::size_of::<usize>()
+);

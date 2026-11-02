@@ -51,8 +51,11 @@ consumers on one worker can consume results a future is waiting for.
 
 ## 3. Follow the memory separately
 
-Read [`buf.rs`](../crates/safeverbs-core/src/buf.rs), especially `Region`, `RawMut`,
-`BufMut`, `Buf` and `Exposed`, then
+Read [`buf.rs`](../crates/safeverbs-core/src/buf.rs), especially `Region`,
+`BufMut` and `Exposed`, then
+[`buf/memory.rs`](../crates/safeverbs-core/src/buf/memory.rs) for actual `RawMut`/`Frozen`
+ownership and [`buf/view.rs`](../crates/safeverbs-core/src/buf/view.rs) for frozen `Buf`
+views. Continue with
 [`buf/lease.rs`](../crates/safeverbs-core/src/buf/lease.rs) for `Part` and `Leases`:
 
 - `Region` owns the allocation and its registration; references keep it alive.
@@ -68,15 +71,16 @@ logical SGE and its operation, even when multiple inputs share one physical Arc.
 `keep_parts` in `hw.rs`, then `ring_resources_ok`, `take` and
 [`buf/projection.rs`](../crates/safeverbs-core/src/buf/projection.rs) to see how the
 actual request metadata becomes A's member ranges and access directions. Fresh names
-and byte permissions are still separate obligations.
+and typed validity are still separate obligations. The real buffers now carry linear
+byte permissions, but global compatibility and A placement remain unfinished.
 
 For remote access, `Exposed::try_reclaim` revokes the remote registration before returning
 typed access. A refused close returns its owner for retry; a failed final cleanup retains
 the allocation and dependency chain.
 
 [`buf/range.rs`](../crates/safeverbs-core/src/buf/range.rs) is the verified executable
-arithmetic these buffers use for splits and frozen views. Read it before the eventual
-allocation-permission integration: bounded ranges alone do not establish ownership.
+arithmetic these buffers use for splits and frozen views. `memory.rs` ties that geometry
+to the allocator's permissions; `permissions.rs` is the erased linear-token bookkeeping.
 
 Then read [`wc.rs`](../crates/safeverbs-core/src/wc.rs): its accessors expose only
 operation-defined metadata. SEND/WRITE do not report a byte count; READ and receive

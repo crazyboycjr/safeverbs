@@ -135,7 +135,9 @@ returns a linear raw-byte permission and deallocation capability on success; it
 returns no permission on failure. Checked executable code carries that permission in
 the actual `RawMut` and `Frozen` contents, partitions it when splitting, and transfers
 the identical contents through freeze and successful thaw. Shared views retain the
-same frozen permission. `Part`'s invariant ties its actual SGE to that permission's
+same frozen permission. An erased map of per-byte vstd tokens supports borrowed
+nonaliasing proofs while preserving exact token identities; no map is built at runtime.
+`Part`'s invariant ties its actual SGE to that permission's
 byte domain; `Leases` preserves this relation through guard deduplication. Alignment
 checks use the absolute pointer, including when recovering over-aligned elements.
 Failed registration returns the whole permission for checked deallocation. An erased
@@ -143,6 +145,14 @@ pool supports streaming withdrawal and return, but the native `RingBuf` callers 
 need to prove the pool preconditions. Final Arc-driven region cleanup, registration
 lifetime, initialized typed contents and the public wrappers remain unverified. These
 tokens describe allocation ownership, not validity of arbitrary incoming bytes as `T`.
+
+**Actual frozen views** (`buf/view.rs`). `Buf<T, N>` itself is verified: its native
+Arc and element range retain the same frozen permission through cloning and bounded
+slicing. The view has whole-element offsets and stays within the frozen range. Checked
+thaw returns that whole range on success, including when the handle was a subview, or
+retains the same view on failure. SGE construction uses the actual view geometry.
+The public range-syntax parser and zerocopy/slice-reference wrappers remain outside
+Verus; these geometry facts alone do not establish initialized `T` contents.
 
 **Actual request resources** (`buf/lease.rs`). `Part` and `Leases` are no longer
 opaque to the verifier. Their actual field observations, empty construction, native
@@ -293,14 +303,12 @@ a token over a fresh share. These are trusted, not proved.
     `impl Refines`. What that needs: the ghost state of A (which leases the program holds) in
     the worker, which only the buffers can supply (next point); and integration with the
     checked A-side frame/transfer rules of `abs_share.rs`.
-  - **Buffers.** The wrappers in `buf.rs` remain outside `verus!`; their executable range
-    arithmetic in `buf/range.rs` is verified. Relating a part's advertised domain and
-    exclusivity to actual byte ownership remains unverified; its registration lifetime
-    is trusted through `registered` and `registered_all`. Part accessors and the resource
-    container are now checked, but the allocation payload remains opaque. Lease memory as linear ghost
-    permissions (vstd `PointsToRaw` or a token of our own) moving into the NIC's share on
-    commit and back on retire would turn S1 into a byte-level fact against M and supply A's
-    leases; this is not done.
+  - **Buffers.** Actual mutable/frozen ranges and frozen views now carry the allocator's
+    byte permissions through checked geometry, splitting, freeze/thaw and SGE construction.
+    The typed wrappers in `buf.rs` remain outside `verus!`. Initialized contents,
+    zerocopy contracts, native streaming-pool callers, exposure/revocation and final
+    cleanup remain unfinished; registration lifetime is still trusted through
+    `registered` and `registered_all`.
   - **Concrete grouped permissions.** The checked actual loan ledger now accounts for
     shared deduplication, operation access and exact SGE/member projection. `Hw` retains
     that invariant through its rings and returns it with owned results. Fresh member
@@ -540,18 +548,17 @@ that value (`refine.rs`). Its ghost `Permissions<L>` interpretation preserves th
 ordered member resources and their access directions through the ring and side list.
 `buf/projection.rs` derives spans and exclusivity from the actual logical inputs, and
 the worker retains their complete WQE provenance. The maps from sequence numbers to A's
-group/member names, validity and the originating byte permissions still need the buffer
-integration before those projected groups can be placed in A.
+group/member names, typed validity and global byte compatibility still need the buffer
+and worker integration before those projected groups can be placed in A.
 
-**Memory as linear ghost permissions (not done).** The core would hold vstd's `PointsToRaw`
-permission for every byte of every buffer. A `BufMut` or `Buf` carries the permissions for its
-bytes (a `Buf` shares them read-only). Posting moves the permissions of the WR's bytes into
-the worker's share of the NIC, and the poll hands back the permissions of the WRs a CQE
-retires; the token's contract keeps the permissions it holds in step with what M says the NIC
-may access (`nic_may_read`, `nic_may_write`). Ordinary Verus ownership checking then gives S1
-for the implementation, and turning bytes into a `T` goes through `FromBytes` or
-`TryFromBytes`. This needs `buf.rs` inside `verus!`, so that the permissions originate in
-verified code; today `registered` stands in for the part of it the doorbell needs.
+**Memory as linear ghost permissions (partly integrated).** The real buffer payloads
+carry the fallible allocator's byte permissions through `OwnedRange`, `RawMut`, frozen
+Arc contents and bounded `Buf` views. Actual requests retain those payloads. Native
+WQE provenance links each local SGE to its retained loan and keeper. Global nonaliasing,
+A placement, initialized typed access and final release are still needed for S1 of the
+whole implementation. `registered` continues to supply the registration-lifetime
+assumption used by the verbs contracts. These remaining obligations are not discharged
+by having allocation tokens in the structs.
 
 **The `Refines` implementation (not done).** The core would implement `refinement::Refines`
 for a worker's state (its `Hw`, with A's state as the worker last saw it), relate each public
