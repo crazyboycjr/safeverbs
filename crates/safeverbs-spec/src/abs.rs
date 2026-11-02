@@ -92,7 +92,8 @@ impl Group {
             && (#[trigger] self.members[k]).unique && self.members[k].mem.contains(x)
     }
     pub open spec fn nic_may_read(self, x: int) -> bool {
-        (self.in_flight() || self.holder is Exposed) && self.contains(x)
+        exists|k: int| 0 <= k < self.members.len()
+            && (#[trigger] self.members[k]).mem.contains(x) && self.read_member(k)
     }
     pub open spec fn nic_may_write(self, x: int) -> bool {
         exists|k: int| 0 <= k < self.members.len()
@@ -101,6 +102,9 @@ impl Group {
     pub open spec fn write_member(self, k: int) -> bool {
         (self.in_flight() && self.holder->req.dirs[k] is In)
             || (self.holder is Exposed && self.holder->remote_write)
+    }
+    pub open spec fn read_member(self, k: int) -> bool {
+        (self.in_flight() && self.holder->req.dirs[k] is Out) || self.holder is Exposed
     }
     pub open spec fn allows(self, dirs: Seq<Dir>) -> bool {
         &&& dirs.len() == self.members.len()

@@ -129,7 +129,7 @@ pub open spec fn resources_match<L>(v: View<L>, a: Abs::State, ids: Map<int, Id>
 /// The ring's requests sit in `a`: every request A sees in the ring is the
 /// request group `ids[s]` of `a`, on queue pair `q`, with member directions
 /// `dirs.access[s]`, with the same phase, waker and owner; every staged request's
-/// leases are the program lease `ids[s]`, which may be posted in direction
+/// leases are the program group `ids[s]`, which may be posted in direction
 /// `dirs.access[s]`; every refused request's leases are the program lease
 /// `ids[s]`; no two hold the same lease.
 pub open spec fn placed<L>(
@@ -975,6 +975,7 @@ pub proof fn lemma_take<L>(
         placed(without(v, s), a2, q, ids, dirs),
         a2.wakes == a.wakes,
         a2.is_program(a.next_id) && a2.groups[a.next_id].members == a.groups[ids[s]].members,
+        a2.groups[a.next_id].members == (dirs.resources)(l),
 {
     let r = ids[s];
     let a2 = take_state(a, r);
@@ -1608,6 +1609,7 @@ pub proof fn lemma_ring_take<L>(
         placed(post.view(), a2, q, ids, dirs),
         a2.wakes == a.wakes,
         a2.is_program(a.next_id) && a2.groups[a.next_id].members == a.groups[ids[seq]].members,
+        a2.groups[a.next_id].members == (dirs.resources)(leases),
 {
     let a2 = lemma_take(pre.view(), a, q, ids, dirs, seq, outcome, leases);
     lemma_same(without(pre.view(), seq), post.view(), a2, q, ids, dirs);
@@ -1905,6 +1907,7 @@ pub proof fn lemma_side_take<L>(
         abs_step(a, a2, Abs::Step::take(ids[seq], side[seq].0.outcome())),
         placed(with_side(v, side.remove(seq), refused), a2, q, ids, dirs),
         a2.is_program(a.next_id) && a2.groups[a.next_id].members == a.groups[ids[seq]].members,
+        a2.groups[a.next_id].members == (dirs.resources)(side[seq].1),
 {
     let w = with_side(v, side, refused);
     let a2 = lemma_take(w, a, q, ids, dirs, seq, side[seq].0, side[seq].1);

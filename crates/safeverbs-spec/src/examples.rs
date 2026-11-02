@@ -291,6 +291,7 @@ pub proof fn example_mixed_group() {
     assert(Abs::State::post_request(a6, a7, 3, 7, dirs));
     Abs::State::post_request_inductive(a6, a7, 3, 7, dirs);
     assert(a7.nic_writes(128) && !a7.program_reads(128));
+    assert(!a7.nic_reads(128));
     assert(a7.program_reads(0) && a7.nic_reads(0) && !a7.nic_writes(0));
     crate::guarantees::lemma_s1_no_conflict(a7, 0);
     crate::guarantees::lemma_s1_no_conflict(a7, 128);

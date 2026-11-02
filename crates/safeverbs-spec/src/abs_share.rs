@@ -1,9 +1,10 @@
 //! A worker's share of A, framed across the other workers' abstract transitions.
 //!
-//! Shares own QP names and stable lease IDs, not disjoint sets of bytes. Frozen clones
+//! Shares own QP names and stable group handles, not disjoint sets of bytes. Frozen clones
 //! may overlap while their IDs have different owners. A share reserves no future IDs:
 //! unrelated allocations may advance A's global allocator and append to its wake log.
-//! Existing IDs move between owners only through an explicit ghost ownership transfer.
+//! Moving an existing group between owners is an explicit ghost ownership transfer;
+//! member identities and permissions remain unchanged.
 //!
 //! Every real variant of `Abs::Step` is covered by `foreign` and `lemma_foreign_step`.
 //! A foreign completion acts on a foreign request, never on a local request on behalf
@@ -27,8 +28,8 @@ use vstd::prelude::*;
 
 verus! {
 
-/// QP names and lease IDs owned by one worker. IDs remain owned after a lease is taken
-/// or dropped, so its historical outcome and posted bytes are still protected.
+/// QP names and group handles owned by one worker. Handles remain owned after a group is taken
+/// or dropped, so its historical outcome and original resource sequence remain protected.
 pub struct Share {
     pub qps: ISet<QpId>,
     pub ids: ISet<Id>,
