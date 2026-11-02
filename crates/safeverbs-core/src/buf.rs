@@ -35,6 +35,7 @@ use crate::verbs::Verbs;
 mod range;
 use range::{ByteRange, ElementRange, checked_sge_len};
 mod lease;
+pub mod projection;
 pub(crate) use lease::Lease;
 #[allow(unused_imports)] // Named only by contracts erased from plain cargo builds.
 pub(crate) use lease::Loan;
