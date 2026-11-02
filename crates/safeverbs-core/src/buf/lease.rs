@@ -320,6 +320,7 @@ impl<N: Nic> Leases<N> {
     {}
 
     /// Retains an incoming resource or drops only a redundant shared reference.
+    #[allow(clippy::collapsible_if)] // Keep the pattern and pointer primitive explicit for Verus.
     #[inline]
     fn push_resource(&mut self, lease: Lease<N>)
         ensures

@@ -77,7 +77,7 @@ pub proof fn lemma_loan_recorded<N: Nic>(leases: Leases<N>, dir: Dir, addr: int)
     assert(covers_inputs(leases.wqes(), leases.loans().len() as int));
     assert(input_is_covered(leases.wqes(), i));
     let w = choose|w: int| 0 <= w < leases.wqes().len()
-        && leases.wqes()[w].first <= i < leases.wqes()[w].end();
+        && (#[trigger] leases.wqes()[w]).first <= i < leases.wqes()[w].end();
     leases.lemma_wqes();
     let wqe = leases.wqes()[w];
     assert(wqe.matches(leases.loans()));
