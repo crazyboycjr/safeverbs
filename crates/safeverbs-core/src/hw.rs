@@ -151,7 +151,7 @@ fn keep_parts<N: Device>(
     leases: &mut Leases<N>, parts: &mut Vec<Part<N>>,
     Ghost(wqe): Ghost<crate::buf::WqeLoans>,
 )
-    requires old(leases).inv(),
+    requires old(leases).inv(), old(leases).fully_recorded(),
         wqe.first == old(leases).loans().len(),
         wqe.sges.len() == old(parts)@.len(),
         forall|i: int| 0 <= i < old(parts)@.len()
@@ -159,6 +159,7 @@ fn keep_parts<N: Device>(
                 && (wqe.access() is In ==> part_writable(old(parts)@[i])),
     ensures final(parts)@.len() == 0,
         final(leases).inv(),
+        final(leases).fully_recorded(),
         final(leases).loans() == old(leases).loans()
             + collected_parts(old(parts)@, 0, wqe.access()),
         final(leases).wqes() == old(leases).wqes().push(wqe),
@@ -175,6 +176,7 @@ fn keep_parts<N: Device>(
         invariant
             leases.inv(),
             leases.wqes() == old_wqes,
+            crate::buf::covers_inputs(old_wqes, prefix.len() as int),
             parts@.len() <= original.len(),
             parts@ == original.take(parts@.len() as int),
             leases.loans() == prefix + collected_parts(original, parts@.len() as int, access),
@@ -299,9 +301,13 @@ pub open spec fn rq_linked<L>(r: Ring<L>, index: u16, qp: Qp) -> bool {
 /// Every concrete resource value held by the ring has its checked logical loan
 /// and WQE provenance. Refused requests keep their original, unposted ledger.
 pub(crate) open spec fn ring_resources_ok<N: Device>(r: Ring<Leases<N>>) -> bool {
-    &&& forall|s: int| #[trigger] r.req(s) is Some ==> r.req(s)->0.leases.inv()
-    &&& forall|s: int| #[trigger] r.staged(s) is Some ==> r.staged(s)->0.leases.inv()
-    &&& forall|s: int| #[trigger] r.refused(s) is Some ==> r.refused(s)->0.inv()
+    &&& forall|s: int| #[trigger] r.req(s) is Some ==> request_resources_ok(r.req(s)->0.leases)
+    &&& forall|s: int| #[trigger] r.staged(s) is Some ==> request_resources_ok(r.staged(s)->0.leases)
+    &&& forall|s: int| #[trigger] r.refused(s) is Some ==> request_resources_ok(r.refused(s)->0)
+}
+
+pub(crate) open spec fn request_resources_ok<N: Device>(leases: Leases<N>) -> bool {
+    leases.inv() && leases.fully_recorded()
 }
 
 /// A resource at a sequence keeps its identity across the three ring views.
@@ -318,13 +324,13 @@ proof fn lemma_resources_kept<N: Device>(pre: Ring<Leases<N>>, post: Ring<Leases
         forall|s: int| #[trigger] post.refused(s) is Some ==> resource_at(pre, s, post.refused(s)->0),
     ensures ring_resources_ok(post),
 {
-    assert forall|s: int| #[trigger] post.req(s) is Some implies post.req(s)->0.leases.inv() by {}
-    assert forall|s: int| #[trigger] post.staged(s) is Some implies post.staged(s)->0.leases.inv() by {}
-    assert forall|s: int| #[trigger] post.refused(s) is Some implies post.refused(s)->0.inv() by {}
+    assert forall|s: int| #[trigger] post.req(s) is Some implies request_resources_ok(post.req(s)->0.leases) by {}
+    assert forall|s: int| #[trigger] post.staged(s) is Some implies request_resources_ok(post.staged(s)->0.leases) by {}
+    assert forall|s: int| #[trigger] post.refused(s) is Some implies request_resources_ok(post.refused(s)->0) by {}
 }
 
 proof fn lemma_resources_added<N: Device>(pre: Ring<Leases<N>>, post: Ring<Leases<N>>, seq: int, leases: Leases<N>)
-    requires ring_resources_ok(pre), leases.inv(),
+    requires ring_resources_ok(pre), request_resources_ok(leases),
         forall|s: int| #[trigger] post.req(s) is Some ==> resource_at(pre, s, post.req(s)->0.leases),
         forall|s: int| #[trigger] post.staged(s) is Some
             ==> (s == seq && post.staged(s)->0.leases == leases)
@@ -332,9 +338,9 @@ proof fn lemma_resources_added<N: Device>(pre: Ring<Leases<N>>, post: Ring<Lease
         forall|s: int| #[trigger] post.refused(s) is Some ==> resource_at(pre, s, post.refused(s)->0),
     ensures ring_resources_ok(post),
 {
-    assert forall|s: int| #[trigger] post.req(s) is Some implies post.req(s)->0.leases.inv() by {}
-    assert forall|s: int| #[trigger] post.staged(s) is Some implies post.staged(s)->0.leases.inv() by {}
-    assert forall|s: int| #[trigger] post.refused(s) is Some implies post.refused(s)->0.inv() by {}
+    assert forall|s: int| #[trigger] post.req(s) is Some implies request_resources_ok(post.req(s)->0.leases) by {}
+    assert forall|s: int| #[trigger] post.staged(s) is Some implies request_resources_ok(post.staged(s)->0.leases) by {}
+    assert forall|s: int| #[trigger] post.refused(s) is Some implies request_resources_ok(post.refused(s)->0) by {}
 }
 
 /// Completion changes outcomes and ownership, while surviving requests retain
@@ -447,6 +453,7 @@ impl<N: Device> HwQp<N> {
         )
         &&& self.building@.len() <= MAX_SGES
         &&& self.open_leases.inv()
+        &&& self.open_leases.fully_recorded()
     }
 }
 
@@ -2051,7 +2058,7 @@ impl<N: Device> Hw<N> {
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
-            r matches Err((_, Some(leases))) ==> leases.inv(),
+            r matches Err((_, Some(leases))) ==> leases.inv() && leases.fully_recorded(),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -2987,7 +2994,7 @@ impl<N: Device> Hw<N> {
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
-            r matches Some((_, leases)) ==> leases.inv(),
+            r matches Some((_, leases)) ==> leases.inv() && leases.fully_recorded(),
     {
         if index >= self.qps.len() {
             return None;

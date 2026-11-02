@@ -41,6 +41,8 @@ pub(crate) use lease::Lease;
 pub(crate) use lease::Loan;
 #[allow(unused_imports)] // Erased WQE provenance used by the verified worker.
 pub(crate) use lease::WqeLoans;
+#[cfg(verus_keep_ghost)]
+pub(crate) use lease::covers_inputs;
 pub use lease::{Leases, Part};
 
 /// Linux's `ENOMEM`.

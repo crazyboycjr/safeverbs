@@ -110,6 +110,17 @@ impl WqeLoans {
     }
 }
 
+/// Every logical input below the frontier belongs to a recorded WQE.
+pub open spec fn input_is_covered(wqes: Seq<WqeLoans>, i: int) -> bool {
+    exists|w: int| 0 <= w < wqes.len()
+        && (#[trigger] wqes[w]).first <= i < wqes[w].end()
+}
+
+/// A covered prefix is stable while more logical inputs are collected.
+pub open spec fn covers_inputs(wqes: Seq<WqeLoans>, frontier: int) -> bool {
+    forall|i: int| 0 <= i < frontier ==> #[trigger] input_is_covered(wqes, i)
+}
+
 /// The only new primitive here: std Arc's pointer comparison. Equality implies
 /// both references retain exactly the same frozen allocation.
 #[verifier::external_body]
@@ -193,6 +204,12 @@ impl<N: Nic> Leases<N> {
     /// The posted or staged WQEs whose guards this request retains.
     pub closed spec fn wqes(self) -> Seq<WqeLoans> { self.wqes@ }
 
+    /// Every input in this request has WQE provenance, rather than only some.
+    /// Standalone, unposted `Leases::from(part)` intentionally need not satisfy it.
+    pub open spec fn fully_recorded(self) -> bool {
+        covers_inputs(self.wqes(), self.loans().len() as int)
+    }
+
     closed spec fn wqes_ok(self) -> bool {
         &&& forall|i: int| 0 <= i < self.wqes().len()
             ==> (#[trigger] self.wqes()[i]).matches(self.loans())
@@ -228,7 +245,7 @@ impl<N: Nic> Leases<N> {
     /// An empty resource group, with no allocation.
     pub fn new() -> (r: Self)
         ensures r.inv(), r.view() == Seq::<Resource<N>>::empty(), r.loans().len() == 0,
-            r.wqes().len() == 0,
+            r.wqes().len() == 0, r.fully_recorded(),
     { Leases { first: None, rest: Vec::new(), loans: Ghost(Seq::empty()), wqes: Ghost(Seq::empty()) } }
 
     /// Adds provenance only after the checked collection loop established its footprint.
@@ -240,6 +257,8 @@ impl<N: Nic> Leases<N> {
         ensures final(self).inv(), final(self).loans() == old(self).loans(),
             final(self).view() == old(self).view(),
             final(self).wqes() == old(self).wqes().push(wqe),
+            covers_inputs(old(self).wqes(), wqe.first) && wqe.end() == old(self).loans().len()
+                ==> final(self).fully_recorded(),
     {
         let ghost before = *self;
         self.wqes = Ghost(self.wqes().push(wqe));
@@ -272,6 +291,20 @@ impl<N: Nic> Leases<N> {
                 let j = choose|j: int| 0 <= j < before.view().len()
                     && before.view()[j].same_backing(before.loans()[i].part.resource());
                 assert(self.view()[j] == before.view()[j]);
+            }
+            if covers_inputs(before.wqes(), wqe.first) && wqe.end() == before.loans().len() {
+                assert forall|i: int| 0 <= i < self.loans().len()
+                    implies #[trigger] input_is_covered(self.wqes(), i) by {
+                    if i < wqe.first {
+                        assert(input_is_covered(before.wqes(), i));
+                        let w = choose|w: int| 0 <= w < before.wqes().len()
+                            && (#[trigger] before.wqes()[w]).first <= i < before.wqes()[w].end();
+                        assert(self.wqes()[w] == before.wqes()[w]);
+                    } else {
+                        assert(self.wqes()[before.wqes().len() as int] == wqe);
+                        assert(wqe.first <= i < wqe.end());
+                    }
+                }
             }
         }
     }

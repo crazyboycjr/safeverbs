@@ -740,6 +740,7 @@ pub fn registered_all<N: Device>(_parts: &Vec<Part<N>>, _pd: &Pd<N>, Tracked(tok
 /// No leases (`Leases::default`).
 pub fn no_leases<N: Device>() -> (r: Leases<N>)
     ensures r.inv(), r.view().len() == 0, r.loans().len() == 0, r.wqes().len() == 0,
+        r.fully_recorded(),
 {
     Leases::new()
 }
