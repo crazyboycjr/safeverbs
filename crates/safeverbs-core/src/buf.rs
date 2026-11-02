@@ -58,7 +58,8 @@ pub(crate) struct Region<N: Nic> {
     ptr: NonNull<u8>,
     layout: Layout,
     lkey: u32,
-    pd: Pd<N>,
+    /// Retained with the MR and allocation if revocation fails or unwinds.
+    pd: ManuallyDrop<Pd<N>>,
 }
 
 // SAFETY: the region is plain memory plus a registration handle; who may
@@ -92,7 +93,7 @@ impl<N: Nic> Region<N> {
                 mr: ManuallyDrop::new(mr),
                 ptr,
                 layout,
-                pd: pd.clone(),
+                pd: ManuallyDrop::new(pd.clone()),
             })),
             Err(e) => {
                 // SAFETY: allocated above with this layout.
@@ -105,9 +106,8 @@ impl<N: Nic> Region<N> {
 
 impl<N: Nic> Drop for Region<N> {
     fn drop(&mut self) {
-        // Keep the PD/device chain alive even if revocation fails or the backend
-        // unwinds. The MR and allocation must then remain alive together.
-        let mut dependency = ManuallyDrop::new(self.pd.clone());
+        // Both the MR and PD fields are ManuallyDrop: a refused revocation or
+        // backend unwind retains the allocation and the dependency chain together.
         if close_registration::<N>(&mut self.mr).is_err() {
             return;
         }
@@ -115,7 +115,7 @@ impl<N: Nic> Drop for Region<N> {
         // destructor) excludes further access through this registration.
         unsafe {
             dealloc(self.ptr.as_ptr(), self.layout);
-            ManuallyDrop::drop(&mut dependency);
+            ManuallyDrop::drop(&mut self.pd);
         }
     }
 }
