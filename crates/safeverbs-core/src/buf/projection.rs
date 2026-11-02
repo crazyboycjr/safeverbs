@@ -57,6 +57,42 @@ pub open spec fn loan_accesses<N: Nic>(leases: Leases<N>, dir: Dir, addr: int) -
         && loan_span(leases.loans()[i]).contains(addr)
 }
 
+/// The union of recorded WQE SGE spans with the required local access role.
+/// These are this request's records, not the WQEs in M's current queues.
+pub open spec fn recorded_accesses<N: Nic>(leases: Leases<N>, dir: Dir, addr: int) -> bool {
+    exists|w: int| 0 <= w < leases.wqes().len()
+        && (#[trigger] leases.wqes()[w]).access() == dir
+        && wqe_contains(leases.wqes()[w], addr)
+}
+
+/// Full input coverage makes every loan access an access of a recorded WQE.
+/// Inverting its reverse-order indexing recovers an actual SGE witness.
+pub proof fn lemma_loan_recorded<N: Nic>(leases: Leases<N>, dir: Dir, addr: int)
+    requires leases.inv(), leases.fully_recorded(), loan_accesses(leases, dir, addr),
+    ensures recorded_accesses(leases, dir, addr),
+{
+    let i = choose|i: int| 0 <= i < leases.loans().len()
+        && leases.loans()[i].access == Some(dir)
+        && loan_span(leases.loans()[i]).contains(addr);
+    assert(covers_inputs(leases.wqes(), leases.loans().len() as int));
+    assert(input_is_covered(leases.wqes(), i));
+    let w = choose|w: int| 0 <= w < leases.wqes().len()
+        && leases.wqes()[w].first <= i < leases.wqes()[w].end();
+    leases.lemma_wqes();
+    let wqe = leases.wqes()[w];
+    assert(wqe.matches(leases.loans()));
+    let j = wqe.end() - 1 - i;
+    assert(0 <= j < wqe.sges.len());
+    assert(wqe_loan_index(wqe, j) == i);
+    assert(leases.loans()[i].part.spec_sge() == wqe.sges[j]);
+    assert(leases.loans()[i].access == Some(wqe.access()));
+    assert(wqe.access() == dir);
+    assert(loan_span(leases.loans()[i]) == wqe_span(wqe, j));
+    assert(wqe_span(wqe, j).contains(addr));
+    assert(wqe_contains(wqe, addr));
+    assert(recorded_accesses(leases, dir, addr));
+}
+
 /// Caller-supplied metadata that the current buffer proof does not establish.
 /// Request/member positions name logical loans even when one Arc guards several.
 pub ghost struct Projection {
@@ -229,6 +265,45 @@ impl Projection {
         match wqe.access() {
             Dir::Out => { assert(loan_accesses(leases, Dir::Out, addr)); },
             Dir::In => { assert(loan_accesses(leases, Dir::In, addr)); },
+        }
+    }
+
+    /// With every loan recorded, projected request access is exactly the union
+    /// of the corresponding recorded WQE spans. This needs no fresh-name,
+    /// byte-token or registration premise and establishes no global M coupling.
+    pub proof fn lemma_recorded_access<N: Nic>(self, s: int, leases: Leases<N>, req: Req, addr: int)
+        requires
+            leases.inv(), leases.fully_recorded(),
+            access_matches(leases, req.dirs), req.phase is InFlight,
+        ensures
+            self.group(s, leases).with_req(req).nic_may_read(addr)
+                <==> recorded_accesses(leases, Dir::Out, addr),
+            self.group(s, leases).with_req(req).nic_may_write(addr)
+                <==> recorded_accesses(leases, Dir::In, addr),
+    {
+        self.lemma_operation_access(s, leases, req, addr);
+        let group = self.group(s, leases).with_req(req);
+        if group.nic_may_read(addr) {
+            assert(loan_accesses(leases, Dir::Out, addr));
+            lemma_loan_recorded(leases, Dir::Out, addr);
+        }
+        if recorded_accesses(leases, Dir::Out, addr) {
+            let w = choose|w: int| 0 <= w < leases.wqes().len()
+                && leases.wqes()[w].access() == Dir::Out
+                && wqe_contains(leases.wqes()[w], addr);
+            self.lemma_wqe_access(s, leases, req, w, addr);
+            assert(group.nic_may_read(addr));
+        }
+        if group.nic_may_write(addr) {
+            assert(loan_accesses(leases, Dir::In, addr));
+            lemma_loan_recorded(leases, Dir::In, addr);
+        }
+        if recorded_accesses(leases, Dir::In, addr) {
+            let w = choose|w: int| 0 <= w < leases.wqes().len()
+                && leases.wqes()[w].access() == Dir::In
+                && wqe_contains(leases.wqes()[w], addr);
+            self.lemma_wqe_access(s, leases, req, w, addr);
+            assert(group.nic_may_write(addr));
         }
     }
 
