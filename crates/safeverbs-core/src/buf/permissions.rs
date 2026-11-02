@@ -4,6 +4,7 @@
 //! All operations are erased proofs; no map exists in the native buffer layout.
 
 #![allow(dead_code)]
+#![allow(unused_imports)] // Raw allocation conversion is entirely erased.
 
 use vstd::prelude::*;
 use vstd::raw_ptr::{PointsTo, PointsToRaw, Provenance};

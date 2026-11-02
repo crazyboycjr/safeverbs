@@ -247,6 +247,7 @@ impl<N: Nic> RawMut<N> {
     /// The borrowed token proof preserves the exact native and ghost contents.
     #[inline(always)]
     #[allow(dead_code)] // The request-level permission adapter uses this bridge.
+    #[allow(unused_variables)] // The borrowed permission proof is entirely erased.
     pub(crate) fn disjoint(&mut self, other: &Self)
         requires old(self).inv(), other.inv(),
         ensures *final(self) == *old(self),
@@ -346,6 +347,7 @@ pub(super) fn allocate(size: usize, align: usize) -> (r: Option<(
 }
 
 /// On registration failure the original full owner is still available to free.
+#[allow(unused_variables)] // The permission is consumed only in erased proof code.
 pub(super) fn release_failed_allocation(
     ptr: *mut u8, size: usize, align: usize, range: OwnedRange, dealloc: Tracked<Dealloc>,
 )
