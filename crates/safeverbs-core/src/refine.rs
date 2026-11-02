@@ -57,7 +57,7 @@ use crate::wc::Wc;
 
 verus! {
 
-/// A pure ghost interpretation of the ring's concrete resource value, with one direction
+/// A pure ghost interpretation of each request's concrete resource value, with one direction
 /// per member. A future buffer-token proof must construct this interpretation honestly;
 /// these adapters prove that the ring preserves it rather than assuming a whole worker
 /// refinement. No runtime field, allocation or check is introduced.
@@ -65,8 +65,11 @@ verus! {
 pub ghost struct Permissions<L> {
     /// The operation's required access for each retained resource member.
     pub access: Map<int, Seq<Dir>>,
-    /// The exact ordered member resources represented by a concrete lease value.
-    pub resources: spec_fn(L) -> Seq<Lease>,
+    /// The exact ordered members at a request sequence and concrete lease value. Equal
+    /// shared values in different requests can have distinct abstract member identities.
+    /// The sequence stays fixed through posting, refusal, side storage and taking; it is
+    /// not A's group handle, which can change without changing the members.
+    pub resources: spec_fn(int, L) -> Seq<Lease>,
 }
 
 impl<L> Permissions<L> {
@@ -126,11 +129,11 @@ pub open spec fn as_req<L>(r: ReqView<L>, q: QpId, dir: Seq<Dir>) -> Req {
     Req { qp: q, dirs: dir, phase: r.phase, waker: r.waker, detached: r.detached }
 }
 
-/// The abstract group is exactly the resource sequence represented by the concrete `L`.
+/// The abstract group is exactly the resource sequence represented by request `s`'s `L`.
 pub open spec fn resources_match<L>(v: View<L>, a: Abs::State, ids: Map<int, Id>, dirs: Permissions<L>, s: int) -> bool {
-    &&& (v.req)(s) is Some ==> a.groups[ids[s]].members == (dirs.resources)((v.req)(s)->0.leases)
-    &&& (v.staged)(s) is Some ==> a.groups[ids[s]].members == (dirs.resources)((v.staged)(s)->0.leases)
-    &&& (v.refused)(s) is Some ==> a.groups[ids[s]].members == (dirs.resources)((v.refused)(s)->0)
+    &&& (v.req)(s) is Some ==> a.groups[ids[s]].members == (dirs.resources)(s, (v.req)(s)->0.leases)
+    &&& (v.staged)(s) is Some ==> a.groups[ids[s]].members == (dirs.resources)(s, (v.staged)(s)->0.leases)
+    &&& (v.refused)(s) is Some ==> a.groups[ids[s]].members == (dirs.resources)(s, (v.refused)(s)->0)
 }
 
 /// The ring's requests sit in `a`: every request A sees in the ring is the
@@ -982,7 +985,7 @@ pub proof fn lemma_take<L>(
         placed(without(v, s), a2, q, ids, dirs),
         a2.wakes == a.wakes,
         a2.is_program(a.next_id) && a2.groups[a.next_id].members == a.groups[ids[s]].members,
-        a2.groups[a.next_id].members == (dirs.resources)(l),
+        a2.groups[a.next_id].members == (dirs.resources)(s, l),
 {
     let r = ids[s];
     let a2 = take_state(a, r);
@@ -1201,7 +1204,7 @@ pub proof fn lemma_end<L>(
         placed(v, a, q, ids, dirs),
         !holds(v, s),
         a.is_program(i),
-        a.groups[i].members == (dirs.resources)(l),
+        a.groups[i].members == (dirs.resources)(s, l),
         a.groups[i].allows(dir),
         forall|t: int| #[trigger] holds(v, t) ==> ids[t] != i,
     ensures
@@ -1421,7 +1424,7 @@ pub proof fn lemma_ring_end<L>(
         pre.inv(),
         placed(pre.view(), a, q, ids, dirs),
         a.is_program(i),
-        a.groups[i].members == (dirs.resources)(leases),
+        a.groups[i].members == (dirs.resources)(pre.spec_posted() as int, leases),
         a.groups[i].allows(dir),
         forall|t: int| #[trigger] holds(pre.view(), t) ==> ids[t] != i,
         forall|s: int| #[trigger] post.req(s) == pre.req(s),
@@ -1616,7 +1619,7 @@ pub proof fn lemma_ring_take<L>(
         placed(post.view(), a2, q, ids, dirs),
         a2.wakes == a.wakes,
         a2.is_program(a.next_id) && a2.groups[a.next_id].members == a.groups[ids[seq]].members,
-        a2.groups[a.next_id].members == (dirs.resources)(leases),
+        a2.groups[a.next_id].members == (dirs.resources)(seq, leases),
 {
     let a2 = lemma_take(pre.view(), a, q, ids, dirs, seq, outcome, leases);
     lemma_same(without(pre.view(), seq), post.view(), a2, q, ids, dirs);
@@ -1914,7 +1917,7 @@ pub proof fn lemma_side_take<L>(
         abs_step(a, a2, Abs::Step::take(ids[seq], side[seq].0.outcome())),
         placed(with_side(v, side.remove(seq), refused), a2, q, ids, dirs),
         a2.is_program(a.next_id) && a2.groups[a.next_id].members == a.groups[ids[seq]].members,
-        a2.groups[a.next_id].members == (dirs.resources)(side[seq].1),
+        a2.groups[a.next_id].members == (dirs.resources)(seq, side[seq].1),
 {
     let w = with_side(v, side, refused);
     let a2 = lemma_take(w, a, q, ids, dirs, seq, side[seq].0, side[seq].1);
@@ -2017,7 +2020,7 @@ pub proof fn example_mixed_resources() {
     assert(abs_inv(a0));
     let v0 = View::<Seq<Lease>> { req: |s: int| None, staged: |s: int| None, refused: |s: int| None };
     let ids0 = Map::empty();
-    let dirs0 = Permissions { access: Map::empty(), resources: |members: Seq<Lease>| members };
+    let dirs0 = Permissions { access: Map::empty(), resources: |_s: int, members: Seq<Lease>| members };
     assert(placed(v0, a0, 7, ids0, dirs0));
     let access = seq![Dir::In, Dir::Out];
     lemma_end(v0, a0, 7, ids0, dirs0, 0, 3, access, false, mixed.members);
@@ -2065,6 +2068,96 @@ pub proof fn example_mixed_resources() {
     let released = complete_state(detached_state, r, wc.outcome());
     assert(!released.groups.contains_key(r));
     assert(released.wakes.len() == 0);
+}
+
+/// Equal shared descriptors in different request positions have different A member IDs.
+/// Their bytes overlap compatibly, and the interpretation keeps the request sequence
+/// through posting, completion, side storage and take. `Span` is only an example resource
+/// value; constructing the physical buffer-token interpretation remains a separate proof.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(20)]
+pub proof fn example_indexed_shared_resources() {
+    let shared = safeverbs_spec::types::Span { start: 0, len: 64 };
+    let first = Group::singleton(0, shared.bytes(), false, true);
+    let second = Group::singleton(1, shared.bytes(), false, true);
+    assert(first.compatible(second));
+    assert(first.members[0].mem == second.members[0].mem);
+    assert(first.members[0].mem.contains(0) && second.members[0].mem.contains(0));
+    assert(first.members[0].id != second.members[0].id);
+    let a0 = Abs::State {
+        qps: Set::empty().insert(7), groups: Map::empty().insert(0, first).insert(1, second),
+        next_id: 2, outcomes: Map::empty(), posted: Map::empty(), wakes: Seq::empty(),
+    };
+    assert(abs_inv(a0));
+    let empty = View::<safeverbs_spec::types::Span> {
+        req: |s: int| None, staged: |s: int| None, refused: |s: int| None,
+    };
+    let ids0 = Map::empty();
+    let dirs0 = Permissions {
+        access: Map::empty(),
+        resources: |s: int, span: safeverbs_spec::types::Span|
+            Group::singleton(if s == 0 { 0nat } else { 1nat }, span.bytes(), false, true).members,
+    };
+    assert((dirs0.resources)(0, shared) == first.members);
+    assert((dirs0.resources)(1, shared) == second.members);
+    assert(placed(empty, a0, 7, ids0, dirs0));
+    let out = seq![Dir::Out];
+    lemma_end(empty, a0, 7, ids0, dirs0, 0, 0, out, false, shared);
+    let one = staged_with(empty, 0, false, shared);
+    let ids1 = ids0.insert(0, 0);
+    let dirs1 = dirs0.insert(0, out);
+    lemma_end(one, a0, 7, ids1, dirs1, 1, 1, out, false, shared);
+    let staged = staged_with(one, 1, false, shared);
+    let staged_ids = ids1.insert(1, 1);
+    let dirs = dirs1.insert(1, out);
+    assert((staged.staged)(0) is Some && (staged.staged)(1) is Some);
+    assert((staged.staged)(0)->0.leases == (staged.staged)(1)->0.leases);
+    assert((dirs.resources)(0, shared) != (dirs.resources)(1, shared));
+
+    let (a1, ids) = lemma_commit(staged, a0, 7, staged_ids, dirs, 0, 2);
+    let in_flight = posted_range(staged, 0, 2);
+    assert((in_flight.req)(0) is Some && (in_flight.req)(1) is Some);
+    assert((in_flight.req)(0)->0.leases == shared && (in_flight.req)(1)->0.leases == shared);
+    assert(holds(in_flight, 0) && holds(in_flight, 1));
+    assert(resources_match(in_flight, a1, ids, dirs, 0));
+    assert(resources_match(in_flight, a1, ids, dirs, 1));
+    assert(ids[0] != ids[1]);
+    assert(a1.in_flight(ids[0]) && a1.in_flight(ids[1]));
+    assert(a1.groups[ids[0]].members == first.members);
+    assert(a1.groups[ids[1]].members == second.members);
+    assert(a1.groups[ids[0]].compatible(a1.groups[ids[1]]));
+    assert(a1.groups[ids[0]].nic_may_read(0) && a1.groups[ids[1]].nic_may_read(0));
+    assert(!a1.groups[ids[0]].nic_may_write(0) && !a1.groups[ids[1]].nic_may_write(0));
+
+    let wc = Wc {
+        wr_id: 1, status: crate::wc::Status::SUCCESS, opcode: crate::wc::Opcode::SEND,
+        byte_len: 0, imm: None, vendor_err: 0, qp_num: 7,
+    };
+    lemma_complete_one(in_flight, a1, 7, ids, dirs, 0, wc);
+    let a2 = complete_state(a1, ids[0], wc.outcome());
+    let one_done = completed(in_flight, 0, wc);
+    assert((one_done.req)(1) is Some && (one_done.req)(1)->0.phase is InFlight);
+    lemma_complete_one(one_done, a2, 7, ids, dirs, 1, wc);
+    let done = complete_state(a2, ids[1], wc.outcome());
+    let done_view = completed(one_done, 1, wc);
+    let side = Map::empty().insert(0, (wc, shared)).insert(1, (wc, shared));
+    let refused = Map::empty();
+    let side_view = with_side(empty, side, refused);
+    assert(same(done_view, side_view));
+    lemma_same(done_view, side_view, done, 7, ids, dirs);
+    assert(side[0].1 == side[1].1);
+    assert(resources_match(side_view, done, ids, dirs, 0));
+    assert(resources_match(side_view, done, ids, dirs, 1));
+
+    let taken = lemma_side_take(empty, 0, side, refused, done, 7, ids, dirs);
+    assert(taken.groups[done.next_id].members == (dirs.resources)(0, shared));
+    let remaining = with_side(empty, side.remove(0), refused);
+    assert((remaining.req)(1) is Some && holds(remaining, 1));
+    assert(resources_match(remaining, taken, ids, dirs, 1));
+    assert(taken.groups[done.next_id].members[0].id == 0);
+    assert(taken.groups[ids[1]].members[0].id == 1);
+    assert(taken.groups[done.next_id].members[0].mem == taken.groups[ids[1]].members[0].mem);
+    assert(!taken.groups[done.next_id].members[0].unique && !taken.groups[ids[1]].members[0].unique);
 }
 
 } // verus!
