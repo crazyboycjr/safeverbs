@@ -33,7 +33,7 @@ use crate::pd::Pd;
 use crate::verbs::Verbs;
 
 mod range;
-use range::{ByteRange, checked_sge_len};
+use range::{ByteRange, ElementRange, checked_sge_len};
 
 /// Linux's `ENOMEM`.
 const ENOMEM: i32 = 12;
@@ -170,8 +170,8 @@ pub struct BufMut<T, N: Nic = Verbs> {
 /// as wanted, at once.
 pub struct Buf<T, N: Nic = Verbs> {
     frozen: Arc<Frozen<N>>,
-    /// Bytes relative to the frozen range, with its length as the ghost capacity.
-    view: ByteRange,
+    /// Byte offset and element count, with erased byte geometry.
+    view: ElementRange,
     _t: PhantomData<Arc<[T]>>,
 }
 
@@ -286,7 +286,7 @@ impl<T, N: Nic> BufMut<T, N> {
     where
         T: Immutable,
     {
-        let view = ByteRange::whole(self.raw.range.len());
+        let view = ElementRange::from_bytes(ByteRange::whole(self.raw.range.len()), size_of::<T>());
         Buf {
             frozen: Arc::new(Frozen { raw: self.raw }),
             view,
@@ -426,7 +426,7 @@ impl<T, N: Nic> Iterator for Chunks<T, N> {
 impl<T, N: Nic> Buf<T, N> {
     /// The number of elements.
     pub fn len(&self) -> usize {
-        self.view.len() / size_of::<T>()
+        self.view.len()
     }
 
     /// Whether it has no elements.
@@ -457,7 +457,7 @@ impl<T, N: Nic> Buf<T, N> {
         };
         let view = self
             .view
-            .slice_elements(start, end, size_of::<T>())
+            .slice(start, end, size_of::<T>())
             .unwrap_or_else(|| panic!("range {start}..{end} of a buffer of {}", self.len()));
         Buf {
             frozen: self.frozen.clone(),
@@ -499,7 +499,8 @@ impl<T, N: Nic> Buf<T, N> {
     {
         let sge = Sge {
             addr: self.frozen.raw.ptr() as u64 + self.view.offset() as u64,
-            length: checked_sge_len(self.view.len()).expect("a single SGE exceeds u32::MAX bytes"),
+            length: checked_sge_len(self.view.byte_len(size_of::<T>()))
+                .expect("a single SGE exceeds u32::MAX bytes"),
             lkey: self.frozen.raw.region.lkey,
         };
         Part {

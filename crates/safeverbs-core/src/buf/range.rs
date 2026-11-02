@@ -148,35 +148,88 @@ impl ByteRange {
         )
     }
 
-    /// Select whole elements from a byte range, rejecting invalid bounds and sizes.
+}
+
+/// A frozen view keeps its element count directly, as the original buffer did.
+/// Byte geometry and element width are erased; `len()` needs no division.
+#[derive(Clone, Copy)]
+pub(super) struct ElementRange {
+    offset: usize,
+    len: usize,
+    // Its reads disappear with the proof code in a plain cargo build.
+    #[allow(dead_code)]
+    bytes: Ghost<ByteRange>,
+    width: Ghost<usize>,
+}
+
+impl ElementRange {
+    pub(super) closed spec fn spec_offset(self) -> usize { self.offset }
+    pub(super) closed spec fn spec_len(self) -> usize { self.len }
+    pub(super) closed spec fn spec_bytes(self) -> ByteRange { self.bytes@ }
+    pub(super) closed spec fn spec_width(self) -> usize { self.width@ }
+
+    pub(super) open spec fn inv(self) -> bool {
+        &&& self.spec_width() > 0
+        &&& self.spec_bytes().inv()
+        &&& self.spec_offset() == self.spec_bytes().spec_offset()
+        &&& self.spec_len() * self.spec_width() == self.spec_bytes().spec_len()
+    }
+
+    /// The caller supplies whole elements, the same invariant as `RawMut::fits`.
     #[inline]
-    pub(super) fn slice_elements(self, start: usize, end: usize, width: usize) -> (r: Option<Self>)
-        requires self.inv(),
-        ensures
-            r is Some <==> width > 0 && start <= end && end <= self.spec_len() / width,
-            r is Some ==> r->0.inv()
-                && r->0.spec_offset() == self.spec_offset() + start * width
-                && r->0.spec_len() == (end - start) * width
-                && r->0.spec_capacity() == self.spec_capacity()
-                && r->0.span(0).within(self.span(0)),
+    pub(super) fn from_bytes(bytes: ByteRange, width: usize) -> (r: Self)
+        requires bytes.inv(), width > 0, bytes.spec_len() % width == 0,
+        ensures r.inv(), r.spec_bytes() == bytes, r.spec_width() == width,
     {
-        if width == 0 || start > end || end > self.len / width {
+        proof {
+            vstd::arithmetic::div_mod::lemma_fundamental_div_mod(bytes.len as int, width as int);
+            vstd::arithmetic::mul::lemma_mul_is_commutative(bytes.len as int / width as int, width as int);
+        }
+        ElementRange { offset: bytes.offset, len: bytes.len / width, bytes: Ghost(bytes), width: Ghost(width) }
+    }
+
+    #[inline]
+    pub(super) fn offset(&self) -> (r: usize)
+        ensures r == self.spec_offset(),
+    { self.offset }
+
+    #[inline]
+    pub(super) fn len(&self) -> (r: usize)
+        ensures r == self.spec_len(),
+    { self.len }
+
+    #[inline]
+    pub(super) fn byte_len(&self, width: usize) -> (r: usize)
+        requires self.inv(), width == self.spec_width(),
+        ensures r == self.spec_bytes().spec_len(),
+    { self.len * width }
+
+    #[inline]
+    pub(super) fn slice(self, start: usize, end: usize, width: usize) -> (r: Option<Self>)
+        requires self.inv(), width == self.spec_width(),
+        ensures
+            r is Some <==> start <= end && end <= self.spec_len(),
+            r is Some ==> r->0.inv() && r->0.spec_width() == width
+                && r->0.spec_offset() == self.spec_offset() + start * width
+                && r->0.spec_len() == end - start
+                && r->0.spec_bytes().span(0).within(self.spec_bytes().span(0)),
+    {
+        if start > end || end > self.len {
             None
         } else {
             proof {
-                vstd::arithmetic::div_mod::lemma_fundamental_div_mod(self.len as int, width as int);
-                vstd::arithmetic::div_mod::lemma_mod_pos_bound(self.len as int, width as int);
-                vstd::arithmetic::mul::lemma_mul_inequality(end as int, self.len as int / width as int, width as int);
-                vstd::arithmetic::mul::lemma_mul_is_commutative(self.len as int / width as int, width as int);
-                assert(end * width <= self.len);
                 vstd::arithmetic::mul::lemma_mul_inequality(start as int, end as int, width as int);
-                assert(start * width <= end * width);
-                assert((end - start) * width == end * width - start * width) by(nonlinear_arith);
+                vstd::arithmetic::mul::lemma_mul_inequality(end as int, self.len as int, width as int);
+                vstd::arithmetic::mul::lemma_mul_is_distributive_sub_other_way(width as int, end as int, start as int);
             }
-            Some(ByteRange {
-                offset: self.offset + start * width,
-                len: (end - start) * width,
-                capacity: self.capacity,
+            let offset = self.offset + start * width;
+            let len = end - start;
+            Some(ElementRange {
+                offset, len,
+                bytes: Ghost(ByteRange {
+                    offset, len: (len * width) as usize, capacity: self.bytes@.capacity,
+                }),
+                width: self.width,
             })
         }
     }
@@ -196,6 +249,7 @@ pub(super) fn checked_sge_len(len: usize) -> (r: Option<u32>)
 
 // Proof metadata must not add a third word to every buffer and retained lease.
 const _: () = assert!(core::mem::size_of::<ByteRange>() == 2 * core::mem::size_of::<usize>());
+const _: () = assert!(core::mem::size_of::<ElementRange>() == 2 * core::mem::size_of::<usize>());
 
 #[cfg(test)]
 mod tests {

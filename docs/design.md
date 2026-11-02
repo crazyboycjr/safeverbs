@@ -352,7 +352,8 @@ leases, including shared-reference deduplication, rather than assume one lease p
 The executable range operations in `buf/range.rs` are verified separately from the
 ownership permissions: they bound the unique ranges and frozen views and preserve the
 exact byte partition when splitting. Capacity is ghost state, so each range still takes
-two machine words. A single SGE has a native 32-bit byte length; `into_part` panics for
+two machine words; frozen views still store their element count directly, so `len()`
+does not add a division. A single SGE has a native 32-bit byte length; `into_part` panics for
 a larger range instead of truncating it. Large registered buffers remain usable through
 splits and slices.
 

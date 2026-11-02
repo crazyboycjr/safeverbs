@@ -111,13 +111,15 @@ The code of `crates/safeverbs-core` written inside `verus!` is verified with no 
 `admit`; it trusts only the items listed in `scripts/trusted.txt` (see "Trusted computing
 base" below), and the script refuses any other.
 
-**Executable buffer ranges** (`buf/range.rs`). The real `RawMut` and frozen `Buf`
-views use `ByteRange`: an offset, a byte length and an erased capacity. Verus proves
+**Executable buffer ranges** (`buf/range.rs`). The real `RawMut` uses `ByteRange`:
+an offset, a byte length and an erased capacity. Frozen `Buf` views use `ElementRange`,
+which keeps the original offset/element-count representation and erases its byte
+geometry and element width; `Buf::len()` still needs only a field read. Verus proves
 checked construction, non-overflowing end calculation, exact adjacent splits, and
 bounded element slicing (including multiplication by the element size). Checked SGE
 length conversion either preserves every byte or rejects a length above `u32::MAX`.
 The ordinary buffer methods call these executable operations, rather than a separate
-copy of their arithmetic. A compile-time layout assertion keeps the runtime range at
+copy of their arithmetic. Compile-time layout assertions keep both runtime ranges at
 two machine words. Checked lemmas identify its finite byte domain with A/M's `Span`,
 prove that slices stay within the retained range, and split an existing vstd
 `PointsToRaw` token along the exact range partition without changing provenance.
