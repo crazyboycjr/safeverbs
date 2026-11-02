@@ -117,8 +117,8 @@ The code of `crates/safeverbs-core` written inside `verus!` is verified with no 
 `admit`; it trusts only the items listed in `scripts/trusted.txt` (see "Trusted computing
 base" below), and the script refuses any other.
 
-**Executable buffer ranges** (`buf/range.rs`). The real `RawMut` uses `ByteRange`:
-an offset, a byte length and an erased capacity. Frozen `Buf` views use `ElementRange`,
+**Executable buffer ranges** (`buf/range.rs`, `buf/memory.rs`). The real `RawMut` holds
+an `OwnedRange`: a pointer, a byte length and erased `ByteRange` geometry. Frozen `Buf` views use `ElementRange`,
 which keeps the original offset/element-count representation and erases its byte
 geometry and element width; `Buf::len()` still needs only a field read. Verus proves
 checked construction, non-overflowing end calculation, exact adjacent splits, and
@@ -129,9 +129,20 @@ copy of their arithmetic. Compile-time layout assertions keep both runtime range
 two machine words. Checked lemmas identify its finite byte domain with A/M's `Span`,
 prove that slices stay within the retained range, and split an existing vstd
 `PointsToRaw` token along the exact range partition without changing provenance.
-The buffer objects do not yet carry those tokens. This does not prove allocation
-ownership, initializedness, alignment, registration lifetime or the wrappers' complete
-invariants.
+
+**Actual allocation permissions** (`buf/memory.rs`). The fallible zeroed allocator
+returns a linear raw-byte permission and deallocation capability on success; it
+returns no permission on failure. Checked executable code carries that permission in
+the actual `RawMut` and `Frozen` contents, partitions it when splitting, and transfers
+the identical contents through freeze and successful thaw. Shared views retain the
+same frozen permission. `Part`'s invariant ties its actual SGE to that permission's
+byte domain; `Leases` preserves this relation through guard deduplication. Alignment
+checks use the absolute pointer, including when recovering over-aligned elements.
+Failed registration returns the whole permission for checked deallocation. An erased
+pool supports streaming withdrawal and return, but the native `RingBuf` callers still
+need to prove the pool preconditions. Final Arc-driven region cleanup, registration
+lifetime, initialized typed contents and the public wrappers remain unverified. These
+tokens describe allocation ownership, not validity of arbitrary incoming bytes as `T`.
 
 **Actual request resources** (`buf/lease.rs`). `Part` and `Leases` are no longer
 opaque to the verifier. Their actual field observations, empty construction, native
@@ -161,8 +172,9 @@ SEND/WRITE sources remain distinct from READ destinations and receives. The adap
 constructs `Permissions<Leases<N>>` for the ring using request/member-indexed names.
 Names and arbitrary-byte validity are supplied separately; it does not establish fresh
 allocation, `Group::wf`, A placement or coupling to M's current request intervals.
-The allocation payload types `RawMut` and `Frozen` remain opaque; this is a resource
-retention result, not yet a byte-ownership or registration-lifetime proof.
+The actual payload types `RawMut` and `Frozen` now carry byte permissions, but the
+projection still needs their disjointness, fresh A identities and typed validity to
+construct a well-formed A group. Registration lifetime is a separate obligation.
 
 **Failed MR revocation (runtime behavior, tested).** `Nic::close_mr` is fallible and
 idempotent. A failed close retains its handle. `Exposed::try_reclaim` returns the still
@@ -337,7 +349,9 @@ exists. Each of them, and why it is trusted:
 | `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name |
 | `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
 | `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
-| `buf/lease.rs` `ExRawMut`, `ExFrozen` | the allocation payload and typed-buffer ownership boundary remains opaque |
+| `buf/memory.rs` `ExRegion` | registration and final Arc-driven cleanup remain opaque; actual buffer ranges and permissions are verified |
+| `buf/memory.rs` `allocate_zeroed_raw` | fallible `alloc_zeroed`, with vstd-compatible address, layout, provenance and linear allocation/deallocation permissions on success; no initialized-content claim |
+| `buf/memory.rs` `arc_try_unwrap` | std Arc returns its exact contents on success, or an Arc to the same contents on failure; no promised success condition |
 | `buf/lease.rs` `same_frozen_arc` | std Arc pointer equality implies that both references retain the same frozen allocation |
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's (`caps_model`) |

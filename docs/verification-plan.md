@@ -38,6 +38,12 @@ relation, not an assumed arbitrary interpretation of `Leases`.
 
 ## 2. Allocation and byte permissions
 
+Checked so far: the actual `RawMut`/`Frozen` carry the allocator's linear byte
+permission through splitting, freeze/thaw and actual SGE construction. Failed MR
+registration returns the whole permission for deallocation. Pool withdrawal/return
+is checked given its preconditions; native `RingBuf` callers, typed validity,
+nonaliasing, exposure and final cleanup remain obligations. See `buf/memory.rs`.
+
 Create permissions at the allocator/registration boundary and carry them in real
 buffer objects through unique splitting, freezing, cloning, slicing, thawing, exposure,
 revocation and release. Derive disjoint mutable access from linear permissions.

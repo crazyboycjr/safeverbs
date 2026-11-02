@@ -14,6 +14,7 @@ verus! {
 pub(super) struct ByteRange {
     offset: usize,
     len: usize,
+    #[allow(dead_code)] // Read only by the erased geometry after pointer/length ownership.
     capacity: Ghost<usize>,
 }
 
@@ -26,6 +27,26 @@ impl ByteRange {
     pub(super) closed spec fn spec_offset(self) -> usize { self.offset }
     pub(super) closed spec fn spec_len(self) -> usize { self.len }
     pub(super) closed spec fn spec_capacity(self) -> usize { self.capacity@ }
+
+    /// Erased geometry for a native pointer/length split.
+    pub(super) closed spec fn split_geometry(self, at: usize) -> (Self, Self) {
+        (
+            ByteRange { offset: self.offset, len: at, capacity: self.capacity },
+            ByteRange { offset: (self.offset + at) as usize, len: (self.len - at) as usize, capacity: self.capacity },
+        )
+    }
+
+    pub(super) proof fn lemma_split_geometry(self, at: usize)
+        requires self.inv(), at <= self.spec_len(),
+        ensures
+            self.split_geometry(at).0.inv(), self.split_geometry(at).1.inv(),
+            self.split_geometry(at).0.spec_offset() == self.spec_offset(),
+            self.split_geometry(at).0.spec_len() == at,
+            self.split_geometry(at).1.spec_offset() == self.spec_offset() + at,
+            self.split_geometry(at).1.spec_len() == self.spec_len() - at,
+            self.split_geometry(at).0.spec_capacity() == self.spec_capacity(),
+            self.split_geometry(at).1.spec_capacity() == self.spec_capacity(),
+    {}
 
     /// The same address range used by A and M, relative to an allocation's base.
     pub(super) open spec fn span(self, base: int) -> safeverbs_spec::types::Span {
@@ -122,6 +143,7 @@ impl ByteRange {
     { self.len }
 
     #[inline]
+    #[cfg(test)]
     pub(super) fn end(&self) -> (r: usize)
         requires self.inv(),
         ensures r == self.spec_offset() + self.spec_len(), r <= self.spec_capacity(),
@@ -129,6 +151,7 @@ impl ByteRange {
 
     /// Split without losing bytes, overlapping the pieces or exceeding the allocation.
     #[inline]
+    #[cfg(test)]
     pub(super) fn split_at(self, at: usize) -> (r: (Self, Self))
         requires self.inv(), at <= self.spec_len(),
         ensures

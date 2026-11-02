@@ -21,19 +21,22 @@ use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, align_of, size_of};
 use core::ops::{Bound, Deref, DerefMut, RangeBounds};
 use core::ptr::NonNull;
-use std::alloc::{alloc_zeroed, dealloc};
+use std::alloc::dealloc;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::error::{Error, Result};
-use crate::nic::{Access, Nic, RemoteBuf, Sge};
+use crate::nic::{Access, Nic, RemoteBuf};
 use crate::pd::Pd;
 use crate::verbs::Verbs;
 
 mod range;
-use range::{ByteRange, ElementRange, checked_sge_len};
+use range::{ByteRange, ElementRange};
+mod memory;
+pub(crate) use memory::{Frozen, RawMut};
+use memory::{OwnedRange, PermissionPool};
 mod lease;
 pub mod projection;
 pub(crate) use lease::Lease;
@@ -60,6 +63,9 @@ pub(crate) struct Region<N: Nic> {
     lkey: u32,
     /// Retained with the MR and allocation if revocation fails or unwinds.
     pd: ManuallyDrop<Pd<N>>,
+    /// Allocation identity retained with the registration (proof only).
+    #[allow(dead_code)]
+    deallocation: vstd::prelude::Tracked<vstd::raw_ptr::Dealloc>,
 }
 
 // SAFETY: the region is plain memory plus a registration handle; who may
@@ -72,14 +78,15 @@ unsafe impl<N: Nic> Sync for Region<N> {}
 impl<N: Nic> Region<N> {
     /// Allocates `bytes` zeroed bytes aligned to `align` (at least a cache
     /// line) and registers them in `pd` for local writes.
-    fn new(pd: &Pd<N>, bytes: usize, align: usize) -> Result<Arc<Region<N>>> {
+    fn new(pd: &Pd<N>, bytes: usize, align: usize) -> Result<(Arc<Region<N>>, OwnedRange)> {
         if bytes == 0 {
             return Err(Error::Invalid("an empty buffer"));
         }
         let layout = Layout::from_size_align(bytes, align.max(REGION_ALIGN))
             .map_err(|_| Error::Invalid("buffer size"))?;
-        // SAFETY: the layout has a non-zero size.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(Error::Os(ENOMEM))?;
+        let (address, range, deallocation) =
+            memory::allocate(layout.size(), layout.align()).ok_or(Error::Os(ENOMEM))?;
+        let ptr = NonNull::new(address).expect("the allocation primitive returns nonnull memory");
         // SAFETY: the memory stays allocated until `drop`, which deregisters
         // it first.
         let mr = unsafe {
@@ -88,16 +95,25 @@ impl<N: Nic> Region<N> {
                 .reg_mr(pd.raw(), ptr.as_ptr(), bytes, Access::LOCAL_WRITE)
         };
         match mr {
-            Ok(mr) => Ok(Arc::new(Region {
-                lkey: N::mr_keys(&mr).0,
-                mr: ManuallyDrop::new(mr),
-                ptr,
-                layout,
-                pd: ManuallyDrop::new(pd.clone()),
-            })),
+            Ok(mr) => Ok((
+                Arc::new(Region {
+                    lkey: N::mr_keys(&mr).0,
+                    mr: ManuallyDrop::new(mr),
+                    ptr,
+                    layout,
+                    pd: ManuallyDrop::new(pd.clone()),
+                    deallocation,
+                }),
+                range,
+            )),
             Err(e) => {
-                // SAFETY: allocated above with this layout.
-                unsafe { dealloc(ptr.as_ptr(), layout) };
+                memory::release_failed_allocation(
+                    address,
+                    layout.size(),
+                    layout.align(),
+                    range,
+                    deallocation,
+                );
                 Err(e)
             }
         }
@@ -135,55 +151,10 @@ fn close_registration<N: Nic>(mr: &mut ManuallyDrop<N::Mr>) -> Result<()> {
     }
 }
 
-/// Unique access to `len` bytes at `offset` of a region.
-pub(crate) struct RawMut<N: Nic> {
-    region: Arc<Region<N>>,
-    range: ByteRange,
-}
-
 impl<N: Nic> RawMut<N> {
-    fn ptr(&self) -> *mut u8 {
-        // SAFETY: `offset <= layout.size()` by construction.
-        unsafe { self.region.ptr.as_ptr().add(self.range.offset()) }
-    }
-
-    fn sge(&self) -> Sge {
-        Sge {
-            addr: self.ptr() as u64,
-            length: checked_sge_len(self.range.len()).expect("a single SGE exceeds u32::MAX bytes"),
-            lkey: self.region.lkey,
-        }
-    }
-
     fn pd(&self) -> &Pd<N> {
         &self.region.pd
     }
-
-    /// Splits at byte `at` (at most `len`).
-    fn split_at(self, at: usize) -> (RawMut<N>, RawMut<N>) {
-        let (left, right) = self.range.split_at(at);
-        let right = RawMut {
-            region: self.region.clone(),
-            range: right,
-        };
-        let left = RawMut {
-            region: self.region,
-            range: left,
-        };
-        (left, right)
-    }
-
-    /// Whether the bytes can hold `[T]` (aligned, a whole number of `T`).
-    fn fits<T>(&self) -> bool {
-        size_of::<T>() > 0
-            && self.range.offset().is_multiple_of(align_of::<T>())
-            && self.range.len().is_multiple_of(size_of::<T>())
-    }
-}
-
-/// A frozen range: shared and read only until thawed.
-pub(crate) struct Frozen<N: Nic> {
-    raw: RawMut<N>,
 }
 
 /// A unique, writable buffer of registered memory: `[T]` that the NIC can
@@ -225,22 +196,21 @@ impl<N: Nic> Pd<N> {
         let bytes = n
             .checked_mul(size_of::<T>())
             .ok_or(Error::Invalid("buffer size"))?;
-        let region = Region::new(self, bytes, align_of::<T>())?;
+        let (region, range) = Region::new(self, bytes, align_of::<T>())?;
         Ok(BufMut {
-            raw: RawMut {
-                region,
-                range: ByteRange::whole(bytes),
-            },
+            raw: RawMut { region, range },
             _t: PhantomData,
         })
     }
 
     /// A ring of `capacity` registered bytes for streaming messages.
     pub fn ring_buf(&self, capacity: usize) -> Result<RingBuf<N>> {
+        let (region, range) = Region::new(self, capacity, 1)?;
         Ok(RingBuf {
-            region: Region::new(self, capacity, 1)?,
+            region,
             capacity,
             chunks: VecDeque::new(),
+            free: range.into_pool(),
         })
     }
 }
@@ -319,7 +289,7 @@ impl<T, N: Nic> BufMut<T, N> {
     {
         let view = ElementRange::from_bytes(ByteRange::whole(self.raw.range.len()), size_of::<T>());
         Buf {
-            frozen: Arc::new(Frozen { raw: self.raw }),
+            frozen: self.raw.freeze(),
             view,
             _t: PhantomData,
         }
@@ -377,11 +347,9 @@ impl<T, N: Nic> BufMut<T, N> {
     where
         T: IntoBytes,
     {
-        Part {
-            sge: self.raw.sge(),
-            pd: self.raw.pd().id(),
-            lease: Lease::Unique(self.raw),
-        }
+        let lkey = self.raw.region.lkey;
+        let pd = self.raw.pd().id();
+        Part::unique(self.raw, lkey, pd)
     }
 
     /// Its bytes.
@@ -507,8 +475,8 @@ impl<T, N: Nic> Buf<T, N> {
     /// else gives it back unchanged.
     pub fn try_thaw(self) -> Result<BufMut<T, N>, Buf<T, N>> {
         let Buf { frozen, view, .. } = self;
-        match Arc::try_unwrap(frozen) {
-            Ok(frozen) => Ok(BufMut::from_raw(frozen.raw)),
+        match memory::thaw(frozen) {
+            Ok(raw) => Ok(BufMut::from_raw(raw)),
             Err(frozen) => Err(Buf {
                 frozen,
                 view,
@@ -528,17 +496,15 @@ impl<T, N: Nic> Buf<T, N> {
     where
         T: IntoBytes + Immutable,
     {
-        let sge = Sge {
-            addr: self.frozen.raw.ptr() as u64 + self.view.offset() as u64,
-            length: checked_sge_len(self.view.byte_len(size_of::<T>()))
-                .expect("a single SGE exceeds u32::MAX bytes"),
-            lkey: self.frozen.raw.region.lkey,
-        };
-        Part {
-            sge,
-            pd: self.pd_id(),
-            lease: Lease::Shared(self.frozen),
-        }
+        let lkey = self.frozen.raw.region.lkey;
+        let pd = self.pd_id();
+        Part::shared(
+            self.frozen,
+            self.view.offset(),
+            self.view.byte_len(size_of::<T>()),
+            lkey,
+            pd,
+        )
     }
 
     /// Its bytes.
@@ -799,6 +765,8 @@ pub struct RingBuf<N: Nic = Verbs> {
     capacity: usize,
     /// The chunks handed out and not reclaimed, oldest first.
     chunks: VecDeque<Arc<Frozen<N>>>,
+    /// Actual free-byte permissions, erased in a native build.
+    free: PermissionPool,
 }
 
 impl<N: Nic> RingBuf<N> {
@@ -823,7 +791,14 @@ impl<N: Nic> RingBuf<N> {
             if Arc::strong_count(front) != 1 {
                 break;
             }
-            self.chunks.pop_front();
+            let chunk = self.chunks.pop_front().expect("the front chunk exists");
+            match memory::thaw(chunk) {
+                Ok(raw) => self.free.put(raw.range),
+                Err(chunk) => {
+                    self.chunks.push_front(chunk);
+                    break;
+                }
+            }
         }
     }
 
@@ -834,8 +809,8 @@ impl<N: Nic> RingBuf<N> {
             return (len <= self.capacity).then_some(0);
         };
         // The ring owns its whole region: offsets are positions in the ring.
-        let tail = front.raw.range.offset();
-        let head = back.raw.range.end();
+        let tail = front.raw.range.offset(self.region.ptr.as_ptr());
+        let head = back.raw.range.end(self.region.ptr.as_ptr());
         // Chunks lie from `tail` to `head`, or wrapped from `tail` to the end
         // and from the start to `head`. A wrapped head never reaches the
         // tail (strict comparisons), so `head >= tail` means not wrapped.
@@ -860,7 +835,10 @@ impl<N: Nic> RingBuf<N> {
         let at = self.place(len)?;
         let mut buf: BufMut<u8, N> = BufMut::from_raw(RawMut {
             region: self.region.clone(),
-            range: ByteRange::new(at, len, self.capacity).expect("a chunk fits the ring"),
+            range: self.free.take(
+                self.region.ptr.as_ptr(),
+                ByteRange::new(at, len, self.capacity).expect("a chunk fits the ring"),
+            ),
         });
         fill(&mut buf);
         let buf = buf.freeze();

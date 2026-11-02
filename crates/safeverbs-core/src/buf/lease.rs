@@ -6,25 +6,12 @@ use safeverbs_spec::abs::Dir;
 use std::sync::Arc;
 use vstd::prelude::*;
 
+use super::range::checked_sge_len;
 use super::{Frozen, RawMut};
 use crate::nic::{Nic, Sge};
 use crate::verbs::Verbs;
 
 verus! {
-
-/// Allocation/typed-buffer ownership is the remaining buffer boundary.
-#[cfg(verus_keep_ghost)]
-#[verifier::external_type_specification]
-#[verifier::external_body]
-#[verifier::reject_recursive_types(N)]
-pub struct ExRawMut<N: Nic>(RawMut<N>);
-
-/// Frozen allocation contents are opaque here; std Arc preserves their identity.
-#[cfg(verus_keep_ghost)]
-#[verifier::external_type_specification]
-#[verifier::external_body]
-#[verifier::reject_recursive_types(N)]
-pub struct ExFrozen<N: Nic>(Frozen<N>);
 
 /// What keeps a buffer's memory alive while the NIC uses it.
 #[verifier::reject_recursive_types(N)]
@@ -54,6 +41,19 @@ pub ghost struct Resource<N: Nic> {
 }
 
 impl<N: Nic> Resource<N> {
+    /// The byte permission retained by this actual physical keeper.
+    pub closed spec fn byte_domain(self) -> Set<int> {
+        match self.resource {
+            Lease::Unique(raw) => raw.byte_domain(),
+            Lease::Shared(frozen) => (*frozen).byte_domain(),
+        }
+    }
+
+    /// Backing identity preserves byte domains even after shared guard deduplication.
+    pub proof fn lemma_backing_domain(self, other: Self)
+        ensures self.same_backing(other) ==> self.byte_domain() == other.byte_domain(),
+    {}
+
     /// Both resources retain the same shared frozen allocation.
     pub closed spec fn same_frozen(self, other: Self) -> bool {
         self.resource.same_frozen(other.resource)
@@ -139,6 +139,74 @@ pub struct Part<N: Nic = Verbs> {
 }
 
 impl<N: Nic> Part<N> {
+    /// The actual SGE byte set is covered by the permission of its retained owner.
+    #[verifier::type_invariant]
+    pub closed spec fn inv(self) -> bool {
+        match self.lease {
+            Lease::Unique(raw) => raw.inv()
+                && self.byte_domain() == raw.byte_domain()
+                && self.sge.addr == raw.pointer().addr()
+                && self.sge.length == raw.byte_len(),
+            Lease::Shared(frozen) => (*frozen).inv()
+                && self.byte_domain().subset_of((*frozen).byte_domain()),
+        }
+    }
+
+    /// Exact local bytes named by this SGE (registration is a separate obligation).
+    pub closed spec fn byte_domain(self) -> Set<int> {
+        Set::range(self.sge.addr as int, self.sge.addr as int + self.sge.length)
+    }
+
+    /// No arbitrary SGE/keeper pair is assembled by the typed buffer wrapper.
+    #[inline]
+    pub(super) fn unique(raw: RawMut<N>, lkey: u32, pd: u64) -> (r: Self)
+        requires raw.byte_len() <= u32::MAX,
+        ensures r.inv(), r.resource() == Lease::Unique(raw).observation(),
+    {
+        proof { use_type_invariant(&raw); raw.lemma_domain(); }
+        let length = match checked_sge_len(raw.len()) {
+            Some(length) => length,
+            None => panic!("a single SGE exceeds u32::MAX bytes"),
+        };
+        Part { sge: Sge { addr: raw.ptr().addr() as u64, length, lkey }, pd, lease: Lease::Unique(raw) }
+    }
+
+    /// A shared SGE is a bounded view of the frozen owner's actual permission.
+    #[inline]
+    pub(super) fn shared(frozen: Arc<Frozen<N>>, offset: usize, len: usize, lkey: u32, pd: u64) -> (r: Self)
+        requires offset <= (*frozen).byte_len(), len <= (*frozen).byte_len() - offset,
+            len <= u32::MAX,
+        ensures r.inv(), r.resource() == Lease::Shared(frozen).observation(),
+    {
+        proof {
+            use_type_invariant(&*frozen);
+            frozen.lemma_contents();
+            frozen.raw.lemma_domain();
+        }
+        let length = match checked_sge_len(len) {
+            Some(length) => length,
+            None => panic!("a single SGE exceeds u32::MAX bytes"),
+        };
+        let ptr = frozen.raw.ptr();
+        let addr = ptr.addr() + offset;
+        let part = Part { sge: Sge { addr: addr as u64, length, lkey }, pd, lease: Lease::Shared(frozen) };
+        proof { assert(part.byte_domain().subset_of((*frozen).byte_domain())); }
+        part
+    }
+
+    /// Bridge the SGE footprint to the actual linear owner, without registration assumptions.
+    pub proof fn lemma_byte_backing(self)
+        requires self.inv(),
+        ensures self.byte_domain().subset_of(self.resource().byte_domain()),
+            self.byte_domain().to_iset() == (safeverbs_spec::types::Span {
+                start: self.spec_sge().addr as int, len: self.spec_sge().length as nat,
+            }).bytes(),
+    {
+        assert(self.byte_domain().to_iset() =~= (safeverbs_spec::types::Span {
+            start: self.spec_sge().addr as int, len: self.spec_sge().length as nat,
+        }).bytes());
+    }
+
     /// The range passed to the NIC.
     pub closed spec fn spec_sge(self) -> Sge { self.sge }
     /// The resource's protection domain.
@@ -224,6 +292,7 @@ impl<N: Nic> Leases<N> {
         &&& self.wqes_ok()
         &&& forall|i: int| 0 <= i < self.loans().len() ==> {
             let loan = #[trigger] self.loans()[i];
+            &&& loan.part.inv()
             &&& exists|j: int| 0 <= j < self.view().len()
                 && (#[trigger] self.view()[j]).same_backing(loan.part.resource())
             &&& loan.access == Some(Dir::In) ==> loan.part.spec_writable()
@@ -236,11 +305,37 @@ impl<N: Nic> Leases<N> {
         ensures
             forall|i: int| 0 <= i < self.loans().len() ==> {
                 let loan = #[trigger] self.loans()[i];
+                &&& loan.part.inv()
                 &&& exists|j: int| 0 <= j < self.view().len()
                     && (#[trigger] self.view()[j]).same_backing(loan.part.resource())
                 &&& loan.access == Some(Dir::In) ==> loan.part.spec_writable()
             },
     {}
+
+    /// Every recorded SGE is covered by an actual retained raw-byte permission.
+    pub proof fn lemma_byte_backing(self)
+        requires self.inv(),
+        ensures forall|i: int| 0 <= i < self.loans().len() ==> {
+            let part = (#[trigger] self.loans()[i]).part;
+            exists|j: int| 0 <= j < self.view().len()
+                && (#[trigger] self.view()[j]).same_backing(part.resource())
+                && part.byte_domain().subset_of(self.view()[j].byte_domain())
+        },
+    {
+        self.lemma_loans();
+        assert forall|i: int| 0 <= i < self.loans().len() implies {
+            let part = (#[trigger] self.loans()[i]).part;
+            exists|j: int| 0 <= j < self.view().len()
+                && (#[trigger] self.view()[j]).same_backing(part.resource())
+                && part.byte_domain().subset_of(self.view()[j].byte_domain())
+        } by {
+            let loan = self.loans()[i];
+            let j = choose|j: int| 0 <= j < self.view().len()
+                && self.view()[j].same_backing(loan.part.resource());
+            loan.part.lemma_byte_backing();
+            self.view()[j].lemma_backing_domain(loan.part.resource());
+        }
+    }
 
     /// An empty resource group, with no allocation.
     pub fn new() -> (r: Self)
@@ -284,6 +379,7 @@ impl<N: Nic> Leases<N> {
             assert(self.loans() == before.loans());
             assert forall|i: int| 0 <= i < self.loans().len() implies {
                 let loan = #[trigger] self.loans()[i];
+                &&& loan.part.inv()
                 &&& exists|j: int| 0 <= j < self.view().len()
                     && (#[trigger] self.view()[j]).same_backing(loan.part.resource())
                 &&& loan.access == Some(Dir::In) ==> loan.part.spec_writable()
@@ -374,6 +470,7 @@ impl<N: Nic> Leases<N> {
             final(self).loans() == old(self).loans().push(Loan { part, access }),
             final(self).wqes() == old(self).wqes(),
     {
+        proof { use_type_invariant(&part); }
         let ghost before = *self;
         let ghost incoming = part;
         self.push_resource(part.lease);
@@ -395,6 +492,7 @@ impl<N: Nic> Leases<N> {
                 }
                 assert forall|i: int| 0 <= i < self.loans().len() implies {
                     let loan = #[trigger] self.loans()[i];
+                    &&& loan.part.inv()
                     &&& exists|j: int| 0 <= j < self.view().len()
                         && (#[trigger] self.view()[j]).same_backing(loan.part.resource())
                     &&& loan.access == Some(Dir::In) ==> loan.part.spec_writable()

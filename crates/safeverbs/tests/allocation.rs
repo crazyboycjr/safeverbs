@@ -52,11 +52,9 @@ unsafe impl GlobalAlloc for ObservedAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let _ = BACKING.try_with(|events| {
-            if let Some(mut value) = events.get() {
-                if value.address == ptr as usize {
-                    value.frees = value.frees.saturating_add(1);
-                    events.set(Some(value));
-                }
+            if let Some(mut value) = events.get().filter(|value| value.address == ptr as usize) {
+                value.frees = value.frees.saturating_add(1);
+                events.set(Some(value));
             }
         });
         // SAFETY: the caller supplies the allocation's pointer and layout.
@@ -104,7 +102,10 @@ fn refused_allocation_frees_backing_and_the_next_allocation_succeeds() {
     assert_eq!(result.err(), Some(Error::Os(11)));
     assert_eq!(model.registered(), 0);
     assert_eq!(events.allocations, 1);
-    assert_eq!(events.frees, 1, "registration refusal leaked its allocation");
+    assert_eq!(
+        events.frees, 1,
+        "registration refusal leaked its allocation"
+    );
 
     let mut buf = pd.alloc::<u64>(37).unwrap();
     assert_eq!(buf.len(), 37);
@@ -163,8 +164,14 @@ fn invalid_allocations_do_not_reach_registration() {
     let (model, pd) = device(103);
     model.refuse_next_mr_registration();
     let (_, events) = observe_backing(|| {
-        assert_eq!(pd.alloc::<u8>(0).err(), Some(Error::Invalid("an empty buffer")));
-        assert_eq!(pd.ring_buf(0).err(), Some(Error::Invalid("an empty buffer")));
+        assert_eq!(
+            pd.alloc::<u8>(0).err(),
+            Some(Error::Invalid("an empty buffer"))
+        );
+        assert_eq!(
+            pd.ring_buf(0).err(),
+            Some(Error::Invalid("an empty buffer"))
+        );
         assert_eq!(
             pd.alloc::<()>(1).err(),
             Some(Error::Invalid("zero-sized elements"))
@@ -220,7 +227,11 @@ fn split_ranges_and_repeated_frozen_views_keep_their_owners() {
         assert!(empty_left.is_empty());
         assert!(empty_right.is_empty());
         drop((left, middle, right, empty_left));
-        assert_eq!(model.registered(), 1, "the empty end still retains its owner");
+        assert_eq!(
+            model.registered(),
+            1,
+            "the empty end still retains its owner"
+        );
         drop(empty_right);
         assert_eq!(model.registered(), 0);
     });
@@ -295,7 +306,11 @@ fn a_chunk_outlives_its_ring_and_thaws_after_its_last_other_view() {
         drop(chunk);
 
         let mut buf = view.try_thaw().unwrap();
-        assert_eq!(&buf[..], b"abcdefgh", "thaw recovers the whole frozen chunk");
+        assert_eq!(
+            &buf[..],
+            b"abcdefgh",
+            "thaw recovers the whole frozen chunk"
+        );
         buf.fill(7);
         drop(buf);
         assert_eq!(model.registered(), 0);
