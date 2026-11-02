@@ -18,12 +18,14 @@ crates/safeverbs-core/src/trusted.rs ExDeviceCaps
 crates/safeverbs-core/src/trusted.rs ExQpType
 crates/safeverbs-core/src/trusted.rs ExError
 crates/safeverbs-core/src/trusted.rs ExBufError
-# Types only the device or buf.rs reads: opaque.
+# Device and allocation payload types: opaque.
 crates/safeverbs-core/src/trusted.rs ExConnectAttr
 crates/safeverbs-core/src/trusted.rs ExEndpoint
 crates/safeverbs-core/src/trusted.rs ExPd
-crates/safeverbs-core/src/trusted.rs ExPart
-crates/safeverbs-core/src/trusted.rs ExLeases
+crates/safeverbs-core/src/buf/lease.rs ExRawMut
+crates/safeverbs-core/src/buf/lease.rs ExFrozen
+# A standard-library observation, not the deduplication algorithm itself.
+crates/safeverbs-core/src/buf/lease.rs same_frozen_arc
 # The NIC traits, declared without specifications (the wrappers carry them).
 crates/safeverbs-core/src/trusted.rs ExNic
 crates/safeverbs-core/src/trusted.rs ExNicQp
@@ -41,15 +43,10 @@ crates/safeverbs-core/src/trusted.rs destroy_cq
 crates/safeverbs-core/src/trusted.rs qp_num_of
 crates/safeverbs-core/src/trusted.rs qp_lock_free
 crates/safeverbs-core/src/trusted.rs no_qp
-# The buffer boundary (buf.rs is not verified yet): a part's fields, its lease's promise.
+# PD identity and allocation/registration lifetime (the resource container is verified).
 crates/safeverbs-core/src/trusted.rs pd_id_of
-crates/safeverbs-core/src/trusted.rs part_sge_of
-crates/safeverbs-core/src/trusted.rs part_pd_of
-crates/safeverbs-core/src/trusted.rs part_writable_of
 crates/safeverbs-core/src/trusted.rs registered
 crates/safeverbs-core/src/trusted.rs registered_all
-crates/safeverbs-core/src/trusted.rs no_leases
-crates/safeverbs-core/src/trusted.rs keep_lease
 # The verbs of the data path, each with its contract from M; their bodies call the NIC.
 crates/safeverbs-core/src/trusted.rs start
 crates/safeverbs-core/src/trusted.rs post

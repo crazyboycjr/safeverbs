@@ -127,6 +127,17 @@ The buffer objects do not yet carry those tokens. This does not prove allocation
 ownership, initializedness, alignment, registration lifetime or the wrappers' complete
 invariants.
 
+**Actual request resources** (`buf/lease.rs`). `Part` and `Leases` are no longer
+opaque to the verifier. Their actual field observations, empty construction, native
+retention/deduplication algorithm, and first-unique-resource extraction are checked.
+`Leases::view` describes the ordered resources it physically retains. `new` establishes
+the inline/spill representation invariant and `push` preserves it: the incoming resource
+is appended or only a redundant reference to the same frozen allocation is dropped.
+Extraction returns the first unique resource from the original sequence. The container's
+length accessor assumes its mathematical resource count fits `usize`.
+The allocation payload types `RawMut` and `Frozen` remain opaque; this is a resource
+retention result, not yet a byte-ownership or registration-lifetime proof.
+
 **The completion ring** (`ring.rs`). `Ring::new` establishes the eight invariants of the
 module documentation (`Ring::inv`) and every operation requires and keeps them; Verus also
 checks that no operation panics (indexing, the `assert!`s left for callers outside the
@@ -287,7 +298,9 @@ exists. Each of them, and why it is trusted:
 | `ring.rs` `will_wake` | `Waker::will_wake`: when it says two wakers wake the same task, they share a name in A (`waker_id`) |
 | `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name |
 | `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
-| `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExPd`, `ExPart`, `ExLeases` | these types are opaque (only the device or `buf.rs` reads them) |
+| `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
+| `buf/lease.rs` `ExRawMut`, `ExFrozen` | the allocation payload and typed-buffer ownership boundary remains opaque |
+| `buf/lease.rs` `same_frozen_arc` | std Arc pointer equality implies that both references retain the same frozen allocation |
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's (`caps_model`) |
 | `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a name never used, after whatever happened before, in a state where M's invariants hold; the new worker's share is that CQ and QP names nobody uses (this is where tokens come from) |
@@ -295,9 +308,8 @@ exists. Each of them, and why it is trusted:
 | `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these verbs are M's `create_qp` (with the attributes `qp_attr` says), three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or (on error) nothing, after rely steps |
 | `trusted.rs` `qp_num_of`, `qp_lock_free` | facts of no meaning in M (no contract) |
 | `trusted.rs` `no_qp` | panics: a key that names no QP never returns |
-| `trusted.rs` `pd_id_of`, `part_sge_of`, `part_pd_of`, `part_writable_of` | read the fields of a buffer part and its PD (`buf.rs`, `pd.rs`) |
+| `trusted.rs` `pd_id_of` | the PD's runtime identity matches its observation in the model |
 | `trusted.rs` `registered`, `registered_all` | a part's lease promises its region is registered in its domain (writable if the part is unique) and stays so while the lease lives (`buf.rs`'s `Region`); learning it moves the view to the present |
-| `trusted.rs` `no_leases`, `keep_lease` | `Leases::default` and `Leases::push` keep the leases they are given |
 | `trusted.rs` `start`, `post`, `abort` | `ibv_wr_start`, `ibv_wr_*`, `ibv_wr_abort`: writing WRs changes nothing in M until the doorbell; an abort discards them |
 | `trusted.rs` `doorbell` | `ibv_wr_complete` is M's `post_send` of the WRs written since the start (after rely steps), or nothing on error |
 | `trusted.rs` `post_recv` | `ibv_post_recv` of one WR is M's `post_recv`, or nothing on error |
@@ -315,7 +327,7 @@ holds every WQE to it); and safeverbs posts no inline data, so M sees a QP's inl
 zero.
 
 `Waker::wake` and the wrappers' bodies are the only code the proofs call without checking it.
-The rest of `safeverbs-core` (`buf.rs` apart from its verified range helper, `worker.rs`,
+The rest of `safeverbs-core` (`buf.rs` apart from its verified range/resource helpers, `worker.rs`,
 `verbs.rs`, `model.rs`, `pd.rs`) is
 outside `verus!`: not trusted by the proofs, but not verified either. `worker.rs` holds no
 state M sees (keys, the event loop's cursors, the drain's clock): it cannot break the coupling,

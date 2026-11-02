@@ -117,20 +117,6 @@ pub struct ExEndpoint(Endpoint);
 #[verifier::reject_recursive_types(N)]
 pub struct ExPd<N: Device>(Pd<N>);
 
-/// [`Part`], opaque: a buffer's range with its lease.
-#[cfg(verus_keep_ghost)]
-#[verifier::external_type_specification]
-#[verifier::external_body]
-#[verifier::reject_recursive_types(N)]
-pub struct ExPart<N: Device>(Part<N>);
-
-/// [`Leases`], opaque.
-#[cfg(verus_keep_ghost)]
-#[verifier::external_type_specification]
-#[verifier::external_body]
-#[verifier::reject_recursive_types(N)]
-pub struct ExLeases<N: Device>(Leases<N>);
-
 /// [`Nic`], without specifications of its own (the wrappers carry them).
 #[cfg(verus_keep_ghost)]
 #[verifier::external_trait_specification]
@@ -275,15 +261,15 @@ pub uninterp spec fn pd_of<N: Device>(pd: Pd<N>) -> PdId;
 pub uninterp spec fn pd_id<N: Device>(pd: Pd<N>) -> u64;
 
 /// The range of a buffer part, as a specification.
-pub uninterp spec fn part_sge<N: Device>(part: Part<N>) -> Sge;
+pub open spec fn part_sge<N: Device>(part: Part<N>) -> Sge { part.spec_sge() }
 
 /// The protection domain a buffer part is registered in ([`Pd::id`]), as a
 /// specification.
-pub uninterp spec fn part_pd<N: Device>(part: Part<N>) -> u64;
+pub open spec fn part_pd<N: Device>(part: Part<N>) -> u64 { part.spec_pd() }
 
 /// Whether a buffer part is unique (the NIC may write it), as a
 /// specification.
-pub uninterp spec fn part_writable<N: Device>(part: Part<N>) -> bool;
+pub open spec fn part_writable<N: Device>(part: Part<N>) -> bool { part.spec_writable() }
 
 // =============================================================================
 // The token
@@ -677,29 +663,29 @@ pub fn pd_id_of<N: Device>(pd: &Pd<N>) -> (id: u64)
 }
 
 /// A part's range of registered memory.
-#[verifier::external_body]
 pub fn part_sge_of<N: Device>(part: &Part<N>) -> (sge: Sge)
     ensures
         sge == part_sge(*part),
 {
+    proof { part.lemma_fields(); }
     part.sge
 }
 
 /// A part's protection domain ([`Pd::id`]).
-#[verifier::external_body]
 pub fn part_pd_of<N: Device>(part: &Part<N>) -> (pd: u64)
     ensures
         pd == part_pd(*part),
 {
+    proof { part.lemma_fields(); }
     part.pd
 }
 
 /// Whether a part is unique, so that the NIC may write it.
-#[verifier::external_body]
 pub fn part_writable_of<N: Device>(part: &Part<N>) -> (writable: bool)
     ensures
         writable == part_writable(*part),
 {
+    proof { part.lemma_fields(); }
     part.is_writable()
 }
 
@@ -746,14 +732,24 @@ pub fn registered_all<N: Device>(_parts: &Vec<Part<N>>, _pd: &Pd<N>, Tracked(tok
 }
 
 /// No leases (`Leases::default`).
-#[verifier::external_body]
-pub fn no_leases<N: Device>() -> Leases<N> {
-    Leases::default()
+pub fn no_leases<N: Device>() -> (r: Leases<N>)
+    ensures r.inv(), r.view().len() == 0,
+{
+    Leases::new()
 }
 
 /// Keeps a part's lease among `leases` (`Leases::push`).
-#[verifier::external_body]
-pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>) {
+pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>)
+    ensures
+        old(leases).inv() ==> final(leases).inv(),
+        old(leases).inv() ==> (
+            final(leases).view() == old(leases).view().push(part.resource())
+            || (old(leases).view().len() > 0
+                && old(leases).view().last().same_frozen(part.resource())
+                && final(leases).view() == old(leases).view())
+        ),
+{
+    proof { part.lemma_fields(); }
     leases.push(part.lease)
 }
 

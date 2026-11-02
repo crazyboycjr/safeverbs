@@ -34,6 +34,9 @@ use crate::verbs::Verbs;
 
 mod range;
 use range::{ByteRange, ElementRange, checked_sge_len};
+mod lease;
+pub(crate) use lease::Lease;
+pub use lease::{Leases, Part};
 
 /// Linux's `ENOMEM`.
 const ENOMEM: i32 = 12;
@@ -682,21 +685,6 @@ impl<B> From<BufError<B>> for std::io::Error {
     }
 }
 
-/// What keeps a buffer's memory alive and untouched while the NIC uses it.
-pub(crate) enum Lease<N: Nic> {
-    /// A frozen buffer (sends, WRITEs).
-    Shared(Arc<Frozen<N>>),
-    /// A unique buffer (receives, READs, atomics).
-    Unique(RawMut<N>),
-}
-
-/// The leases of one request. The first is kept inline; repeated leases of
-/// the same frozen buffer are kept once.
-pub struct Leases<N: Nic = Verbs> {
-    first: Option<Lease<N>>,
-    rest: Vec<Lease<N>>,
-}
-
 impl<N: Nic> fmt::Debug for Leases<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Leases({})", self.len())
@@ -705,62 +693,17 @@ impl<N: Nic> fmt::Debug for Leases<N> {
 
 impl<N: Nic> Default for Leases<N> {
     fn default() -> Self {
-        Leases {
-            first: None,
-            rest: Vec::new(),
-        }
+        Leases::new()
     }
 }
 
 impl<N: Nic> Leases<N> {
-    /// Keeps `lease`, unless it is a frozen buffer the last lease already
-    /// holds.
-    pub(crate) fn push(&mut self, lease: Lease<N>) {
-        let last = match self.rest.last() {
-            Some(l) => Some(l),
-            None => self.first.as_ref(),
-        };
-        if let (Some(Lease::Shared(a)), Lease::Shared(b)) = (last, &lease)
-            && Arc::ptr_eq(a, b)
-        {
-            return;
-        }
-        if self.first.is_none() {
-            self.first = Some(lease);
-        } else {
-            self.rest.push(lease);
-        }
-    }
-
-    /// The number of leases kept.
-    pub fn len(&self) -> usize {
-        self.first.is_some() as usize + self.rest.len()
-    }
-
-    /// Whether none is kept.
-    pub fn is_empty(&self) -> bool {
-        self.first.is_none()
-    }
-
     /// Takes back the first unique buffer (of a receive, READ or atomic) as
     /// a `BufMut<T>`; `None` if there is none or its bytes cannot hold
     /// `[T]`.
-    pub fn into_buf_mut<T: FromBytes>(mut self) -> Option<BufMut<T, N>> {
-        let mut found = None;
-        if let Some(Lease::Unique(_)) = &self.first {
-            found = self.first.take();
-        } else {
-            let mut i = 0;
-            while i < self.rest.len() {
-                if let Lease::Unique(_) = &self.rest[i] {
-                    found = Some(self.rest.remove(i));
-                    break;
-                }
-                i += 1;
-            }
-        }
-        match found {
-            Some(Lease::Unique(raw)) if raw.fits::<T>() => Some(BufMut::from_raw(raw)),
+    pub fn into_buf_mut<T: FromBytes>(self) -> Option<BufMut<T, N>> {
+        match self.into_unique_raw() {
+            Some(raw) if raw.fits::<T>() => Some(BufMut::from_raw(raw)),
             _ => None,
         }
     }
@@ -774,30 +717,7 @@ impl<N: Nic> From<Part<N>> for Leases<N> {
     }
 }
 
-/// A buffer on loan to the NIC: one scatter/gather element and the lease
-/// that keeps it valid.
-pub struct Part<N: Nic = Verbs> {
-    pub(crate) sge: Sge,
-    pub(crate) pd: u64,
-    pub(crate) lease: Lease<N>,
-}
-
 impl<N: Nic> Part<N> {
-    /// Its length in bytes.
-    pub fn len(&self) -> u64 {
-        self.sge.length as u64
-    }
-
-    /// Whether it is empty.
-    pub fn is_empty(&self) -> bool {
-        self.sge.length == 0
-    }
-
-    /// Whether the NIC may write it (a unique buffer).
-    pub fn is_writable(&self) -> bool {
-        matches!(self.lease, Lease::Unique(_))
-    }
-
     /// Gives back a unique buffer as a `BufMut<T>`; `None` for a frozen one
     /// or if its bytes cannot hold `[T]`.
     pub fn into_buf_mut<T: FromBytes>(self) -> Option<BufMut<T, N>> {
