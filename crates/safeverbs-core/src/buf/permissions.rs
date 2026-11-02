@@ -17,6 +17,11 @@ pub(crate) tracked struct BytePermission {
 }
 
 impl BytePermission {
+    /// Stable identities of the linear tokens, exposed only as proof values.
+    pub(crate) closed spec fn tokens(self) -> Map<int, PointsTo<u8>> {
+        self.bytes
+    }
+
     /// The exact set of byte addresses owned by this permission.
     pub(crate) closed spec fn dom(self) -> Set<int> {
         self.bytes.dom()
@@ -118,9 +123,9 @@ impl BytePermission {
             parts.0.dom() == keys,
             parts.1.dom() == self.dom().difference(keys),
             parts.0.dom().disjoint(parts.1.dom()),
-            parts.0.bytes == self.bytes.restrict(keys),
-            parts.1.bytes == self.bytes.remove_keys(keys),
-            parts.0.bytes.union_prefer_right(parts.1.bytes) == self.bytes,
+            parts.0.tokens() == self.tokens().restrict(keys),
+            parts.1.tokens() == self.tokens().remove_keys(keys),
+            parts.0.tokens().union_prefer_right(parts.1.tokens()) == self.tokens(),
     {
         let ghost original = self;
         let tracked selected = self.bytes.tracked_remove_keys(keys);
@@ -146,7 +151,7 @@ impl BytePermission {
             joined.inv(),
             joined.provenance() == self.provenance(),
             joined.dom() == self.dom().union(other.dom()),
-            joined.bytes == self.bytes.union_prefer_right(other.bytes),
+            joined.tokens() == self.tokens().union_prefer_right(other.tokens()),
     {
         self.bytes.tracked_union_prefer_right(other.bytes);
         assert(self.inv());

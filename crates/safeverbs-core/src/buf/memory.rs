@@ -11,6 +11,7 @@ use vstd::prelude::*;
 use vstd::raw_ptr::{Dealloc, DeallocData, PointsToRaw};
 
 use super::Region;
+use super::permissions::BytePermission;
 use super::range::ByteRange;
 use crate::nic::Nic;
 
@@ -66,7 +67,7 @@ pub(super) struct OwnedRange {
     #[allow(dead_code)]
     base: Ghost<*mut u8>,
     #[allow(dead_code)]
-    permission: Tracked<PointsToRaw>,
+    permission: Tracked<BytePermission>,
 }
 
 impl OwnedRange {
@@ -74,7 +75,7 @@ impl OwnedRange {
     pub(super) closed spec fn pointer(self) -> *mut u8 { self.ptr }
     pub(super) closed spec fn spec_len(self) -> usize { self.len }
     pub(super) closed spec fn base(self) -> *mut u8 { self.base@ }
-    pub(super) closed spec fn permission(self) -> PointsToRaw { self.permission@ }
+    pub(super) closed spec fn permission(self) -> BytePermission { self.permission@ }
 
     #[verifier::type_invariant]
     pub(super) open spec fn inv(self) -> bool {
@@ -82,6 +83,7 @@ impl OwnedRange {
         &&& self.spec_len() == self.geometry().spec_len()
         &&& self.base().addr() != 0
         &&& self.base().addr() as int + self.geometry().spec_capacity() <= usize::MAX
+        &&& self.permission().inv()
         &&& self.permission().dom() == self.geometry().byte_set(self.base().addr() as int)
         &&& self.permission().provenance() == self.base()@.provenance
         &&& self.pointer().addr() == self.base().addr() + self.geometry().spec_offset()
@@ -140,7 +142,10 @@ impl OwnedRange {
         let ghost right = bytes.split_geometry(at).1;
         proof { bytes.lemma_split_geometry(at); }
         let right_ptr = self.ptr.with_addr(self.ptr.addr() + at);
-        let tracked (p, q) = bytes.split_permission(left, right, self.base@.addr() as int, self.permission.get());
+        let tracked (p, q) = self.permission.get().split(left.byte_set(self.base@.addr() as int));
+        proof {
+            assert(q.dom() =~= right.byte_set(self.base@.addr() as int));
+        }
         (
             OwnedRange { ptr: self.ptr, len: at, geometry: Ghost(left), base: self.base, permission: Tracked(p) },
             OwnedRange { ptr: right_ptr, len: self.len - at, geometry: Ghost(right), base: self.base, permission: Tracked(q) },
@@ -237,6 +242,20 @@ impl<N: Nic> RawMut<N> {
             =~= Set::range(self.pointer().addr() as int,
                 self.pointer().addr() as int + self.byte_len()));
     }
+
+    /// A unique owner and any separately borrowed owner have disjoint bytes.
+    /// The borrowed token proof preserves the exact native and ghost contents.
+    #[inline(always)]
+    #[allow(dead_code)] // The request-level permission adapter uses this bridge.
+    pub(crate) fn disjoint(&mut self, other: &Self)
+        requires old(self).inv(), other.inv(),
+        ensures *final(self) == *old(self),
+            final(self).byte_domain().disjoint(other.byte_domain()),
+    {
+        proof {
+            self.range.permission.borrow_mut().disjoint(other.range.permission.borrow());
+        }
+    }
 }
 
 /// Shared freeze stores the same unique byte permission inside the Arc contents.
@@ -320,8 +339,9 @@ pub(super) fn allocate(size: usize, align: usize) -> (r: Option<(
         return None;
     }
     let _geometry = ByteRange::whole(size);
+    let tracked permission = BytePermission::from_raw(permission.get(), ptr.addr(), size);
     Some((ptr, OwnedRange {
-        ptr, len: size, geometry: Ghost(_geometry), base: Ghost(ptr), permission,
+        ptr, len: size, geometry: Ghost(_geometry), base: Ghost(ptr), permission: Tracked(permission),
     }, dealloc))
 }
 
@@ -336,7 +356,8 @@ pub(super) fn release_failed_allocation(
             provenance: range.permission().provenance(),
         }),
 {
-    vstd::raw_ptr::deallocate(ptr, size, align, range.permission, dealloc);
+    let tracked raw = range.permission.get().into_raw(ptr.addr(), size);
+    vstd::raw_ptr::deallocate(ptr, size, align, Tracked(raw), dealloc);
 }
 
 /// A streaming allocator's free bytes. This adds no runtime field or counter.
@@ -345,7 +366,7 @@ pub(super) struct PermissionPool {
     #[allow(dead_code)]
     capacity: Ghost<usize>,
     #[allow(dead_code)]
-    permission: Tracked<Option<PointsToRaw>>,
+    permission: Tracked<Option<BytePermission>>,
 }
 
 impl PermissionPool {
@@ -357,6 +378,7 @@ impl PermissionPool {
         &&& self.permission@ is Some
         &&& self.base().addr() != 0
         &&& self.base().addr() as int + self.capacity() <= usize::MAX
+        &&& self.permission@->0.inv()
         &&& self.permission@->0.provenance() == self.base()@.provenance
         &&& self.dom().subset_of(Set::range(self.base().addr() as int,
             self.base().addr() as int + self.capacity()))

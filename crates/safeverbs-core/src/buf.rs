@@ -35,6 +35,7 @@ use crate::verbs::Verbs;
 mod range;
 use range::{ByteRange, ElementRange};
 mod memory;
+mod permissions;
 pub(crate) use memory::{Frozen, RawMut};
 use memory::{OwnedRange, PermissionPool};
 mod lease;
