@@ -342,6 +342,13 @@ the program's until the rkey is revoked) and is registered on its own, so that t
 reaches exactly that buffer and nothing next to it. These are exactly the rules of A's
 `post_request` and `expose`.
 
+In A, a request owns an ordered group of resources. Each member keeps its own identity,
+byte range and access permission: a batch may contain exclusive READ destinations and
+shared SEND/WRITE sources without making those sources exclusive. The group has one
+completion lifetime, outcome and waker. Ghost joining and separation preserve the member
+permissions and add no runtime work. The concrete projection must describe retained
+leases, including shared-reference deduplication, rather than assume one lease per WQE.
+
 ## 10. Workers, queue pairs and completion queues
 
 The efficient way to use RDMA is one CQ per thread, shared by all of that thread's queue
@@ -475,12 +482,12 @@ async style of the API carry over.
 - Theorem 1 for the worker: each worker's share of M is settled by rely and guarantee
   (`safeverbs-spec/src/share.rs`), and M's side of the refinement is proved for the worker's
   hardware side (`safeverbs-core/src/hw.rs`). Open: A's side for the worker (the map from
-  its requests to A's leases), the buffers as linear ghost permissions, and whether a
-  successful send's reported length should be fixed in M so that an unsignaled request's
-  implied outcome is exactly M's (see `verification.md`).
+  its requests to A's grouped resources), the buffers as linear ghost permissions,
+  and concrete thread composition. Undefined SEND/WRITE lengths are already projected
+  out of outcomes; READ and receive metadata have operation-specific contracts (section 8).
 - Whether a request should say who takes its result (the event loop or its owner), so that
   futures and the event loop can share a worker.
 - Out-of-order transports and SRQs need their own completion rules in M before the core
   supports them.
-- What the model implementation of the NIC trait looks like, so that the same tests run
-  against it and against hardware.
+- The simulated NIC already runs the integration scenarios and injected-error cases;
+  its agreement with M is tested, not yet a refinement theorem.

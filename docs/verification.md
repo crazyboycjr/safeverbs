@@ -20,16 +20,25 @@ the crate (the script refuses them). The core's verified parts follow them, unde
 state and every transition preserves them (`lemma_step_keeps_invariant`). The guarantees are
 lemmas about every state A can reach (`guarantees.rs`):
 
+A separates **member resources** (`Lease`: identity, byte range, uniqueness and byte
+validity) from **groups** (`Group`: an ordered member sequence and one holder). A request
+owns one group, with one access direction per member and one outcome and waker for the
+whole group. Ghost `join` and `separate` transitions preserve member identities and
+permissions while replacing the group handles. Shared sources may overlap other shared
+clones; each writable destination must remain exclusive. These are specification steps,
+with no runtime allocation or interval lookup.
+
 | Property | Lemma | Meaning |
 | --- | --- | --- |
 | S1 | `lemma_s1_no_conflict` | what the program may write, the NIC may neither read nor write; what the program may read, the NIC may not write |
 | S1 | `lemma_s1_nic_writes_any_bytes` | the NIC writes only uniquely held memory whose element type accepts every bit pattern |
 | F1 | `lemma_f1_outcome_fixed` | an outcome, once produced, never changes |
-| F1 | `lemma_f1_take` | taking a request's outcome returns that outcome and exactly the bytes it was posted with |
+| F1 | `lemma_f1_take` | taking a request's outcome returns that outcome and its exact ordered member identities, ranges and permissions |
 | F1 | `lemma_f1_taken_once` | a request no longer held never comes back (ids are not reused) |
-| R1 | `lemma_r1_kept_while_in_flight` | an in-flight request keeps its lease, unchanged, until its outcome exists |
+| R1 | `lemma_member_owned_once` | each live member identity occupies exactly one position in one group |
+| R1 | `lemma_r1_kept_while_in_flight` | an in-flight request keeps its members, unchanged, until its outcome exists |
 | R1 | `lemma_r1_requests_on_live_qps` | no request outlives its queue pair |
-| R1 | `lemma_r1_released_once` | a released lease never comes back |
+| R1 | `lemma_r1_released_once` | a retired group handle never comes back; its members may survive under fresh handles |
 | L1 | `lemma_l1_no_waker_left` | a complete request holds no waker |
 | L1 | `lemma_l1_completion_wakes` | completing a request invokes the waker it holds |
 
@@ -65,10 +74,10 @@ for every disjoint share (`lemma_mine_is_foreign`, the guarantee) and keep its o
 formed (`lemma_mine_keeps_share_wf`).
 
 **Each worker's share of A** (`abs_share.rs`). A share owns QP names and historical
-lease IDs, not disjoint byte ranges: readonly clones may overlap across workers.
+group handles, not disjoint byte ranges: readonly clones may overlap across workers.
 `foreign` covers every real transition of A; `lemma_foreign_step` and `lemma_rely_frame`
-prove that foreign steps preserve local leases (including wakers and phases), posted
-bytes, outcomes and QPs. Fresh allocations may advance the allocator and foreign
+prove that foreign steps preserve local groups (including wakers and phases), posted
+members, outcomes and QPs. Fresh allocations may advance the allocator and foreign
 completions may append wakes. `lemma_mine_is_foreign` supplies the disjoint-share
 compatibility rule. `lemma_transfer` proves explicit ownership transfer for program
 leases without changing A. Concrete two-worker examples cover local in-flight state,
@@ -90,7 +99,10 @@ the batch returns the remote error only after both WQEs retire. These are specif
 results; the real worker still needs to discharge `Refines`.
 
 **Worked examples** (`examples.rs`) are concrete executions checked step by step; they show
-that the transitions can happen, so no lemma above is vacuous.
+that the transitions can happen, so no lemma above is vacuous. A mixed group contains a
+READ destination and a frozen SEND/WRITE source whose clone remains readable by the
+program. Both ordinary completion/take/separation and cancellation preserve the individual
+permissions and aggregate the WQE interval before releasing the group.
 
 #### The core
 
@@ -122,9 +134,9 @@ staged requests are woken (the ring's log grows by them; A, which never saw thos
 wakes nothing).
 
 **The ring refines A** (`refine.rs`). In every state of A where the ring's requests sit
-(`placed`: each request A sees in the ring is a request lease of A, on the ring's queue
-pair, with the same phase, waker and owner; each staged or refused request's leases a program
-lease of A; no two the same), each operation's change is zero or more steps of A to a state
+(`placed`: each request A sees in the ring is a request group of A, on the ring's queue
+pair, with the same phase, waker and owner; each staged or refused request's resources a
+program group of A; no two the same), each operation's change is zero or more steps of A to a state
 where they sit again: none for `begin`, `push_wqe`, `end` and `take_detached_error`;
 `post_request` (then `register` or `detach`) for each request `commit` posts; `drop` for each
 staged lease without an owner an abort releases, none for the others (their leases stay the
@@ -136,6 +148,12 @@ refused request and `drop` for detaching one; and for `release_all` a flush, `de
 moved out of a clogged ring is covered as well (`with_side`): moving a result there is no
 step, taking it is A's `take` with the outcome and leases the ring gave (no step for a
 refused one). This is the ring's share of the obligations of `Refines`.
+
+`Permissions<L>` supplies a ghost interpretation of each concrete resource value as an
+exact ordered member sequence, plus each request's member directions. Placement requires
+that correspondence, and every ring/side-list adapter preserves it. Concrete ghost views
+exercise these contracts with mixed permissions. The adapters do not construct the
+interpretation from real buffers: that remains a buffer-token obligation below.
 
 The ring also states its WQE accounting (`spec_wqe_retired`, `spec_wqe_committed`,
 `spec_wqe_posted`, `lemma_wqes`): `push_wqe` hands out the next number, `commit` commits every
@@ -204,12 +222,12 @@ a token over a fresh share. These are trusted, not proved.
     permissions (vstd `PointsToRaw` or a token of our own) moving into the NIC's share on
     commit and back on retire would turn S1 into a byte-level fact against M and supply A's
     leases; this is not done.
-  - **Grouped memory permissions.** A request currently carries one lease and one
-    direction. The synchronous request builder can mix READ destinations and shared
-    SEND/WRITE sources in one request. A single uniform direction cannot represent that
-    group faithfully: the next memory model must track each member's access rights and
-    join their completion lifetime without declaring shared sources uniquely writable.
-    The WQE interval/first-error result above solves outcome aggregation only.
+  - **Concrete grouped permissions.** A and the ring adapters now support mixed member
+    directions. The remaining step is an honest resource interpretation for `buf::Leases`,
+    which retains resources rather than one member per WQE or SGE: consecutive shared
+    references to the same frozen allocation can be deduplicated. The proof must account
+    for that reference drop, preserve each retained member's identity and permissions,
+    and show every SGE is covered with the access its operation requires.
   - **Composition.** Each worker's view is coupled to M under rely, and every worker verb is a
     foreign step for the others (`lemma_mine_is_foreign`); that the interleaving of all
     threads' steps is a run of M follows, but is argued, not a theorem in Verus (the tokens are
@@ -435,8 +453,10 @@ whenever the unverified worker calls in.
 
 **Leases.** The ring tracks each request's leases as the value itself: the `L` A sees a
 request hold is the one `end` moved into its slot, and `take` or `abort_keeping` hands back
-that value (`refine.rs`). The ghost maps from sequence numbers to A's lease ids and
-directions would belong to the QP entries of `Hw`; they wait for the buffers.
+that value (`refine.rs`). Its ghost `Permissions<L>` interpretation preserves the exact
+ordered member resources and their access directions through the ring and side list.
+The maps from sequence numbers to A's group handles and the concrete interpretation
+would belong to the QP entries of `Hw`; their construction still waits for buffer tokens.
 
 **Memory as linear ghost permissions (not done).** The core would hold vstd's `PointsToRaw`
 permission for every byte of every buffer. A `BufMut` or `Buf` carries the permissions for its
