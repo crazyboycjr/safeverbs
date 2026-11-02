@@ -62,6 +62,10 @@ Read [`buf.rs`](../crates/safeverbs-core/src/buf.rs), especially `Region`, `RawM
   can deduplicate consecutive references to the same frozen allocation, so the number
   of retained resources need not equal the number of WQEs or SGEs.
 
+[`buf/range.rs`](../crates/safeverbs-core/src/buf/range.rs) is the verified executable
+arithmetic these buffers use for splits and frozen views. Read it before the eventual
+allocation-permission integration: bounded ranges alone do not establish ownership.
+
 Then read [`wc.rs`](../crates/safeverbs-core/src/wc.rs): its accessors expose only
 operation-defined metadata. SEND/WRITE do not report a byte count; READ and receive
 cases have different metadata. A WRITE_WITH_IMM notification is distinct from a receive

@@ -111,6 +111,20 @@ The code of `crates/safeverbs-core` written inside `verus!` is verified with no 
 `admit`; it trusts only the items listed in `scripts/trusted.txt` (see "Trusted computing
 base" below), and the script refuses any other.
 
+**Executable buffer ranges** (`buf/range.rs`). The real `RawMut` and frozen `Buf`
+views use `ByteRange`: an offset, a byte length and an erased capacity. Verus proves
+checked construction, non-overflowing end calculation, exact adjacent splits, and
+bounded element slicing (including multiplication by the element size). Checked SGE
+length conversion either preserves every byte or rejects a length above `u32::MAX`.
+The ordinary buffer methods call these executable operations, rather than a separate
+copy of their arithmetic. A compile-time layout assertion keeps the runtime range at
+two machine words. Checked lemmas identify its finite byte domain with A/M's `Span`,
+prove that slices stay within the retained range, and split an existing vstd
+`PointsToRaw` token along the exact range partition without changing provenance.
+The buffer objects do not yet carry those tokens. This does not prove allocation
+ownership, initializedness, alignment, registration lifetime or the wrappers' complete
+invariants.
+
 **The completion ring** (`ring.rs`). `Ring::new` establishes the eight invariants of the
 module documentation (`Ring::inv`) and every operation requires and keeps them; Verus also
 checks that no operation panics (indexing, the `assert!`s left for callers outside the
@@ -217,7 +231,8 @@ a token over a fresh share. These are trusted, not proved.
     `impl Refines`. What that needs: the ghost state of A (which leases the program holds) in
     the worker, which only the buffers can supply (next point); and integration with the
     checked A-side frame/transfer rules of `abs_share.rs`.
-  - **Buffers.** `buf.rs` is outside `verus!`: a part's range, domain and uniqueness, and the
+  - **Buffers.** The wrappers in `buf.rs` remain outside `verus!`; their executable range
+    arithmetic in `buf/range.rs` is verified, but a part's domain and uniqueness, and the
     registration of its region while its lease lives, are a trusted boundary
     (`registered`, `registered_all`, the part accessors). Lease memory as linear ghost
     permissions (vstd `PointsToRaw` or a token of our own) moving into the NIC's share on
@@ -298,7 +313,8 @@ holds every WQE to it); and safeverbs posts no inline data, so M sees a QP's inl
 zero.
 
 `Waker::wake` and the wrappers' bodies are the only code the proofs call without checking it.
-The rest of `safeverbs-core` (`buf.rs`, `worker.rs`, `verbs.rs`, `model.rs`, `pd.rs`) is
+The rest of `safeverbs-core` (`buf.rs` apart from its verified range helper, `worker.rs`,
+`verbs.rs`, `model.rs`, `pd.rs`) is
 outside `verus!`: not trusted by the proofs, but not verified either. `worker.rs` holds no
 state M sees (keys, the event loop's cursors, the drain's clock): it cannot break the coupling,
 only misuse the API, which `Hw` handles. The futures layer (`safeverbs`) is safe Rust on top

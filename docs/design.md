@@ -349,6 +349,13 @@ completion lifetime, outcome and waker. Ghost joining and separation preserve th
 permissions and add no runtime work. The concrete projection must describe retained
 leases, including shared-reference deduplication, rather than assume one lease per WQE.
 
+The executable range operations in `buf/range.rs` are verified separately from the
+ownership permissions: they bound the unique ranges and frozen views and preserve the
+exact byte partition when splitting. Capacity is ghost state, so each range still takes
+two machine words. A single SGE has a native 32-bit byte length; `into_part` panics for
+a larger range instead of truncating it. Large registered buffers remain usable through
+splits and slices.
+
 ## 10. Workers, queue pairs and completion queues
 
 The efficient way to use RDMA is one CQ per thread, shared by all of that thread's queue
