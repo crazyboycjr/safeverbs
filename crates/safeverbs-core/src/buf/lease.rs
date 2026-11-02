@@ -31,6 +31,37 @@ impl<N: Nic> Lease<N> {
     }
 
     pub(crate) closed spec fn observation(self) -> Resource<N> { Resource { resource: self } }
+
+    /// Borrow actual owners to establish separation without changing either keeper.
+    #[inline(always)]
+    fn disjoint(&mut self, other: &mut Self)
+        ensures
+            *final(self) == *old(self), *final(other) == *old(other),
+            *final(self) is Unique || *final(other) is Unique ==>
+                final(self).observation().byte_domain().disjoint(final(other).observation().byte_domain()),
+    {
+        match (self, other) {
+            (Lease::Unique(a), Lease::Unique(b)) => {
+                proof { use_type_invariant(&*a); use_type_invariant(&*b); }
+                a.disjoint(b);
+            },
+            (Lease::Unique(a), Lease::Shared(b)) => {
+                proof {
+                    use_type_invariant(&*a); use_type_invariant(&**b);
+                    b.lemma_contents();
+                }
+                a.disjoint(&b.raw);
+            },
+            (Lease::Shared(a), Lease::Unique(b)) => {
+                proof {
+                    use_type_invariant(&**a); use_type_invariant(&*b);
+                    a.lemma_contents();
+                }
+                b.disjoint(&a.raw);
+            },
+            (Lease::Shared(_), Lease::Shared(_)) => {},
+        }
+    }
 }
 
 /// The exact retained resource as a proof value. Its allocation internals stay private.
@@ -41,6 +72,9 @@ pub ghost struct Resource<N: Nic> {
 }
 
 impl<N: Nic> Resource<N> {
+    /// Whether this physical keeper owns its bytes exclusively.
+    pub closed spec fn unique(self) -> bool { self.resource is Unique }
+
     /// The byte permission retained by this actual physical keeper.
     pub closed spec fn byte_domain(self) -> Set<int> {
         match self.resource {
@@ -51,7 +85,8 @@ impl<N: Nic> Resource<N> {
 
     /// Backing identity preserves byte domains even after shared guard deduplication.
     pub proof fn lemma_backing_domain(self, other: Self)
-        ensures self.same_backing(other) ==> self.byte_domain() == other.byte_domain(),
+        ensures self.same_backing(other) ==>
+            self.byte_domain() == other.byte_domain() && self.unique() == other.unique(),
     {}
 
     /// Both resources retain the same shared frozen allocation.
@@ -162,6 +197,10 @@ impl<N: Nic> Part<N> {
     pub(super) fn unique(raw: RawMut<N>, lkey: u32, pd: u64) -> (r: Self)
         requires raw.byte_len() <= u32::MAX,
         ensures r.inv(), r.resource() == Lease::Unique(raw).observation(),
+            r.spec_sge() == (Sge {
+                addr: raw.pointer().addr() as u64, length: raw.byte_len() as u32, lkey,
+            }),
+            r.spec_pd() == pd, r.spec_writable(),
     {
         proof { use_type_invariant(&raw); raw.lemma_domain(); }
         let length = match checked_sge_len(raw.len()) {
@@ -177,6 +216,10 @@ impl<N: Nic> Part<N> {
         requires offset <= (*frozen).byte_len(), len <= (*frozen).byte_len() - offset,
             len <= u32::MAX,
         ensures r.inv(), r.resource() == Lease::Shared(frozen).observation(),
+            r.spec_sge() == (Sge {
+                addr: (frozen.pointer().addr() + offset) as u64, length: len as u32, lkey,
+            }),
+            r.spec_pd() == pd, !r.spec_writable(),
     {
         proof {
             use_type_invariant(&*frozen);
@@ -198,6 +241,7 @@ impl<N: Nic> Part<N> {
     pub proof fn lemma_byte_backing(self)
         requires self.inv(),
         ensures self.byte_domain().subset_of(self.resource().byte_domain()),
+            self.resource().unique() == self.spec_writable(),
             self.byte_domain().to_iset() == (safeverbs_spec::types::Span {
                 start: self.spec_sge().addr as int, len: self.spec_sge().length as nat,
             }).bytes(),
@@ -285,11 +329,20 @@ impl<N: Nic> Leases<N> {
             ==> (#[trigger] self.wqes()[i]).end() <= (#[trigger] self.wqes()[j]).first
     }
 
+    /// Logical SGE inputs may overlap only when both retain shared owners.
+    closed spec fn nonalias(self) -> bool {
+        forall|i: int, j: int| #![trigger self.loans()[i], self.loans()[j]]
+            0 <= i < j < self.loans().len()
+                && (self.loans()[i].part.spec_writable() || self.loans()[j].part.spec_writable())
+                ==> self.loans()[i].part.byte_domain().disjoint(self.loans()[j].part.byte_domain())
+    }
+
     /// Every logical input has a retained physical lifetime guard. Incoming local
     /// writes require exclusive resources; shared deduplication changes neither fact.
     pub closed spec fn inv(self) -> bool {
         &&& self.repr_inv()
         &&& self.wqes_ok()
+        &&& self.nonalias()
         &&& forall|i: int| 0 <= i < self.loans().len() ==> {
             let loan = #[trigger] self.loans()[i];
             &&& loan.part.inv()
@@ -311,6 +364,128 @@ impl<N: Nic> Leases<N> {
                 &&& loan.access == Some(Dir::In) ==> loan.part.spec_writable()
             },
     {}
+
+    /// Actual unique ownership separates each SGE from every other request input.
+    pub proof fn lemma_disjoint(self)
+        requires self.inv(),
+        ensures forall|i: int, j: int| #![trigger self.loans()[i], self.loans()[j]]
+            0 <= i < self.loans().len() && 0 <= j < self.loans().len() && i != j
+                && (self.loans()[i].part.spec_writable() || self.loans()[j].part.spec_writable())
+                ==> self.loans()[i].part.byte_domain().disjoint(self.loans()[j].part.byte_domain()),
+    {
+        assert forall|i: int, j: int| #![trigger self.loans()[i], self.loans()[j]]
+            0 <= i < self.loans().len() && 0 <= j < self.loans().len() && i != j
+                && (self.loans()[i].part.spec_writable() || self.loans()[j].part.spec_writable())
+                implies self.loans()[i].part.byte_domain().disjoint(self.loans()[j].part.byte_domain()) by {
+            if j < i {
+                assert(self.loans()[j].part.byte_domain().disjoint(self.loans()[i].part.byte_domain()));
+            }
+        }
+    }
+
+    /// Only references are traversed; the inlined native bodies have no effects.
+    #[inline(always)]
+    fn disjoint_incoming(&mut self, incoming: &mut Lease<N>)
+        ensures
+            final(self).first == old(self).first,
+            final(self).rest@ == old(self).rest@,
+            final(self).loans() == old(self).loans(),
+            final(self).wqes() == old(self).wqes(),
+            final(self).raw_view() == old(self).raw_view(),
+            final(self).view() == old(self).view(),
+            old(self).inv() ==> final(self).inv(),
+            *final(incoming) == *old(incoming),
+            forall|i: int| 0 <= i < final(self).raw_view().len() ==> {
+                let kept = #[trigger] final(self).raw_view()[i];
+                kept is Unique || *final(incoming) is Unique ==>
+                    kept.observation().byte_domain().disjoint(final(incoming).observation().byte_domain())
+            },
+    {
+        let ghost before = *self;
+        if let Some(first) = self.first.as_mut() {
+            first.disjoint(incoming);
+        }
+        let mut i = 0;
+        while i < self.rest.len()
+            invariant
+                self.first == before.first,
+                self.rest@ == before.rest@,
+                self.loans() == before.loans(),
+                self.wqes() == before.wqes(),
+                *incoming == *old(incoming),
+                i <= self.rest@.len(),
+                self.first is Some ==> (
+                    self.first->0 is Unique || *incoming is Unique ==>
+                        self.first->0.observation().byte_domain().disjoint(incoming.observation().byte_domain())
+                ),
+                forall|j: int| 0 <= j < i ==> {
+                    let kept = #[trigger] self.rest@[j];
+                    kept is Unique || *incoming is Unique ==>
+                        kept.observation().byte_domain().disjoint(incoming.observation().byte_domain())
+                },
+            decreases self.rest@.len() - i,
+        {
+            self.rest[i].disjoint(incoming);
+            i += 1;
+        }
+        proof {
+            assert(self.raw_view() == before.raw_view());
+            assert(self.view() == before.view());
+            if before.inv() {
+                assert forall|j: int| 0 <= j < self.loans().len() implies {
+                    let loan = #[trigger] self.loans()[j];
+                    &&& loan.part.inv()
+                    &&& exists|k: int| 0 <= k < self.view().len()
+                        && (#[trigger] self.view()[k]).same_backing(loan.part.resource())
+                    &&& loan.access == Some(Dir::In) ==> loan.part.spec_writable()
+                } by {
+                    let k = choose|k: int| 0 <= k < before.view().len()
+                        && before.view()[k].same_backing(before.loans()[j].part.resource());
+                    assert(self.loans()[j] == before.loans()[j]);
+                    assert(self.view()[k] == before.view()[k]);
+                }
+                assert(self.inv());
+            }
+            assert forall|j: int| 0 <= j < self.raw_view().len() implies {
+                let kept = #[trigger] self.raw_view()[j];
+                kept is Unique || *incoming is Unique ==>
+                    kept.observation().byte_domain().disjoint(incoming.observation().byte_domain())
+            } by {
+                if self.first is Some {
+                    if j > 0 { assert(self.raw_view()[j] == self.rest@[j - 1]); }
+                } else { assert(self.raw_view()[j] == self.rest@[j]); }
+            }
+        }
+    }
+
+    /// Transfer the freshly checked keeper separation to the old logical inputs.
+    proof fn lemma_incoming(self, incoming: Part<N>)
+        requires
+            self.inv(), incoming.inv(),
+            forall|i: int| 0 <= i < self.raw_view().len() ==> {
+                let kept = #[trigger] self.raw_view()[i];
+                kept is Unique || incoming.spec_writable() ==>
+                    kept.observation().byte_domain().disjoint(incoming.resource().byte_domain())
+            },
+        ensures forall|i: int| 0 <= i < self.loans().len()
+            && ((#[trigger] self.loans()[i]).part.spec_writable() || incoming.spec_writable())
+            ==> self.loans()[i].part.byte_domain().disjoint(incoming.byte_domain()),
+    {
+        self.lemma_loans();
+        incoming.lemma_byte_backing();
+        assert forall|i: int| 0 <= i < self.loans().len()
+            && ((#[trigger] self.loans()[i]).part.spec_writable() || incoming.spec_writable())
+            implies self.loans()[i].part.byte_domain().disjoint(incoming.byte_domain()) by {
+            let part = self.loans()[i].part;
+            let j = choose|j: int| 0 <= j < self.view().len()
+                && self.view()[j].same_backing(part.resource());
+            part.lemma_byte_backing();
+            self.view()[j].lemma_backing_domain(part.resource());
+            assert(self.view()[j] == self.raw_view()[j].observation());
+            assert(self.raw_view()[j] is Unique || incoming.spec_writable());
+            assert(self.view()[j].byte_domain().disjoint(incoming.resource().byte_domain()));
+        }
+    }
 
     /// Every recorded SGE is covered by an actual retained raw-byte permission.
     pub proof fn lemma_byte_backing(self)
@@ -473,11 +648,26 @@ impl<N: Nic> Leases<N> {
         proof { use_type_invariant(&part); }
         let ghost before = *self;
         let ghost incoming = part;
-        self.push_resource(part.lease);
+        let mut lease = part.lease;
+        self.disjoint_incoming(&mut lease);
+        proof { if before.inv() { self.lemma_incoming(incoming); } }
+        self.push_resource(lease);
         self.loans = Ghost(before.loans().push(Loan { part: incoming, access }));
         proof {
             if before.inv() {
                 assert(self.repr_inv());
+                assert forall|i: int, j: int| #![trigger self.loans()[i], self.loans()[j]]
+                    0 <= i < j < self.loans().len()
+                        && (self.loans()[i].part.spec_writable() || self.loans()[j].part.spec_writable())
+                        implies self.loans()[i].part.byte_domain().disjoint(self.loans()[j].part.byte_domain()) by {
+                    if j < before.loans().len() {
+                        assert(self.loans()[i] == before.loans()[i]);
+                        assert(self.loans()[j] == before.loans()[j]);
+                    } else {
+                        assert(self.loans()[j].part == incoming);
+                        assert(self.loans()[i] == before.loans()[i]);
+                    }
+                }
                 assert forall|i: int| 0 <= i < self.wqes().len()
                     implies (#[trigger] self.wqes()[i]).matches(self.loans()) by {
                     let w = self.wqes()[i];
@@ -597,6 +787,10 @@ impl<N: Nic> Leases<N> {
 }
 
 } // verus!
+
+#[cfg(all(test, not(verus_keep_ghost)))]
+#[path = "nonalias_erasure.rs"]
+mod nonalias_erasure;
 
 #[cfg(test)]
 mod tests {

@@ -3,8 +3,9 @@
 //! Logical inputs, not deduplicated physical guards, determine member order,
 //! byte spans, exclusivity and operation access. All items here are erased.
 //! Names and arbitrary-byte validity come from the caller: neither fresh identities
-//! nor typed validity follow from retaining a resource. This adapter establishes no
-//! allocation permission, registration, nonaliasing, `Group::wf` or A transition.
+//! nor typed validity follow from retaining a resource. Actual byte permissions
+//! establish within-request nonaliasing; distinct supplied names then establish
+//! `Group::wf`. Registration, global compatibility and A transitions remain separate.
 #![allow(unused_imports)]
 
 use safeverbs_spec::abs::{Dir, Group, Holder, Id, Lease, Req};
@@ -134,6 +135,43 @@ impl Projection {
         forall|i: int| 0 <= i < leases.loans().len()
             && (#[trigger] leases.loans()[i]).access == Some(Dir::In)
             ==> (self.any_bytes)(s, i)
+    }
+
+    /// Distinct member positions receive distinct names inside this request.
+    /// This does not establish freshness against any group already present in A.
+    pub open spec fn distinct_names<N: Nic>(self, s: int, leases: Leases<N>) -> bool {
+        forall|i: int, j: int| #![trigger (self.names)(s, i), (self.names)(s, j)]
+            0 <= i < leases.loans().len() && 0 <= j < leases.loans().len() && i != j
+                ==> (self.names)(s, i) != (self.names)(s, j)
+    }
+
+    /// Actual unique byte permissions separate the members of this request.
+    /// Only member-name uniqueness is supplied; arbitrary-byte validity is not
+    /// part of A's `wf` and remains the separate premise of `lemma_allows`.
+    pub proof fn lemma_wf<N: Nic>(self, s: int, leases: Leases<N>)
+        requires leases.inv(), self.distinct_names(s, leases),
+        ensures self.group(s, leases).wf(),
+    {
+        leases.lemma_loans();
+        leases.lemma_disjoint();
+        self.lemma_members(s, leases);
+        let members = self.members(s, leases);
+        assert forall|i: int, j: int| #![trigger members[i], members[j]]
+            0 <= i < members.len() && 0 <= j < members.len() && i != j implies {
+                &&& members[i].id != members[j].id
+                &&& members[i].unique || members[j].unique ==> members[i].mem.disjoint(members[j].mem)
+            } by {
+            let left = leases.loans()[i].part;
+            let right = leases.loans()[j].part;
+            if members[i].unique || members[j].unique {
+                left.lemma_byte_backing();
+                right.lemma_byte_backing();
+                assert(left.byte_domain().disjoint(right.byte_domain()));
+                assert(members[i].mem == left.byte_domain().to_iset());
+                assert(members[j].mem == right.byte_domain().to_iset());
+                assert(members[i].mem.disjoint(members[j].mem));
+            }
+        }
     }
 
     /// Exact metadata for every member, without a well-formedness assumption.
