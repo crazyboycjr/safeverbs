@@ -65,7 +65,7 @@ Read [`buf.rs`](../crates/safeverbs-core/src/buf.rs), especially `Region`, `RawM
 
 `Leases::view` describes physical keepers. Its ghost `loans` and `wqes` describe every
 logical SGE and its operation, even when multiple inputs share one physical Arc. Follow
-`Hw::keep_parts`, `ring_resources_ok`, `take`, then
+`keep_parts` in `hw.rs`, then `ring_resources_ok`, `take` and
 [`buf/projection.rs`](../crates/safeverbs-core/src/buf/projection.rs) to see how the
 actual request metadata becomes A's member ranges and access directions. Fresh names
 and byte permissions are still separate obligations.
