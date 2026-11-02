@@ -162,9 +162,11 @@ impl Drop for VerbsPd {
     }
 }
 
-/// A registered memory region (`struct ibv_mr`); deregistered when dropped,
-/// which revokes its keys.
+/// A registered memory region (`struct ibv_mr`); closed explicitly or on drop.
+/// Drop aborts if deregistration fails: this handle cannot retain the caller's
+/// backing memory. Owners that recover from close failure must retain both.
 pub struct VerbsMr {
+    /// Null only after successful deregistration.
     mr: *mut ffi::ibv_mr,
 }
 
@@ -175,8 +177,12 @@ unsafe impl Sync for VerbsMr {}
 
 impl Drop for VerbsMr {
     fn drop(&mut self) {
-        // SAFETY: no work request uses it any more (the leases keep it).
-        unsafe { ffi::ibv_dereg_mr(self.mr) };
+        if Verbs::close_mr(self).is_err() {
+            // Returning or unwinding could free the caller's backing memory
+            // while its registration is still live. The owner must intercept
+            // a recoverable close failure before dropping this handle.
+            std::process::abort();
+        }
     }
 }
 
@@ -559,8 +565,25 @@ unsafe impl Nic for Verbs {
     }
 
     fn mr_keys(mr: &VerbsMr) -> (u32, u32) {
+        assert!(!mr.mr.is_null(), "verbs: keys of a closed MR");
         // SAFETY: a live region.
         unsafe { ((*mr.mr).lkey, (*mr.mr).rkey) }
+    }
+
+    fn close_mr(mr: &mut VerbsMr) -> Result<()> {
+        if mr.mr.is_null() {
+            return Ok(());
+        }
+        // SAFETY: a live MR; its owner keeps its memory, PD and device alive,
+        // and has retired local work using it, as for dropping the region.
+        // rdma-core 58e40801, libibverbs/verbs.c and providers/{mlx5,rxe}:
+        // dereg_mr returns errno on failure and retains the provider's MR.
+        let rc = unsafe { ffi::ibv_dereg_mr(mr.mr) };
+        if rc != 0 {
+            return Err(Error::Os(rc));
+        }
+        mr.mr = null_mut();
+        Ok(())
     }
 
     fn create_cq(&self, entries: u32, single_threaded: bool) -> Result<VerbsCq> {

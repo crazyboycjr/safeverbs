@@ -12,6 +12,7 @@
 //! (signaled or not) with its own completion. Errors, flushes and refused
 //! doorbells can be injected ([`Model::inject_error`],
 //! [`Model::force_error`], [`Model::refuse_doorbells`]).
+//! MR close refusals can be injected with [`Model::refuse_mr_closes`].
 //!
 //! The model panics where hardware would silently misbehave and safeverbs
 //! promises it never happens: a send or receive queue overflow, a CQ
@@ -90,6 +91,8 @@ struct MrRec {
     len: usize,
     access: Access,
     pd: u32,
+    /// Close attempts to refuse before allowing deregistration.
+    refuse_close: u32,
 }
 
 struct CqRec {
@@ -166,6 +169,15 @@ impl Model {
     pub fn refuse_doorbells(&self, qp_num: u32, n: u32) {
         if let Some(qp) = self.lock().qps.get_mut(&qp_num) {
             qp.refuse += n;
+        }
+    }
+
+    /// Refuses the next `n` close attempts for the MR with `lkey`, in addition
+    /// to any refusals already pending. A refusal returns `EAGAIN` and leaves
+    /// the registration and its keys usable. Unknown keys are ignored.
+    pub fn refuse_mr_closes(&self, lkey: u32, n: u32) {
+        if let Some(mr) = self.lock().mrs.get_mut(&lkey) {
+            mr.refuse_close = mr.refuse_close.saturating_add(n);
         }
     }
 
@@ -607,16 +619,21 @@ pub struct ModelPd {
     id: u32,
 }
 
-/// A registered region of the model; deregistered when dropped.
+/// A registered region of the model; closed explicitly or on drop.
+/// Like the verbs backend, drop aborts if close is refused, since this handle
+/// cannot keep the caller's backing memory alive by itself.
 pub struct ModelMr {
     fabric: Arc<Mutex<Fabric>>,
-    key: u32,
+    /// None only after successful deregistration.
+    key: Option<u32>,
 }
 
 impl Drop for ModelMr {
     fn drop(&mut self) {
-        let mut f = self.fabric.lock().unwrap_or_else(|e| e.into_inner());
-        f.mrs.remove(&self.key);
+        if Model::close_mr(self).is_err() {
+            // Do not unwind into the caller's backing-memory destructor.
+            std::process::abort();
+        }
     }
 }
 
@@ -851,16 +868,38 @@ unsafe impl Nic for Model {
                 len,
                 access,
                 pd: pd.id,
+                refuse_close: 0,
             },
         );
         Ok(ModelMr {
             fabric: self.fabric.clone(),
-            key,
+            key: Some(key),
         })
     }
 
     fn mr_keys(mr: &ModelMr) -> (u32, u32) {
-        (mr.key, mr.key)
+        let key = mr.key.expect("model: keys of a closed MR");
+        (key, key)
+    }
+
+    fn close_mr(mr: &mut ModelMr) -> Result<()> {
+        let Some(key) = mr.key else {
+            return Ok(());
+        };
+        // Every simulated DMA access holds this mutex. Removing the record
+        // under it revokes both keys before any later access can proceed.
+        let mut f = mr.fabric.lock().unwrap_or_else(|e| e.into_inner());
+        let registration = f
+            .mrs
+            .get_mut(&key)
+            .ok_or(Error::Invalid("model: unregistered MR"))?;
+        if registration.refuse_close > 0 {
+            registration.refuse_close -= 1;
+            return Err(Error::Os(EAGAIN));
+        }
+        f.mrs.remove(&key);
+        mr.key = None;
+        Ok(())
     }
 
     fn create_cq(&self, entries: u32, _single_threaded: bool) -> Result<ModelCq> {
@@ -922,6 +961,84 @@ unsafe impl Nic for Model {
 }
 
 #[cfg(test)]
+mod mr_tests {
+    use super::*;
+
+    #[test]
+    fn refused_close_retains_registration_for_retry() {
+        let model = Model::new(7);
+        let pd = model.alloc_pd().unwrap();
+        let mut bytes = [0u8; 16];
+        let addr = bytes.as_mut_ptr();
+        // SAFETY: the memory, PD and model outlive the MR; no work is posted.
+        let mut mr = unsafe {
+            model.reg_mr(
+                &pd,
+                addr,
+                bytes.len(),
+                Access::LOCAL_WRITE | Access::REMOTE_WRITE,
+            )
+        }
+        .unwrap();
+        let (lkey, rkey) = Model::mr_keys(&mr);
+        let sge = Sge {
+            addr: addr as u64,
+            length: bytes.len() as u32,
+            lkey,
+        };
+        model.refuse_mr_closes(lkey, 2);
+        for _ in 0..2 {
+            assert_eq!(Model::close_mr(&mut mr), Err(Error::Os(EAGAIN)));
+            assert_eq!(model.registered(), 1);
+            assert_eq!(Model::mr_keys(&mr), (lkey, rkey));
+            let fabric = model.lock();
+            assert_eq!(fabric.check_local(pd.id, &[sge], true), Some(bytes.len()));
+            assert!(fabric.check_remote(
+                pd.id,
+                rkey,
+                addr as u64,
+                bytes.len(),
+                Access::REMOTE_WRITE,
+            ));
+        }
+        assert_eq!(Model::close_mr(&mut mr), Ok(()));
+        assert!(mr.key.is_none());
+        assert_eq!(model.registered(), 0);
+        {
+            let fabric = model.lock();
+            assert_eq!(fabric.check_local(pd.id, &[sge], true), None);
+            assert!(!fabric.check_remote(
+                pd.id,
+                rkey,
+                addr as u64,
+                bytes.len(),
+                Access::REMOTE_WRITE,
+            ));
+        }
+        assert_eq!(Model::close_mr(&mut mr), Ok(()));
+        drop(mr);
+        assert_eq!(model.registered(), 0);
+    }
+
+    #[test]
+    fn drop_retries_a_previously_refused_close() {
+        let model = Model::new(9);
+        let pd = model.alloc_pd().unwrap();
+        let mut bytes = [0u8; 16];
+        // SAFETY: the memory, PD and model outlive the MR; no work is posted.
+        let mut mr = unsafe {
+            model.reg_mr(&pd, bytes.as_mut_ptr(), bytes.len(), Access::LOCAL_WRITE)
+        }
+        .unwrap();
+        model.refuse_mr_closes(Model::mr_keys(&mr).0, 1);
+        assert_eq!(Model::close_mr(&mut mr), Err(Error::Os(EAGAIN)));
+        assert_eq!(model.registered(), 1);
+        drop(mr);
+        assert_eq!(model.registered(), 0);
+    }
+}
+
+#[cfg(test)]
 mod range_tests {
     use super::*;
 
@@ -936,6 +1053,7 @@ mod range_tests {
                 len: 4096,
                 access: Access::LOCAL_WRITE | Access::REMOTE_WRITE | Access::REMOTE_READ,
                 pd: 3,
+                refuse_close: 0,
             },
         );
         assert!(fabric.check_remote(3, 7, 0x1000, 4096, Access::REMOTE_WRITE));

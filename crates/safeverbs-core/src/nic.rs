@@ -12,7 +12,7 @@
 
 use core::fmt;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::wc::Wc;
 
 /// A scatter/gather element: a range of registered memory.
@@ -324,15 +324,18 @@ pub struct ConnectAttr {
 /// protection domains and permissions of registered memory. Completions must truthfully
 /// identify retired work: reporting retirement permits the safe core to release its
 /// buffers immediately. An in-order completion must imply all earlier work on that queue
-/// has stopped accessing local memory. Deregistration and resource destruction must
-/// quiesce access before returning or releasing backing memory. Associated queue methods
-/// must honor their documented posting, cancellation and completion contracts, including
+/// has stopped accessing local memory. Successful deregistration must revoke access
+/// before returning; a failed close must retain the registration and its handle.
+/// Resource destruction must quiesce access or prevent backing memory from being
+/// released if deregistration fails. Associated queue methods must honor their
+/// documented posting, cancellation and completion contracts, including
 /// rejecting invalid remote descriptors rather than accessing arbitrary process memory.
 /// A backend is part of the trusted boundary even when its implementation is software.
 pub unsafe trait Nic: Send + Sync + Sized + 'static {
     /// A protection domain.
     type Pd: Send + Sync + 'static;
-    /// A registered memory region; deregistered when dropped.
+    /// A registered memory region; dropping it must revoke access or prevent
+    /// backing memory from being released if revocation fails.
     type Mr: Send + Sync + 'static;
     /// A completion queue.
     type Cq: NicCq + 'static;
@@ -362,9 +365,9 @@ pub unsafe trait Nic: Send + Sync + Sized + 'static {
     ///
     /// # Safety
     ///
-    /// The memory must stay allocated until the region is dropped, and with
-    /// remote or local-write access nothing may read it as Rust values while
-    /// the NIC may write it.
+    /// The memory must stay allocated until the region is successfully closed
+    /// or dropped. With remote or local-write access nothing may read it as
+    /// Rust values while the NIC may write it.
     unsafe fn reg_mr(
         &self,
         pd: &Self::Pd,
@@ -373,8 +376,26 @@ pub unsafe trait Nic: Send + Sync + Sized + 'static {
         access: Access,
     ) -> Result<Self::Mr>;
 
-    /// The local and remote keys of a region.
+    /// The local and remote keys of a region. Must not dereference a released
+    /// handle if the region has already been closed; implementations may panic.
     fn mr_keys(mr: &Self::Mr) -> (u32, u32);
+
+    /// Tries to deregister a region without consuming its handle.
+    ///
+    /// `Ok(())` means its keys are revoked, the NIC can no longer access its
+    /// memory, and the handle is closed. Closing an already closed handle
+    /// succeeds without another deregistration. `Err` leaves the registration
+    /// and handle alive for retry: its memory, PD and device must stay alive.
+    /// As when dropping a region, local work using it must have retired first.
+    ///
+    /// A caller retaining resources after an error must retain the MR itself
+    /// too, without running its destructor. Dropping it may retry and abort if
+    /// revocation still fails, since the MR alone does not own its backing memory.
+    /// Backends without an explicit close keep their existing destructor contract;
+    /// this default reports no revocation and leaves the handle untouched.
+    fn close_mr(_mr: &mut Self::Mr) -> Result<()> {
+        Err(Error::Unsupported("explicit MR close"))
+    }
 
     /// Creates a completion queue of at least `entries` entries, polled by
     /// one thread at a time when `single_threaded`.
