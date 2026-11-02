@@ -8,8 +8,8 @@
 //! `complete`, which gives a request its outcome.
 //!
 //! The guarantees S1, F1, R1 and L1 are invariants of this machine (proved here and in
-//! [`crate::guarantees`]); the refinement theorem ([`crate::refinement`]) says the real
-//! library behaves like A.
+//! [`crate::guarantees`]). The refinement theorem ([`crate::refinement`]) applies to
+//! implementations that discharge its obligations; the real worker still needs to do so.
 //!
 //! The module is called `abs` because `abstract` is a reserved word in Rust.
 #![allow(unused_imports)]

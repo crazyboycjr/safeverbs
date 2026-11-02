@@ -45,8 +45,8 @@ impl Share {
     }
 }
 
-/// No future lease ID is reserved. A request belongs to this share exactly when its QP
-/// does; program and exposed leases are owned separately by ID. QP names may be reserved
+/// No future group handle is reserved. A request belongs to this share exactly when its QP
+/// does; program and exposed groups are owned separately by handle. QP names may be reserved
 /// before creation. This adds no condition about the byte ranges of different shares.
 pub open spec fn share_wf(a: Abs::State, sh: Share) -> bool {
     &&& forall|i: Id| #[trigger] sh.ids.contains(i) ==> i < a.next_id
@@ -110,7 +110,7 @@ pub open spec fn mine(sh: Share, step: Abs::Step) -> bool {
 }
 
 /// Preserve both presence and absence, and the entire lease (including its phase,
-/// registered waker and detached flag), outcome and posted-byte record at one ID.
+/// registered waker and detached flag), outcome and original members at one group handle.
 pub open spec fn id_framed(pre: Abs::State, post: Abs::State, i: Id) -> bool {
     &&& post.groups.contains_key(i) <==> pre.groups.contains_key(i)
     &&& pre.groups.contains_key(i) ==> post.groups[i] == pre.groups[i]
@@ -169,7 +169,7 @@ proof fn lemma_foreign_id(sh: Share, pre: Abs::State, post: Abs::State, step: Ab
     }
 }
 
-/// Every request left by a foreign step still has matching lease-ID and QP ownership.
+/// Every request left by a foreign step still has matching group-handle and QP ownership.
 proof fn lemma_foreign_request(
     sh: Share,
     pre: Abs::State,

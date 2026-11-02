@@ -89,8 +89,8 @@ pub proof fn lemma_f1_outcome_fixed(pre: Abs::State, post: Abs::State, r: Id)
 }
 
 /// **F1, its own outcome and buffers.** When the client takes request `r`'s outcome, it is
-/// the outcome the NIC produced for `r`, and the buffer that comes back is exactly the one
-/// `r` was posted with.
+/// the outcome the NIC produced for `r`, and the ordered members that come back retain
+/// exactly the identities, byte ranges and permissions `r` was posted with.
 pub proof fn lemma_f1_take(pre: Abs::State, post: Abs::State, r: Id, o: Outcome)
     requires
         pre.invariant(),
@@ -139,7 +139,7 @@ pub proof fn lemma_member_owned_once(s: Abs::State, i: Id, j: Id, k: int, l: int
     }
 }
 
-/// **R1, never before the NIC is done.** A request in flight keeps its lease, unchanged,
+/// **R1, never before the NIC is done.** A request in flight keeps its members unchanged,
 /// until the NIC produces its outcome: no client action (dropping the future included)
 /// releases it earlier. With S1 this means its memory is never reused while the NIC may
 /// still access it.
@@ -167,8 +167,9 @@ pub proof fn lemma_r1_requests_on_live_qps(s: Abs::State, r: Id)
 {
 }
 
-/// **R1, exactly once.** A lease that was returned or dropped never comes back, so no buffer
-/// is returned or dropped twice.
+/// **R1, group handles.** A retired group handle never reappears. Member identities can
+/// survive a take or separation under fresh program handles; this lemma does not claim
+/// those members disappear. `lemma_member_owned_once` prevents duplicate live ownership.
 pub proof fn lemma_r1_released_once(pre: Abs::State, post: Abs::State, i: Id)
     requires
         pre.invariant(),

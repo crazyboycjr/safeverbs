@@ -35,12 +35,14 @@
 //! Leases are tracked as values: the `L` that A sees a request hold is the
 //! one `end` moved into the ring, and `take` and `abort_keeping` hand back
 //! that value. With the linearity of `L` (Rust moves it; the ring never
-//! duplicates it), this is S1 and R1 for the ring: a request's leases stay
+//! duplicates it), this proves retention of the ring's resource values: its leases stay
 //! in its slot, unreachable, from `end` until A says the NIC is done with
 //! them (complete, or never posted), and leave it exactly once.
 //!
 //! Which lease of A a request's `L` stands for (`ids`) and each member's access direction (`dirs`) are ghost maps the queue pair keeps; the ring needs
 //! neither.
+//! Per-byte S1 additionally needs an honest resource projection and concrete buffer
+//! permissions. These adapters preserve a supplied projection; they do not construct it.
 //!
 //! Everything here is ghost code: a plain build erases it.
 // The imports are used by ghost code only.
