@@ -1980,4 +1980,60 @@ pub proof fn lemma_side_detach_refused<L>(
     a2
 }
 
+/// A concrete mixed-resource view exercises the same adapters used by the ring
+/// postconditions. Here `L` is the ordered resource sequence itself, so its interpretation
+/// is identity. This is not a construction of the concrete buffer-token interpretation.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(20)]
+pub proof fn example_mixed_resources() {
+    let src = safeverbs_spec::types::Span { start: 0, len: 64 }.bytes();
+    let dst = safeverbs_spec::types::Span { start: 128, len: 64 }.bytes();
+    let read = Group::singleton(0, dst, true, true);
+    let send = Group::singleton(1, src, false, true);
+    let clone = Group::singleton(2, src, false, true);
+    let mixed = Group { members: read.members + send.members, holder: Holder::Program };
+    let a0 = Abs::State {
+        qps: Set::empty().insert(7), groups: Map::empty().insert(3, mixed).insert(2, clone),
+        next_id: 4, outcomes: Map::empty(), posted: Map::empty(), wakes: Seq::empty(),
+    };
+    assert(abs_inv(a0));
+    let v0 = View::<Seq<Lease>> { req: |s: int| None, staged: |s: int| None, refused: |s: int| None };
+    let ids0 = Map::empty();
+    let dirs0 = Permissions { access: Map::empty(), resources: |members: Seq<Lease>| members };
+    assert(placed(v0, a0, 7, ids0, dirs0));
+    let access = seq![Dir::In, Dir::Out];
+    lemma_end(v0, a0, 7, ids0, dirs0, 0, 3, access, false, mixed.members);
+    let staged = staged_with(v0, 0, false, mixed.members);
+    let ids = ids0.insert(0, 3);
+    let dirs = dirs0.insert(0, access);
+    let (a1, posted_ids) = lemma_post_one(staged, a0, 7, ids, dirs, 0);
+    let posted = posted(staged, 0);
+    let a2 = lemma_register(posted, a1, 7, posted_ids, dirs, 0, 9);
+    let waiting = registered(posted, 0, 9);
+    let r = posted_ids[0];
+    assert(a2.in_flight(r) && a2.groups[r].members == mixed.members);
+    assert(a2.req(r).waker == Some(9));
+    assert(a2.nic_writes(128) && a2.program_reads(0) && !a2.nic_writes(0));
+    let wc = Wc {
+        wr_id: 1, status: crate::wc::Status::WR_FLUSH_ERR, opcode: crate::wc::Opcode::SEND,
+        byte_len: 0, imm: None, vendor_err: 0, qp_num: 7,
+    };
+    lemma_complete_one(waiting, a2, 7, posted_ids, dirs, 0, wc);
+    let done = complete_state(a2, r, wc.outcome());
+    let completed = completed(waiting, 0, wc);
+    let taken = lemma_take(completed, done, 7, posted_ids, dirs, 0, wc, mixed.members);
+    assert(taken.groups[done.next_id].members == mixed.members);
+    assert(taken.groups[done.next_id].members[0].unique);
+    assert(!taken.groups[done.next_id].members[1].unique);
+    assert(taken.wakes == seq![9nat]);
+
+    let detached_state = lemma_detach(waiting, a2, 7, posted_ids, dirs, 0);
+    let detached_view = detached(waiting, 0);
+    assert(detached_state.in_flight(r) && detached_state.groups[r].members == mixed.members);
+    lemma_complete_one(detached_view, detached_state, 7, posted_ids, dirs, 0, wc);
+    let released = complete_state(detached_state, r, wc.outcome());
+    assert(!released.groups.contains_key(r));
+    assert(released.groups[2] == clone && released.wakes.len() == 0);
+}
+
 } // verus!
