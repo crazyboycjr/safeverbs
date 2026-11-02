@@ -660,7 +660,7 @@ impl<L> Ring<L> {
 
     /// A sees the same requests in `self` and `other`, with the same staged
     /// ones and wakers woken: a stuttering step.
-    pub closed spec fn same_view(&self, other: &Self) -> bool {
+    pub open spec fn same_view(&self, other: &Self) -> bool {
         &&& forall|s: int| #[trigger] self.req(s) == other.req(s)
         &&& forall|s: int| #[trigger] self.staged(s) == other.staged(s)
         &&& forall|s: int| #[trigger] self.refused(s) == other.refused(s)
@@ -1199,6 +1199,7 @@ impl<L> Ring<L> {
         ensures
             final(self).inv(),
             final(self).same_view(old(self)),
+            final(self).spec_posted() == old(self).spec_posted(),
             seq is Some ==> seq == Some(old(self).spec_posted()) && final(self).is_open()
                 && final(self).open_wqes() == 0,
             seq is None ==> *final(self) == *old(self),
@@ -1269,6 +1270,7 @@ impl<L> Ring<L> {
         ensures
             final(self).inv(),
             final(self).same_view(old(self)),
+            final(self).spec_posted() == old(self).spec_posted(),
             final(self).is_open() == old(self).is_open(),
             id is Some ==> final(self).open_wqes() == old(self).open_wqes() + 1,
             id is None ==> final(self).open_wqes() == old(self).open_wqes(),

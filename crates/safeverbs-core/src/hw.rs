@@ -296,6 +296,68 @@ pub open spec fn rq_linked<L>(r: Ring<L>, index: u16, qp: Qp) -> bool {
         )
 }
 
+/// Every concrete resource value held by the ring has its checked logical loan
+/// and WQE provenance. Refused requests keep their original, unposted ledger.
+pub(crate) open spec fn ring_resources_ok<N: Device>(r: Ring<Leases<N>>) -> bool {
+    &&& forall|s: int| #[trigger] r.req(s) is Some ==> r.req(s)->0.leases.inv()
+    &&& forall|s: int| #[trigger] r.staged(s) is Some ==> r.staged(s)->0.leases.inv()
+    &&& forall|s: int| #[trigger] r.refused(s) is Some ==> r.refused(s)->0.inv()
+}
+
+/// A resource at a sequence keeps its identity across the three ring views.
+pub(crate) open spec fn resource_at<N: Device>(r: Ring<Leases<N>>, s: int, l: Leases<N>) -> bool {
+    ||| r.req(s) is Some && r.req(s)->0.leases == l
+    ||| r.staged(s) is Some && r.staged(s)->0.leases == l
+    ||| r.refused(s) == Some(l)
+}
+
+proof fn lemma_resources_kept<N: Device>(pre: Ring<Leases<N>>, post: Ring<Leases<N>>)
+    requires ring_resources_ok(pre),
+        forall|s: int| #[trigger] post.req(s) is Some ==> resource_at(pre, s, post.req(s)->0.leases),
+        forall|s: int| #[trigger] post.staged(s) is Some ==> resource_at(pre, s, post.staged(s)->0.leases),
+        forall|s: int| #[trigger] post.refused(s) is Some ==> resource_at(pre, s, post.refused(s)->0),
+    ensures ring_resources_ok(post),
+{
+    assert forall|s: int| #[trigger] post.req(s) is Some implies post.req(s)->0.leases.inv() by {}
+    assert forall|s: int| #[trigger] post.staged(s) is Some implies post.staged(s)->0.leases.inv() by {}
+    assert forall|s: int| #[trigger] post.refused(s) is Some implies post.refused(s)->0.inv() by {}
+}
+
+proof fn lemma_resources_added<N: Device>(pre: Ring<Leases<N>>, post: Ring<Leases<N>>, seq: int, leases: Leases<N>)
+    requires ring_resources_ok(pre), leases.inv(),
+        forall|s: int| #[trigger] post.req(s) is Some ==> resource_at(pre, s, post.req(s)->0.leases),
+        forall|s: int| #[trigger] post.staged(s) is Some
+            ==> (s == seq && post.staged(s)->0.leases == leases)
+                || resource_at(pre, s, post.staged(s)->0.leases),
+        forall|s: int| #[trigger] post.refused(s) is Some ==> resource_at(pre, s, post.refused(s)->0),
+    ensures ring_resources_ok(post),
+{
+    assert forall|s: int| #[trigger] post.req(s) is Some implies post.req(s)->0.leases.inv() by {}
+    assert forall|s: int| #[trigger] post.staged(s) is Some implies post.staged(s)->0.leases.inv() by {}
+    assert forall|s: int| #[trigger] post.refused(s) is Some implies post.refused(s)->0.inv() by {}
+}
+
+/// Completion changes outcomes and ownership, while surviving requests retain
+/// the exact resource value that was staged and committed.
+proof fn lemma_resources_completed<N: Device>(pre: Ring<Leases<N>>, post: Ring<Leases<N>>, wqe: u64, wc: Wc)
+    requires pre.inv(), ring_resources_ok(pre),
+        pre.spec_retired() <= post.spec_retired() <= pre.spec_committed(),
+        forall|s: int| #[trigger] post.req(s) == if pre.spec_retired() <= s < post.spec_retired() {
+            pre.retired_view(s, pre.retire_outcome(s, wqe, wc))
+        } else { pre.req(s) },
+        forall|s: int| #[trigger] post.staged(s) == pre.staged(s),
+        forall|s: int| #[trigger] post.refused(s) == pre.refused(s),
+    ensures ring_resources_ok(post),
+{
+    assert forall|s: int| #[trigger] post.req(s) is Some
+        implies resource_at(pre, s, post.req(s)->0.leases) by {
+        if pre.spec_retired() <= s < post.spec_retired() {
+            pre.lemma_retired_view(s, pre.retire_outcome(s, wqe, wc));
+        }
+    }
+    lemma_resources_kept(pre, post);
+}
+
 /// What the worker knows of the QP's state holds in M.
 pub open spec fn phase_ok(phase: Phase, state: QpState) -> bool {
     match phase {
@@ -363,6 +425,8 @@ impl<N: Device> HwQp<N> {
         &&& self.atomics ==> self.qp_type == QpType::Rc
         &&& sq_linked(self.send, index, qp)
         &&& rq_linked(self.recv, index, qp)
+        &&& ring_resources_ok(self.send)
+        &&& ring_resources_ok(self.recv)
         &&& phase_ok(self.phase, qp.state)
         &&& self.phase != Phase::Ready ==> qp.sq.len() == 0 && qp.rq.len() == 0
             && self.send.spec_wqe_committed() == self.send.spec_wqe_retired()
@@ -1524,12 +1588,19 @@ impl<N: Device> Hw<N> {
                         leases.record_wqe(Ghost(crate::buf::WqeLoans {
                             wr_id: id, opcode: None, sges: sges@, first: 0,
                         }));
+                        let ghost resource = leases;
+                        let ghost before_end = e.recv;
+                        proof { lemma_resources_kept(e1.recv, e.recv); }
                         e.recv.end(true, detached, implied, leases);
+                        proof { lemma_resources_added(before_end, e.recv, seq as int, resource); }
+                        let ghost staged = e.recv;
                         e.recv.commit();
+                        proof { lemma_resources_kept(staged, e.recv); }
                         Ok(seq)
                     },
                     Err(error) => {
                         e.recv.abort();
+                        proof { lemma_resources_kept(e1.recv, e.recv); }
                         Err(BufError { error, buf: part })
                     },
                 }
@@ -1739,6 +1810,7 @@ impl<N: Device> Hw<N> {
                         assert(wqe == e.seq);
                     }
                     let _known = qp_entry.recv.complete(wqe, *wc);
+                    proof { lemma_resources_completed(e0.recv, qp_entry.recv, wqe, *wc); }
                     changed = qp_entry.recv.retired() != retired;
                     proof {
                         assert(qp_entry.send == e0.send);
@@ -1753,6 +1825,7 @@ impl<N: Device> Hw<N> {
                         assert(wqe == e.seq);
                     }
                     let _known = qp_entry.send.complete(wqe, *wc);
+                    proof { lemma_resources_completed(e0.send, qp_entry.send, wqe, *wc); }
                     changed = qp_entry.send.retired() != retired;
                     proof {
                         assert(qp_entry.recv == e0.recv);
@@ -1978,6 +2051,7 @@ impl<N: Device> Hw<N> {
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
+            r matches Err((_, Some(leases))) ==> leases.inv(),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -2313,7 +2387,9 @@ impl<N: Device> Hw<N> {
                 proof {
                     e1.send.lemma_wqes();
                 }
+                let ghost resource = leases;
                 let (seq, signaled) = e.send.end(signal, detached, implied, leases);
+                proof { lemma_resources_added(e1.send, e.send, seq as int, resource); }
                 if !e.started {
                     crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                     e.started = true;
@@ -2822,6 +2898,7 @@ impl<N: Device> Hw<N> {
             assert(caps_model(m3.caps, self.caps));
             assert(total <= m3.caps.max_msg);
             assert(held_ok(e.held->0, e.held_parts@, index as u16, e.send.spec_wqe_committed() + written.len(), attr, e.pd_id@, m3.caps.max_msg));
+            lemma_resources_kept(e3.send, e.send);
             assert(self.entry_ok(index as int, t4, m3));
             self.lemma_commit_frame(&s3, t3, t4, m3, m3, index as int);
         }
@@ -2910,6 +2987,7 @@ impl<N: Device> Hw<N> {
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
+            r matches Some((_, leases)) ==> leases.inv(),
     {
         if index >= self.qps.len() {
             return None;
@@ -2929,6 +3007,10 @@ impl<N: Device> Hw<N> {
         };
         proof {
             if start.qps@[index as int] is Some {
+                let old_e = start.qps@[index as int]->0;
+                let e = self.qps@[index as int]->0;
+                lemma_resources_kept(old_e.send, e.send);
+                lemma_resources_kept(old_e.recv, e.recv);
                 assert(self.entry_ok(index as int, t, m));
                 self.lemma_touch_one(&start, t, m, m, index as int);
             } else {
@@ -2996,9 +3078,17 @@ impl<N: Device> Hw<N> {
             assert(start.entry_ok(index as int, t, m));
         }
         match &mut self.qps[index] {
-            Some(e) => match side {
-                Side::Send => e.send.set_waker(seq, waker),
-                Side::Recv => e.recv.set_waker(seq, waker),
+            Some(e) => {
+                let ghost send = e.send;
+                let ghost recv = e.recv;
+                match side {
+                    Side::Send => e.send.set_waker(seq, waker),
+                    Side::Recv => e.recv.set_waker(seq, waker),
+                }
+                proof {
+                    lemma_resources_kept(send, e.send);
+                    lemma_resources_kept(recv, e.recv);
+                }
             },
             None => {},
         }
@@ -3231,18 +3321,23 @@ impl<N: Device> Hw<N> {
                 }
                 // Nothing staged or open is posted: refused (their owners are
                 // gone too).
+                let ghost before_abort = e.send;
                 e.send.abort();
+                proof { lemma_resources_kept(before_abort, e.send); }
                 let ghost s1 = e.send;
                 let mut seq = e.send.head();
                 while seq < e.send.posted()
                     invariant
                         e.send.inv(),
+                        ring_resources_ok(e.send),
                         e.send.same_wqes(&s1),
                         e.send.same_open(&s1),
                         e.send.spec_posted() == s1.spec_posted(),
                     decreases e.send.spec_posted() - seq,
                 {
+                    let ghost before_detach = e.send;
                     e.send.detach(seq);
+                    proof { lemma_resources_kept(before_detach, e.send); }
                     seq += 1;
                 }
                 let ghost r1 = e.recv;
@@ -3250,12 +3345,15 @@ impl<N: Device> Hw<N> {
                 while seq < e.recv.posted()
                     invariant
                         e.recv.inv(),
+                        ring_resources_ok(e.recv),
                         e.recv.same_wqes(&r1),
                         e.recv.same_open(&r1),
                         e.recv.spec_posted() == r1.spec_posted(),
                     decreases e.recv.spec_posted() - seq,
                 {
+                    let ghost before_detach = e.recv;
                     e.recv.detach(seq);
+                    proof { lemma_resources_kept(before_detach, e.recv); }
                     seq += 1;
                 }
                 e.send.in_flight_wqes() > 0 || e.recv.in_flight_wqes() > 0
@@ -3355,7 +3453,17 @@ impl<N: Device> Hw<N> {
                     },
                 };
                 let implied = Wc::success(Opcode::SEND, 0);
-                let (_, signaled) = e.send.end(true, true, implied, no_leases());
+                let mut leases = no_leases();
+                leases.record_wqe(Ghost(crate::buf::WqeLoans {
+                    wr_id: spec_wr_id(index as u16, false, wqe),
+                    opcode: Some(safeverbs_spec::nic::Opcode::Send),
+                    sges: Seq::empty(), first: 0,
+                }));
+                let ghost resource = leases;
+                let ghost before_end = e.send;
+                proof { lemma_resources_kept(e0.send, e.send); }
+                let (_seq, signaled) = e.send.end(true, true, implied, leases);
+                proof { lemma_resources_added(before_end, e.send, _seq as int, resource); }
                 if !e.started {
                     crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                     e.started = true;
