@@ -130,6 +130,9 @@ cargo run --release -p uchan -- -c <server_addr> -s 65536 --num-iters 1000000
 ```
 
 ## Code Structure
+For a source-level reading order and a request's path through the implementation, see
+[the code tour](docs/code-tour.md).
+
 SafeVerbs was inspired by [rust-ibverbs](https://github.com/jonhoo/rust-ibverbs), which provides simple abstractions for RDMA but leaves data path operations marked as unsafe. SafeVerbs makes the data path safe too, and keeps every `unsafe` line in one small crate.
 
 - `crates/safeverbs`: the crate applications use, `#![forbid(unsafe_code)]`: queue pairs on per-thread workers, futures, sinks and streams.
