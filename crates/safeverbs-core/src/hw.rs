@@ -135,6 +135,92 @@ struct Held {
     n: usize,
 }
 
+/// Exact logical inputs appended by the native pop loop, in its actual order.
+pub(crate) open spec fn collected_parts<N: Device>(
+    parts: Seq<Part<N>>, remaining: int, access: safeverbs_spec::abs::Dir,
+) -> Seq<crate::buf::Loan<N>> {
+    Seq::new((parts.len() - remaining) as nat, |i: int| crate::buf::Loan {
+        part: parts[parts.len() - 1 - i], access: Some(access),
+    })
+}
+
+/// Moves all SGE guards into their request without changing the native algorithm.
+/// The erased ledger records even a shared input whose redundant Arc is dropped.
+#[inline]
+fn keep_parts<N: Device>(
+    leases: &mut Leases<N>, parts: &mut Vec<Part<N>>,
+    Ghost(wqe): Ghost<crate::buf::WqeLoans>,
+)
+    requires old(leases).inv(),
+        wqe.first == old(leases).loans().len(),
+        wqe.sges.len() == old(parts)@.len(),
+        forall|i: int| 0 <= i < old(parts)@.len()
+            ==> wqe.sges[i] == part_sge(#[trigger] old(parts)@[i])
+                && (wqe.access() is In ==> part_writable(old(parts)@[i])),
+    ensures final(parts)@.len() == 0,
+        final(leases).inv(),
+        final(leases).loans() == old(leases).loans()
+            + collected_parts(old(parts)@, 0, wqe.access()),
+        final(leases).wqes() == old(leases).wqes().push(wqe),
+{
+    let ghost access = wqe.access();
+    let ghost original = parts@;
+    let ghost prefix = leases.loans();
+    let ghost old_wqes = leases.wqes();
+    proof {
+        leases.lemma_wqes();
+        assert(collected_parts(original, original.len() as int, access) =~= Seq::empty());
+    }
+    while parts.len() > 0
+        invariant
+            leases.inv(),
+            leases.wqes() == old_wqes,
+            parts@.len() <= original.len(),
+            parts@ == original.take(parts@.len() as int),
+            leases.loans() == prefix + collected_parts(original, parts@.len() as int, access),
+            forall|i: int| 0 <= i < original.len()
+                ==> access is In ==> part_writable(#[trigger] original[i]),
+            forall|i: int| 0 <= i < original.len()
+                ==> wqe.sges[i] == part_sge(#[trigger] original[i]),
+            wqe.first == prefix.len(), wqe.sges.len() == original.len(),
+            forall|i: int| 0 <= i < old_wqes.len()
+                ==> (#[trigger] old_wqes[i]).end() <= prefix.len(),
+        decreases parts@.len(),
+    {
+        let ghost before = parts@;
+        match parts.pop() {
+            Some(part) => {
+                proof { assert(part == original[before.len() - 1]); }
+                keep_lease(leases, part, Ghost(access));
+            },
+            None => {},
+        }
+        proof {
+            assert(parts@ =~= original.take(parts@.len() as int));
+            let old_tail = collected_parts(original, before.len() as int, access);
+            let new_tail = collected_parts(original, parts@.len() as int, access);
+            assert(new_tail =~= old_tail.push(crate::buf::Loan {
+                part: original[before.len() - 1], access: Some(access),
+            }));
+            assert(prefix + new_tail =~= (prefix + old_tail).push(crate::buf::Loan {
+                part: original[before.len() - 1], access: Some(access),
+            }));
+        }
+    }
+    proof {
+        assert forall|j: int| 0 <= j < wqe.sges.len() implies {
+            let loan = #[trigger] leases.loans()[wqe.end() - 1 - j];
+            &&& loan.part.spec_sge() == wqe.sges[j]
+            &&& loan.access == Some(wqe.access())
+        } by {
+            let k = original.len() - 1 - j;
+            assert(leases.loans()[wqe.end() - 1 - j] == collected_parts(original, 0, access)[k]);
+            assert(leases.loans()[wqe.end() - 1 - j].part == original[j]);
+        }
+    }
+    leases.record_wqe(Ghost(wqe));
+}
+
 /// The WR M sees for a held WQE.
 spec fn held_wr(h: Held, signaled: bool) -> SendWr {
     send_wr(h.wr_id, signaled, h.op, h.sges@.take(h.n as int))
@@ -296,6 +382,7 @@ impl<N: Device> HwQp<N> {
             m.caps.max_msg,
         )
         &&& self.building@.len() <= MAX_SGES
+        &&& self.open_leases.inv()
     }
 }
 
@@ -1434,6 +1521,9 @@ impl<N: Device> Hw<N> {
                         let implied = Wc::success(Opcode::RECV, sge.length);
                         let mut leases = no_leases();
                         keep_lease(&mut leases, part, Ghost(safeverbs_spec::abs::Dir::In));
+                        leases.record_wqe(Ghost(crate::buf::WqeLoans {
+                            wr_id: id, opcode: None, sges: sges@, first: 0,
+                        }));
                         e.recv.end(true, detached, implied, leases);
                         e.recv.commit();
                         Ok(seq)
@@ -2207,29 +2297,11 @@ impl<N: Device> Hw<N> {
                         return None;
                     },
                 };
-                while e.held_parts.len() > 0
-                    invariant
-                        e.open_leases == e.open_leases,
-                        e.held_parts@.len() <= e1.held_parts@.len(),
-                        e.held_parts@ == e1.held_parts@.take(e.held_parts@.len() as int),
-                        forall|j: int| 0 <= j < e.held_parts@.len()
-                            ==> opcode_model(h.op).writes_local() ==> part_writable(#[trigger] e.held_parts@[j]),
-                    decreases e.held_parts@.len(),
-                {
-                    let ghost previous_parts = e.held_parts@;
-                    match e.held_parts.pop() {
-                        Some(part) => keep_lease(&mut e.open_leases, part, Ghost(send_access(h.op))),
-                        None => {},
-                    }
-                    proof {
-                        assert forall|j: int| 0 <= j < e.held_parts@.len()
-                            implies e.held_parts@[j] == e1.held_parts@[j] by {
-                            assert(e.held_parts@[j] == previous_parts[j]);
-                            assert(previous_parts[j] == e1.held_parts@[j]);
-                        }
-                        assert(e.held_parts@ =~= e1.held_parts@.take(e.held_parts@.len() as int));
-                    }
-                }
+                let ghost footprint = crate::buf::WqeLoans {
+                    wr_id: h.wr_id, opcode: Some(opcode_model(h.op)),
+                    sges: h.sges@.take(h.n as int), first: e.open_leases.loans().len() as int,
+                };
+                keep_parts(&mut e.open_leases, &mut e.held_parts, Ghost(footprint));
                 let mut leases = no_leases();
                 core::mem::swap(&mut leases, &mut e.open_leases);
                 let bytes = if e.open_bytes > u32::MAX as u64 {
@@ -2711,28 +2783,11 @@ impl<N: Device> Hw<N> {
                             assert(held_sges@ == h.sges@.take(h.n as int));
                             lemma_held_wr_ok(h, e3.held_parts@, index as u16, e3.send.spec_wqe_committed() + t3.written(q).len(), m3, m3.qps[q].attr, e3.pd_id@, false);
                         }
-                        while e.held_parts.len() > 0
-                            invariant
-                                e.held_parts@.len() <= e3.held_parts@.len(),
-                                e.held_parts@ == e3.held_parts@.take(e.held_parts@.len() as int),
-                                forall|j: int| 0 <= j < e.held_parts@.len()
-                                    ==> opcode_model(h.op).writes_local() ==> part_writable(#[trigger] e.held_parts@[j]),
-                            decreases e.held_parts@.len(),
-                        {
-                            let ghost previous_parts = e.held_parts@;
-                            match e.held_parts.pop() {
-                                Some(part) => keep_lease(&mut e.open_leases, part, Ghost(send_access(h.op))),
-                                None => {},
-                            }
-                            proof {
-                                assert forall|j: int| 0 <= j < e.held_parts@.len()
-                                    implies e.held_parts@[j] == e3.held_parts@[j] by {
-                                    assert(e.held_parts@[j] == previous_parts[j]);
-                                    assert(previous_parts[j] == e3.held_parts@[j]);
-                                }
-                                assert(e.held_parts@ =~= e3.held_parts@.take(e.held_parts@.len() as int));
-                            }
-                        }
+                        let ghost footprint = crate::buf::WqeLoans {
+                            wr_id: h.wr_id, opcode: Some(opcode_model(h.op)),
+                            sges: h.sges@.take(h.n as int), first: e.open_leases.loans().len() as int,
+                        };
+                        keep_parts(&mut e.open_leases, &mut e.held_parts, Ghost(footprint));
                     },
                     None => {},
                 }

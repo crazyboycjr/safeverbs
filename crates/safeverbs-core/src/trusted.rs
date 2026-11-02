@@ -739,7 +739,7 @@ pub fn registered_all<N: Device>(_parts: &Vec<Part<N>>, _pd: &Pd<N>, Tracked(tok
 
 /// No leases (`Leases::default`).
 pub fn no_leases<N: Device>() -> (r: Leases<N>)
-    ensures r.inv(), r.view().len() == 0, r.loans().len() == 0,
+    ensures r.inv(), r.view().len() == 0, r.loans().len() == 0, r.wqes().len() == 0,
 {
     Leases::new()
 }
@@ -750,6 +750,7 @@ pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>, Ghost(access
     ensures
         old(leases).inv() ==> final(leases).inv(),
         final(leases).loans() == old(leases).loans().push(crate::buf::Loan { part, access: Some(access) }),
+        final(leases).wqes() == old(leases).wqes(),
 {
     proof { part.lemma_fields(); }
     leases.push_access(part, Ghost(access))

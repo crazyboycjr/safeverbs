@@ -38,6 +38,8 @@ mod lease;
 pub(crate) use lease::Lease;
 #[allow(unused_imports)] // Named only by contracts erased from plain cargo builds.
 pub(crate) use lease::Loan;
+#[allow(unused_imports)] // Erased WQE provenance used by the verified worker.
+pub(crate) use lease::WqeLoans;
 pub use lease::{Leases, Part};
 
 /// Linux's `ENOMEM`.
