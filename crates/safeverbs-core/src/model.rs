@@ -13,6 +13,7 @@
 //! doorbells can be injected ([`Model::inject_error`],
 //! [`Model::force_error`], [`Model::refuse_doorbells`]).
 //! MR close refusals can be injected with [`Model::refuse_mr_closes`].
+//! The next registration can be refused with [`Model::refuse_next_mr_registration`].
 //!
 //! The model panics where hardware would silently misbehave and safeverbs
 //! promises it never happens: a send or receive queue overflow, a CQ
@@ -110,6 +111,8 @@ struct Fabric {
     rng: u64,
     next_id: u32,
     mrs: BTreeMap<u32, MrRec>,
+    /// Refuse the next registration without creating an MR.
+    refuse_registration: bool,
     cqs: BTreeMap<u32, CqRec>,
     qps: BTreeMap<u32, QpRec>,
     /// Chance in 1000 that a poll carries out nothing.
@@ -128,6 +131,7 @@ impl Model {
                 rng: seed | 1,
                 next_id: 1,
                 mrs: BTreeMap::new(),
+                refuse_registration: false,
                 cqs: BTreeMap::new(),
                 qps: BTreeMap::new(),
                 delay_permille: 0,
@@ -170,6 +174,12 @@ impl Model {
         if let Some(qp) = self.lock().qps.get_mut(&qp_num) {
             qp.refuse += n;
         }
+    }
+
+    /// Refuses the next MR registration on this fabric with `EAGAIN`.
+    /// Clones share this one-shot refusal; existing MRs are unaffected.
+    pub fn refuse_next_mr_registration(&self) {
+        self.lock().refuse_registration = true;
     }
 
     /// Refuses the next `n` close attempts for the MR with `lkey`, in addition
@@ -860,6 +870,9 @@ unsafe impl Nic for Model {
         access: Access,
     ) -> Result<ModelMr> {
         let mut f = self.lock();
+        if core::mem::take(&mut f.refuse_registration) {
+            return Err(Error::Os(EAGAIN));
+        }
         let key = f.id();
         f.mrs.insert(
             key,
