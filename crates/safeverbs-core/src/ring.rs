@@ -653,6 +653,50 @@ impl<L> Ring<L> {
         }
     }
 
+    /// The actual live request retaining WQE `w`. Refused and retired slots
+    /// never authorize DMA, even when a refused WQE number is reused.
+    pub closed spec fn dma(&self, s: int, w: int) -> Option<L> {
+        if self.head <= s < self.posted
+            && (self.slot(s).state == State::InFlight || self.slot(s).state == State::Staged)
+            && self.slot(s).first_wqe <= w < self.slot(s).end_wqe {
+            self.slot(s).leases
+        } else { None }
+    }
+
+    /// The end of the closed requests, excluding the request being gathered.
+    pub open spec fn spec_closed_end(&self) -> int {
+        self.spec_wqe_posted() - self.spec_open_wqes()
+    }
+
+    /// All still-live WQEs retain their original request and exact resource value.
+    pub open spec fn keeps_dma(&self, pre: &Self) -> bool {
+        forall|s: int, w: int| pre.dma(s, w) is Some
+            && self.spec_wqe_retired() <= w < self.spec_closed_end()
+            ==> #[trigger] self.dma(s, w) == pre.dma(s, w)
+    }
+
+    /// Every live WQE retains exactly the same request and resource value.
+    pub open spec fn same_dma(&self, pre: &Self) -> bool {
+        forall|s: int, w: int| #[trigger] self.dma(s, w) == pre.dma(s, w)
+    }
+
+    /// A DMA observer names an actual in-flight or staged request, with its
+    /// exact resources, and never a result retained after refusal.
+    pub proof fn lemma_dma(&self, s: int, w: int)
+        requires self.inv(), self.dma(s, w) is Some,
+        ensures
+            self.spec_retired() <= s < self.spec_posted(),
+            self.spec_wqe_retired() <= w < self.spec_closed_end(),
+            (self.req(s) is Some && self.req(s)->0.phase is InFlight
+                && self.req(s)->0.leases == self.dma(s, w)->0)
+                || (self.staged(s) is Some && self.staged(s)->0.leases == self.dma(s, w)->0),
+            self.refused(s) is None,
+    {
+        reveal(Ring::inv_slots);
+        if s < self.retired { assert(self.done_ok(s)); }
+        assert(self.live_ok(s));
+    }
+
     /// The names of the wakers the ring has woken, in order.
     pub closed spec fn woken(&self) -> vstd::seq::Seq<WakerId> {
         self.woken@
@@ -665,6 +709,7 @@ impl<L> Ring<L> {
         &&& forall|s: int| #[trigger] self.staged(s) == other.staged(s)
         &&& forall|s: int| #[trigger] self.refused(s) == other.refused(s)
         &&& self.woken() == other.woken()
+        &&& self.same_dma(other)
     }
 
     /// What A sees of the ring, as functions of the sequence number.
@@ -807,6 +852,7 @@ impl<L> Ring<L> {
             post.inv_slots(),
             post.inv_wqes(),
             pre.head_ok() ==> post.head_ok(),
+            post.same_dma(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1348,6 +1394,11 @@ impl<L> Ring<L> {
                 },
             forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
             final(self).woken() == old(self).woken(),
+            forall|s: int, w: int| #[trigger] final(self).dma(s, w) ==
+                if s == old(self).spec_posted()
+                    && old(self).spec_closed_end() <= w < old(self).spec_wqe_posted() {
+                    Some(leases)
+                } else { old(self).dma(s, w) },
     {
         assert!(self.open && self.open_wqes >= 1, "no open request with a WQE");
         let signaled = want_signal || self.must_signal();
@@ -1419,6 +1470,10 @@ impl<L> Ring<L> {
                     pre.staged(s)
                 },
             forall|s: int| #[trigger] self.refused(s) == pre.refused(s),
+            forall|s: int, w: int| #[trigger] self.dma(s, w) ==
+                if s == pre.spec_posted() && pre.spec_closed_end() <= w < pre.spec_wqe_posted() {
+                    self.slot(p).leases
+                } else { pre.dma(s, w) },
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1501,6 +1556,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
             final(self).spec_depth() == old(self).spec_depth(),
             !final(self).spec_is_open(),
+            final(self).same_dma(old(self)),
     {
         assert!(!self.open, "commit with an open request");
         let ghost pre = *self;
@@ -1585,6 +1641,7 @@ impl<L> Ring<L> {
                 },
             forall|s: int| #[trigger] self.staged(s) is None,
             forall|s: int| #[trigger] self.refused(s) == pre.refused(s),
+            self.same_dma(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1636,6 +1693,15 @@ impl<L> Ring<L> {
         if self.head < self.retired {
             assert(pre.slot(self.head as int) == self.slot(self.head as int));
         }
+        assert forall|s: int, w: int| #[trigger] self.dma(s, w) == pre.dma(s, w) by {
+            if pre.head <= s < pre.posted {
+                assert(self.slot(s) == if pre.committed <= s < pre.posted {
+                    pre.slot(s).with_state(State::InFlight)
+                } else { pre.slot(s) });
+                if pre.committed <= s { assert(pre.live_ok(s)); }
+            }
+        }
+
     }
 
     /// The hardware discarded everything since the last commit (the device
@@ -1674,6 +1740,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
             final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
             final(self).spec_depth() == old(self).spec_depth(),
+            final(self).keeps_dma(old(self)),
     {
         let dropped = self.posted - self.committed;
         // No request is staged at `posted`: none is handed back.
@@ -1721,6 +1788,7 @@ impl<L> Ring<L> {
                 #[trigger] old(self).staged(s) is Some && s != keep ==> !old(self).staged(
                     s,
                 )->0.detached,
+            final(self).keeps_dma(old(self)),
     {
         let ghost pre = *self;
         let wqe = self.wqe_committed;
@@ -1871,6 +1939,7 @@ impl<L> Ring<L> {
                 } else {
                     pre.refused(s)
                 },
+            self.keeps_dma(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1927,6 +1996,16 @@ impl<L> Ring<L> {
         if self.head < self.retired {
             assert(pre.slot(self.head as int) == self.slot(self.head as int));
         }
+        assert forall|s: int, w: int| pre.dma(s, w) is Some
+            && self.spec_wqe_retired() <= w < self.spec_closed_end()
+            implies #[trigger] self.dma(s, w) == pre.dma(s, w) by {
+            if s < pre.retired { assert(pre.done_ok(s)); }
+            assert(pre.live_ok(s));
+            if s >= pre.committed { assert(pre.posted_ok(s)); }
+            assert(s < pre.committed);
+            assert(self.slot(s) == pre.slot(s));
+        }
+
     }
 
     /// Moves `retired` past the refused requests at the front of the
@@ -2131,6 +2210,7 @@ impl<L> Ring<L> {
             old(self).spec_wqe_retired() <= final(self).spec_wqe_retired(),
             wqe >= old(self).spec_wqe_retired() ==> final(self).spec_wqe_retired() <= wqe + 1,
             final(self).same_open(old(self)),
+            final(self).keeps_dma(old(self)),
     {
         if wqe >= self.wqe_committed {
             return false;
@@ -2152,6 +2232,7 @@ impl<L> Ring<L> {
                 ),
             invariant
                 self.inv_body(),
+                self.keeps_dma(&pre),
                 pre.inv(),
                 self.committed == pre.committed,
                 self.posted == pre.posted,
@@ -2260,6 +2341,7 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] self.req(s) == pre.req(s),
             forall|s: int| #[trigger] self.staged(s) == pre.staged(s),
             forall|s: int| #[trigger] self.refused(s) == pre.refused(s),
+            self.same_dma(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -2337,6 +2419,7 @@ impl<L> Ring<L> {
                 Some(w) => old(self).woken().push(waker_id(w)),
                 None => old(self).woken(),
             },
+            final(self).keeps_dma(old(self)),
     {
         let ghost pre = *self;
         if !outcome.is_ok() {
@@ -2424,6 +2507,7 @@ impl<L> Ring<L> {
             forall|s: int|
                 pre.head <= s < pre.head + pre.n() && s != pre.retired ==> #[trigger] self.slot(s)
                     == pre.slot(s),
+            self.keeps_dma(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -2628,6 +2712,7 @@ impl<L> Ring<L> {
             final(self).woken() == old(self).woken(),
             final(self).same_wqes(old(self)),
             final(self).same_open(old(self)),
+            final(self).same_dma(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -2750,6 +2835,7 @@ impl<L> Ring<L> {
                 } else {
                     pre.refused(s)
                 },
+            self.same_dma(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -2848,6 +2934,7 @@ impl<L> Ring<L> {
             final(self).same_wqes(old(self)),
             final(self).same_open(old(self)),
             final(self).spec_posted() == old(self).spec_posted(),
+            final(self).same_dma(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -2933,6 +3020,7 @@ impl<L> Ring<L> {
                     pre.staged(s)
                 },
             forall|s: int| #[trigger] self.refused(s) == pre.refused(s),
+            self.same_dma(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -3022,6 +3110,7 @@ impl<L> Ring<L> {
             final(self).woken() == old(self).woken(),
             final(self).same_wqes(old(self)),
             final(self).same_open(old(self)),
+            final(self).same_dma(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -3068,6 +3157,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_committed() == old(self).spec_wqe_posted(),
             final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
             final(self).spec_depth() == old(self).spec_depth(),
+            final(self).keeps_dma(old(self)),
     {
         let ghost pre = *self;
         let mut i = 0;
