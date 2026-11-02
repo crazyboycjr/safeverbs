@@ -290,11 +290,26 @@ pub proof fn example_mixed_group() {
     };
     assert(Abs::State::post_request(a6, a7, 3, 7, dirs));
     Abs::State::post_request_inductive(a6, a7, 3, 7, dirs);
-    assert(a7.nic_writes(128) && !a7.program_reads(128));
-    assert(!a7.nic_reads(128));
-    assert(a7.program_reads(0) && a7.nic_reads(0) && !a7.nic_writes(0));
+    // Give the byte predicates their group/member witnesses before using S1 to
+    // exclude conflicting program access and NIC writes through the frozen clone.
+    assert(a7.groups.contains_key(4));
+    assert(a7.groups[4].members[0].mem.contains(128));
+    assert(a7.groups[4].write_member(0));
+    assert(a7.groups[4].nic_may_write(128));
+    assert(a7.nic_writes(128));
+    assert(a7.groups.contains_key(2) && a7.groups[2].is_program());
+    assert(a7.groups[2].members[0].mem.contains(0));
+    assert(a7.groups[2].contains(0));
+    assert(a7.program_reads(0));
+    assert(a7.groups[4].members[1].mem.contains(0));
+    assert(a7.groups[4].read_member(1));
+    assert(a7.groups[4].nic_may_read(0));
+    assert(a7.nic_reads(0));
     crate::guarantees::lemma_s1_no_conflict(a7, 0);
     crate::guarantees::lemma_s1_no_conflict(a7, 128);
+    assert(!a7.program_reads(128));
+    assert(!a7.nic_reads(128));
+    assert(!a7.nic_writes(0));
     crate::guarantees::lemma_s1_nic_writes_any_bytes(a7, 4, 0);
     assert(a7.groups[4].members[0].unique && !a7.groups[4].members[1].unique);
     let a8 = Abs::State { groups: a7.groups.insert(4, mixed.with_req(req.with_waker(9))), ..a7 };
@@ -337,10 +352,21 @@ pub proof fn example_mixed_group() {
     let separated = Abs::State {
         groups: taken.groups.remove(5).insert(6, read).insert(7, frozen), next_id: 8, ..taken
     };
+    assert(mixed.members.take(1) =~= read.members);
+    assert(mixed.members.skip(1) =~= frozen.members);
     assert(Abs::State::separate(taken, separated, 5, 1));
     Abs::State::separate_inductive(taken, separated, 5, 1);
     assert(separated.groups[6].members[0].id == 0 && separated.groups[7].members[0].id == 1);
-    assert(separated.program_writes(128) && !separated.program_writes(0));
+    assert(separated.groups.contains_key(6) && separated.groups[6].is_program());
+    assert(separated.groups[6].writes_program(128));
+    assert(separated.program_writes(128));
+    if separated.program_writes(0) {
+        let i = choose|i: Id| separated.groups.contains_key(i)
+            && separated.groups[i].is_program() && separated.groups[i].writes_program(0);
+        assert(i == 2 || i == 6 || i == 7);
+        assert(!separated.groups[i].writes_program(0));
+    }
+    assert(!separated.program_writes(0));
     assert(separated.wakes == seq![9nat]);
 }
 

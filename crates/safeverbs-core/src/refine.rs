@@ -61,13 +61,18 @@ verus! {
 /// per member. A future buffer-token proof must construct this interpretation honestly;
 /// these adapters prove that the ring preserves it rather than assuming a whole worker
 /// refinement. No runtime field, allocation or check is introduced.
+#[verifier::reject_recursive_types(L)]
 pub ghost struct Permissions<L> {
+    /// The operation's required access for each retained resource member.
     pub access: Map<int, Seq<Dir>>,
+    /// The exact ordered member resources represented by a concrete lease value.
     pub resources: spec_fn(L) -> Seq<Lease>,
 }
 
 impl<L> Permissions<L> {
+    /// Whether this request has an assigned per-member access sequence.
     pub open spec fn contains_key(self, s: int) -> bool { self.access.contains_key(s) }
+    /// Assigns member directions without changing the resource interpretation.
     pub open spec fn insert(self, s: int, dirs: Seq<Dir>) -> Self {
         Permissions { access: self.access.insert(s, dirs), resources: self.resources }
     }
@@ -765,7 +770,7 @@ pub open spec fn refused_range<L>(v: View<L>, from: int, to: int, keep: int) -> 
             },
         refused: |t: int|
             if from <= t < to && t != keep && !(v.staged)(t)->0.detached {
-                Some((v.staged)(t)->0.groups)
+                Some((v.staged)(t)->0.leases)
             } else {
                 (v.refused)(t)
             },
@@ -1503,7 +1508,7 @@ pub proof fn lemma_ring_abort<L>(
             #[trigger] post.refused(s) == if pre.staged(s) is Some && s != keep && !pre.staged(
                 s,
             )->0.detached {
-                Some(pre.staged(s)->0.groups)
+                Some(pre.staged(s)->0.leases)
             } else {
                 pre.refused(s)
             },
@@ -2021,8 +2026,17 @@ pub proof fn example_mixed_resources() {
     let dirs = dirs0.insert(0, access);
     let (a1, posted_ids) = lemma_post_one(staged, a0, 7, ids, dirs, 0);
     let posted = posted(staged, 0);
+    assert((staged.staged)(0) is Some);
+    assert((posted.req)(0) is Some);
+    assert(holds(posted, 0));
+    assert(posted_ids.contains_key(0));
     let a2 = lemma_register(posted, a1, 7, posted_ids, dirs, 0, 9);
     let waiting = registered(posted, 0, 9);
+    assert((waiting.req)(0) is Some);
+    assert((waiting.req)(0)->0.phase is InFlight);
+    assert((waiting.req)(0)->0.waker == Some(9));
+    assert(holds(waiting, 0));
+    assert(resources_match(waiting, a2, posted_ids, dirs, 0));
     let r = posted_ids[0];
     assert(a2.in_flight(r) && a2.groups[r].members == mixed.members);
     assert(a2.req(r).waker == Some(9));
@@ -2042,6 +2056,10 @@ pub proof fn example_mixed_resources() {
 
     let detached_state = lemma_detach(waiting, a2, 7, posted_ids, dirs, 0);
     let detached_view = detached(waiting, 0);
+    assert((detached_view.req)(0) is Some);
+    assert((detached_view.req)(0)->0.phase is InFlight);
+    assert(holds(detached_view, 0));
+    assert(resources_match(detached_view, detached_state, posted_ids, dirs, 0));
     assert(detached_state.in_flight(r) && detached_state.groups[r].members == mixed.members);
     lemma_complete_one(detached_view, detached_state, 7, posted_ids, dirs, 0, wc);
     let released = complete_state(detached_state, r, wc.outcome());
