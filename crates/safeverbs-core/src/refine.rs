@@ -1053,6 +1053,10 @@ pub proof fn lemma_detach<L>(
         safeverbs_spec::refinement::lemma_abs_reaches_refl(a);
         assert forall|t: int| #[trigger] (w.req)(t) is Some implies req_wf((w.req)(t)->0) by {}
         assert forall|t: int| #[trigger] (w.staged)(t) is Some implies staged_wf((w.staged)(t)->0) by {}
+        assert forall|t: int| #[trigger] holds(w, t) implies resources_match(w, a, ids, dirs, t) by {
+            assert(holds(v, t));
+            assert(resources_match(v, a, ids, dirs, t));
+        }
         assert forall|t: int| #[trigger] holds(w, t) implies ids.contains_key(t) && dirs.contains_key(t) by {
             assert(holds(v, t));
         }
@@ -1131,6 +1135,10 @@ pub proof fn lemma_register<L>(
         safeverbs_spec::refinement::lemma_abs_reaches_refl(a);
         assert forall|t: int| #[trigger] (w.req)(t) is Some implies req_wf((w.req)(t)->0) by {}
         assert forall|t: int| #[trigger] (w.staged)(t) is Some implies staged_wf((w.staged)(t)->0) by {}
+        assert forall|t: int| #[trigger] holds(w, t) implies resources_match(w, a, ids, dirs, t) by {
+            assert(holds(v, t));
+            assert(resources_match(v, a, ids, dirs, t));
+        }
         assert forall|t: int| #[trigger] holds(w, t) implies ids.contains_key(t) && dirs.contains_key(t) by {
             assert(holds(v, t));
         }
