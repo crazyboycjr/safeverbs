@@ -489,12 +489,7 @@ impl<T, N: Nic> Deref for Buf<T, N> {
         // SAFETY: frozen bytes are only ever read (by Rust and by the NIC's
         // sends) until thawed, which needs every `Buf` gone; they hold valid
         // `T` and the offset stays aligned.
-        unsafe {
-            core::slice::from_raw_parts(
-                self.frozen.raw.ptr().add(self.view.offset()).cast::<T>(),
-                self.len(),
-            )
-        }
+        unsafe { core::slice::from_raw_parts(self.view_ptr().cast::<T>(), self.len()) }
     }
 }
 

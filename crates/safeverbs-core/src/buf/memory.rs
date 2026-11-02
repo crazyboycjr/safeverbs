@@ -80,6 +80,7 @@ impl OwnedRange {
     #[verifier::type_invariant]
     pub(super) open spec fn inv(self) -> bool {
         &&& self.geometry().inv()
+        &&& self.geometry().spec_capacity() <= isize::MAX
         &&& self.spec_len() == self.geometry().spec_len()
         &&& self.base().addr() != 0
         &&& self.base().addr() as int + self.geometry().spec_capacity() <= usize::MAX
@@ -242,6 +243,7 @@ impl<N: Nic> RawMut<N> {
             self.pointer().addr() as int + self.byte_len()),
             self.pointer()@.provenance == self.provenance(),
             self.pointer().addr() as int + self.byte_len() <= usize::MAX,
+            self.byte_len() <= isize::MAX,
     {
         assert(self.range.geometry().byte_set(self.range.base().addr() as int)
             =~= Set::range(self.pointer().addr() as int,
@@ -344,6 +346,11 @@ pub(super) fn allocate(size: usize, align: usize) -> (r: Option<(
         vstd::raw_ptr::deallocate(ptr, size, align, permission, dealloc);
         return None;
     }
+    proof {
+        reveal(vstd::arithmetic::power2::is_pow2);
+        assert(align > 0);
+        assert(size <= isize::MAX);
+    }
     let _geometry = ByteRange::whole(size);
     let tracked permission = BytePermission::from_raw(permission.get(), ptr.addr(), size);
     Some((ptr, OwnedRange {
@@ -385,6 +392,7 @@ impl PermissionPool {
         &&& self.permission@ is Some
         &&& self.base().addr() != 0
         &&& self.base().addr() as int + self.capacity() <= usize::MAX
+        &&& self.capacity() <= isize::MAX
         &&& self.permission@->0.inv()
         &&& self.permission@->0.provenance() == self.base()@.provenance
         &&& self.dom().subset_of(Set::range(self.base().addr() as int,

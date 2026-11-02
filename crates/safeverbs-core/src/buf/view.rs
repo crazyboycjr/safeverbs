@@ -82,6 +82,42 @@ impl<T, N: Nic> Buf<T, N> {
         ensures r == (self.element_len() == 0),
     { self.view.len() == 0 }
 
+    /// Computes the native view pointer with checked bounds and typed alignment.
+    /// This does not create a reference or establish initialized contents.
+    #[inline]
+    pub(super) fn view_ptr(&self) -> (r: *mut u8)
+        ensures
+            r.addr() == self.frozen.pointer().addr() + self.view.spec_offset(),
+            r@.provenance == self.frozen.pointer()@.provenance,
+            r.addr() as nat % vstd::layout::align_of::<T>() == 0,
+            r.addr() as int + self.view.spec_bytes().spec_len()
+                <= self.frozen.pointer().addr() as int + self.frozen.byte_len(),
+            self.view.spec_bytes().spec_len() <= isize::MAX,
+    {
+        vstd::layout::layout_for_type_is_valid::<T>();
+        let ptr = self.frozen.raw.ptr();
+        proof {
+            use_type_invariant(self);
+            self.frozen.lemma_contents();
+            self.frozen.raw.lemma_domain();
+            let offset = self.view.spec_offset() as int;
+            let width = vstd::layout::size_of::<T>() as int;
+            let alignment = vstd::layout::align_of::<T>() as int;
+            vstd::arithmetic::div_mod::lemma_fundamental_div_mod(offset, width);
+            vstd::arithmetic::mul::lemma_mul_is_commutative(width, offset / width);
+            assert(offset == (offset / width) * width);
+            assert(width % alignment == 0);
+            vstd::arithmetic::div_mod::lemma_small_mod(0, alignment as nat);
+            vstd::arithmetic::div_mod::lemma_mul_mod_noop_right(offset / width, width, alignment);
+            assert(((offset / width) * width) % alignment == 0);
+            assert(offset % alignment == 0);
+            assert(ptr.addr() as int % alignment == 0);
+            vstd::arithmetic::div_mod::lemma_mod_adds(ptr.addr() as int, offset, alignment);
+            assert((ptr.addr() as int + offset) % alignment == 0);
+        }
+        ptr.with_addr(ptr.addr() + self.view.offset())
+    }
+
     /// The native clone retains identical geometry and the same frozen contents.
     #[inline]
     pub(super) fn clone_view(&self) -> (r: Self)
