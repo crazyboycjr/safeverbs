@@ -31,6 +31,7 @@
 
 pub mod abs;
 pub mod abs_share;
+pub mod composition;
 pub mod examples;
 pub mod guarantees;
 pub mod nic;
