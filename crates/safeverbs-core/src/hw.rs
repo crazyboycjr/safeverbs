@@ -1433,7 +1433,7 @@ impl<N: Device> Hw<N> {
                     Ok(()) => {
                         let implied = Wc::success(Opcode::RECV, sge.length);
                         let mut leases = no_leases();
-                        keep_lease(&mut leases, part);
+                        keep_lease(&mut leases, part, Ghost(safeverbs_spec::abs::Dir::In));
                         e.recv.end(true, detached, implied, leases);
                         e.recv.commit();
                         Ok(seq)
@@ -2210,11 +2210,24 @@ impl<N: Device> Hw<N> {
                 while e.held_parts.len() > 0
                     invariant
                         e.open_leases == e.open_leases,
+                        e.held_parts@.len() <= e1.held_parts@.len(),
+                        e.held_parts@ == e1.held_parts@.take(e.held_parts@.len() as int),
+                        forall|j: int| 0 <= j < e.held_parts@.len()
+                            ==> opcode_model(h.op).writes_local() ==> part_writable(#[trigger] e.held_parts@[j]),
                     decreases e.held_parts@.len(),
                 {
+                    let ghost previous_parts = e.held_parts@;
                     match e.held_parts.pop() {
-                        Some(part) => keep_lease(&mut e.open_leases, part),
+                        Some(part) => keep_lease(&mut e.open_leases, part, Ghost(send_access(h.op))),
                         None => {},
+                    }
+                    proof {
+                        assert forall|j: int| 0 <= j < e.held_parts@.len()
+                            implies e.held_parts@[j] == e1.held_parts@[j] by {
+                            assert(e.held_parts@[j] == previous_parts[j]);
+                            assert(previous_parts[j] == e1.held_parts@[j]);
+                        }
+                        assert(e.held_parts@ =~= e1.held_parts@.take(e.held_parts@.len() as int));
                     }
                 }
                 let mut leases = no_leases();
@@ -2699,11 +2712,25 @@ impl<N: Device> Hw<N> {
                             lemma_held_wr_ok(h, e3.held_parts@, index as u16, e3.send.spec_wqe_committed() + t3.written(q).len(), m3, m3.qps[q].attr, e3.pd_id@, false);
                         }
                         while e.held_parts.len() > 0
+                            invariant
+                                e.held_parts@.len() <= e3.held_parts@.len(),
+                                e.held_parts@ == e3.held_parts@.take(e.held_parts@.len() as int),
+                                forall|j: int| 0 <= j < e.held_parts@.len()
+                                    ==> opcode_model(h.op).writes_local() ==> part_writable(#[trigger] e.held_parts@[j]),
                             decreases e.held_parts@.len(),
                         {
+                            let ghost previous_parts = e.held_parts@;
                             match e.held_parts.pop() {
-                                Some(part) => keep_lease(&mut e.open_leases, part),
+                                Some(part) => keep_lease(&mut e.open_leases, part, Ghost(send_access(h.op))),
                                 None => {},
+                            }
+                            proof {
+                                assert forall|j: int| 0 <= j < e.held_parts@.len()
+                                    implies e.held_parts@[j] == e3.held_parts@[j] by {
+                                    assert(e.held_parts@[j] == previous_parts[j]);
+                                    assert(previous_parts[j] == e3.held_parts@[j]);
+                                }
+                                assert(e.held_parts@ =~= e3.held_parts@.take(e.held_parts@.len() as int));
                             }
                         }
                     },

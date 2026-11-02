@@ -2,6 +2,7 @@
 //! boundary. Shared deduplication preserves the retained frozen allocation; unique
 //! resources move unchanged into and out of the container.
 
+use safeverbs_spec::abs::Dir;
 use std::sync::Arc;
 use vstd::prelude::*;
 
@@ -57,6 +58,25 @@ impl<N: Nic> Resource<N> {
     pub closed spec fn same_frozen(self, other: Self) -> bool {
         self.resource.same_frozen(other.resource)
     }
+
+    /// One physical keeper backs the same exclusive resource or frozen allocation.
+    pub closed spec fn same_backing(self, other: Self) -> bool {
+        match (self.resource, other.resource) {
+            (Lease::Unique(a), Lease::Unique(b)) => a == b,
+            (Lease::Shared(a), Lease::Shared(b)) => *a == *b,
+            _ => false,
+        }
+    }
+}
+
+/// One logical input, preserved even if its redundant physical Arc is dropped.
+#[verifier::reject_recursive_types(N)]
+#[allow(dead_code)]
+pub ghost struct Loan<N: Nic> {
+    /// The actual input metadata and resource, captured before deduplication.
+    pub part: Part<N>,
+    /// None for a standalone, unposted resource group.
+    pub access: Option<Dir>,
 }
 
 /// The only new primitive here: std Arc's pointer comparison. Equality implies
@@ -115,6 +135,8 @@ impl<N: Nic> Part<N> {
 pub struct Leases<N: Nic = Verbs> {
     first: Option<Lease<N>>,
     rest: Vec<Lease<N>>,
+    #[allow(dead_code)]
+    loans: Ghost<Seq<Loan<N>>>,
 }
 
 impl<N: Nic> Leases<N> {
@@ -128,21 +150,49 @@ impl<N: Nic> Leases<N> {
         self.raw_view().map_values(|lease: Lease<N>| lease.observation())
     }
 
-    /// The inline element is populated before the spill vector.
-    pub closed spec fn inv(self) -> bool {
+    closed spec fn repr_inv(self) -> bool {
         self.first is Some || self.rest@.len() == 0
     }
 
+    /// The actual input parts, including logically distinct shared borrows.
+    pub closed spec fn loans(self) -> Seq<Loan<N>> { self.loans@ }
+
+    /// Every logical input has a retained physical lifetime guard. Incoming local
+    /// writes require exclusive resources; shared deduplication changes neither fact.
+    pub closed spec fn inv(self) -> bool {
+        &&& self.repr_inv()
+        &&& forall|i: int| 0 <= i < self.loans().len() ==> {
+            let loan = #[trigger] self.loans()[i];
+            &&& exists|j: int| 0 <= j < self.view().len()
+                && (#[trigger] self.view()[j]).same_backing(loan.part.resource())
+            &&& loan.access == Some(Dir::In) ==> loan.part.spec_writable()
+        }
+    }
+
+    /// Export the checked backing/permission facts without exposing private fields.
+    pub proof fn lemma_loans(self)
+        requires self.inv(),
+        ensures
+            forall|i: int| 0 <= i < self.loans().len() ==> {
+                let loan = #[trigger] self.loans()[i];
+                &&& exists|j: int| 0 <= j < self.view().len()
+                    && (#[trigger] self.view()[j]).same_backing(loan.part.resource())
+                &&& loan.access == Some(Dir::In) ==> loan.part.spec_writable()
+            },
+    {}
+
     /// An empty resource group, with no allocation.
     pub fn new() -> (r: Self)
-        ensures r.inv(), r.view() == Seq::<Resource<N>>::empty(),
-    { Leases { first: None, rest: Vec::new() } }
+        ensures r.inv(), r.view() == Seq::<Resource<N>>::empty(), r.loans().len() == 0,
+    { Leases { first: None, rest: Vec::new(), loans: Ghost(Seq::empty()) } }
 
     /// Retains an incoming resource or drops only a redundant shared reference.
-    pub(crate) fn push(&mut self, lease: Lease<N>)
+    #[inline]
+    fn push_resource(&mut self, lease: Lease<N>)
         ensures
-            old(self).inv() ==> final(self).inv(),
-            old(self).inv() ==> (
+            final(self).loans() == old(self).loans(),
+            old(self).repr_inv() ==> final(self).repr_inv(),
+            old(self).repr_inv() ==> (
                 final(self).view() == old(self).view().push(lease.observation())
                 || (old(self).view().len() > 0
                     && old(self).view().last().same_frozen(lease.observation())
@@ -162,6 +212,63 @@ impl<N: Nic> Leases<N> {
             self.first = Some(lease);
         } else {
             self.rest.push(lease);
+        }
+    }
+
+    /// An unposted input group has no selected operation yet.
+    #[inline]
+    pub(crate) fn push(&mut self, part: Part<N>)
+        ensures old(self).inv() ==> final(self).inv(),
+            final(self).loans() == old(self).loans().push(Loan { part, access: None }),
+    { self.push_loan(part, Ghost(None)); }
+
+    /// Record the actual operation's access without storing it at runtime.
+    #[inline]
+    pub(crate) fn push_access(&mut self, part: Part<N>, Ghost(access): Ghost<Dir>)
+        requires access is In ==> part.spec_writable(),
+        ensures old(self).inv() ==> final(self).inv(),
+            final(self).loans() == old(self).loans().push(Loan { part, access: Some(access) }),
+    { self.push_loan(part, Ghost(Some(access))); }
+
+    fn push_loan(&mut self, part: Part<N>, Ghost(access): Ghost<Option<Dir>>)
+        requires access == Some(Dir::In) ==> part.spec_writable(),
+        ensures
+            old(self).inv() ==> final(self).inv(),
+            final(self).loans() == old(self).loans().push(Loan { part, access }),
+    {
+        let ghost before = *self;
+        let ghost incoming = part;
+        self.push_resource(part.lease);
+        self.loans = Ghost(before.loans().push(Loan { part: incoming, access }));
+        proof {
+            if before.inv() {
+                assert(self.repr_inv());
+                assert forall|i: int| 0 <= i < self.loans().len() implies {
+                    let loan = #[trigger] self.loans()[i];
+                    &&& exists|j: int| 0 <= j < self.view().len()
+                        && (#[trigger] self.view()[j]).same_backing(loan.part.resource())
+                    &&& loan.access == Some(Dir::In) ==> loan.part.spec_writable()
+                } by {
+                    if i < before.loans().len() {
+                        let loan = before.loans()[i];
+                        let j = choose|j: int| 0 <= j < before.view().len()
+                            && before.view()[j].same_backing(loan.part.resource());
+                        assert(self.view()[j] == before.view()[j]);
+                        assert(self.loans()[i] == loan);
+                    } else {
+                        assert(i == before.loans().len());
+                        if self.view() == before.view().push(incoming.resource()) {
+                            assert(self.view()[before.view().len() as int] == incoming.resource());
+                            assert(incoming.resource().same_backing(incoming.resource()));
+                        } else {
+                            assert(before.view().len() > 0);
+                            assert(self.view() == before.view());
+                            assert(self.view().last().same_frozen(incoming.resource()));
+                            assert(self.view().last().same_backing(incoming.resource()));
+                        }
+                    }
+                }
+            }
         }
     }
 

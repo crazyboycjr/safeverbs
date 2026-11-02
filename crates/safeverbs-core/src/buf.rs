@@ -36,6 +36,8 @@ mod range;
 use range::{ByteRange, ElementRange, checked_sge_len};
 mod lease;
 pub(crate) use lease::Lease;
+#[allow(unused_imports)] // Named only by contracts erased from plain cargo builds.
+pub(crate) use lease::Loan;
 pub use lease::{Leases, Part};
 
 /// Linux's `ENOMEM`.
@@ -712,7 +714,7 @@ impl<N: Nic> Leases<N> {
 impl<N: Nic> From<Part<N>> for Leases<N> {
     fn from(part: Part<N>) -> Leases<N> {
         let mut leases = Leases::default();
-        leases.push(part.lease);
+        leases.push(part);
         leases
     }
 }

@@ -271,6 +271,12 @@ pub open spec fn part_pd<N: Device>(part: Part<N>) -> u64 { part.spec_pd() }
 /// specification.
 pub open spec fn part_writable<N: Device>(part: Part<N>) -> bool { part.spec_writable() }
 
+/// Access to the local bytes, as opposed to the operation's remote effects.
+pub open spec fn send_access(op: WrOp) -> safeverbs_spec::abs::Dir {
+    if opcode_model(op).writes_local() { safeverbs_spec::abs::Dir::In }
+    else { safeverbs_spec::abs::Dir::Out }
+}
+
 // =============================================================================
 // The token
 
@@ -733,24 +739,20 @@ pub fn registered_all<N: Device>(_parts: &Vec<Part<N>>, _pd: &Pd<N>, Tracked(tok
 
 /// No leases (`Leases::default`).
 pub fn no_leases<N: Device>() -> (r: Leases<N>)
-    ensures r.inv(), r.view().len() == 0,
+    ensures r.inv(), r.view().len() == 0, r.loans().len() == 0,
 {
     Leases::new()
 }
 
 /// Keeps a part's lease among `leases` (`Leases::push`).
-pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>)
+pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>, Ghost(access): Ghost<safeverbs_spec::abs::Dir>)
+    requires access is In ==> part_writable(part),
     ensures
         old(leases).inv() ==> final(leases).inv(),
-        old(leases).inv() ==> (
-            final(leases).view() == old(leases).view().push(part.resource())
-            || (old(leases).view().len() > 0
-                && old(leases).view().last().same_frozen(part.resource())
-                && final(leases).view() == old(leases).view())
-        ),
+        final(leases).loans() == old(leases).loans().push(crate::buf::Loan { part, access: Some(access) }),
 {
     proof { part.lemma_fields(); }
-    leases.push(part.lease)
+    leases.push_access(part, Ghost(access))
 }
 
 // =============================================================================
