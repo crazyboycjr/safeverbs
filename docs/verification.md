@@ -152,7 +152,10 @@ slicing. The view has whole-element offsets and stays within the frozen range. C
 thaw returns that whole range on success, including when the handle was a subview, or
 retains the same view on failure. SGE construction uses the actual view geometry.
 The public range-syntax parser and zerocopy/slice-reference wrappers remain outside
-Verus; these geometry facts alone do not establish initialized `T` contents.
+Verus; these geometry facts alone do not establish initialized `T` contents. The actual
+view-pointer computation proves absolute typed alignment, provenance and byte bounds
+within `isize::MAX`. Fallible `Buf::try_into_part` returns an oversize view unchanged;
+the checked successful SGE has exactly that view's bytes and readonly access.
 
 **Actual request resources** (`buf/lease.rs`). `Part` and `Leases` are no longer
 opaque to the verifier. Their actual field observations, empty construction, native
@@ -311,9 +314,10 @@ a token over a fresh share. These are trusted, not proved.
     `registered` and `registered_all`.
   - **Concrete grouped permissions.** The checked actual loan ledger now accounts for
     shared deduplication, operation access and exact SGE/member projection. `Hw` retains
-    that invariant through its rings and returns it with owned results. Fresh member
-    names, arbitrary-byte validity, nonaliasing, A placement and the global request-to-M
-    interval coupling are not yet constructed from buffer tokens.
+that invariant through its rings and returns it with owned results. Actual keepers
+now prove nonaliasing within each request, so projected groups satisfy `Group::wf`
+given distinct names. Fresh global member names, arbitrary-byte validity,
+cross-request compatibility and A placement remain unfinished.
   - **Composition.** Each worker's view is coupled to M under rely, and every worker verb is a
     foreign step for the others (`lemma_mine_is_foreign`). `composition.rs` now proves
     finite interleavings given one coherent legal global history. Constructing that

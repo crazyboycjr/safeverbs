@@ -1,7 +1,8 @@
 //! Actual frozen views, with geometry tied to the retained byte permission.
 //!
 //! These checks concern ownership and layout. Initialized `T` values, the
-//! zerocopy trait contracts and the public slice-reference bridge are separate.+#![allow(unused_imports)]
+//! zerocopy trait contracts and the public slice-reference bridge are separate.
+#![allow(unused_imports)]
 
 use core::marker::PhantomData;
 use std::sync::Arc;
@@ -175,12 +176,29 @@ impl<T, N: Nic> Buf<T, N> {
     /// Builds the SGE only from the checked view and its actual frozen keeper.
     /// The caller supplies registration metadata, not byte geometry.
     #[inline]
-    pub(super) fn part_with_keys(self, lkey: u32, pd: u64) -> (r: Part<N>)
-        requires self.view.spec_bytes().spec_len() <= u32::MAX,
-        ensures r.inv(),
+    pub(super) fn try_part_with_keys(self, lkey: u32, pd: u64) -> (r: Result<Part<N>, Self>)
+        ensures
+            r is Ok <==> self.view.spec_bytes().spec_len() <= u32::MAX,
+            r matches Ok(part) ==> part.inv() && part.byte_domain() == self.byte_domain()
+                && part.spec_pd() == pd && !part.spec_writable(),
+            r matches Err(same) ==> same.inv() && *same.frozen == *self.frozen
+                && same.view == self.view && same.byte_domain() == self.byte_domain(),
     {
-        proof { use_type_invariant(&self); }
-        Part::shared(self.frozen, self.view.offset(), self.view.byte_len(core::mem::size_of::<T>()), lkey, pd)
+        proof {
+            use_type_invariant(&self);
+            self.frozen.lemma_contents();
+            self.frozen.raw.lemma_domain();
+        }
+        let ghost expected = self.byte_domain();
+        let len = self.view.byte_len(core::mem::size_of::<T>());
+        if len > u32::MAX as usize { return Err(self); }
+        let part = Part::shared(self.frozen, self.view.offset(), len, lkey, pd);
+        proof {
+            part.lemma_byte_backing();
+            assert(part.byte_domain().to_iset() =~= expected.to_iset());
+            assert(part.byte_domain() =~= expected);
+        }
+        Ok(part)
     }
 }
 

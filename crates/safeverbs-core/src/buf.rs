@@ -458,9 +458,21 @@ impl<T, N: Nic> Buf<T, N> {
     where
         T: IntoBytes + Immutable,
     {
+        match self.try_into_part() {
+            Ok(part) => part,
+            Err(_) => panic!("a single SGE exceeds u32::MAX bytes"),
+        }
+    }
+
+    /// Lends this frozen view as one SGE, returning it unchanged if its byte
+    /// length exceeds `u32::MAX`. Slice a larger view before lending it.
+    pub fn try_into_part(self) -> Result<Part<N>, Self>
+    where
+        T: IntoBytes + Immutable,
+    {
         let lkey = self.frozen.raw.region.lkey;
         let pd = self.pd_id();
-        self.part_with_keys(lkey, pd)
+        self.try_part_with_keys(lkey, pd)
     }
 
     /// Its bytes.

@@ -41,8 +41,12 @@ relation, not an assumed arbitrary interpretation of `Leases`.
 Checked so far: the actual `RawMut`/`Frozen` carry the allocator's linear byte
 permission through splitting, freeze/thaw and actual SGE construction. Failed MR
 registration returns the whole permission for deallocation. Pool withdrawal/return
-is checked given its preconditions; native `RingBuf` callers, typed validity,
-nonaliasing, exposure and final cleanup remain obligations. See `buf/memory.rs`.
+is checked given its preconditions. Actual frozen views prove bounded whole-element
+clone/slice/thaw geometry and aligned pointer construction within Rust's size limit.
+Request-local nonaliasing follows from the actual byte keepers, and projected groups
+are well formed given distinct member names. Native `RingBuf` callers, typed validity,
+cross-request/global compatibility, exposure and final cleanup remain obligations.
+See `buf/memory.rs`, `buf/view.rs` and `docs/request-nonalias.md`.
 
 Create permissions at the allocator/registration boundary and carry them in real
 buffer objects through unique splitting, freezing, cloning, slicing, thawing, exposure,
@@ -59,6 +63,11 @@ bookkeeping, assume its invariant, or strengthen M merely to complete a proof.
 Construct the worker's A state and request/member-name maps. Couple its requests to
 disjoint WQE intervals, operation-specific memory access and first-error outcomes in M.
 Prove actual state transitions simulate A and M, including error and teardown paths.
+
+Checked so far: each actual local M WQE and staged WR matches a live native request's
+exact opcode/SGEs and retained byte permissions. Refused requests cannot back a reused
+WQE number. The final held WQE retains its parts directly. Whole-worker outcome
+aggregation, abstract request placement and global compatibility remain open.
 
 One coherent device authority/history must support every worker. Conditional trace
 lemmas over disjoint shares do not construct that authority from independent tokens.
