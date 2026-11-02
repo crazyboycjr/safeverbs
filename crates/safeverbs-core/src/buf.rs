@@ -32,6 +32,9 @@ use crate::nic::{Access, Nic, RemoteBuf, Sge};
 use crate::pd::Pd;
 use crate::verbs::Verbs;
 
+mod range;
+use range::{ByteRange, checked_sge_len};
+
 /// Linux's `ENOMEM`.
 const ENOMEM: i32 = 12;
 
@@ -104,20 +107,19 @@ impl<N: Nic> Drop for Region<N> {
 /// Unique access to `len` bytes at `offset` of a region.
 pub(crate) struct RawMut<N: Nic> {
     region: Arc<Region<N>>,
-    offset: usize,
-    len: usize,
+    range: ByteRange,
 }
 
 impl<N: Nic> RawMut<N> {
     fn ptr(&self) -> *mut u8 {
         // SAFETY: `offset <= layout.size()` by construction.
-        unsafe { self.region.ptr.as_ptr().add(self.offset) }
+        unsafe { self.region.ptr.as_ptr().add(self.range.offset()) }
     }
 
     fn sge(&self) -> Sge {
         Sge {
             addr: self.ptr() as u64,
-            length: self.len as u32,
+            length: checked_sge_len(self.range.len()).expect("a single SGE exceeds u32::MAX bytes"),
             lkey: self.region.lkey,
         }
     }
@@ -128,16 +130,14 @@ impl<N: Nic> RawMut<N> {
 
     /// Splits at byte `at` (at most `len`).
     fn split_at(self, at: usize) -> (RawMut<N>, RawMut<N>) {
-        assert!(at <= self.len);
+        let (left, right) = self.range.split_at(at);
         let right = RawMut {
             region: self.region.clone(),
-            offset: self.offset + at,
-            len: self.len - at,
+            range: right,
         };
         let left = RawMut {
             region: self.region,
-            offset: self.offset,
-            len: at,
+            range: left,
         };
         (left, right)
     }
@@ -145,8 +145,8 @@ impl<N: Nic> RawMut<N> {
     /// Whether the bytes can hold `[T]` (aligned, a whole number of `T`).
     fn fits<T>(&self) -> bool {
         size_of::<T>() > 0
-            && self.offset.is_multiple_of(align_of::<T>())
-            && self.len.is_multiple_of(size_of::<T>())
+            && self.range.offset().is_multiple_of(align_of::<T>())
+            && self.range.len().is_multiple_of(size_of::<T>())
     }
 }
 
@@ -170,10 +170,8 @@ pub struct BufMut<T, N: Nic = Verbs> {
 /// as wanted, at once.
 pub struct Buf<T, N: Nic = Verbs> {
     frozen: Arc<Frozen<N>>,
-    /// Bytes from the start of the frozen range.
-    offset: usize,
-    /// Elements.
-    len: usize,
+    /// Bytes relative to the frozen range, with its length as the ghost capacity.
+    view: ByteRange,
     _t: PhantomData<Arc<[T]>>,
 }
 
@@ -181,8 +179,7 @@ impl<T, N: Nic> Clone for Buf<T, N> {
     fn clone(&self) -> Self {
         Buf {
             frozen: self.frozen.clone(),
-            offset: self.offset,
-            len: self.len,
+            view: self.view,
             _t: PhantomData,
         }
     }
@@ -201,8 +198,7 @@ impl<N: Nic> Pd<N> {
         Ok(BufMut {
             raw: RawMut {
                 region,
-                offset: 0,
-                len: bytes,
+                range: ByteRange::whole(bytes),
             },
             _t: PhantomData,
         })
@@ -232,12 +228,12 @@ impl<T, N: Nic> BufMut<T, N> {
 
     /// The number of elements.
     pub fn len(&self) -> usize {
-        self.raw.len / size_of::<T>()
+        self.raw.range.len() / size_of::<T>()
     }
 
     /// Whether it has no elements.
     pub fn is_empty(&self) -> bool {
-        self.raw.len == 0
+        self.raw.range.len() == 0
     }
 
     /// The protection domain it is registered in.
@@ -290,11 +286,10 @@ impl<T, N: Nic> BufMut<T, N> {
     where
         T: Immutable,
     {
-        let len = self.len();
+        let view = ByteRange::whole(self.raw.range.len());
         Buf {
             frozen: Arc::new(Frozen { raw: self.raw }),
-            offset: 0,
-            len,
+            view,
             _t: PhantomData,
         }
     }
@@ -317,7 +312,7 @@ impl<T, N: Nic> BufMut<T, N> {
         let mr = unsafe {
             pd.context()
                 .nic()
-                .reg_mr(pd.raw(), self.raw.ptr(), self.raw.len, access)
+                .reg_mr(pd.raw(), self.raw.ptr(), self.raw.range.len(), access)
         };
         match mr {
             Ok(mr) => Ok(Exposed {
@@ -335,6 +330,11 @@ impl<T, N: Nic> BufMut<T, N> {
     ///
     /// A part may also be used as an outbound source by the synchronous API,
     /// so every byte must be initialized, including after Rust writes a value.
+    ///
+    /// # Panics
+    ///
+    /// If the byte length exceeds `u32::MAX`, the native SGE limit. Split a larger
+    /// buffer before lending it.
     ///
     /// ```compile_fail
     /// use safeverbs_core::BufMut;
@@ -426,12 +426,12 @@ impl<T, N: Nic> Iterator for Chunks<T, N> {
 impl<T, N: Nic> Buf<T, N> {
     /// The number of elements.
     pub fn len(&self) -> usize {
-        self.len
+        self.view.len() / size_of::<T>()
     }
 
     /// Whether it has no elements.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.view.len() == 0
     }
 
     /// The protection domain it is registered in.
@@ -447,23 +447,21 @@ impl<T, N: Nic> Buf<T, N> {
     pub fn slice(&self, range: impl RangeBounds<usize>) -> Buf<T, N> {
         let start = match range.start_bound() {
             Bound::Included(&s) => s,
-            Bound::Excluded(&s) => s + 1,
+            Bound::Excluded(&s) => s.checked_add(1).expect("range start overflow"),
             Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
-            Bound::Included(&e) => e + 1,
+            Bound::Included(&e) => e.checked_add(1).expect("range end overflow"),
             Bound::Excluded(&e) => e,
-            Bound::Unbounded => self.len,
+            Bound::Unbounded => self.len(),
         };
-        assert!(
-            start <= end && end <= self.len,
-            "range {start}..{end} of a buffer of {}",
-            self.len
-        );
+        let view = self
+            .view
+            .slice_elements(start, end, size_of::<T>())
+            .unwrap_or_else(|| panic!("range {start}..{end} of a buffer of {}", self.len()));
         Buf {
             frozen: self.frozen.clone(),
-            offset: self.offset + start * size_of::<T>(),
-            len: end - start,
+            view,
             _t: PhantomData,
         }
     }
@@ -477,18 +475,12 @@ impl<T, N: Nic> Buf<T, N> {
     /// other `Buf` (of any part of it) and no request in flight holds it;
     /// else gives it back unchanged.
     pub fn try_thaw(self) -> Result<BufMut<T, N>, Buf<T, N>> {
-        let Buf {
-            frozen,
-            offset,
-            len,
-            ..
-        } = self;
+        let Buf { frozen, view, .. } = self;
         match Arc::try_unwrap(frozen) {
             Ok(frozen) => Ok(BufMut::from_raw(frozen.raw)),
             Err(frozen) => Err(Buf {
                 frozen,
-                offset,
-                len,
+                view,
                 _t: PhantomData,
             }),
         }
@@ -496,13 +488,18 @@ impl<T, N: Nic> Buf<T, N> {
 
     /// Lends it to the NIC as one scatter/gather element (for sends and
     /// WRITEs from it).
+    ///
+    /// # Panics
+    ///
+    /// If the byte length exceeds `u32::MAX`, the native SGE limit. Slice a larger
+    /// buffer before lending it.
     pub fn into_part(self) -> Part<N>
     where
         T: IntoBytes + Immutable,
     {
         let sge = Sge {
-            addr: self.frozen.raw.ptr() as u64 + self.offset as u64,
-            length: (self.len * size_of::<T>()) as u32,
+            addr: self.frozen.raw.ptr() as u64 + self.view.offset() as u64,
+            length: checked_sge_len(self.view.len()).expect("a single SGE exceeds u32::MAX bytes"),
             lkey: self.frozen.raw.region.lkey,
         };
         Part {
@@ -540,8 +537,8 @@ impl<T, N: Nic> Deref for Buf<T, N> {
         // `T` and the offset stays aligned.
         unsafe {
             core::slice::from_raw_parts(
-                self.frozen.raw.ptr().add(self.offset).cast::<T>(),
-                self.len,
+                self.frozen.raw.ptr().add(self.view.offset()).cast::<T>(),
+                self.len(),
             )
         }
     }
@@ -553,8 +550,8 @@ impl<T, N: Nic> fmt::Debug for Buf<T, N> {
             f,
             "Buf({:p}+{}, {} × {} bytes)",
             self.frozen.raw.ptr(),
-            self.offset,
-            self.len,
+            self.view.offset(),
+            self.len(),
             size_of::<T>()
         )
     }
@@ -577,19 +574,19 @@ impl<T, N: Nic> Exposed<T, N> {
     pub fn remote(&self) -> RemoteBuf {
         RemoteBuf {
             addr: self.raw.ptr() as u64,
-            len: self.raw.len as u64,
+            len: self.raw.range.len() as u64,
             rkey: self.rkey,
         }
     }
 
     /// The number of elements.
     pub fn len(&self) -> usize {
-        self.raw.len / size_of::<T>()
+        self.raw.range.len() / size_of::<T>()
     }
 
     /// Whether it has no elements.
     pub fn is_empty(&self) -> bool {
-        self.raw.len == 0
+        self.raw.range.len() == 0
     }
 
     /// Copies its current contents into `out` (the first `out.len()`
@@ -832,7 +829,7 @@ impl<N: Nic> RingBuf<N> {
         self.reclaim();
         let mut n = 0;
         for c in &self.chunks {
-            n += c.raw.len;
+            n += c.raw.range.len();
         }
         n
     }
@@ -854,8 +851,8 @@ impl<N: Nic> RingBuf<N> {
             return (len <= self.capacity).then_some(0);
         };
         // The ring owns its whole region: offsets are positions in the ring.
-        let tail = front.raw.offset;
-        let head = back.raw.offset + back.raw.len;
+        let tail = front.raw.range.offset();
+        let head = back.raw.range.end();
         // Chunks lie from `tail` to `head`, or wrapped from `tail` to the end
         // and from the start to `head`. A wrapped head never reaches the
         // tail (strict comparisons), so `head >= tail` means not wrapped.
@@ -880,8 +877,7 @@ impl<N: Nic> RingBuf<N> {
         let at = self.place(len)?;
         let mut buf: BufMut<u8, N> = BufMut::from_raw(RawMut {
             region: self.region.clone(),
-            offset: at,
-            len,
+            range: ByteRange::new(at, len, self.capacity).expect("a chunk fits the ring"),
         });
         fill(&mut buf);
         let buf = buf.freeze();

@@ -48,6 +48,45 @@ fn filled(pd: &Pd<Model>, len: usize, seed: u8) -> Buf<u8, Model> {
     buf.freeze()
 }
 
+#[test]
+fn typed_nested_views_keep_exact_bytes() {
+    let pd = Context::new(Model::new(41)).alloc_pd().unwrap();
+    let mut buf = pd.alloc::<u16>(16).unwrap();
+    for (i, value) in buf.iter_mut().enumerate() {
+        *value = i as u16;
+    }
+    let (left, right) = buf.split_at(5);
+    assert_eq!(&left[..], &[0, 1, 2, 3, 4]);
+    let frozen = right.freeze();
+    let view = frozen.slice(2..9).slice(1..4);
+    assert_eq!(&view[..], &[8, 9, 10]);
+    assert_eq!(view.clone().into_part().len(), 6);
+    assert_eq!(frozen.slice(11..11).into_part().len(), 0);
+    let frozen = frozen.try_thaw().unwrap_err();
+    drop(view);
+    assert_eq!(
+        &frozen.try_thaw().unwrap()[..],
+        &[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    );
+}
+
+#[test]
+#[should_panic(expected = "range start overflow")]
+fn frozen_view_rejects_excluded_max_start() {
+    use core::ops::Bound::{Excluded, Unbounded};
+    let pd = Context::new(Model::new(42)).alloc_pd().unwrap();
+    let buf = pd.alloc::<u8>(16).unwrap().freeze();
+    let _ = buf.slice((Excluded(usize::MAX), Unbounded));
+}
+
+#[test]
+#[should_panic(expected = "range end overflow")]
+fn frozen_view_rejects_included_max_end() {
+    let pd = Context::new(Model::new(43)).alloc_pd().unwrap();
+    let buf = pd.alloc::<u8>(16).unwrap().freeze();
+    let _ = buf.slice(..=usize::MAX);
+}
+
 /// Polls a future once with a waker that does nothing.
 fn poll_once<F: Future + Unpin>(f: &mut F) -> Poll<F::Output> {
     let waker = noop_waker();
