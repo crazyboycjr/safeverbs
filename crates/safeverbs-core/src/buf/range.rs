@@ -27,6 +27,67 @@ impl ByteRange {
     pub(super) closed spec fn spec_len(self) -> usize { self.len }
     pub(super) closed spec fn spec_capacity(self) -> usize { self.capacity@ }
 
+    /// The same address range used by A and M, relative to an allocation's base.
+    pub(super) open spec fn span(self, base: int) -> safeverbs_spec::types::Span {
+        safeverbs_spec::types::Span { start: base + self.spec_offset(), len: self.spec_len() as nat }
+    }
+
+    /// A finite byte domain suitable for vstd's raw-pointer permissions.
+    pub(super) open spec fn byte_set(self, base: int) -> Set<int> {
+        Set::range(base + self.spec_offset(), base + self.spec_offset() + self.spec_len())
+    }
+
+    pub(super) proof fn lemma_span_set(self, base: int)
+        ensures self.byte_set(base).to_iset() == self.span(base).bytes(),
+    {
+        assert(self.byte_set(base).to_iset() =~= self.span(base).bytes());
+    }
+
+    /// A frozen view names only bytes in the retained allocation range.
+    pub(super) proof fn lemma_view_bytes(self, view: Self, base: int)
+        requires view.span(base).within(self.span(base)),
+        ensures view.byte_set(base).subset_of(self.byte_set(base)),
+    {
+        assert(view.byte_set(base).subset_of(self.byte_set(base)));
+    }
+
+    /// The exact geometry returned by `split_at` partitions its byte permissions.
+    pub(super) proof fn lemma_split_bytes(self, left: Self, right: Self, base: int)
+        requires
+            left.spec_offset() == self.spec_offset(),
+            left.spec_offset() + left.spec_len() == right.spec_offset(),
+            right.spec_offset() + right.spec_len() == self.spec_offset() + self.spec_len(),
+        ensures
+            left.byte_set(base).disjoint(right.byte_set(base)),
+            left.byte_set(base).subset_of(self.byte_set(base)),
+            left.byte_set(base).union(right.byte_set(base)) == self.byte_set(base),
+            self.byte_set(base).difference(left.byte_set(base)) == right.byte_set(base),
+    {
+        assert(left.byte_set(base).disjoint(right.byte_set(base)));
+        assert(left.byte_set(base).subset_of(self.byte_set(base)));
+        assert(left.byte_set(base).union(right.byte_set(base)) =~= self.byte_set(base));
+        assert(self.byte_set(base).difference(left.byte_set(base)) =~= right.byte_set(base));
+    }
+
+    /// Split an existing linear raw-byte token, preserving its allocation provenance.
+    /// This does not create the initial token or attach tokens to runtime buffers.
+    pub(super) proof fn split_permission(
+        self, left: Self, right: Self, base: int,
+        tracked perm: vstd::raw_ptr::PointsToRaw,
+    ) -> (tracked r: (vstd::raw_ptr::PointsToRaw, vstd::raw_ptr::PointsToRaw))
+        requires
+            perm.dom() == self.byte_set(base),
+            left.spec_offset() == self.spec_offset(),
+            left.spec_offset() + left.spec_len() == right.spec_offset(),
+            right.spec_offset() + right.spec_len() == self.spec_offset() + self.spec_len(),
+        ensures
+            r.0.dom() == left.byte_set(base), r.1.dom() == right.byte_set(base),
+            r.0.provenance() == perm.provenance(), r.1.provenance() == perm.provenance(),
+    {
+        self.lemma_split_bytes(left, right, base);
+        perm.split(left.byte_set(base))
+    }
+
     #[inline]
     pub(super) fn whole(len: usize) -> (r: Self)
         ensures
@@ -96,7 +157,8 @@ impl ByteRange {
             r is Some ==> r->0.inv()
                 && r->0.spec_offset() == self.spec_offset() + start * width
                 && r->0.spec_len() == (end - start) * width
-                && r->0.spec_capacity() == self.spec_capacity(),
+                && r->0.spec_capacity() == self.spec_capacity()
+                && r->0.span(0).within(self.span(0)),
     {
         if width == 0 || start > end || end > self.len / width {
             None
@@ -131,6 +193,9 @@ pub(super) fn checked_sge_len(len: usize) -> (r: Option<u32>)
 }
 
 } // verus!
+
+// Proof metadata must not add a third word to every buffer and retained lease.
+const _: () = assert!(core::mem::size_of::<ByteRange>() == 2 * core::mem::size_of::<usize>());
 
 #[cfg(test)]
 mod tests {
