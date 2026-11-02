@@ -8,18 +8,29 @@ passing another isolated helper is a checkpoint within the work.
 
 - [x] Verify actual `Part` observations, `Leases` construction, physical retention,
   consecutive shared deduplication, and first-unique extraction.
-- [ ] Preserve a ghost record of every input part and its actual operation access.
+- [x] Preserve a ghost record of every input part and its actual operation access.
   Prove that every logical loan is backed by a retained physical resource, even when
   several overlapping source views share one native Arc keeper.
-- [ ] Construct abstract member ranges/rights from those actual parts, with names indexed
-  by request and member position. Identical shared values in different requests must
-  receive distinct logical names without a runtime ID counter.
-- [ ] Relate every posted WQE's SGEs to the recorded loans, carry the relation through
-  the ring, and return the same ledger with its result. Keep staged, committed,
-  refused, completed, detached and side-list states distinct.
-- [ ] Handle failed MR revocation without releasing backing memory or its dependencies;
+- [x] Construct abstract member ranges/rights from those actual parts, with names indexed
+  by request and member position. This supports distinct names for identical shared
+  values without a runtime ID counter; actually creating fresh names is still an
+  allocation/worker-state obligation in milestones 2 and 3.
+- [x] Record actual data-path WQE SGEs and operation access against logical loans,
+  carry complete provenance through both worker rings, and export it with owned results.
+  Preserve the same resource value through staged, committed, refused, completed and
+  detached states; existing side-list adapters preserve that value too. Coupling the
+  entire worker's request intervals and resources to M remains milestone 3.
+- [x] Handle failed MR revocation without releasing backing memory or its dependencies;
   test refusal, retry, final drop and successful cleanup with the simulated NIC.
-- [ ] Check erasure/layout, relevant optimized code, model/rxe regressions and Verus.
+- [x] Check erased ledger layout, model/rxe regressions and Verus. This milestone
+  establishes no whole-path assembly equivalence or native-NIC performance result.
+
+Checked integration: the actual collection loop captures every SGE and its opcode;
+each logical input is covered by a recorded WQE, and every WQE SGE maps to a logical
+input with an actual lifetime keeper. The projected A read/write footprint equals
+the union of recorded WQE footprints with the corresponding role. `Hw::inv` keeps
+the complete ledger across its real rings, and owned returns export that invariant.
+Fresh logical names, byte validity and A placement remain explicit obligations.
 
 The logical members need not correspond one-to-one with physical keepers. A shared
 allocation may back several logical source loans. This requires a checked backing

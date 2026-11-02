@@ -52,7 +52,8 @@ consumers on one worker can consume results a future is waiting for.
 ## 3. Follow the memory separately
 
 Read [`buf.rs`](../crates/safeverbs-core/src/buf.rs), especially `Region`, `RawMut`,
-`BufMut`, `Buf`, `Part` and `Leases`:
+`BufMut`, `Buf` and `Exposed`, then
+[`buf/lease.rs`](../crates/safeverbs-core/src/buf/lease.rs) for `Part` and `Leases`:
 
 - `Region` owns the allocation and its registration; references keep it alive.
 - `BufMut` owns an exclusive byte range. Splitting produces disjoint ranges.
@@ -61,6 +62,17 @@ Read [`buf.rs`](../crates/safeverbs-core/src/buf.rs), especially `Region`, `RawM
 - `Leases` retains a request's resources until they can be returned or released. It
   can deduplicate consecutive references to the same frozen allocation, so the number
   of retained resources need not equal the number of WQEs or SGEs.
+
+`Leases::view` describes physical keepers. Its ghost `loans` and `wqes` describe every
+logical SGE and its operation, even when multiple inputs share one physical Arc. Follow
+`Hw::keep_parts`, `ring_resources_ok`, `take`, then
+[`buf/projection.rs`](../crates/safeverbs-core/src/buf/projection.rs) to see how the
+actual request metadata becomes A's member ranges and access directions. Fresh names
+and byte permissions are still separate obligations.
+
+For remote access, `Exposed::try_reclaim` revokes the remote registration before returning
+typed access. A refused close returns its owner for retry; a failed final cleanup retains
+the allocation and dependency chain.
 
 [`buf/range.rs`](../crates/safeverbs-core/src/buf/range.rs) is the verified executable
 arithmetic these buffers use for splits and frozen views. Read it before the eventual
@@ -100,7 +112,8 @@ Start with [verification.md](verification.md), then:
 6. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the ring-to-A adapters;
    return to `Hw::inv` and [`trusted.rs`](../crates/safeverbs-core/src/trusted.rs)
    for the hardware-facing contracts. `abs_share.rs` and `share.rs` provide the
-   abstract and hardware worker framing rules.
+   abstract and hardware worker framing rules. `composition.rs` lifts coherent finite
+   interleavings; constructing that global authority from actual workers remains open.
 
 The executable test backend
 [`model.rs`](../crates/safeverbs-core/src/model.rs) is different from the formal model

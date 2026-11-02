@@ -87,6 +87,12 @@ These are ghost ownership/frame proofs; they do not construct concrete buffer pe
 tokens or the real worker's simulation. A local thaw's enabledness is not preserved by
 foreign readonly cloning, so the implementation must still test uniqueness.
 
+**Finite interleavings** (`composition.rs`). Given one coherent global history of
+legal events, the checked trace lemmas lift disjoint workers' guarantees into M and A
+runs and each worker's rely/frame relation. M also preserves enabled local verbs. A
+does not promise this for thaw, which a foreign readonly clone can invalidate. These
+lemmas do not create a shared device authority from independent `NicToken`s.
+
 **The refinement theorem's composition** (`refinement.rs`). `theorem_1` proves that for any
 implementation meeting the obligations of the `Refines` trait, along any execution, A's and
 M's invariants hold, every verb met its precondition (S2), and A and M stay coupled.
@@ -130,13 +136,42 @@ invariants.
 **Actual request resources** (`buf/lease.rs`). `Part` and `Leases` are no longer
 opaque to the verifier. Their actual field observations, empty construction, native
 retention/deduplication algorithm, and first-unique-resource extraction are checked.
-`Leases::view` describes the ordered resources it physically retains. `new` establishes
-the inline/spill representation invariant and `push` preserves it: the incoming resource
-is appended or only a redundant reference to the same frozen allocation is dropped.
-Extraction returns the first unique resource from the original sequence. The container's
-length accessor assumes its mathematical resource count fits `usize`.
+`Leases::view` describes physical keepers, while its erased `loans` ledger preserves
+every logical input's actual SGE, domain and operation access. An existential backing
+relation proves each logical input has a retained keeper; several overlapping shared
+inputs may use the same keeper. Incoming local writes require unique resources. `new`
+establishes the invariant and the native `push` algorithm preserves it even when dropping
+a redundant Arc. Extraction returns the first unique resource from the original sequence.
+The container's length accessor assumes its mathematical resource count fits `usize`.
+
+The erased `wqes` ledger records each WQE's actual `wr_id`, opcode, SGEs and disjoint
+interval of logical inputs. The actual collection loop in `Hw` proves the correspondence,
+including its reverse SGE order. Receive and drain paths record their footprints too.
+`fully_recorded` says every logical input belongs to a WQE. `Hw::inv` establishes both
+properties for open resources and all staged, posted, completed or refused ring payloads;
+`take` and an abort returning a kept owner export them. The ring preserves the entire
+resource value, including both ledgers, through completion, refusal, detach and waker
+changes. Layout tests show the ledgers add no native size or alignment.
+
+**Actual member projection** (`buf/projection.rs`). A member's byte set is derived from
+the corresponding actual input SGE, and exclusivity from its actual `Part`. Each projected
+member has a retained guard. With complete provenance, the projected request's local
+read/write footprint is exactly the union of its recorded WQE SGEs with that role.
+SEND/WRITE sources remain distinct from READ destinations and receives. The adapter
+constructs `Permissions<Leases<N>>` for the ring using request/member-indexed names.
+Names and arbitrary-byte validity are supplied separately; it does not establish fresh
+allocation, `Group::wf`, A placement or coupling to M's current request intervals.
 The allocation payload types `RawMut` and `Frozen` remain opaque; this is a resource
 retention result, not yet a byte-ownership or registration-lifetime proof.
+
+**Failed MR revocation (runtime behavior, tested).** `Nic::close_mr` is fallible and
+idempotent. A failed close retains its handle. `Exposed::try_reclaim` returns the still
+exposed owner for retry; successful reclaim alone returns typed access. On failed final
+cleanup, the wrapper retains the registration, backing allocation, PD and device rather
+than freeing memory the NIC can still access. Backend unwinding also retains backing
+resources. The model tests cover refusal/retry, successful release and retained dependency
+chains. These control-path routines remain outside Verus; no unconditional leak-freedom
+claim follows.
 
 **The completion ring** (`ring.rs`). `Ring::new` establishes the eight invariants of the
 module documentation (`Ring::inv`) and every operation requires and keeps them; Verus also
@@ -177,11 +212,13 @@ moved out of a clogged ring is covered as well (`with_side`): moving a result th
 step, taking it is A's `take` with the outcome and leases the ring gave (no step for a
 refused one). This is the ring's share of the obligations of `Refines`.
 
-`Permissions<L>` supplies a ghost interpretation of each concrete resource value as an
-exact ordered member sequence, plus each request's member directions. Placement requires
+`Permissions<L>` supplies a ghost interpretation indexed by request sequence and concrete
+resource value, plus each request's member directions. Equal frozen values in distinct
+requests can therefore have distinct member names without a native ID counter. Placement requires
 that correspondence, and every ring/side-list adapter preserves it. Concrete ghost views
-exercise these contracts with mixed permissions. The adapters do not construct the
-interpretation from real buffers: that remains a buffer-token obligation below.
+exercise these contracts with mixed permissions and repeated equal source values. The
+actual loan projection supplies spans and exclusivity; originating byte permissions and
+fresh identities remains a buffer-token obligation below.
 
 The ring also states its WQE accounting (`spec_wqe_retired`, `spec_wqe_committed`,
 `spec_wqe_posted`, `lemma_wqes`): `push_wqe` hands out the next number, `commit` commits every
@@ -245,22 +282,23 @@ a token over a fresh share. These are trusted, not proved.
     the worker, which only the buffers can supply (next point); and integration with the
     checked A-side frame/transfer rules of `abs_share.rs`.
   - **Buffers.** The wrappers in `buf.rs` remain outside `verus!`; their executable range
-    arithmetic in `buf/range.rs` is verified, but a part's domain and uniqueness, and the
-    registration of its region while its lease lives, are a trusted boundary
-    (`registered`, `registered_all`, the part accessors). Lease memory as linear ghost
+    arithmetic in `buf/range.rs` is verified. Relating a part's advertised domain and
+    exclusivity to actual byte ownership remains unverified; its registration lifetime
+    is trusted through `registered` and `registered_all`. Part accessors and the resource
+    container are now checked, but the allocation payload remains opaque. Lease memory as linear ghost
     permissions (vstd `PointsToRaw` or a token of our own) moving into the NIC's share on
     commit and back on retire would turn S1 into a byte-level fact against M and supply A's
     leases; this is not done.
-  - **Concrete grouped permissions.** A and the ring adapters now support mixed member
-    directions. The remaining step is an honest resource interpretation for `buf::Leases`,
-    which retains resources rather than one member per WQE or SGE: consecutive shared
-    references to the same frozen allocation can be deduplicated. The proof must account
-    for that reference drop, preserve each retained member's identity and permissions,
-    and show every SGE is covered with the access its operation requires.
+  - **Concrete grouped permissions.** The checked actual loan ledger now accounts for
+    shared deduplication, operation access and exact SGE/member projection. `Hw` retains
+    that invariant through its rings and returns it with owned results. Fresh member
+    names, arbitrary-byte validity, nonaliasing, A placement and the global request-to-M
+    interval coupling are not yet constructed from buffer tokens.
   - **Composition.** Each worker's view is coupled to M under rely, and every worker verb is a
-    foreign step for the others (`lemma_mine_is_foreign`); that the interleaving of all
-    threads' steps is a run of M follows, but is argued, not a theorem in Verus (the tokens are
-    not split from one global token: `create_cq` makes each). The control path (allocating
+    foreign step for the others (`lemma_mine_is_foreign`). `composition.rs` now proves
+    finite interleavings given one coherent legal global history. Constructing that
+    authority from real workers remains open: tokens are not split from one global token;
+    `create_cq` makes each. The control path (allocating
     PDs, registering and deregistering regions in `buf.rs` and `pd.rs`) is not verified; rely
     assumes it deregisters no region a worker's written WR names, which leases ensure.
   - **Operation-specific outcomes.** The earlier SEND/WRITE `byte_len` mismatch is
@@ -354,8 +392,8 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 160 verified, 0 errors
-safeverbs-core: verification results:: 237 verified, 0 errors
+safeverbs-spec: verification results:: 173 verified, 0 errors
+safeverbs-core: verification results:: 290 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only
@@ -486,8 +524,10 @@ whenever the unverified worker calls in.
 request hold is the one `end` moved into its slot, and `take` or `abort_keeping` hands back
 that value (`refine.rs`). Its ghost `Permissions<L>` interpretation preserves the exact
 ordered member resources and their access directions through the ring and side list.
-The maps from sequence numbers to A's group handles and the concrete interpretation
-would belong to the QP entries of `Hw`; their construction still waits for buffer tokens.
+`buf/projection.rs` derives spans and exclusivity from the actual logical inputs, and
+the worker retains their complete WQE provenance. The maps from sequence numbers to A's
+group/member names, validity and the originating byte permissions still need the buffer
+integration before those projected groups can be placed in A.
 
 **Memory as linear ghost permissions (not done).** The core would hold vstd's `PointsToRaw`
 permission for every byte of every buffer. A `BufMut` or `Buf` carries the permissions for its
