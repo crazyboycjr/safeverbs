@@ -1026,10 +1026,9 @@ mod mr_tests {
         let pd = model.alloc_pd().unwrap();
         let mut bytes = [0u8; 16];
         // SAFETY: the memory, PD and model outlive the MR; no work is posted.
-        let mut mr = unsafe {
-            model.reg_mr(&pd, bytes.as_mut_ptr(), bytes.len(), Access::LOCAL_WRITE)
-        }
-        .unwrap();
+        let mut mr =
+            unsafe { model.reg_mr(&pd, bytes.as_mut_ptr(), bytes.len(), Access::LOCAL_WRITE) }
+                .unwrap();
         model.refuse_mr_closes(Model::mr_keys(&mr).0, 1);
         assert_eq!(Model::close_mr(&mut mr), Err(Error::Os(EAGAIN)));
         assert_eq!(model.registered(), 1);

@@ -368,6 +368,7 @@ pub unsafe trait Nic: Send + Sync + Sized + 'static {
     /// The memory must stay allocated until the region is successfully closed
     /// or dropped. With remote or local-write access nothing may read it as
     /// Rust values while the NIC may write it.
+    /// On error no registration or access to this memory may be retained.
     unsafe fn reg_mr(
         &self,
         pd: &Self::Pd,

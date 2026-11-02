@@ -100,12 +100,33 @@ impl<N: Nic> Region<N> {
 
 impl<N: Nic> Drop for Region<N> {
     fn drop(&mut self) {
-        // SAFETY: no lease is left (they hold the region), so no work
-        // request uses the memory: deregister, then free.
-        unsafe {
-            ManuallyDrop::drop(&mut self.mr);
-            dealloc(self.ptr.as_ptr(), self.layout);
+        // Keep the PD/device chain alive even if revocation fails or the backend
+        // unwinds. The MR and allocation must then remain alive together.
+        let mut dependency = ManuallyDrop::new(self.pd.clone());
+        if close_registration::<N>(&mut self.mr).is_err() {
+            return;
         }
+        // SAFETY: successful revocation (or the legacy backend's completed MR
+        // destructor) excludes further access through this registration.
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+            ManuallyDrop::drop(&mut dependency);
+        }
+    }
+}
+
+/// Revokes and destroys an MR once. On error the handle remains live for retry.
+/// The caller must retain its backing memory and dependencies during unwinding.
+fn close_registration<N: Nic>(mr: &mut ManuallyDrop<N::Mr>) -> Result<()> {
+    match N::close_mr(mr) {
+        Ok(()) | Err(Error::Unsupported(_)) => {
+            // SAFETY: the caller owns this handle and will not drop it again.
+            // A legacy backend without explicit close must revoke in Drop by
+            // Nic's contract. An explicitly closed handle has idempotent Drop.
+            unsafe { ManuallyDrop::drop(mr) };
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -312,7 +333,7 @@ impl<T, N: Nic> BufMut<T, N> {
             | Access::REMOTE_ATOMIC;
         let pd = self.raw.pd().clone();
         // SAFETY: the region stays allocated while `Exposed` holds it; the
-        // region is deregistered before `raw` lets go of it (field order),
+        // remote registration is revoked before `raw` lets go of it,
         // and `Exposed` never gives out the bytes as Rust values.
         let mr = unsafe {
             pd.context()
@@ -322,8 +343,8 @@ impl<T, N: Nic> BufMut<T, N> {
         match mr {
             Ok(mr) => Ok(Exposed {
                 rkey: N::mr_keys(&mr).1,
-                mr,
-                raw: self.raw,
+                mr: ManuallyDrop::new(mr),
+                raw: ManuallyDrop::new(self.raw),
                 _t: PhantomData,
             }),
             Err(error) => Err(BufError { error, buf: self }),
@@ -568,9 +589,9 @@ impl<T, N: Nic> fmt::Debug for Buf<T, N> {
 /// only after [`Exposed::reclaim`] revokes the peers' access. The unsafe
 /// [`Exposed::copy_to_slice`] escape hatch requires caller-established quiescence.
 pub struct Exposed<T, N: Nic = Verbs> {
-    /// The remote-access registration; dropped (deregistered) before `raw`.
-    mr: N::Mr,
-    raw: RawMut<N>,
+    /// Kept together with `raw` if revocation fails.
+    mr: ManuallyDrop<N::Mr>,
+    raw: ManuallyDrop<RawMut<N>>,
     rkey: u32,
     _t: PhantomData<T>,
 }
@@ -636,12 +657,45 @@ impl<T, N: Nic> Exposed<T, N> {
         }
     }
 
-    /// Revokes the peers' access (deregisters the remote registration, which
-    /// invalidates the remote key) and gives the buffer back.
+    /// Revokes the peers' access and gives the buffer back. A refused revocation
+    /// returns the exposed owner, whose registration remains live, for retry.
+    pub fn try_reclaim(self) -> Result<BufMut<T, N>, BufError<Self>> {
+        // A backend panic must also retain the allocation and registration.
+        let mut this = ManuallyDrop::new(self);
+        if let Err(error) = close_registration::<N>(&mut this.mr) {
+            return Err(BufError {
+                error,
+                buf: ManuallyDrop::into_inner(this),
+            });
+        }
+        // SAFETY: the registration was revoked and its handle destroyed above;
+        // `this` will not drop, and this is the only extraction of its raw owner.
+        let raw = unsafe { ManuallyDrop::take(&mut this.raw) };
+        Ok(BufMut::from_raw(raw))
+    }
+
+    /// Revokes the peers' access (invalidating the remote key) and gives the
+    /// buffer back. Use [`Self::try_reclaim`] to retain the owner on failure.
+    ///
+    /// # Panics
+    ///
+    /// If the backend refuses revocation. Its backing resources are retained
+    /// whenever a subsequent cleanup attempt also fails.
     pub fn reclaim(self) -> BufMut<T, N> {
-        let Exposed { mr, raw, .. } = self;
-        drop(mr);
-        BufMut::from_raw(raw)
+        match self.try_reclaim() {
+            Ok(buf) => buf,
+            Err(error) => panic!("cannot reclaim exposed memory: {}", error.error),
+        }
+    }
+}
+
+impl<T, N: Nic> Drop for Exposed<T, N> {
+    fn drop(&mut self) {
+        if close_registration::<N>(&mut self.mr).is_ok() {
+            // SAFETY: remote access has been revoked; the raw owner is dropped
+            // exactly once. On failure both ManuallyDrop fields stay retained.
+            unsafe { ManuallyDrop::drop(&mut self.raw) };
+        }
     }
 }
 
@@ -655,7 +709,8 @@ impl<T, N: Nic> fmt::Debug for Exposed<T, N> {
 pub struct BufError<B> {
     /// What went wrong.
     pub error: Error,
-    /// The buffer, no longer used by the NIC.
+    /// The owner returned on failure. It retains the operation's access state;
+    /// for example, failed revocation returns a still-exposed buffer.
     pub buf: B,
 }
 
@@ -812,5 +867,65 @@ impl<N: Nic> RingBuf<N> {
     /// the ring has no room for it.
     pub fn push(&mut self, message: &[u8]) -> Option<Buf<u8, N>> {
         self.write_with(message.len(), |b| b.copy_from_slice(message))
+    }
+}
+
+#[cfg(test)]
+mod revocation_tests {
+    use super::*;
+    use crate::model::Model;
+    use crate::pd::Context;
+
+    #[test]
+    fn refused_reclaim_returns_the_live_exposed_owner_for_retry() {
+        let model = Model::new(51);
+        let ctx = Context::new(model.clone());
+        let pd = ctx.alloc_pd().unwrap();
+        let mut buf = pd.alloc::<u8>(16).unwrap();
+        buf.copy_from_slice(b"reclaim on retry");
+        let exposed = buf.expose().unwrap();
+        let remote = exposed.remote();
+        let key = Model::mr_keys(&exposed.mr).0;
+        model.refuse_mr_closes(key, 2);
+        let mut owner = exposed;
+        for _ in 0..2 {
+            let failed = owner.try_reclaim().unwrap_err();
+            assert_eq!(failed.error, Error::Os(11));
+            owner = failed.buf;
+            assert_eq!(owner.remote(), remote);
+            assert_eq!(model.registered(), 2);
+        }
+        let buf = owner.try_reclaim().unwrap();
+        assert_eq!(&*buf, b"reclaim on retry");
+        assert_eq!(model.registered(), 1);
+        drop(buf);
+        assert_eq!(model.registered(), 0);
+    }
+
+    #[test]
+    fn failed_exposed_drop_retains_backing_and_both_registrations() {
+        let model = Model::new(52);
+        let ctx = Context::new(model.clone());
+        let pd = ctx.alloc_pd().unwrap();
+        let exposed = pd.alloc::<u8>(16).unwrap().expose().unwrap();
+        let backing = Arc::downgrade(&exposed.raw.region);
+        model.refuse_mr_closes(Model::mr_keys(&exposed.mr).0, 1);
+        drop(exposed);
+        assert_eq!(model.registered(), 2);
+        assert!(backing.upgrade().is_some());
+        // This tiny intentional leak models the required retention when revocation
+        // cannot be established; freeing it would violate the NIC's live access.
+    }
+
+    #[test]
+    fn successful_exposed_drop_releases_both_registrations() {
+        let model = Model::new(53);
+        let ctx = Context::new(model.clone());
+        let pd = ctx.alloc_pd().unwrap();
+        let exposed = pd.alloc::<u8>(16).unwrap().expose().unwrap();
+        let backing = Arc::downgrade(&exposed.raw.region);
+        drop(exposed);
+        assert_eq!(model.registered(), 0);
+        assert!(backing.upgrade().is_none());
     }
 }

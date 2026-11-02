@@ -130,3 +130,41 @@ impl<N: Nic> Pd<N> {
         self.inner.id
     }
 }
+
+#[cfg(test)]
+mod revocation_tests {
+    use super::*;
+    use crate::model::Model;
+
+    #[test]
+    fn failed_base_revocation_keeps_the_pd_and_device_alive() {
+        let model = Model::new(54);
+        let ctx = Context::new(model.clone());
+        let pd = ctx.alloc_pd().unwrap();
+        let pd_lifetime = Arc::downgrade(&pd.inner);
+        let device_lifetime = Arc::downgrade(&ctx.nic);
+        let part = pd.alloc::<u8>(16).unwrap().into_part();
+        model.refuse_mr_closes(part.sge.lkey, 1);
+        drop(part);
+        drop(pd);
+        drop(ctx);
+        assert_eq!(model.registered(), 1);
+        assert!(pd_lifetime.upgrade().is_some());
+        assert!(device_lifetime.upgrade().is_some());
+    }
+
+    #[test]
+    fn successful_base_revocation_releases_the_dependency_chain() {
+        let model = Model::new(55);
+        let ctx = Context::new(model.clone());
+        let pd = ctx.alloc_pd().unwrap();
+        let pd_lifetime = Arc::downgrade(&pd.inner);
+        let device_lifetime = Arc::downgrade(&ctx.nic);
+        drop(pd.alloc::<u8>(16).unwrap());
+        drop(pd);
+        drop(ctx);
+        assert_eq!(model.registered(), 0);
+        assert!(pd_lifetime.upgrade().is_none());
+        assert!(device_lifetime.upgrade().is_none());
+    }
+}
