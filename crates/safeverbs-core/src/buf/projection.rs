@@ -24,6 +24,24 @@ pub open spec fn loan_span<N: Nic>(loan: Loan<N>) -> Span {
     Span { start: sge.addr as int, len: sge.length as nat }
 }
 
+/// The logical input for SGE `j`, following the actual reverse-order pop loop.
+/// The bounds and correspondence are established by `lemma_wqe_member`.
+pub open spec fn wqe_loan_index(wqe: WqeLoans, j: int) -> int {
+    wqe.end() - 1 - j
+}
+
+/// Exactly the recorded SGE's byte geometry, independent of registration.
+pub open spec fn wqe_span(wqe: WqeLoans, j: int) -> Span {
+    let sge = wqe.sges[j];
+    Span { start: sge.addr as int, len: sge.length as nat }
+}
+
+/// A byte in any recorded SGE of this WQE. An empty SGE list covers no bytes.
+pub open spec fn wqe_contains(wqe: WqeLoans, addr: int) -> bool {
+    exists|j: int| 0 <= j < wqe.sges.len()
+        && #[trigger] wqe_span(wqe, j).contains(addr)
+}
+
 /// Every logical input has the supplied operation access. Unposted inputs with
 /// `None` cannot satisfy this predicate, except for an empty group.
 pub open spec fn access_matches<N: Nic>(leases: Leases<N>, dirs: Seq<Dir>) -> bool {
@@ -141,6 +159,79 @@ impl Projection {
         }
     }
 
+    /// Each actual WQE SGE names the exact reverse-indexed loan and member,
+    /// with the operation's required access and an actual physical guard.
+    /// Incoming writes are exclusive; guard indices need not be distinct.
+    pub proof fn lemma_wqe_member<N: Nic>(self, s: int, leases: Leases<N>, w: int, j: int)
+        requires
+            leases.inv(), 0 <= w < leases.wqes().len(),
+            0 <= j < leases.wqes()[w].sges.len(),
+        ensures {
+            let wqe = leases.wqes()[w];
+            let i = wqe_loan_index(wqe, j);
+            &&& wqe.first <= i < wqe.end()
+            &&& 0 <= i < leases.loans().len()
+            &&& i < self.members(s, leases).len()
+            &&& leases.loans()[i].part.spec_sge() == wqe.sges[j]
+            &&& loan_span(leases.loans()[i]) == wqe_span(wqe, j)
+            &&& leases.loans()[i].access == Some(wqe.access())
+            &&& self.members(s, leases)[i].mem == wqe_span(wqe, j).bytes()
+            &&& self.members(s, leases)[i].unique == leases.loans()[i].part.spec_writable()
+            &&& wqe.access() is In ==> self.members(s, leases)[i].unique
+            &&& exists|g: int| 0 <= g < leases.view().len()
+                && (#[trigger] leases.view()[g]).same_backing(leases.loans()[i].part.resource())
+        },
+    {
+        leases.lemma_wqes();
+        self.lemma_members(s, leases);
+        self.lemma_backing(s, leases);
+        let wqe = leases.wqes()[w];
+        let i = wqe_loan_index(wqe, j);
+        assert(wqe.matches(leases.loans()));
+        assert(wqe.first <= i < wqe.end());
+        assert(0 <= i < leases.loans().len());
+        assert(leases.loans()[i].part.spec_sge() == wqe.sges[j]);
+        assert(leases.loans()[i].access == Some(wqe.access()));
+        assert(loan_span(leases.loans()[i]) == wqe_span(wqe, j));
+        assert(self.members(s, leases)[i].mem == loan_span(leases.loans()[i]).bytes());
+        assert(self.members(s, leases)[i].unique == leases.loans()[i].part.spec_writable());
+        if wqe.access() is In {
+            assert(leases.loans()[i].access == Some(Dir::In));
+            assert(self.members(s, leases)[i].unique);
+        }
+        let g = choose|g: int| 0 <= g < leases.view().len()
+            && leases.view()[g].same_backing(leases.loans()[i].part.resource());
+    }
+
+    /// Every byte in a recorded WQE's SGEs is covered by the projected request
+    /// with the recorded operation's role: receives and local destinations permit
+    /// writes, while send/write sources permit reads. Extra loans are permitted.
+    /// This is a request-local ledger result, not coupling to M's current queues.
+    pub proof fn lemma_wqe_access<N: Nic>(self, s: int, leases: Leases<N>, req: Req, w: int, addr: int)
+        requires
+            leases.inv(), access_matches(leases, req.dirs), req.phase is InFlight,
+            0 <= w < leases.wqes().len(), wqe_contains(leases.wqes()[w], addr),
+        ensures
+            leases.wqes()[w].access() is Out
+                ==> self.group(s, leases).with_req(req).nic_may_read(addr),
+            leases.wqes()[w].access() is In
+                ==> self.group(s, leases).with_req(req).nic_may_write(addr),
+    {
+        let wqe = leases.wqes()[w];
+        let j = choose|j: int| 0 <= j < wqe.sges.len()
+            && wqe_span(wqe, j).contains(addr);
+        self.lemma_wqe_member(s, leases, w, j);
+        let i = wqe_loan_index(wqe, j);
+        assert(loan_span(leases.loans()[i]).contains(addr));
+        assert(leases.loans()[i].access == Some(wqe.access()));
+        assert(req.dirs[i] == wqe.access());
+        self.lemma_operation_access(s, leases, req, addr);
+        match wqe.access() {
+            Dir::Out => { assert(loan_accesses(leases, Dir::Out, addr)); },
+            Dir::In => { assert(loan_accesses(leases, Dir::In, addr)); },
+        }
+    }
+
     /// The actual operation's access is allowed once arbitrary-byte validity is
     /// supplied. Exclusivity is derived from `Leases`, not assumed for the group.
     pub proof fn lemma_allows<N: Nic>(self, s: int, leases: Leases<N>, dirs: Seq<Dir>)
@@ -174,8 +265,8 @@ impl Projection {
     }
 
     /// Projected NIC access is exactly the bytes of loans carrying that access.
-    /// This does not prove that a concrete WQE uses those same loans; the WQE
-    /// provenance ledger must establish that separate correspondence.
+    /// This lemma uses loan access alone; `lemma_wqe_access` additionally uses
+    /// the recorded WQE-to-loan correspondence to cover its SGE spans.
     pub proof fn lemma_operation_access<N: Nic>(self, s: int, leases: Leases<N>, req: Req, addr: int)
         requires leases.inv(), access_matches(leases, req.dirs), req.phase is InFlight,
         ensures
