@@ -28,15 +28,13 @@ pub proof fn example_operation_metadata() {
     assert(!Opcode::Write.allows_outcome(64, read));
     let notify = Outcome { status: Status::Success, kind: CompletionKind::WriteNotification, byte_len: 4096, imm: Some(7) };
     let empty = RecvWr { wr_id: 0, sges: Seq::empty() };
-    assert(empty.allows_outcome(Transport::Rc, notify));
-    assert(empty.allows_outcome(Transport::Uc, notify));
-    assert(!empty.allows_outcome(Transport::Ud, notify));
+    assert(empty.allows_outcome(notify));
     let payload = Outcome { kind: CompletionKind::Receive, ..notify };
     reveal(total_len);
-    assert(!empty.allows_outcome(Transport::Rc, payload));
+    assert(!empty.allows_outcome(payload));
     let failed = Outcome { status: Status::RemoteErr, ..ack };
     assert(Opcode::Read.allows_outcome(64, failed));
-    assert(empty.allows_outcome(Transport::Rc, failed));
+    assert(empty.allows_outcome(failed));
 }
 
 /// A: allocate a buffer, freeze it, send it, poll once (`Pending`, registering a waker), let

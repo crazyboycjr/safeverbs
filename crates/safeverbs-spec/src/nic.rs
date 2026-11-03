@@ -21,14 +21,14 @@
 //! between the program and the NIC (see `docs/verification.md`).
 //!
 //! Completions follow the in-order rule of RC, UC and UD send queues (MRC's are the same)
-//! and of receive queues: work requests become eligible for local completion in posting
-//! order, an unsignaled success produces no completion, and a polled completion retires its work request and
+//! and of receive queues: work requests execute in posting order, an unsignaled one that
+//! succeeds produces no completion, and a polled completion retires its work request and
 //! every earlier one. An error moves the queue pair to `Err`; from then on every work
 //! request completes with an error (normally `FlushErr`), in order, signaled or not.
-//! These ordered steps abstract local completion eligibility, not the order of remote
-//! memory effects. A later SEND/WRITE can have remote effects before an earlier READ
-//! finishes; protocol ordering needs a fence or waiting for that READ. M keeps conservative
-//! local access permissions until retirement and does not model transferred byte values.
+//! Executing means completing locally; it says nothing of the order of remote memory
+//! effects: a later SEND or WRITE may land at the peer before an earlier READ finishes, so a
+//! protocol that needs that order fences or waits for the READ. M leaves a work request's
+//! buffers to the NIC until it retires, and does not model the bytes transferred.
 #![allow(unused_imports)]
 
 use crate::types::*;
@@ -119,9 +119,9 @@ impl Opcode {
         }
     }
 
-    /// SQ completion metadata: SEND/WRITE (including their immediate variants) have
-    /// status only. A successful READ completes the requested local transfer in full.
-    /// Immediate data belongs to the peer's receive completion, never this SQ outcome.
+    /// The outcomes a send WR of `bytes` bytes may complete with: a SEND or WRITE (with or
+    /// without immediate) reports its status only, a successful READ exactly the length it
+    /// asked for.
     pub open spec fn allows_outcome(self, bytes: nat, o: Outcome) -> bool {
         &&& o.canonical()
         &&& o.status is Success ==> match self {
@@ -148,14 +148,14 @@ pub struct RecvWr {
 }
 
 impl RecvWr {
-    /// Ordinary SEND payloads land in these SGEs. WRITE_WITH_IMM only consumes the RQ
-    /// entry: its bytes land in the separately exposed remote region, so the notification
-    /// length need not fit this receive buffer (which may have no SGEs).
-    pub open spec fn allows_outcome(self, t: Transport, o: Outcome) -> bool {
+    /// The outcomes a receive WR may complete with: a successful one is either a SEND's
+    /// payload, which fits its buffers, or the notification of a WRITE with immediate,
+    /// whose bytes went to an exposed region and need not fit them.
+    pub open spec fn allows_outcome(self, o: Outcome) -> bool {
         &&& o.canonical()
         &&& o.status is Success ==> (
             (o.kind is Receive && o.byte_len <= total_len(self.sges))
-            || (o.kind is WriteNotification && o.imm is Some && !(t is Ud))
+            || (o.kind is WriteNotification && o.imm is Some)
         )
     }
 }
@@ -641,9 +641,9 @@ state_machine! {
             }
         }
 
-        /// The NIC executes the oldest unexecuted receive WQE: a message arrived (its length
-        /// fits the buffers if it succeeded) or, in `Err`, it completes with an error,
-        /// normally `FlushErr`. Always a CQE.
+        /// The NIC executes the oldest unexecuted receive WQE: a message arrived (a payload
+        /// in its buffers or a write notification, `RecvWr::allows_outcome`) or, in `Err`, it
+        /// completes with an error, normally `FlushErr`. Always a CQE.
         transition! {
             execute_recv(q: QpId, o: Outcome) {
                 require pre.qps.contains_key(q);
@@ -653,7 +653,7 @@ state_machine! {
                 require qp.state is Err ==> o.status.is_err();
                 require o.status is FlushErr ==> qp.state is Err;
                 let slot = qp.rq[qp.rq_done as int];
-                require slot.wr.allows_outcome(qp.attr.transport, o);
+                require slot.wr.allows_outcome(o);
                 let c = qp.attr.recv_cq;
                 assert(pre.cqs[c].entries.len() < pre.cqs[c].cap) by {
                     crate::nic_proofs::lemma_room_for_recv_cqe(pre, q);

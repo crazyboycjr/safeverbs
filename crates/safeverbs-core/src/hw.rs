@@ -660,7 +660,7 @@ spec fn queued_outcomes_ok(m: Nic::State, q: QpId) -> bool {
         &&& forall|k: int| 0 <= k < qp.sq.len() && (#[trigger] qp.sq[k]).outcome is Some
             ==> qp.sq[k].wr.opcode.allows_outcome(total_len(qp.sq[k].wr.sges), qp.sq[k].outcome->0)
         &&& forall|k: int| 0 <= k < qp.rq.len() && (#[trigger] qp.rq[k]).outcome is Some
-            ==> qp.rq[k].wr.allows_outcome(qp.attr.transport, qp.rq[k].outcome->0)
+            ==> qp.rq[k].wr.allows_outcome(qp.rq[k].outcome->0)
     }
 }
 
@@ -703,7 +703,7 @@ proof fn lemma_queued_outcomes_step(m: Nic::State, n: Nic::State, step: Nic::Ste
             }
         }
         assert forall|k: int| 0 <= k < b.rq.len() && (#[trigger] b.rq[k]).outcome is Some
-            implies b.rq[k].wr.allows_outcome(b.attr.transport, b.rq[k].outcome->0) by {
+            implies b.rq[k].wr.allows_outcome(b.rq[k].outcome->0) by {
             match step {
                 Nic::Step::create_qp(p, _) => {},
                 Nic::Step::execute_recv(p, o) => {

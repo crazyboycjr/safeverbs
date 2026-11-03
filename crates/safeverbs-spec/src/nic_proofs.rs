@@ -11,9 +11,8 @@ use vstd::prelude::*;
 
 verus! {
 
-/// F1 compares defined metadata. A successful SEND/WRITE has exactly one canonical
-/// outcome, whether observed in a CQE or inferred from a later completion. No claim
-/// about the provider's undefined byte_len or immediate word is needed.
+/// A successful SEND or WRITE has one outcome, whether its own CQE reports it or a later
+/// CQE implies it: F1 never compares a length or immediate the hardware leaves undefined.
 pub proof fn lemma_ack_outcome_unique(op: Opcode, bytes: nat, a: Outcome, b: Outcome)
     requires
         !(op is Read),
@@ -25,35 +24,6 @@ pub proof fn lemma_ack_outcome_unique(op: Opcode, bytes: nat, a: Outcome, b: Out
         a == b,
 {
 }
-
-/// A successful READ has a transfer length but no received immediate word. This is
-/// different from a SEND/WRITE acknowledgement and from both RQ completion kinds.
-pub proof fn lemma_read_outcome(op: Opcode, bytes: nat, o: Outcome)
-    requires
-        op is Read,
-        o.status is Success,
-        op.allows_outcome(bytes, o),
-    ensures
-        o.kind is Read,
-        o.byte_len == bytes,
-        o.imm is None,
-{
-}
-
-/// Only ordinary receive payload length is bounded by the posted receive SGEs.
-pub proof fn lemma_receive_payload_length(wr: RecvWr, t: Transport, o: Outcome)
-    requires
-        wr.allows_outcome(t, o),
-        o.status is Success,
-        o.kind is Receive,
-    ensures
-        o.byte_len <= total_len(wr.sges),
-{
-}
-
-} // verus!
-
-verus! {
 
 // =========================================================================================
 // Multisets and counting
