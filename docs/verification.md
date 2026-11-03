@@ -158,19 +158,6 @@ properties for open resources and all staged, posted, completed or refused ring 
 resource value, including both ledgers, through completion, refusal, detach and waker
 changes. Layout tests show the ledgers add no native size or alignment.
 
-**Actual member projection** (`buf/projection.rs`). A member's byte set is derived from
-the corresponding actual input SGE, and exclusivity from its actual `Part`. Each projected
-member has a retained guard. With complete provenance, the projected request's local
-read/write footprint is exactly the union of its recorded WQE SGEs with that role.
-SEND/WRITE sources remain distinct from READ destinations and receives. The adapter
-constructs `Permissions<Leases<N>>` for the ring using request/member-indexed names.
-Names and arbitrary-byte validity are supplied separately; it does not establish fresh
-allocation, `Group::wf`, A placement or coupling to M's current request intervals.
-The actual payload types `RawMut` and `Frozen` now carry byte permissions, and
-request-local disjointness gives `Group::wf` under distinct names. Fresh global A
-identities, typed validity and global compatibility remain obligations. Registration
-lifetime is a separate obligation.
-
 **Actual receive admission** (`hw/separation.rs`, `ring/separation.rs`). The real
 `post_recv` proves its unique input separated from every prior local keeper, including
 open, held and building parts and completed/refused ring owners. Success retains the
@@ -255,9 +242,8 @@ refused one). This is the ring's share of the obligations of `Refines`.
 resource value, plus each request's member directions. Equal frozen values in distinct
 requests can therefore have distinct member names without a native ID counter. Placement requires
 that correspondence, and every ring/side-list adapter preserves it. Concrete ghost views
-exercise these contracts with mixed permissions and repeated equal source values. The
-actual loan projection supplies spans and exclusivity; originating byte permissions and
-fresh identities remains a buffer-token obligation below.
+exercise these contracts with mixed permissions and repeated equal source values. Mapping
+the worker's leases onto A's groups (spans, exclusivity, fresh names) is still open.
 
 The ring also states its WQE accounting (`spec_wqe_retired`, `spec_wqe_committed`,
 `spec_wqe_posted`, `lemma_wqes`): `push_wqe` hands out the next number, `commit` commits every
@@ -325,12 +311,11 @@ a token over a fresh share. These are trusted, not proved.
     zerocopy contracts, native streaming-pool callers, exposure/revocation and final
     cleanup remain unfinished; registration lifetime is still trusted through
     `registered` and `registered_all`.
-  - **Concrete grouped permissions.** The checked actual loan ledger now accounts for
-    shared deduplication, operation access and exact SGE/member projection. `Hw` retains
-    that invariant through its rings and returns it with owned results. Actual keepers
-    now prove nonaliasing within each request, so projected groups satisfy `Group::wf`
-    given distinct names. Fresh global member names, arbitrary-byte validity,
-    cross-request compatibility and A placement remain unfinished.
+  - **Concrete grouped permissions.** The checked loan ledger accounts for shared
+    deduplication, operation access and each WQE's SGEs. `Hw` retains that invariant
+    through its rings and returns it with owned results, and the keepers prove nonaliasing
+    within each request. Mapping requests onto A's groups (fresh names, arbitrary-byte
+    validity, cross-request compatibility, placement) remains unfinished.
   - **Composition.** Each worker's view is coupled to M under rely, and every worker verb is a
     foreign step for the others (`lemma_mine_is_foreign`). How several workers compose
     into one device history is open: tokens are not split from one global token;
@@ -565,11 +550,10 @@ whenever the unverified worker calls in.
 **Leases.** The ring tracks each request's leases as the value itself: the `L` A sees a
 request hold is the one `end` moved into its slot, and `take` or `abort_keeping` hands back
 that value (`refine.rs`). Its ghost `Permissions<L>` interpretation preserves the exact
-ordered member resources and their access directions through the ring and side list.
-`buf/projection.rs` derives spans and exclusivity from the actual logical inputs, and
-the worker retains their complete WQE provenance. The maps from sequence numbers to A's
-group/member names, typed validity and global byte compatibility still need the buffer
-and worker integration before those projected groups can be placed in A.
+ordered members and their access directions through the ring and side list, and the
+worker retains each request's complete WQE provenance. The maps from sequence numbers to
+A's groups, typed validity and global byte compatibility still need the buffer and worker
+integration before requests can be placed in A.
 
 **Memory as linear ghost permissions (partly integrated).** The real buffer payloads
 carry the fallible allocator's byte permissions through `OwnedRange`, `RawMut`, frozen

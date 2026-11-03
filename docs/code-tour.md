@@ -68,11 +68,8 @@ views. Continue with
 
 `Leases::view` describes physical keepers. Its ghost `loans` and `wqes` describe every
 logical SGE and its operation, even when multiple inputs share one physical Arc. Follow
-`keep_parts` in `hw.rs`, then `ring_resources_ok`, `take` and
-[`buf/projection.rs`](../crates/safeverbs-core/src/buf/projection.rs) to see how the
-actual request metadata becomes A's member ranges and access directions. Fresh names
-and typed validity are still separate obligations. The real buffers now carry linear
-byte permissions, but global compatibility and A placement remain unfinished.
+`keep_parts` in `hw.rs`, then `ring_resources_ok` and `take` to see how a request's
+metadata travels through the rings with it.
 
 For remote access, `Exposed::try_reclaim` revokes the remote registration before returning
 typed access. A refused close returns its owner for retry; a failed final cleanup retains

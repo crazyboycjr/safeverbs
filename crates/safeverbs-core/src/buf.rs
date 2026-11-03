@@ -41,7 +41,6 @@ pub(crate) use memory::{Frozen, RawMut};
 use memory::{OwnedRange, PermissionPool};
 pub use view::Buf;
 mod lease;
-pub mod projection;
 pub(crate) use lease::Lease;
 #[allow(unused_imports)] // Named only by contracts erased from plain cargo builds.
 pub(crate) use lease::Loan;
