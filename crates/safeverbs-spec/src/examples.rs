@@ -2,12 +2,14 @@
 //!
 //! They show that the transitions can actually happen (no precondition is accidentally
 //! unsatisfiable, which would make the lemmas about them vacuous) and illustrate the rules:
-//! a buffer's lease moves into a request and back, a waker is invoked on completion, and an
-//! unsignaled write is retired, as a success, by the CQE of a later signaled one.
+//! a buffer's lease moves into a request and back, a waker is invoked on completion, an
+//! unsignaled write is retired, as a success, by the CQE of a later signaled one, and a
+//! batch completes with its first error once all its WQEs retired.
 #![allow(unused_imports)]
 
 use crate::abs::*;
 use crate::nic::*;
+use crate::refinement::WqeRange;
 use crate::types::*;
 use vstd::multiset::*;
 use vstd::prelude::*;
@@ -134,109 +136,191 @@ pub proof fn example_dropped_receive_in_a() {
     assert(!s3.groups.contains_key(1) && s3.outcomes[1] == got);
 }
 
-/// M: post an unsignaled RDMA write and a signaled one with one doorbell; the NIC executes
-/// both, only the second produces a CQE, and polling it retires both, the first as a success.
-/// (Concrete states make big terms: this example gets its own resource limit.)
+/// QP 7 of the M examples, connected: RC, in protection domain 1, room for four sends and
+/// four receives, both completing on CQ 3.
+spec fn qp7() -> Qp {
+    Qp {
+        attr: QpAttr {
+            pd: 1, transport: Transport::Rc, send_cq: 3, recv_cq: 3,
+            sq_depth: 4, rq_depth: 4, max_sge: 1, max_inline: 0,
+        },
+        state: QpState::Rts,
+        sq: Seq::empty(), sq_head: 0, sq_done: 0,
+        rq: Seq::empty(), rq_head: 0, rq_done: 0,
+    }
+}
+
+/// M with QP 7 connected, CQ 3 (16 entries) reserving its eight completions, and region 5
+/// covering bytes `[0, 4096)`, writable locally.
+spec fn connected() -> Nic::State {
+    let cq = Cq { cap: 16, entries: Seq::empty(), reserved: Multiset::empty(), used: Multiset::empty() };
+    let mr = Mr { pd: 1, span: Span { start: 0, len: 4096 }, local_write: true, remote_read: false, remote_write: false };
+    Nic::State {
+        caps: Caps { max_qp_wr: 16, max_sge: 4, max_inline: 64, max_cqe: 64, max_msg: 1024 },
+        pds: Set::empty().insert(1),
+        mrs: Map::empty().insert(5, mr),
+        cqs: Map::empty().insert(3, cq.reserve(7, 4).reserve(7, 4)),
+        qps: Map::empty().insert(7, qp7()),
+        retired: IMap::empty(),
+    }
+}
+
+/// M reaches `connected()` from its start by legal verbs: opening the device, allocating
+/// the protection domain, registering the region, creating the CQ and the queue pair and
+/// connecting it. So M's invariants hold there.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(30)]
+proof fn lemma_connected()
+    ensures
+        connected().invariant(),
+{
+    broadcast use vstd::multiset::group_multiset_axioms;
+    let s = connected();
+    let m0 = Nic::State { pds: Set::empty(), mrs: Map::empty(), cqs: Map::empty(), qps: Map::empty(), ..s };
+    assert(Nic::State::open(m0, s.caps));
+    reveal(Nic::State::init);
+    reveal(Nic::State::init_by);
+    assert(Nic::State::init_by(m0, Nic::Config::open(s.caps)));
+    crate::refinement::lemma_nic_init_invariant(m0);
+    let m1 = Nic::State { pds: s.pds, ..m0 };
+    assert(Nic::State::alloc_pd(m0, m1, 1));
+    crate::nic_proofs::lemma_alloc_pd(m0, m1, 1);
+    let m2 = Nic::State { mrs: s.mrs, ..m1 };
+    assert(Nic::State::reg_mr(m1, m2, 5, s.mrs[5]));
+    crate::nic_proofs::lemma_reg_mr(m1, m2, 5, s.mrs[5]);
+    let cq = Cq { cap: 16, entries: Seq::empty(), reserved: Multiset::empty(), used: Multiset::empty() };
+    let m3 = Nic::State { cqs: Map::empty().insert(3, cq), ..m2 };
+    assert(Nic::State::create_cq(m2, m3, 3, 16));
+    crate::nic_proofs::lemma_create_cq(m2, m3, 3, 16);
+    let qp = qp7().with_state(QpState::Reset);
+    let cqs1 = m3.cqs.insert(3, m3.cqs[3].reserve(7, 4));
+    assert(cqs1.insert(3, cqs1[3].reserve(7, 4)) =~= s.cqs);
+    crate::nic_proofs::lemma_copies(7, 4);
+    let m4 = Nic::State { cqs: s.cqs, qps: Map::empty().insert(7, qp), ..m3 };
+    assert(Nic::State::create_qp(m3, m4, 7, qp.attr));
+    crate::nic_proofs::lemma_create_qp(m3, m4, 7, qp.attr);
+    let m5 = Nic::State { qps: m4.qps.insert(7, qp.with_state(QpState::Init)), ..m4 };
+    assert(Nic::State::modify_qp(m4, m5, 7, QpState::Init));
+    crate::nic_proofs::lemma_modify_qp(m4, m5, 7, QpState::Init);
+    let m6 = Nic::State { qps: m5.qps.insert(7, qp.with_state(QpState::Rtr)), ..m5 };
+    assert(Nic::State::modify_qp(m5, m6, 7, QpState::Rtr));
+    crate::nic_proofs::lemma_modify_qp(m5, m6, 7, QpState::Rtr);
+    let m7 = Nic::State { qps: m6.qps.insert(7, qp7()), ..m6 };
+    assert(Nic::State::modify_qp(m6, m7, 7, QpState::Rts));
+    crate::nic_proofs::lemma_modify_qp(m6, m7, 7, QpState::Rts);
+    assert(m7.qps =~= s.qps);
+    assert(m7 == s);
+}
+
+/// Two RDMA writes, from `[0, 64)` and `[64, 128)`, posted with one doorbell; only the
+/// second asks for a completion.
+spec fn two_writes() -> Seq<SendWr> {
+    seq![
+        SendWr { wr_id: 1, opcode: Opcode::Write, sges: seq![Sge { addr: 0, len: 64, lkey: 5 }], signaled: false, inline: false },
+        SendWr { wr_id: 2, opcode: Opcode::Write, sges: seq![Sge { addr: 64, len: 64, lkey: 5 }], signaled: true, inline: false },
+    ]
+}
+
+/// M: the NIC executes the two writes, only the second produces a CQE, and polling it
+/// retires both, the first as a success.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(30)]
 pub proof fn example_unsignaled_in_m() {
-    broadcast use vstd::multiset::group_multiset_axioms;
     reveal_with_fuel(total_len, 2);
-    let caps = Caps { max_qp_wr: 16, max_sge: 4, max_inline: 64, max_cqe: 64, max_msg: 1024 };
     let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    let (m0, wrs) = (connected(), two_writes());
+    lemma_connected();
+    let qp1 = Qp { sq: wrs.map_values(|wr: SendWr| SendSlot { wr, outcome: None }), ..qp7() };
+    let m1 = Nic::State { qps: m0.qps.insert(7, qp1), ..m0 };
+    assert(Nic::State::post_send(m0, m1, 7, wrs));
+    crate::nic_proofs::lemma_post_send(m0, m1, 7, wrs);
 
-    let m0 = Nic::State {
-        caps,
-        pds: Set::empty(),
-        mrs: Map::empty(),
-        cqs: Map::empty(),
-        qps: Map::empty(),
-        retired: IMap::empty(),
+    // The first: unsignaled and successful, so no CQE.
+    let qp2 = Qp { sq: qp1.sq.update(0, SendSlot { wr: wrs[0], outcome: Some(ok) }), sq_done: 1, ..qp1 };
+    let m2 = Nic::State { qps: m1.qps.insert(7, qp2), ..m1 };
+    assert(Nic::State::execute_send(m1, m2, 7, ok));
+    crate::nic_proofs::lemma_execute_send(m1, m2, 7, ok);
+
+    // The second: signaled, so a CQE for sequence number 1.
+    let e = Cqe { qp: 7, queue: Queue::Send, wr_id: 2, outcome: ok, seq: 1 };
+    let qp3 = Qp { sq: qp2.sq.update(1, SendSlot { wr: wrs[1], outcome: Some(ok) }), sq_done: 2, ..qp2 };
+    let m3 = Nic::State { qps: m2.qps.insert(7, qp3), cqs: m2.cqs.insert(3, m2.cqs[3].push(e)), ..m2 };
+    assert(Nic::State::execute_send(m2, m3, 7, ok));
+    crate::nic_proofs::lemma_execute_send(m2, m3, 7, ok);
+
+    // Polling that one CQE retires both writes: by M's lemma, the unsignaled one (sequence
+    // number 0) succeeded, and the send queue is empty again.
+    let m4 = Nic::State {
+        qps: m3.qps.insert(7, Qp { sq: qp3.sq.skip(2), sq_head: 2, sq_done: 0, ..qp3 }),
+        cqs: m3.cqs.insert(3, m3.cqs[3].pop()),
+        retired: m3.retired.union_prefer_right(retires(qp3, e)),
+        ..m3
     };
-    assert(Nic::State::open(m0, caps));
+    assert(Nic::State::poll_cq(m3, m4, 3));
+    crate::nic::lemma_poll(m3, m4, 3);
+    assert(!m3.qps[7].sq[0].wr.signaled);
+    assert(m4.retired[WqeRef { qp: 7, queue: Queue::Send, seq: 0 }].status is Success);
+    assert(m4.retired[WqeRef { qp: 7, queue: Queue::Send, seq: 1 }] == ok);
+    assert(m4.qps[7].sq.len() == 0);
+}
 
-    let m1 = Nic::State { pds: m0.pds.insert(1), ..m0 };
-    assert(Nic::State::alloc_pd(m0, m1, 1));
+/// M: the two writes are one request (a batch) and the first fails. Its CQE retires only a
+/// prefix of the batch, which stays in flight. The second write flushes, and once it
+/// retires too, the batch's outcome is its first error, not the last write's flush.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(30)]
+pub proof fn example_batch_first_error() {
+    reveal_with_fuel(total_len, 2);
+    reveal(retires);
+    let remote = Outcome { status: Status::RemoteErr, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    let flush = Outcome { status: Status::FlushErr, ..remote };
+    let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 2 };
+    let (m0, wrs) = (connected(), two_writes());
+    lemma_connected();
+    let qp1 = Qp { sq: wrs.map_values(|wr: SendWr| SendSlot { wr, outcome: None }), ..qp7() };
+    let m1 = Nic::State { qps: m0.qps.insert(7, qp1), ..m0 };
+    assert(Nic::State::post_send(m0, m1, 7, wrs));
+    crate::nic_proofs::lemma_post_send(m0, m1, 7, wrs);
+    assert(range.pending_at(m1, 0));
 
-    let mr = Mr { pd: 1, span: Span { start: 0, len: 4096 }, local_write: true, remote_read: false, remote_write: false };
-    let m2 = Nic::State { mrs: m1.mrs.insert(5, mr), ..m1 };
-    assert(Nic::State::reg_mr(m1, m2, 5, mr));
+    // A failed WQE produces a CQE even unsignaled, and moves the QP to `Err`.
+    let e1 = Cqe { qp: 7, queue: Queue::Send, wr_id: 1, outcome: remote, seq: 0 };
+    let qp2 = Qp { sq: qp1.sq.update(0, SendSlot { wr: wrs[0], outcome: Some(remote) }), sq_done: 1, state: QpState::Err, ..qp1 };
+    let m2 = Nic::State { qps: m1.qps.insert(7, qp2), cqs: m1.cqs.insert(3, m1.cqs[3].push(e1)), ..m1 };
+    assert(Nic::State::execute_send(m1, m2, 7, remote));
+    crate::nic_proofs::lemma_execute_send(m1, m2, 7, remote);
 
-    let cq = Cq { cap: 16, entries: Seq::empty(), reserved: Multiset::empty(), used: Multiset::empty() };
-    let m3 = Nic::State { cqs: m2.cqs.insert(3, cq), ..m2 };
-    assert(Nic::State::create_cq(m2, m3, 3, 16));
-
-    let attr = QpAttr { pd: 1, transport: Transport::Rc, send_cq: 3, recv_cq: 3, sq_depth: 4, rq_depth: 4, max_sge: 1, max_inline: 0 };
-    let cqs1 = m3.cqs.insert(3, m3.cqs[3].reserve(7, 4));
-    let cqs2 = cqs1.insert(3, cqs1[3].reserve(7, 4));
-    crate::nic_proofs::lemma_copies(7, 4);
-    assert(cqs2[3].reserved.len() == 8);
-    let qp0 = Qp { attr, state: QpState::Reset, sq: Seq::empty(), sq_head: 0, sq_done: 0, rq: Seq::empty(), rq_head: 0, rq_done: 0 };
-    let m4 = Nic::State { cqs: cqs2, qps: m3.qps.insert(7, qp0), ..m3 };
-    assert(Nic::State::create_qp(m3, m4, 7, attr));
-
-    let m5 = Nic::State { qps: m4.qps.insert(7, qp0.with_state(QpState::Init)), ..m4 };
-    assert(Nic::State::modify_qp(m4, m5, 7, QpState::Init));
-    let m6 = Nic::State { qps: m5.qps.insert(7, qp0.with_state(QpState::Rtr)), ..m5 };
-    assert(Nic::State::modify_qp(m5, m6, 7, QpState::Rtr));
-    let qp1 = qp0.with_state(QpState::Rts);
-    let m7 = Nic::State { qps: m6.qps.insert(7, qp1), ..m6 };
-    assert(Nic::State::modify_qp(m6, m7, 7, QpState::Rts));
-
-    // Two RDMA writes from [0, 64) and [64, 128), one doorbell; only the second is signaled.
-    let w1 = SendWr { wr_id: 1, opcode: Opcode::Write, sges: seq![Sge { addr: 0, len: 64, lkey: 5 }], signaled: false, inline: false };
-    let w2 = SendWr { wr_id: 2, opcode: Opcode::Write, sges: seq![Sge { addr: 64, len: 64, lkey: 5 }], signaled: true, inline: false };
-    let wrs = seq![w1, w2];
-    let slots = wrs.map_values(|wr: SendWr| SendSlot { wr, outcome: None });
-    let qp2 = Qp { sq: qp1.sq + slots, ..qp1 };
-    let m8 = Nic::State { qps: m7.qps.insert(7, qp2), ..m7 };
-    assert(Nic::State::post_send(m7, m8, 7, wrs));
-
-    // The NIC executes the first: unsignaled and successful, so no CQE.
-    let d1 = SendSlot { wr: w1, outcome: Some(ok) };
-    assert(!d1.generates());
-    let qp3 = Qp { sq: qp2.sq.update(0, d1), sq_done: 1, state: qp2.state, ..qp2 };
-    let m9 = Nic::State { qps: m8.qps.insert(7, qp3), ..m8 };
-    assert(Nic::State::execute_send(m8, m9, 7, ok));
-
-    // Then the second: signaled, so a CQE for sequence number 1.
-    let d2 = SendSlot { wr: w2, outcome: Some(ok) };
-    let e2 = Cqe { qp: 7, queue: Queue::Send, wr_id: 2, outcome: ok, seq: 1 };
-    let qp4 = Qp { sq: qp3.sq.update(1, d2), sq_done: 2, state: qp3.state, ..qp3 };
-    let m10 = Nic::State { qps: m9.qps.insert(7, qp4), cqs: m9.cqs.insert(3, m9.cqs[3].push(e2)), ..m9 };
-    assert(Nic::State::execute_send(m9, m10, 7, ok));
-
-    // Polling that one CQE retires both writes.
-    let qp5 = Qp { sq: qp4.sq.skip(2), sq_head: 2, sq_done: 0, ..qp4 };
-    let m11 = Nic::State {
-        cqs: m10.cqs.insert(3, m10.cqs[3].pop()),
-        retired: m10.retired.union_prefer_right(retires(qp4, e2)),
-        qps: m10.qps.insert(7, qp5),
-        ..m10
+    // Polling it retires the first write only: the batch is still in flight.
+    let qp3 = Qp { sq: qp2.sq.skip(1), sq_head: 1, sq_done: 0, ..qp2 };
+    let m3 = Nic::State {
+        qps: m2.qps.insert(7, qp3), cqs: m2.cqs.insert(3, m2.cqs[3].pop()),
+        retired: m2.retired.union_prefer_right(retires(qp2, e1)), ..m2
     };
-    assert(Nic::State::poll_cq(m10, m11, 3));
+    assert(Nic::State::poll_cq(m2, m3, 3));
+    crate::nic_proofs::lemma_poll_cq(m2, m3, 3);
+    assert(m3.retired.contains_key(range.at(0)) && !m3.retired.contains_key(range.at(1)));
+    assert(range.pending_at(m3, 1));
 
-    // M's invariants hold all along, so its lemmas apply: the unsignaled write (sequence
-    // number 0) was retired as a success, and the send queue is empty again.
-    reveal(Nic::State::init);
-    reveal(Nic::State::init_by);
-    assert(Nic::State::init_by(m0, Nic::Config::open(caps)));
-    crate::refinement::lemma_nic_init_invariant(m0);
-    crate::nic_proofs::lemma_alloc_pd(m0, m1, 1);
-    crate::nic_proofs::lemma_reg_mr(m1, m2, 5, mr);
-    crate::nic_proofs::lemma_create_cq(m2, m3, 3, 16);
-    crate::nic_proofs::lemma_create_qp(m3, m4, 7, attr);
-    crate::nic_proofs::lemma_modify_qp(m4, m5, 7, QpState::Init);
-    crate::nic_proofs::lemma_modify_qp(m5, m6, 7, QpState::Rtr);
-    crate::nic_proofs::lemma_modify_qp(m6, m7, 7, QpState::Rts);
-    crate::nic_proofs::lemma_post_send(m7, m8, 7, wrs);
-    crate::nic_proofs::lemma_execute_send(m8, m9, 7, ok);
-    crate::nic_proofs::lemma_execute_send(m9, m10, 7, ok);
-    crate::nic::lemma_poll(m10, m11, 3);
-    assert(!m10.qps[7].sq[0].wr.signaled);
-    assert(m11.retired[WqeRef { qp: 7, queue: Queue::Send, seq: 0 }].status is Success);
-    assert(m11.retired[WqeRef { qp: 7, queue: Queue::Send, seq: 1 }] == ok);
-    assert(m11.qps[7].sq.len() == 0);
+    // The second write flushes. Once it retires, the batch's outcome is `RemoteErr`.
+    let e2 = Cqe { qp: 7, queue: Queue::Send, wr_id: 2, outcome: flush, seq: 1 };
+    let qp4 = Qp { sq: qp3.sq.update(0, SendSlot { wr: wrs[1], outcome: Some(flush) }), sq_done: 1, ..qp3 };
+    let m4 = Nic::State { qps: m3.qps.insert(7, qp4), cqs: m3.cqs.insert(3, m3.cqs[3].push(e2)), ..m3 };
+    assert(Nic::State::execute_send(m3, m4, 7, flush));
+    crate::nic_proofs::lemma_execute_send(m3, m4, 7, flush);
+    let m5 = Nic::State {
+        qps: m4.qps.insert(7, Qp { sq: qp4.sq.skip(1), sq_head: 2, sq_done: 0, ..qp4 }),
+        cqs: m4.cqs.insert(3, m4.cqs[3].pop()),
+        retired: m4.retired.union_prefer_right(retires(qp4, e2)), ..m4
+    };
+    assert(Nic::State::poll_cq(m4, m5, 3));
+    assert(m5.retired[range.at(0)] == remote && m5.retired[range.last()] == flush);
+    assert(range.all_retired(m5.retired)) by {
+        assert forall|s: nat| range.first <= s < range.end
+            implies m5.retired.contains_key(#[trigger] range.at(s)) by { assert(s == 0 || s == 1); }
+    }
+    assert(range.first_error(m5.retired, 0));
+    crate::refinement::lemma_aggregate_first_error(range, m5.retired, 0);
+    assert(range.aggregate(m5.retired) == remote);
 }
 
 /// One request owns a READ destination and a shared SEND/WRITE source. A separate

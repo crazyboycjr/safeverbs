@@ -80,11 +80,11 @@ M's invariants hold, every verb met its precondition (S2), and A and M stay coup
 `corollary_s1` and `corollary_f1` restate S1 and F1 against M: the NIC touches only memory A
 gives it, and the outcome a client takes aggregates only its own fully retired WQE
 interval. `WqeRange` enforces nonempty, disjoint intervals. `lemma_aggregate` proves that
-aggregation keeps the earliest error or the final success, `lemma_singleton` preserves
-the single-WQE case, and `lemma_poll_prefix_pending` proves that retiring a proper prefix
-keeps the batch in flight. Concrete traces include a remote error followed by a flush;
-the batch returns the remote error only after both WQEs retire. These are specification
-results; the real worker still needs to discharge `Refines`.
+aggregation keeps the earliest error or the final success, and `corollary_inflight` that
+a request whose proper prefix retired is still in flight with its leases. A concrete trace
+(`example_batch_first_error`) has a remote error followed by a flush; the batch returns
+the remote error only after both WQEs retire. These are specification results; the real
+worker still needs to discharge `Refines`.
 
 **Worked examples** (`examples.rs`) are concrete executions checked step by step; they show
 that the transitions can happen, so no lemma above is vacuous. A mixed group contains a
