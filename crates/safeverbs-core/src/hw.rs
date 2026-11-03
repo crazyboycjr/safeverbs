@@ -130,6 +130,9 @@ pub struct HwQp<N: Device> {
     open_leases: Leases<N>,
     /// The local byte count of the final held WQE, for inferred success.
     held_bytes: u64,
+    /// The actual final WR written for each native send request (erased).
+    #[allow(dead_code)]
+    send_tails: Ghost<Map<int, SendWr>>,
 }
 
 /// A WQE held back: its `wr_id`, operation and scatter/gather list.
@@ -540,6 +543,213 @@ proof fn lemma_resources_completed<N: Device>(pre: Ring<Leases<N>>, post: Ring<L
     lemma_resources_kept(pre, post);
 }
 
+/// The native cached first error interpreted over exactly the retired prefix
+/// of this request's own M interval. A proper prefix does not complete it.
+spec fn prefix_outcome(
+    range: WqeRange, cut: nat, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
+    seen: Option<safeverbs_spec::types::Outcome>,
+) -> bool {
+    &&& range.wf() && range.first <= cut <= range.end
+    &&& forall|s: nat| range.first <= s < cut ==> retired.contains_key(#[trigger] range.at(s))
+    &&& match seen {
+        None => forall|s: nat| range.first <= s < cut
+            ==> (#[trigger] retired[range.at(s)]).status is Success,
+        Some(o) => o.status.is_err() && exists|s: nat| range.first <= s < cut
+            && #[trigger] range.first_error(retired, s) && retired[range.at(s)] == o,
+    }
+}
+
+proof fn lemma_prefix_same(
+    range: WqeRange, cut: nat, before: IMap<WqeRef, safeverbs_spec::types::Outcome>,
+    after: IMap<WqeRef, safeverbs_spec::types::Outcome>, seen: Option<safeverbs_spec::types::Outcome>,
+)
+    requires prefix_outcome(range, cut, before, seen),
+        forall|s: nat| range.first <= s < cut ==> after.contains_key(#[trigger] range.at(s))
+            && after[range.at(s)] == before[range.at(s)],
+    ensures prefix_outcome(range, cut, after, seen),
+{
+    match seen {
+        Some(o) => {
+            let s = choose|s: nat| range.first <= s < cut && range.first_error(before, s)
+                && before[range.at(s)] == o;
+            assert(range.first_error(after, s));
+        },
+        None => {},
+    }
+}
+
+/// Additional successes leave the prior first error, if any, unchanged.
+proof fn lemma_prefix_successes(
+    range: WqeRange, cut: nat, to: nat, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
+    seen: Option<safeverbs_spec::types::Outcome>,
+)
+    requires prefix_outcome(range, cut, retired, seen), cut <= to <= range.end,
+        forall|s: nat| cut <= s < to ==> retired.contains_key(#[trigger] range.at(s))
+            && retired[range.at(s)].status is Success,
+    ensures prefix_outcome(range, to, retired, seen),
+{
+    match seen {
+        Some(o) => {
+            let s = choose|s: nat| range.first <= s < cut && range.first_error(retired, s)
+                && retired[range.at(s)] == o;
+            assert(range.first <= s < to);
+        },
+        None => {},
+    }
+}
+
+/// Once an error was observed, later errors or successes cannot replace it.
+proof fn lemma_prefix_error_kept(
+    range: WqeRange, cut: nat, to: nat, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
+    error: safeverbs_spec::types::Outcome,
+)
+    requires prefix_outcome(range, cut, retired, Some(error)), cut <= to <= range.end,
+        forall|s: nat| cut <= s < to ==> retired.contains_key(#[trigger] range.at(s)),
+    ensures prefix_outcome(range, to, retired, Some(error)),
+{
+    let s = choose|s: nat| range.first <= s < cut && range.first_error(retired, s)
+        && retired[range.at(s)] == error;
+    assert(range.first <= s < to);
+}
+
+/// The CQE at the end of a newly retired prefix supplies its first failure.
+proof fn lemma_prefix_first_error(
+    range: WqeRange, cut: nat, at: nat, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
+    error: safeverbs_spec::types::Outcome,
+)
+    requires prefix_outcome(range, cut, retired, None), cut <= at < range.end,
+        forall|s: nat| cut <= s < at ==> retired.contains_key(#[trigger] range.at(s))
+            && retired[range.at(s)].status is Success,
+        retired.contains_key(range.at(at)), retired[range.at(at)] == error, error.status.is_err(),
+    ensures prefix_outcome(range, at + 1, retired, Some(error)),
+{
+    assert(range.first_error(retired, at));
+}
+
+/// The completed native cache agrees with M's existing interval aggregate.
+proof fn lemma_prefix_aggregate(
+    range: WqeRange, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
+    seen: Option<safeverbs_spec::types::Outcome>,
+)
+    requires prefix_outcome(range, range.end, retired, seen),
+    ensures range.all_retired(retired),
+        seen is Some ==> range.aggregate(retired) == seen->0,
+        seen is None ==> range.aggregate(retired) == retired[range.last()]
+            && range.aggregate(retired).status is Success,
+{
+    match seen {
+        Some(o) => {
+            let s = choose|s: nat| range.first <= s < range.end && range.first_error(retired, s)
+                && retired[range.at(s)] == o;
+            lemma_aggregate_first_error(range, retired, s);
+        },
+        None => { lemma_aggregate_success(range, retired); },
+    }
+}
+
+/// A derived execution-history invariant, not an additional assumption of M.
+/// M's existing execution transitions choose only operation-valid outcomes.
+spec fn queued_outcomes_ok(m: Nic::State, q: QpId) -> bool {
+    !m.qps.contains_key(q) || {
+        let qp = m.qps[q];
+        &&& forall|k: int| 0 <= k < qp.sq.len() && (#[trigger] qp.sq[k]).outcome is Some
+            ==> qp.sq[k].wr.opcode.allows_outcome(total_len(qp.sq[k].wr.sges), qp.sq[k].outcome->0)
+        &&& forall|k: int| 0 <= k < qp.rq.len() && (#[trigger] qp.rq[k]).outcome is Some
+            ==> qp.rq[k].wr.allows_outcome(qp.attr.transport, qp.rq[k].outcome->0)
+    }
+}
+
+/// Every actual M step preserves validity of already executed local metadata.
+proof fn lemma_queued_outcomes_step(m: Nic::State, n: Nic::State, step: Nic::Step, q: QpId)
+    requires nic_inv(m), nic_step(m, n, step), queued_outcomes_ok(m, q),
+    ensures queued_outcomes_ok(n, q),
+{
+    // State-machine weak transitions expose their updates after their existing
+    // CQ-capacity safety assertions have been discharged, as in M's own proofs.
+    match step {
+        Nic::Step::execute_send(p, _) => safeverbs_spec::nic_proofs::lemma_room_for_send_cqe(m, p),
+        Nic::Step::execute_recv(p, _) => safeverbs_spec::nic_proofs::lemma_room_for_recv_cqe(m, p),
+        _ => {},
+    }
+
+    if n.qps.contains_key(q) {
+        let b = n.qps[q];
+        assert forall|k: int| 0 <= k < b.sq.len() && (#[trigger] b.sq[k]).outcome is Some
+            implies b.sq[k].wr.opcode.allows_outcome(total_len(b.sq[k].wr.sges), b.sq[k].outcome->0) by {
+            match step {
+                Nic::Step::create_qp(p, _) => {},
+                Nic::Step::execute_send(p, o) => {
+                    if p == q && k == m.qps[q].sq_done {
+                        assert(b.sq[k].outcome == Some(o));
+                    } else { assert(b.sq[k] == m.qps[q].sq[k]); }
+                },
+                Nic::Step::poll_cq(c) => {
+                    let e = m.cqs[c].entries[0];
+                    if e.qp == q && e.queue is Send {
+                        let old_k = k + e.seq + 1 - m.qps[q].sq_head;
+                        assert(b.sq[k] == m.qps[q].sq[old_k]);
+                    } else { assert(b.sq[k] == m.qps[q].sq[k]); }
+                },
+                Nic::Step::post_send(p, _) => {
+                    if p == q && k >= m.qps[q].sq.len() { assert(b.sq[k].outcome is None); }
+                    else { assert(b.sq[k] == m.qps[q].sq[k]); }
+                },
+                _ => { assert(b.sq[k] == m.qps[q].sq[k]); },
+            }
+        }
+        assert forall|k: int| 0 <= k < b.rq.len() && (#[trigger] b.rq[k]).outcome is Some
+            implies b.rq[k].wr.allows_outcome(b.attr.transport, b.rq[k].outcome->0) by {
+            match step {
+                Nic::Step::create_qp(p, _) => {},
+                Nic::Step::execute_recv(p, o) => {
+                    if p == q && k == m.qps[q].rq_done {
+                        assert(b.rq[k].outcome == Some(o));
+                    } else { assert(b.rq[k] == m.qps[q].rq[k]); }
+                },
+                Nic::Step::poll_cq(c) => {
+                    let e = m.cqs[c].entries[0];
+                    if e.qp == q && e.queue is Recv {
+                        let old_k = k + e.seq + 1 - m.qps[q].rq_head;
+                        assert(b.rq[k] == m.qps[q].rq[old_k]);
+                    } else { assert(b.rq[k] == m.qps[q].rq[k]); }
+                },
+                Nic::Step::post_recv(p, _) => {
+                    if p == q && k >= m.qps[q].rq.len() { assert(b.rq[k].outcome is None); }
+                    else { assert(b.rq[k] == m.qps[q].rq[k]); }
+                },
+                _ => { assert(b.rq[k] == m.qps[q].rq[k]); },
+            }
+        }
+    }
+}
+
+proof fn lemma_queued_outcomes_run(run: Seq<Nic::State>, steps: Seq<Nic::Step>, q: QpId)
+    requires run.len() > 0, steps.len() + 1 == run.len(), nic_inv(run[0]), queued_outcomes_ok(run[0], q),
+        forall|i: int| 0 <= i < steps.len() ==> nic_step(#[trigger] run[i], run[i + 1], steps[i]),
+    ensures nic_inv(run.last()), queued_outcomes_ok(run.last(), q),
+    decreases steps.len(),
+{
+    if steps.len() > 0 {
+        let before = run.drop_last();
+        let prefix = steps.drop_last();
+        assert forall|i: int| 0 <= i < prefix.len()
+            implies nic_step(#[trigger] before[i], before[i + 1], prefix[i]) by {}
+        lemma_queued_outcomes_run(before, prefix, q);
+        lemma_queued_outcomes_step(before.last(), run.last(), steps.last(), q);
+        lemma_nic_step_is_next(before.last(), run.last(), steps.last());
+        lemma_step_keeps_invariant(before.last(), run.last());
+    }
+}
+
+proof fn lemma_queued_outcomes_rely(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State, q: QpId)
+    requires nic_inv(m), queued_outcomes_ok(m, q), rely_reaches(sh, pins, m, n),
+    ensures queued_outcomes_ok(n, q),
+{
+    let (run, steps) = choose|run: Seq<Nic::State>, steps: Seq<Nic::Step>|
+        rely_run(sh, pins, run, steps) && run[0] == m && run.last() == n;
+    lemma_queued_outcomes_run(run, steps, q);
+}
+
 /// What the worker knows of the QP's state holds in M.
 pub open spec fn phase_ok(phase: Phase, state: QpState) -> bool {
     match phase {
@@ -700,6 +910,7 @@ impl<N: Device> HwQp<N> {
         &&& rq_linked(self.recv, index, qp)
         &&& ring_resources_ok(self.send)
         &&& ring_resources_ok(self.recv)
+        &&& queued_outcomes_ok(m, self.id@)
         &&& queues_backed(*self, qp)
         &&& forall|j: int| 0 <= j < written.len()
             ==> written_backed(*self, self.send.spec_wqe_committed() + j, #[trigger] written[j])
@@ -868,6 +1079,7 @@ impl<N: Device> HwQp<N> {
         requires
             self.ok(index, m, t.share(), t.pd(), t.started(self.id()), t.written(self.id())),
             framed(t.share(), pinned(t), m, n),
+            queued_outcomes_ok(n, self.id()),
         ensures
             self.ok(index, n, t.share(), t.pd(), t.started(self.id()), t.written(self.id())),
     {
@@ -911,6 +1123,7 @@ impl<N: Device> Hw<N> {
         assert forall|i: int| 0 <= i < self.qps@.len() implies #[trigger] self.entry_ok(i, t, n) by {
             assert(self.entry_ok(i, t, m));
             if let Some(e) = self.qps@[i] {
+                lemma_queued_outcomes_rely(sh, pinned(t), m, n, e.id());
                 e.lemma_framed(i as u16, t, m, n);
             }
         }
@@ -1351,6 +1564,7 @@ impl<N: Device> Hw<N> {
             building: Vec::with_capacity(MAX_SGES),
             open_leases: no_leases(),
             held_bytes: 0,
+            send_tails: Ghost(Map::empty()),
         };
         let ghost before = *self;
         if index == self.qps.len() {
@@ -1483,10 +1697,14 @@ proof fn lemma_modified(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State
         framed_but(sh, pins, m, n, q),
         tos.len() == 0 ==> state_kept(m.qps[q].state, n.qps[q].state),
         tos.len() > 0 ==> n.qps[q].state == tos.last() || n.qps[q].state is Err,
+        forall|p: QpId| #[trigger] queued_outcomes_ok(m, p) ==> queued_outcomes_ok(n, p),
     decreases tos.len(),
 {
     if tos.len() == 0 {
         lemma_rely_frame(sh, pins, m, n);
+        assert forall|p: QpId| #[trigger] queued_outcomes_ok(m, p) implies queued_outcomes_ok(n, p) by {
+            lemma_queued_outcomes_rely(sh, pins, m, n, p);
+        }
     } else {
         let to = tos.last();
         let (mid, before) = choose|mid: Nic::State, before: Nic::State|
@@ -1501,6 +1719,10 @@ proof fn lemma_modified(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State
         lemma_nic_step_is_next(before, n, Nic::Step::modify_qp(q, to));
         lemma_step_keeps_invariant(before, n);
         lemma_mine_keeps_share_wf(sh, pins, before, n, Nic::Step::modify_qp(q, to));
+        assert forall|p: QpId| #[trigger] queued_outcomes_ok(m, p) implies queued_outcomes_ok(n, p) by {
+            lemma_queued_outcomes_rely(sh, pins, mid, before, p);
+            lemma_queued_outcomes_step(before, n, Nic::Step::modify_qp(q, to), p);
+        }
         // Compose: m to mid (framed but q), mid to before (framed), before to
         // n (only q's state).
         assert forall|p: QpId| #[trigger] sh.owns.contains(p) && m.qps.contains_key(p) && p != q
@@ -1705,6 +1927,7 @@ impl<N: Device> Hw<N> {
             self.cq_size == start.cq_size,
             self.reserved == start.reserved,
             self.next_name == start.next_name,
+            forall|p: QpId| #[trigger] queued_outcomes_ok(m, p) ==> queued_outcomes_ok(n, p),
         ensures
             self.inv_with(t, n),
     {
@@ -2889,6 +3112,7 @@ impl<N: Device> Hw<N> {
                 }
                 let sges = vstd::slice::slice_subrange(h.sges.as_slice(), 0, h.n);
                 post(&mut e.hw, h.wr_id, signaled, &h.op, sges, Ghost(q), Tracked(self.token.borrow_mut()));
+                e.send_tails = Ghost(e.send_tails@.insert(seq as int, held_wr(h, signaled)));
                 e.held = None;
                 e.held_bytes = 0;
                 proof {
@@ -4046,6 +4270,8 @@ impl<N: Device> Hw<N> {
                 let nothing: [Sge; 0] = [];
                 let none = nothing.as_slice();
                 post(&mut e.hw, wr_id(index as u16, false, wqe), signaled, &WrOp::Send, none, Ghost(q), Tracked(self.token.borrow_mut()));
+                e.send_tails = Ghost(e.send_tails@.insert(_seq as int,
+                    send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@)));
                 proof {
                     assert(none@ =~= Seq::<Sge>::empty());
                     let wr = send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@);

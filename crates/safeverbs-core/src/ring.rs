@@ -207,6 +207,19 @@ impl<L> ReqView<L> {
     }
 }
 
+/// Native interval and outcome bookkeeping of one actual ring request.
+/// This observation creates neither an abstract request nor a WQE identity.
+pub ghost struct RequestMeta {
+    /// First WQE of this native request, inclusive.
+    pub first: u64,
+    /// End of its WQE interval, exclusive.
+    pub end: u64,
+    /// Operation-defined success used when a later CQE retires the request.
+    pub implied: Wc,
+    /// Its first observed error, or its final outcome after retirement.
+    pub seen: Option<Wc>,
+}
+
 // =============================================================================
 // Slots
 
@@ -653,6 +666,57 @@ impl<L> Ring<L> {
         }
     }
 
+    /// The native WQE interval, inferred success and cached first error.
+    /// Refused results are excluded even if their old WQE numbers are reused.
+    pub closed spec fn meta(&self, s: int) -> Option<RequestMeta> {
+        if self.req(s) is Some || self.staged(s) is Some {
+            let slot = self.slot(s);
+            Some(RequestMeta { first: slot.first_wqe, end: slot.end_wqe,
+                implied: slot.implied, seen: slot.outcome })
+        } else { None }
+    }
+
+    /// A stuttering operation leaves native intervals and outcome caches alone.
+    pub open spec fn same_meta(&self, pre: &Self) -> bool {
+        forall|s: int| #[trigger] self.meta(s) == pre.meta(s)
+    }
+
+    /// Metadata after retiring a request, before its slot is reused.
+    pub closed spec fn completed_meta(&self, s: int, outcome: Wc) -> Option<RequestMeta> {
+        if self.slot(s).detached || self.slot(s).state != State::InFlight { None }
+        else { Some(RequestMeta { seen: Some(outcome), ..self.meta(s)->0 }) }
+    }
+
+    /// A partial error records the first failure and leaves it unchanged later.
+    pub closed spec fn recorded_meta(&self, s: int, wc: Wc) -> Option<RequestMeta> {
+        Some(RequestMeta { seen: Some(wc), ..self.meta(s)->0 })
+    }
+
+    /// Inspect the native bookkeeping of a live or staged request.
+    pub proof fn lemma_meta(&self, s: int)
+        requires self.inv(),
+        ensures
+            self.meta(s) is Some <==> self.req(s) is Some || self.staged(s) is Some,
+            self.meta(s) is Some && (self.req(s) is Some && self.req(s)->0.phase is InFlight
+                || self.staged(s) is Some)
+                ==> self.spec_wqe_retired() <= self.meta(s)->0.first < self.meta(s)->0.end
+                    <= self.spec_closed_end(),
+            self.req(s) is Some && self.req(s)->0.phase is Complete
+                ==> self.meta(s)->0.seen is Some
+                    && self.req(s)->0.phase == Phase::Complete(self.meta(s)->0.seen->0.outcome()),
+            self.staged(s) is Some ==> self.meta(s)->0.seen is None,
+            self.staged(s) is Some ==> self.spec_wqe_committed() <= self.meta(s)->0.first,
+            self.req(s) is Some && self.req(s)->0.phase is InFlight
+                ==> self.meta(s)->0.end <= self.spec_wqe_committed(),
+    {
+        self.lemma_view();
+        reveal(Ring::inv_slots);
+        if self.meta(s) is Some {
+            if s < self.retired { assert(self.done_ok(s)); }
+            else { assert(self.live_ok(s)); }
+        }
+    }
+
     /// The actual live request retaining WQE `w`. Refused and retired slots
     /// never authorize DMA, even when a refused WQE number is reused.
     pub closed spec fn dma(&self, s: int, w: int) -> Option<L> {
@@ -726,6 +790,7 @@ impl<L> Ring<L> {
         &&& forall|s: int| #[trigger] self.refused(s) == other.refused(s)
         &&& self.woken() == other.woken()
         &&& self.same_dma(other)
+        &&& self.same_meta(other)
     }
 
     /// What A sees of the ring, as functions of the sequence number.
@@ -869,6 +934,7 @@ impl<L> Ring<L> {
             post.inv_wqes(),
             pre.head_ok() ==> post.head_ok(),
             post.same_dma(pre),
+            post.same_meta(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1416,6 +1482,10 @@ impl<L> Ring<L> {
                     Some(leases)
                 } else { old(self).dma(s, w) },
             final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) == if s == old(self).spec_posted() {
+                Some(RequestMeta { first: old(self).spec_closed_end() as u64,
+                    end: old(self).spec_wqe_posted(), implied, seen: None })
+            } else { old(self).meta(s) },
     {
         assert!(self.open && self.open_wqes >= 1, "no open request with a WQE");
         let signaled = want_signal || self.must_signal();
@@ -1491,6 +1561,10 @@ impl<L> Ring<L> {
                 if s == pre.spec_posted() && pre.spec_closed_end() <= w < pre.spec_wqe_posted() {
                     self.slot(p).leases
                 } else { pre.dma(s, w) },
+            forall|s: int| #[trigger] self.meta(s) == if s == p {
+                Some(RequestMeta { first: pre.spec_closed_end() as u64,
+                    end: pre.spec_wqe_posted(), implied: self.slot(p).implied, seen: None })
+            } else { pre.meta(s) },
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1574,6 +1648,7 @@ impl<L> Ring<L> {
             final(self).spec_depth() == old(self).spec_depth(),
             !final(self).spec_is_open(),
             final(self).same_dma(old(self)),
+            final(self).same_meta(old(self)),
     {
         assert!(!self.open, "commit with an open request");
         let ghost pre = *self;
@@ -1659,6 +1734,7 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] self.staged(s) is None,
             forall|s: int| #[trigger] self.refused(s) == pre.refused(s),
             self.same_dma(pre),
+            self.same_meta(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -1758,6 +1834,8 @@ impl<L> Ring<L> {
             final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
             final(self).spec_depth() == old(self).spec_depth(),
             final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) ==
+                if old(self).staged(s) is Some { None } else { old(self).meta(s) },
     {
         let dropped = self.posted - self.committed;
         // No request is staged at `posted`: none is handed back.
@@ -1806,6 +1884,8 @@ impl<L> Ring<L> {
                     s,
                 )->0.detached,
             final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) ==
+                if old(self).staged(s) is Some { None } else { old(self).meta(s) },
     {
         let ghost pre = *self;
         let wqe = self.wqe_committed;
@@ -1957,6 +2037,8 @@ impl<L> Ring<L> {
                     pre.refused(s)
                 },
             self.keeps_dma(pre),
+            forall|s: int| #[trigger] self.meta(s) ==
+                if pre.staged(s) is Some { None } else { pre.meta(s) },
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -2193,6 +2275,30 @@ impl<L> Ring<L> {
         }
     }
 
+    /// The metadata change of a completion: full requests retire, while the
+    /// next request may cache its first error from a proper WQE prefix.
+    pub closed spec fn completion_meta(&self, s: int, wqe: u64, wc: Wc, to: int) -> Option<RequestMeta> {
+        if self.retired <= s < to {
+            self.completed_meta(s, self.retire_outcome(s, wqe, wc))
+        } else if s == to && self.req(s) is Some && self.req(s)->0.phase is InFlight
+            && self.meta(s)->0.first <= wqe && wqe as int + 1 < self.meta(s)->0.end
+            && !wc.spec_ok() && self.meta(s)->0.seen is None {
+            self.recorded_meta(s, wc)
+        } else { self.meta(s) }
+    }
+
+    proof fn lemma_ignored_meta(&self, wqe: u64, wc: Wc)
+        requires self.inv(), wqe >= self.spec_wqe_committed() || wqe < self.spec_wqe_retired(),
+        ensures forall|s: int| #[trigger] self.meta(s)
+            == self.completion_meta(s, wqe, wc, self.spec_retired() as int),
+    {
+        self.lemma_view();
+        assert forall|s: int| #[trigger] self.meta(s)
+            == self.completion_meta(s, wqe, wc, self.spec_retired() as int) by {
+            self.lemma_meta(s);
+        }
+    }
+
     /// Records the completion of WQE `wqe` (its `wr_id`): retires every
     /// committed request whose WQEs all lie at or before it.
     ///
@@ -2228,12 +2334,19 @@ impl<L> Ring<L> {
             wqe >= old(self).spec_wqe_retired() ==> final(self).spec_wqe_retired() <= wqe + 1,
             final(self).same_open(old(self)),
             final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) ==
+                old(self).completion_meta(s, wqe, wc, final(self).spec_retired() as int),
+            known && wqe >= old(self).spec_wqe_retired() ==> forall|s: int|
+                #[trigger] final(self).req(s) is Some && final(self).req(s)->0.phase is InFlight
+                ==> final(self).meta(s)->0.end > wqe as int + 1,
     {
         if wqe >= self.wqe_committed {
+            proof { self.lemma_ignored_meta(wqe, wc); }
             return false;
         }
         if wqe < self.wqe_retired {
             proof {
+                self.lemma_ignored_meta(wqe, wc);
                 assert(self.woken() =~= self.woken() + self.wakers(
                     self.retired as int,
                     self.retired as int,
@@ -2247,6 +2360,9 @@ impl<L> Ring<L> {
                 forall|s: int| self.retired <= s < pre.posted ==> #[trigger] self.slot(s) == pre.slot(
                     s,
                 ),
+                forall|s: int| #[trigger] self.meta(s) == if pre.retired <= s < self.retired {
+                    pre.completed_meta(s, pre.retire_outcome(s, wqe, wc))
+                } else { pre.meta(s) },
             invariant
                 self.inv_body(),
                 self.keeps_dma(&pre),
@@ -2270,6 +2386,10 @@ impl<L> Ring<L> {
                 forall|s: int| #[trigger] self.staged(s) == pre.staged(s),
                 forall|s: int| #[trigger] self.refused(s) == pre.refused(s),
                 self.woken() == pre.woken() + pre.wakers(pre.retired as int, self.retired as int),
+            ensures self.retired < self.committed ==> self.slot(self.retired as int).state == State::InFlight
+                && self.slot(self.retired as int).end_wqe > wqe as int + 1,
+                forall|s: int| #[trigger] self.meta(s)
+                    == pre.completion_meta(s, wqe, wc, self.retired as int),
             decreases self.committed - self.retired,
         {
             let i = self.index(self.retired);
@@ -2327,17 +2447,45 @@ impl<L> Ring<L> {
                     }
                 }
             } else {
-                if !wc.is_ok() && self.slots[i].outcome.is_none() {
+                // A CQE ending the preceding request must not become this one's error.
+                if !wc.is_ok() && self.slots[i].outcome.is_none() && self.slots[i].first_wqe <= wqe {
                     let ghost before = *self;
                     self.slots[i].outcome = Some(wc);
                     proof {
                         self.lemma_record(&before);
                     }
                 }
+                proof {
+                    assert forall|s: int| #[trigger] self.meta(s)
+                        == pre.completion_meta(s, wqe, wc, self.retired as int) by {
+                        if s == self.retired {
+                            assert(self.slot(s).first_wqe == pre.slot(s).first_wqe);
+                            assert(self.slot(s).end_wqe == pre.slot(s).end_wqe);
+                        }
+                    }
+                }
                 break;
             }
         }
+        proof {
+            assert forall|s: int| #[trigger] self.meta(s)
+                == pre.completion_meta(s, wqe, wc, self.retired as int) by {
+                if s == self.retired && pre.req(s) is Some {
+                    reveal(Ring::inv_slots);
+                    if self.retired < self.committed { assert(self.live_ok(s)); }
+                }
+            }
+        }
         self.advance_head();
+        proof {
+            self.lemma_view();
+            reveal(Ring::inv_slots);
+            assert forall|s: int| #[trigger] self.req(s) is Some && self.req(s)->0.phase is InFlight
+                implies self.meta(s)->0.end > wqe as int + 1 by {
+                assert(self.live_ok(s));
+                if self.retired < s { self.lemma_ordered(self.retired as int, s); }
+            }
+        }
         true
     }
 
@@ -2353,12 +2501,16 @@ impl<L> Ring<L> {
                 (pre.retired as int) % pre.n(),
                 Slot { outcome: self.slot(pre.retired as int).outcome, ..pre.slot(pre.retired as int) },
             ),
+            self.slot(pre.retired as int).outcome is Some,
         ensures
             self.inv_body(),
             forall|s: int| #[trigger] self.req(s) == pre.req(s),
             forall|s: int| #[trigger] self.staged(s) == pre.staged(s),
             forall|s: int| #[trigger] self.refused(s) == pre.refused(s),
             self.same_dma(pre),
+            forall|s: int| #[trigger] self.meta(s) == if s == pre.retired {
+                pre.recorded_meta(s, self.slot(s).outcome->0)
+            } else { pre.meta(s) },
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -2437,6 +2589,9 @@ impl<L> Ring<L> {
                 None => old(self).woken(),
             },
             final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) == if s == old(self).retired {
+                old(self).completed_meta(s, outcome)
+            } else { old(self).meta(s) },
     {
         let ghost pre = *self;
         if !outcome.is_ok() {
@@ -2511,6 +2666,9 @@ impl<L> Ring<L> {
             self.committed_sig_end == pre.committed_sig_end,
             self.open == pre.open,
             self.open_wqes == pre.open_wqes,
+            self.slot(pre.retired as int).first_wqe == pre.slot(pre.retired as int).first_wqe,
+            self.slot(pre.retired as int).end_wqe == pre.slot(pre.retired as int).end_wqe,
+            self.slot(pre.retired as int).implied == pre.slot(pre.retired as int).implied,
         ensures
             self.inv_body(),
             forall|s: int|
@@ -2525,6 +2683,9 @@ impl<L> Ring<L> {
                 pre.head <= s < pre.head + pre.n() && s != pre.retired ==> #[trigger] self.slot(s)
                     == pre.slot(s),
             self.keeps_dma(pre),
+            forall|s: int| #[trigger] self.meta(s) == if s == pre.retired {
+                pre.completed_meta(s, outcome)
+            } else { pre.meta(s) },
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -2730,6 +2891,9 @@ impl<L> Ring<L> {
             final(self).same_wqes(old(self)),
             final(self).same_open(old(self)),
             final(self).same_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) == if taken is Some && s == seq {
+                None
+            } else { old(self).meta(s) },
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -2853,6 +3017,7 @@ impl<L> Ring<L> {
                     pre.refused(s)
                 },
             self.same_dma(pre),
+            forall|s: int| #[trigger] self.meta(s) == if s == seq { None } else { pre.meta(s) },
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -2952,6 +3117,9 @@ impl<L> Ring<L> {
             final(self).same_open(old(self)),
             final(self).spec_posted() == old(self).spec_posted(),
             final(self).same_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) == if s == seq && old(self).req(s) is Some && old(self).req(s)->0.phase is Complete {
+                None
+            } else { old(self).meta(s) },
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -3038,6 +3206,7 @@ impl<L> Ring<L> {
                 },
             forall|s: int| #[trigger] self.refused(s) == pre.refused(s),
             self.same_dma(pre),
+            self.same_meta(pre),
     {
         reveal(Ring::inv_slots);
         reveal(Ring::inv_wqes);
@@ -3128,6 +3297,7 @@ impl<L> Ring<L> {
             final(self).same_wqes(old(self)),
             final(self).same_open(old(self)),
             final(self).same_dma(old(self)),
+            final(self).same_meta(old(self)),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -3175,6 +3345,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
             final(self).spec_depth() == old(self).spec_depth(),
             final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) is None,
     {
         let ghost pre = *self;
         let mut i = 0;
