@@ -9,8 +9,9 @@ return to their contracts afterward.
 
 Read [`examples/event_loop/src/main.rs`](../examples/event_loop/src/main.rs): `main`
 creates two workers, attaches several QPs to each, connects them, and posts receives.
-`serve` and `ping_pong` show the steady-state loop: poll one CQ, dispatch results,
-repost buffers, stage work, and commit each active QP once per turn.
+`serve` and `ping_pong` show the steady-state loop: poll one CQ, dispatch each result by its
+context (a small `Job` enum, the example's own), repost buffers, stage work, and commit each
+active QP once per turn.
 
 For a smaller asynchronous application, read the
 [greeter client](../examples/greeter/src/client.rs) and
@@ -19,8 +20,8 @@ For a smaller asynchronous application, read the
 Keep three units distinct:
 
 - A **WQE** is one hardware work item.
-- A **request** may own several WQEs, but has one sequence number, result and group of
-  leases. A batch completes only after its entire WQE interval retires.
+- A **request** may own several WQEs, but has one sequence number, context, result and group
+  of leases. A batch completes only after its entire WQE interval retires.
 - A **worker** owns one shared CQ and several QPs. Each QP still has its own send and
   receive rings; sharing the CQ does not merge their completion accounting.
 
@@ -33,15 +34,16 @@ Read these files in order:
 | [`worker.rs`](../crates/safeverbs-core/src/worker.rs) | `Worker::request`, `Request::push`, `Request::finish`, `Worker::commit`, then `Worker::poll` or `Worker::progress` |
 | [`hw.rs`](../crates/safeverbs-core/src/hw.rs) | `Hw::gather`, `push`, `close`, `commit`, `progress`: per-QP state, hardware calls, CQ routing and ring updates |
 | [`ring.rs`](../crates/safeverbs-core/src/ring.rs) | `begin`, `push_wqe`, `end`, `commit`, `complete`, `take`, `detach`: the request lifecycle independently of FFI |
-| [`wr_id.rs`](../crates/safeverbs-core/src/wr_id.rs) | how a CQE identifies its QP, queue and WQE number |
+| [`ring/payload.rs`](../crates/safeverbs-core/src/ring/payload.rs) | what a slot of a worker's rings holds: the buffers and the context, one generic value to the ring |
+| [`wr_id.rs`](../crates/safeverbs-core/src/wr_id.rs) | how a CQE identifies its QP, queue and WQE number (internal: users have contexts) |
 | [`nic.rs`](../crates/safeverbs-core/src/nic.rs) | the unsafe backend contract the core relies on |
 | [`verbs.rs`](../crates/safeverbs-core/src/verbs.rs) | the concrete libibverbs implementation; read after understanding the core |
 
 There are two useful traces:
 
 ```text
-request -> gather/push -> close -> staged in ring -> commit -> doorbell
-CQ poll -> decode wr_id -> ring.complete -> take result and leases
+request -> gather/push -> close (with its context) -> staged in ring -> commit -> doorbell
+CQ poll -> decode wr_id -> ring.complete -> take context, typed result and leases
 ```
 
 `finish` stages a request; `commit` posts it. Neither means it has completed. A CQE
@@ -73,16 +75,18 @@ metadata travels through the rings with it.
 
 For remote access, `Exposed::try_reclaim` revokes the remote registration before returning
 typed access. A refused close returns its owner for retry; a failed final cleanup retains
-the allocation and dependency chain.
+the allocation and dependency chain. While the access lasts, `Exposed::copy_to_slice` reads the
+bytes with volatile reads and forms no reference to them (`buf/memory.rs`, `volatile_copy`).
 
 [`buf/range.rs`](../crates/safeverbs-core/src/buf/range.rs) is the arithmetic these
 buffers use for splits and frozen views. `memory.rs` ties that geometry to the allocator's
 permissions; `permissions.rs` keeps the per-byte linear tokens, which a plain build erases.
 
-Then read [`wc.rs`](../crates/safeverbs-core/src/wc.rs): its accessors expose only
-operation-defined metadata. SEND/WRITE do not report a byte count; READ and receive
-cases have different metadata. A WRITE_WITH_IMM notification is distinct from a receive
-payload written into the posted receive buffer.
+Then read [`wc.rs`](../crates/safeverbs-core/src/wc.rs): `Completed`, `Received` and
+`CompletionError` have only operation-defined metadata, derived from the raw `Wc`, which stays
+in the core. SEND/WRITE report no byte count; READ and receive cases have different metadata. A
+WRITE_WITH_IMM notification is another case than a receive payload written into the posted
+receive buffer, and an error names the WQE that failed.
 
 ## 4. Add the asynchronous layer
 
@@ -93,9 +97,12 @@ Read [`worker.rs`](../crates/safeverbs/src/worker.rs) in the application crate f
 [`backlog.rs`](../crates/safeverbs/src/backlog.rs).
 
 `Op` tracks a queued ticket or posted sequence number. Polling it progresses the
-worker's shared CQ and takes its own result. Dropping queued work releases it; dropping
-a posted future detaches its owner, retaining the buffers until the NIC is done.
-Finally read `batch.rs`, `sink.rs` and `receiver.rs` for amortized operation APIs.
+worker's shared CQ and takes its own result, which the operation's `Outcome` turns into its
+output: `()` for sends and writes, the buffer for a READ, a `Received` and the buffer for a
+receive. Dropping queued work releases it; dropping a posted future detaches its owner,
+retaining the buffers until the NIC is done. The future is the request's identity, so the
+worker's context is `()` here. Finally read `batch.rs`, `sink.rs` (which maps a failed request
+back to its item) and `receiver.rs` for amortized operation APIs.
 
 ## 5. Read the proof claim before its mechanics
 

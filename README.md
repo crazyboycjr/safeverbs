@@ -1,7 +1,7 @@
 # SafeVerbs
 __SafeVerbs__ implements a memory-safe RDMA API in Rust. It leverages Rust’s type system to ensure safety properties at compile time, simplifying the development of high-performance RDMA applications.
 
-- 🛡️ __Memory-Safe__: Memory the NIC uses belongs to the work request until it completes, memory a peer may write is never readable as Rust values, and queues never overflow. No `unsafe` in your code, and none in the public crate either.
+- 🛡️ __Memory-Safe__: Memory the NIC uses belongs to the work request until it completes, no reference to memory a peer may write ever exists (it is read through a volatile copy), and queues never overflow. No `unsafe` in your code, and none in the public crate either.
 - ✨ __User-Friendly__: Typestate connection setup with a builder, registered buffers that behave like `Box<[T]>` and `bytes::Bytes`, and every operation an `async` future, a `Sink` or a `Stream`.
 - 🚀 __High Performance__: Unsignaled work requests, batches with one doorbell and one completion, and repeated sends of the same buffer are safe API without interval-tree checks. Each thread runs a worker with one completion queue shared by all of its queue pairs; supported providers can omit their locks. Device limits and posting arguments are checked before submission.
 
@@ -21,27 +21,32 @@ qp.batch(|b| {                             // one doorbell, one completion
 .await?;
 let mut tx = qp.sink();                    // impl Sink<WriteOp>
 tx.send_all(&mut ops).await?;
-let mut rx = qp.receiver(bufs);            // impl Stream<Item = (Wc, BufMut)>
-while let Some((wc, buf)) = rx.next().await {
+let mut rx = qp.receiver(bufs);            // a stream of (Result<Received, _>, BufMut)
+while let Some((received, buf)) = rx.next().await {
+    match received? {
+        Received::Message { len, imm } => handle(&buf[..len as usize], imm),
+        Received::WriteNotification { imm, len } => wrote(imm, len), // buf is untouched
+    }
     rx.repost(buf)?;
 }
 let buf = buf.try_thaw()?;                 // BufMut again once nothing holds it
 ```
 
-The QPs of a thread share one completion queue: build them on one worker, which every future of the thread polls, or drive the worker yourself in an event loop.
+The QPs of a thread share one completion queue: build them on one worker, which every future of the thread polls, or drive the worker yourself in an event loop. Each request of an event loop carries a context of your own type, in place of C's `wr_id`, and comes back with it exactly once:
 
 ```rust
 let worker = LocalWorker::new(&pd, 4096)?;    // one CQ for this thread's QPs
 let qp = QueuePairBuilder::<RC>::new(&pd).build_on(&worker)?.handshake(remote)?;
 
-let mut w = Worker::new(&pd, 4096)?;          // or the synchronous core
-loop {
-    w.poll(|w, c| {                            // each request that retired:
-        handle(c.qp, c.wc, c.leases);          // its QP, outcome and buffers
-        // ... post new work with w.request(qp)
-    });
-}
+let mut w: Worker<Job> = Worker::new(&pd, 4096)?;   // or the synchronous core
+w.send(qp, buf.slice(..), Job::Reply { client: 7 })?;
+w.poll(|w, c| match (c.ctx, c.result) {             // each request that retired:
+    (Job::Reply { client }, Ok(_)) => done(client), // its context, result and buffers
+    (job, Err(e)) => retry(job, e),                 // ... post new work with w.send, w.request
+});
 ```
+
+An error tells which WQE of the request failed: those before it completed successfully, and it and those after it did not, with their remote effects unknown (a later WRITE may land at the peer before an earlier READ fails, and a lost acknowledgement can hide a WRITE that landed). A request whose doorbell the device refused says so: the NIC never saw it.
 
 ## Getting Started
 
@@ -146,11 +151,12 @@ RDMA programming with C libraries like `libibverbs` is powerful but prone to err
 __Data Path__
 - __Owned buffers instead of bookkeeping__: `BufMut<T>` is unique and writable, `Buf<T>` shared and read only. Posting moves a lease of the buffer into the request, which keeps it until the NIC is done, so a buffer can never be freed or written while in flight, and sending the same buffer or any part of it many times at once needs no check.
 - __Typed memory__: the NIC only writes into types that accept any bit pattern (`zerocopy::FromBytes`); what goes on the wire has no padding (`IntoBytes`); `TryFromBytes` views check types with invalid bit patterns.
-- __Remote access under control__: a buffer exposed to a peer is registered on its own, so its remote key reaches exactly that buffer, and it is not readable as Rust values until the access is revoked.
-- __Completion ring__: each queue pair has a ring of slots indexed by sequence number. Send queues complete in order, so one completion retires every request before it: unsignaled requests and batches are safe, and flushes after an error hand every buffer back with the error. A doorbell the device refuses hands each of its requests back with a flush error; sequence numbers are never reused.
+- __Remote access under control__: a buffer exposed to a peer is registered on its own, so its remote key reaches exactly that buffer. No reference to it exists until the access is revoked; while it lasts, a safe volatile copy reads its bytes, and a write-with-immediate notification or a SEND says when they are complete.
+- __Completion ring__: each queue pair has a ring of slots indexed by sequence number. Send queues complete in order, so one completion retires every request before it: unsignaled requests and batches are safe, and flushes after an error hand every buffer back with the error. A doorbell the device refuses hands each of its requests back as refused; sequence numbers are never reused.
+- __Typed contexts and results__: a request carries a value of your own type, kept in its slot and handed back once with its buffers. Its result has only the fields its operation defines: a SEND has no length, a receive is a message or the notification of a peer's WRITE, and an error names the WQE that failed.
 - __Workers__: a worker is one completion queue and the queue pairs attached to it, the unit of thread affinity, on a thread domain where the device has them. Each queue pair reserves room on the CQ for every completion it may produce, and completions are routed to their queue pair by `wr_id` with no lookup.
 - __Asynchronous operations__: every operation is a `Future` (dropping it never cancels the request), WRITEs stream through a `futures::Sink` and receives through a `futures::Stream`. A full queue means waiting, not an error.
-- __A synchronous layer__ under the futures, for applications that drive their own polling loop: a worker moves between threads as one value, and its poll hands every completed request to the loop with its queue pair and buffers, without allocating.
+- __A synchronous layer__ under the futures, for applications that drive their own polling loop: a worker moves between threads as one value, and its poll hands every completed request to the loop with its context, result and buffers, without allocating.
 
 __Control Path__
 - __Typestate Pattern__: connection setup uses the typestate pattern, so a queue pair posts only once connected, and RC-only settings and operations exist only for RC.

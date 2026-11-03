@@ -48,6 +48,12 @@ conflicting ways.
 - *Not proved:* that the worker's requests are groups of A, so the coupling of A and M for
   the whole library. S1 of the library still rests on Rust's ownership of `BufMut`, `Buf`
   and `Part` together with these component proofs.
+- *The one exception:* `Exposed::copy_to_slice` reads memory a peer may be writing. No
+  reference to exposed memory is ever formed; it is read only through this copy, with volatile
+  reads into a `T` that accepts any bytes, which is a trusted assumption (`volatile_copy`
+  below). The copy may be torn: a protocol learns that the data is complete from a
+  write-with-immediate notification or a SEND, never by polling the bytes (on MRC, data lands
+  out of order).
 
 **S2, no local misuse.** Every verb the library calls meets M's precondition.
 - *Spec.* The preconditions are M's `require`s. The NIC's own steps never invalidate one
@@ -74,8 +80,10 @@ for its own WQEs, with its own buffers.
   order or the last WQE's success (`corollary_f1`, `lemma_aggregate`); a request whose
   prefix retired is still in flight (`corollary_inflight`). A successful SEND or WRITE has
   one outcome, reported or implied (`lemma_ack_outcome_unique`).
-- *Ring.* `take` returns exactly the outcome and the leases of a complete request, or of
-  one whose doorbell was refused with a flush error. Sequence numbers are never reused.
+- *Ring.* `take` returns exactly the outcome and the payload of a complete request, or of
+  one whose doorbell was refused, and says which. Sequence numbers are never reused. A worker's
+  payload is the request's buffers and its context (`ring/payload.rs`), so each context comes
+  back exactly once with its own buffers by the same proof, with no new trust.
 - *Worker.* Each completion reaches the queue pair, queue and request of its own WQE
   (`wr_id.rs` and the coupling of rings to M's queues). A receive request's result is the
   outcome M retired for its WQE (`hw/outcomes.rs`). A send request, one WQE or a batch, agrees
@@ -87,12 +95,20 @@ for its own WQEs, with its own buffers.
   retired and its outcome is M's aggregate: the first error in posting order, else its last
   WQE's success, which is what that WR's operation defines (the length a READ asked for, so
   a batch of READs reports its last READ's length; the status alone for a SEND or WRITE).
-  `Hw::take` returns that outcome with the request's own leases, or a flush error for a
-  request whose doorbell was refused, which M never saw (`send_taken_matches`).
-- *Not proved:* that the first error of a queue's requests without an owner, which
-  `Worker::take_send_error` reports (a sink's error), is M's. Such requests give back no
-  result of their own and the ring's queue-wide cache has no contract yet; their buffers
-  are covered like any request's.
+  `Hw::take` returns that outcome, as a typed result equal to it (`Completed::model`), with the
+  request's own context and buffers (`send_taken_matches`, `recv_taken_matches`). An error's
+  `position` is proved to be that of M's first failed WQE in the request's interval: it is
+  computed from the WQE number in the completion the ring cached (`names_wqe`), with one
+  subtraction, on the error path only. A request whose doorbell was refused, which M never saw,
+  comes back as `CompletionError::Refused`, a case of its own. A request with an owner that is
+  complete or refused is always handed back (`takeable`), and one without an owner holds no
+  context, so a poll runs no destructor of the user's.
+- *Detached.* The first error of a queue's requests without an owner, which
+  `Worker::take_send_error` reports (a sink's error), is tied to M the same way
+  (`detached_result`, `detached_taken_matches`): the request it came from retired all its WQEs,
+  and its status and position are M's first error among them; or it says a refused request,
+  which M never saw. Which of those requests fails first across the queue is not claimed
+  beyond what the ring keeps: the first one to retire with an error since the last take.
 
 **R1, no leak by the library.** Every buffer handed to the library is returned or released
 once, never before the NIC is done with it.
@@ -133,13 +149,21 @@ make progress, someone to poll the CQ and the executor to poll woken tasks.
 - Memory: a refused registration frees its memory; split, frozen, exposed and streamed
   buffers free theirs once (`crates/safeverbs/tests/allocation.rs`).
 - Batches on the model and on rxe, through the unverified `Worker` and evidence that rxe
-  conforms to M: an error in the middle of a batch is its outcome, the WQEs after it flush
-  and its buffers come back once; on rxe a batch of READs, signaled or retired by a later
-  CQE, reports its last READ's length (`tests/batch.rs`). On the model, an error stays
+  conforms to M: an error in a batch is its outcome, at its position, the WQEs after it flush
+  and its context and buffers come back once; on rxe a batch of READs, signaled or retired by
+  a later CQE, reports its last READ's length (`tests/batch.rs`). On the model, an error stays
   within its own request's interval (`tests/outcome.rs`) and READ batches step through both
   ways of completing (`tests/read_batch.rs`).
-- A WRITE with immediate puts no data in the receive's buffers (`tests/wc.rs`, on the model
-  and rxe).
+- Contexts: each comes back with its own request across several QPs and exactly once, counted
+  by its destructor, whatever becomes of the request, including removed QPs and dropped
+  workers (`tests/worker.rs`, and on rxe `event_loop_on_four_qps_of_one_worker`). Refused
+  requests are told from flushed ones on both.
+- A WRITE with immediate puts no data in the receive's buffers, and every kind of receive
+  gets its case of `Received`, zero-SGE and zero-byte notifications included (`tests/wc.rs`, on
+  the model and rxe). A remote WRITE with immediate is read with the safe copy, the same rkey
+  still valid after it (`tests/rxe.rs`).
+- That the worker's typed API hands out what `Hw` returns, and a sink's item number: both are
+  in unverified code (`worker.rs`, `sink.rs`), tested on the model and rxe.
 - `RingBuf`'s placement and the reuse of its chunks.
 - The simulated NIC (`model.rs`) checks some of M's rules at run time: no queue pair
   destroyed with WQEs not retired, no CQ destroyed with a queue pair attached, no work
@@ -201,6 +225,7 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `buf/memory.rs` `allocate_zeroed_raw` | the fallible zeroed allocator returns the address, layout, provenance and linear permissions vstd expects, or nothing; no claim about initialized contents |
 | `buf/memory.rs` `arc_try_unwrap` | `Arc::try_unwrap` returns the exact contents, or an `Arc` to the same contents |
 | `buf/memory.rs` `ring_chunk` | a `RingBuf` chunk comes with the byte permission for exactly its bytes: the ring's placement, which is not verified, keeps its chunks apart |
+| `buf/memory.rs` `volatile_copy` | volatile reads of memory a device may write concurrently are defined and yield arbitrary bytes; its one caller, `Exposed::copy_to_slice`, passes a range it owns and copies into a type that accepts any bytes (S1's one exception) |
 | `buf/lease.rs` `same_frozen_arc` | `Arc::ptr_eq` means both hold the same frozen allocation |
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's |
@@ -233,8 +258,6 @@ data, so M sees a queue pair's inline limit as zero.
   needs from the worker is that complete requests' WQE intervals stay disjoint too (the
   ring keeps this for requests not retired) and, for a request in flight, that M's `retired`
   map holds nothing of the rest of its interval (`WqeRange::pending`).
-- **Detached errors.** Relate the first error of a queue's requests without an owner
-  (`Worker::take_send_error`, what a sink reports) to M, like an owned request's result.
 - **Buffers.** The typed wrappers of `buf.rs` are outside `verus!`; initialized contents
   and the zerocopy contracts, `RingBuf`, exposure and revocation and the final cleanup of a
   region are not verified, and the registration lifetime is trusted (`registered`,
@@ -273,7 +296,7 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 154 verified, 0 errors
-safeverbs-core: verification results:: 395 verified, 0 errors
+safeverbs-core: verification results:: 412 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

@@ -104,6 +104,13 @@ element type that accepts every bit pattern, so received bytes become a `T` only
 invariant that a unique lease overlaps no other lease (`inv_unique`) together with
 `lemma_s1_no_conflict` and `lemma_s1_nic_writes_any_bytes`.
 
+S1 has one exception, and it is deliberate: `Exposed::copy_to_slice` reads memory the peer may
+be writing. No reference to exposed memory is ever formed; it is read only through this copy,
+with volatile reads into a `T` that accepts any bytes. That such reads are defined and yield
+arbitrary bytes is a trusted assumption (`docs/verification.md`, "Trusted computing base"). The
+copy may be torn, so a protocol learns that data is complete from a write-with-immediate
+notification or a SEND, never by polling the bytes: on MRC, data lands out of order.
+
 **S2, no local misuse.** Every verbs call the library makes satisfies its precondition in
 M: there is space in the send or receive queue; the CQ has capacity reserved for every
 completion it may receive; the queue pair is in a state that allows the call; the number of
@@ -233,8 +240,8 @@ qp.batch(|b| {                             // one doorbell, one CQE
 .await?;
 let mut tx = qp.sink();                    // impl Sink<WriteOp>
 tx.send_all(&mut ops).await?;
-let mut rx = qp.receiver(bufs);            // impl Stream<Item = (Wc, BufMut)>
-while let Some((wc, buf)) = rx.next().await {
+let mut rx = qp.receiver(bufs);            // a stream of (Result<Received, _>, BufMut)
+while let Some((received, buf)) = rx.next().await {
     rx.repost(buf)?;
 }
 let buf = buf.try_thaw()?;                 // BufMut again once nothing else holds it
@@ -248,6 +255,42 @@ retires the whole batch. `sink` turns a queue pair into a `futures::Sink<WriteOp
 `poll_ready` waits for ring space, `start_send` writes a WQE, `poll_flush` rings the
 doorbell and `poll_close` waits until everything completed. `receiver` turns a set of
 buffers into a stream of received messages, each with its buffer, which the user may repost.
+
+Results have only the fields their operation defines. Sends, writes, batches and the sink
+resolve to `Ok(())`; a READ gives its buffer back; a receive says `Received::Message { len, imm }` (a SEND, whose `len` bytes are in the buffer) or
+`Received::WriteNotification { imm, len }` (a peer's WRITE with immediate, whose `len` bytes went
+to exposed memory, the buffer untouched). What is undefined in C's work completion, such as the
+byte count of a SEND or the opcode of a failed completion, does not exist in these types.
+
+An error keeps handing buffers back and says what happened. `CompletionError::Failed` has the
+`status`, the `vendor_err` and the `position` of the failing WQE within its request. The WQEs
+before that position completed successfully. That WQE and those after it did not complete
+successfully, and their remote effects are unknown: a later WRITE may land at the peer before
+an earlier READ fails, and a lost acknowledgement can hide a WRITE that landed.
+`CompletionError::Refused` is another case: the doorbell was refused, the NIC never saw the
+request, and nothing of it happened anywhere. A sink's error also says which item failed, its
+position among the items sent through that sink (`Error::SinkItem`).
+
+The event loop of the synchronous core has no future to stand for a request, so each request
+carries a value of the user's own type, which replaces C's `wr_id`:
+
+```rust
+let mut w: Worker<Job> = Worker::new(&pd, 4096)?;
+w.send(qp, buf.slice(..), Job::Reply { client: 7 })?;
+w.poll(|w, c| match (c.ctx, c.result) {
+    (Job::Reply { client }, Ok(_)) => done(client),
+    (job, Err(e)) => retry(job, e),
+});
+```
+
+`Worker<C = (), N = Verbs>` keeps the context in the request's ring slot, as part of the slot's
+generic payload, so that "returned exactly once, with its own buffers" is what the ring already
+proves of every payload. C-style users pick `u64`. `C = ()` costs no work, only the word an
+`Option<()>` takes in the slot. A batch is one request with one context (`Request::submit(signal, ctx)`, the context
+given last, as in `Worker::send`). `c.result` is a `Result<Completed, CompletionError>`, with
+`Completed::Sent`, `Completed::Read { len }` and `Completed::Received(_)`. The hardware `wr_id`
+stays internal: it routes completions (section 10). The asynchronous layer needs no context,
+since each future is its own request's identity: `LocalWorker` is `C = ()`.
 
 A future holds only `(qp, seq)`: the queue pair and the sequence number of its slot. The
 waker lives in the slot. Futures poll their worker's CQ themselves when they are polled (section 10), so there is no
@@ -309,15 +352,15 @@ They share queue accounting but differ in memory access and completion semantics
 A batch is one request of several WQEs. It reports the outcome of the first of them that
 failed or, if none did, the success of its last WQE: a batch of READs reports the length
 of its last READ, not a sum. An error completion's opcode, length and immediate are
-undefined, so an error reports its status only.
+undefined, so an error reports its status, with the vendor's code and the position of that
+WQE in the request, which the library knows from the WQE's number.
 
 A WRITE_WITH_IMM notification length describes the remote write. It is independent of
-receive SGE capacity and never a length to use when slicing the returned receive buffer.
-The safe completion API exposes `received_len()` only for an ordinary receive payload;
-`byte_len()` also describes READ and write notifications. Both return `None` for
-SEND/WRITE acknowledgements and all errors. `opcode()` and `imm()` likewise hide fields
-that are undefined for errors. A zero-length receive payload is `Some(0)`, distinct from
-an undefined length.
+receive SGE capacity and never a length to use when slicing the returned receive buffer,
+which is why it is another case of the typed result: `Received::WriteNotification { imm, len }`
+next to `Received::Message { len, imm }`. A zero-length message is `Message { len: 0, .. }`.
+The raw `Wc` is the only place undefined fields exist; it stays inside the core, and what
+leaves is derived from its verified `outcome()`.
 
 M's `Outcome` contains a `CompletionKind`. Status-only outcomes canonically carry zero
 length and no immediate; zero there is bookkeeping, not a hardware-reported byte count.
@@ -355,7 +398,10 @@ brand or a cheap runtime id check. The NIC may write only into a `BufMut<T>` wit
 `T: FromBytes`; a buffer exposed for remote write is moved into the exposure (it is no longer
 the program's until the rkey is revoked) and is registered on its own, so that the rkey
 reaches exactly that buffer and nothing next to it. These are exactly the rules of A's
-`post_request` and `expose`.
+`post_request` and `expose`. While it is exposed, `Exposed::copy_to_slice` reads it with
+volatile reads into a `[T]` with `T: FromBytes + IntoBytes`, with the rkey still valid after: S1's
+one exception (section 3.2). A protocol that lets a peer write there learns that the data is
+complete from a write-with-immediate notification or a SEND, then copies.
 
 In A, a request owns an ordered group of leases, its members. Each member keeps its own
 identity, byte range and access permission: a batch may contain exclusive READ
@@ -417,7 +463,11 @@ flushes is a fatal error that never frees memory the NIC may use: after `DRAIN_T
 second) without a completion, `remove_qp` fails with `Error::NotFlushed` and keeps the queue
 pair, its buffers, its index and its reservation; dropping the worker tries once more and
 otherwise leaks them, with the CQ and the thread domain (destroying those needs the queue pair
-gone). The cost is waiting for the NIC's flush when a queue pair or a worker is dropped.
+gone). The cost is waiting for the NIC's flush when a queue pair or a worker is dropped. The
+contexts of requests not delivered yet are dropped when the removal gives those requests up,
+before any poll; their buffers follow once the NIC is done. A slot without an owner holds no
+context, so a poll never runs a destructor of the user's and none can unwind through it with
+completions still to record.
 
 **State.** M accepts work only on a queue pair in RTS or ERR, and a connection starts from
 RESET. The worker records what it knows: a queue pair takes work once `connect` succeeded or
@@ -440,12 +490,13 @@ model NIC or the driver spends per completion it is small either way, and the `w
 it constant.
 
 **Two ways to drive a worker.** The event loop (`Worker::poll`) polls the CQ and hands every
-request that retired with an owner to a callback, with the queue pair's index, the queue, the
-sequence number, the outcome and the buffers, in each queue's order; the callback may post
-new work. Nothing is allocated. Owners that take their results by sequence number
+request that retired with an owner to a callback, with its context, its result and its buffers,
+and the queue pair's index, the queue and the sequence number, in each queue's order; the
+callback may post new work. Nothing is allocated. Owners that take their results by sequence number
 (`Worker::progress`, then `take_send` or `take_recv`) are how the futures work: polling
 retires requests into their rings and wakes their wakers. One worker is driven one way or
-the other, since `poll` hands out the results owners would wait for.
+the other, since `poll` hands out the results owners would wait for. Giving up a request
+(`detach_send`, `detach_recv`) hands its context back and leaves its buffers until it retires.
 
 **Futures.** The asynchronous layer puts a worker behind an `Rc<RefCell<..>>`
 (`LocalWorker`): one borrow flag, no atomics. Each `LocalQp` holds a handle to its worker;
@@ -462,9 +513,10 @@ pairs of their own do better with a worker each.
 
 **Refused doorbells.** When the device refuses a doorbell (`ibv_wr_complete` fails), none of
 the requests written since the last doorbell was posted. A request with an owner retires at
-once with a flush error, which its owner takes with its buffers (the event loop gets it at
-once too); one without an owner releases its buffers and is reported as its queue's detached
-error. Sequence numbers are never reused, so no owner can take another request's result. The
+once as `CompletionError::Refused`, never a made-up flush error, and its owner takes that with
+its context and buffers (the event loop gets it at once too); one without an owner releases its
+buffers and is reported as its queue's detached error. Sequence numbers are never reused, so no
+owner can take another request's result. The
 ring keeps the refused requests in its window with no WQEs, and their WQE numbers, which the
 NIC never saw, go to the next requests. A refused doorbell may take with it the signaled
 request that would have retired the unsignaled ones before it; those retire with the next
@@ -494,6 +546,8 @@ says.
 | everything `Send + Sync`, a CQ per queue pair | a worker per thread: one CQ shared by its queue pairs, no locks; `SharedQp` when sharing is needed |
 | `unsafe` spread through the crate | all `unsafe` in `safeverbs-core`, the rest `forbid(unsafe_code)` |
 | no statement of the guarantee | a conditional Theorem 1 over M and A; the real implementation's refinement is still being completed |
+| a user-chosen `wr_id` looked up in a slab | a typed context in each request's slot, handed back once; the `wr_id` is the library's own |
+| `Wc` fields read by hand, some undefined | typed results with only what each operation defines; an error names the failing WQE |
 
 The typestate builder for connection setup, the reference-counted resource handles and the
 async style of the API carry over.

@@ -178,10 +178,14 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
   READs reports its last READ's length (`read_batch.rs`), and a waker's
   panic keeps every polled completion and resumes only after the poll's
   bookkeeping (`waker_unwind.rs`); `wc.rs` checks, on the simulated NIC and
-  on a device, that a WRITE with immediate fills no receive buffer, and
-  `batch.rs`, on both, that an error in the middle of a batch is its outcome
-  while the WQEs after it flush and its buffers come back once, and on a
-  device that a batch of READs reports its last READ's length.
+  on a device, that a WRITE with immediate fills no receive buffer and that
+  every kind of receive gets its case of `Received`, and `batch.rs`, on both,
+  that an error in a batch is its outcome, at its position, while the WQEs
+  after it flush and its context and buffers come back once, and on a device
+  that a batch of READs reports its last READ's length. `worker.rs` also checks
+  that contexts come back with their own requests, exactly once by their
+  destructors, that refused requests are told from flushed ones, and that a
+  detached error has its position.
 - `safeverbs` (`crates/safeverbs/tests/allocation.rs`): every buffer's
   memory is freed exactly once, after a refused registration too.
 - `safeverbs` (`crates/safeverbs/tests/model.rs`): the public API on the
@@ -192,9 +196,11 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
   every buffer is back or released once and nothing stays registered.
 - `safeverbs` (`crates/safeverbs/tests/rxe.rs`): one test per feature on a
   real device, two QPs of it connected to each other; four QPs on one
-  worker, connected pairwise, driven by the event loop and by futures; and
-  QPs removed, and a worker dropped, with work in flight, among it
-  unsignaled WQEs that only the drain WQE retires.
+  worker, connected pairwise, driven by the event loop, with contexts that
+  count their drops, and by futures; a sink's error naming its item; refused
+  requests; a remote WRITE with immediate read with the safe copy, with the
+  same rkey after it; and QPs removed, and a worker dropped, with work in
+  flight, among it unsignaled WQEs that only the drain WQE retires.
 - The crate documentation of `safeverbs` runs its example on the model
   and has `compile_fail` tests for what the types rule out.
 
