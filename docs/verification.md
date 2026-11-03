@@ -1,420 +1,245 @@
 # Verification
 
-SafeVerbs is being verified with [Verus](https://github.com/verus-lang/verus).
-The complete library refinement theorem is still an obligation; the checked components
-and trusted boundaries below describe the current result.
-This document tells users what is proved, what is only stated so far, and what is assumed;
-it tells contributors how to run the proofs and how code written inside `verus!` is built
-with plain `cargo`. The design behind it is in [`design.md`](design.md).
+SafeVerbs is verified with [Verus](https://github.com/verus-lang/verus). This page says
+what is proved, what is only tested, what is assumed and what remains, then how to run
+the proofs. [`design.md`](design.md) explains the design behind them.
 
-## What is proved, what is stated, what is assumed
+## Where things stand
 
-### Proved (checked by `scripts/verify.sh`)
+The guarantee is one refinement theorem: under a model **M** of the NIC
+(`crates/safeverbs-spec/src/nic.rs`), the library behaves like a small abstract machine
+**A** (`abs.rs`), and the properties S1, F1, R1 and L1 are lemmas about A. The theorem
+(`theorem_1` in `refinement.rs`) is proved for every implementation that discharges the
+obligations of the `Refines` trait. **The library does not discharge them yet.** What is
+proved of it are components: the completion ring refines A, and the worker's hardware
+side keeps the NIC within M and its rings coupled to M's queues. The step that would tie
+them together, mapping the worker's requests onto A's groups, is the main open item
+(see "Remaining").
 
-The model, the abstract machine and the theorem's composition are in `crates/safeverbs-spec`
-and verified with no `assume`, `admit`, `external_body` or assumed specification anywhere in
-the crate (the script refuses them). The core's verified parts follow them, under
-"The core".
+`scripts/verify.sh` checks everything below that is called proved. The specification
+crate uses no `assume`, `admit`, `external_body` or assumed specification; the code of
+`crates/safeverbs-core` written inside `verus!` uses no `assume` or `admit` and trusts
+only the items of `scripts/trusted.txt` (see "Trusted computing base"). The rest of the
+core (`buf.rs`, `worker.rs`, `pd.rs`, `verbs.rs`, `model.rs`) and the `safeverbs` crate
+are ordinary Rust: not trusted by the proofs, and not verified either.
 
-**A, the abstract machine** (`abs.rs`). Its invariants are inductive: they hold in its start
-state and every transition preserves them (`lemma_step_keeps_invariant`). The guarantees are
-lemmas about every state A can reach (`guarantees.rs`):
+## The properties
 
-A separates **member resources** (`Lease`: identity, byte range, uniqueness and byte
-validity) from **groups** (`Group`: an ordered member sequence and one holder). A request
-owns one group, with one access direction per member and one outcome and waker for the
-whole group. Ghost `join` and `separate` transitions preserve member identities and
-permissions while replacing the group handles. Shared sources may overlap other shared
-clones; each writable destination must remain exclusive. These are specification steps,
-with no runtime allocation or interval lookup.
+For each property: what the specification proves (`crates/safeverbs-spec`), what the
+ring proves (`ring.rs`, with the steps of A in `refine.rs`) and what the worker proves
+(`hw.rs` and its submodules, `buf/`).
 
-| Property | Lemma | Meaning |
-| --- | --- | --- |
-| S1 | `lemma_s1_no_conflict` | what the program may write, the NIC may neither read nor write; what the program may read, the NIC may not write |
-| S1 | `lemma_s1_nic_writes_any_bytes` | the NIC writes only uniquely held memory whose element type accepts every bit pattern |
-| F1 | `lemma_f1_outcome_fixed` | an outcome, once produced, never changes |
-| F1 | `lemma_f1_take` | taking a request's outcome returns that outcome and its exact ordered member identities, ranges and permissions |
-| F1 | `lemma_f1_taken_once` | a request no longer held never comes back (ids are not reused) |
-| R1 | `lemma_member_owned_once` | each live member identity occupies exactly one position in one group |
-| R1 | `lemma_r1_member_released_once` | once an allocated member identity disappears from all groups, no later step resurrects it |
-| R1 | `lemma_r1_kept_while_in_flight` | an in-flight request keeps its members, unchanged, until its outcome exists |
-| R1 | `lemma_r1_requests_on_live_qps` | no request outlives its queue pair |
-| R1 | `lemma_r1_released_once` | a retired group handle never comes back; its members may survive under fresh handles |
-| L1 | `lemma_l1_no_waker_left` | a complete request holds no waker |
-| L1 | `lemma_l1_completion_wakes` | completing a request invokes the waker it holds |
+**S1, no undefined behaviour.** The program and the NIC never touch a byte in
+conflicting ways.
+- *Spec.* In every state A reaches, nothing the program may write is read or written by
+  the NIC or the peer, and nothing the program may read is written by them
+  (`lemma_s1_no_conflict`); whatever the NIC may write is held uniquely by a type that
+  accepts any bytes (`lemma_s1_nic_writes_any_bytes`). `corollary_s1` restates this
+  against M for a coupled state.
+- *Ring.* A request's leases stay in its slot, unreachable, from `end` until A says the
+  NIC is done with them (completion, or never posted), and leave it exactly once.
+- *Worker.* Every byte a WQE in M may access locally lies in a buffer its live request
+  holds, with the access its operation needs.
+  Buffers carry the allocator's linear byte permissions through splitting, freezing,
+  slicing and thawing (`buf/memory.rs`, `buf/view.rs`), each SGE is covered by the
+  permission of the buffer its request retains (`buf/lease.rs`), the inputs of one request
+  are disjoint where one is unique, and a buffer posted as a receive is disjoint from
+  every buffer the worker holds.
+- *Not proved:* that the worker's requests are groups of A, so the coupling of A and M for
+  the whole library. S1 of the library still rests on Rust's ownership of `BufMut`, `Buf`
+  and `Part` together with these component proofs.
 
-**M, the NIC model** (`nic.rs`, proofs in `nic_proofs.rs`). Its invariants are inductive
-(`lemma_step_keeps_invariant`): each queue is a prefix of executed WRs followed by
-unexecuted ones, within its depth; every CQE names an executed, unretired WR with that WR's
-`wr_id` and outcome, and a queue's CQEs wait in posting order; the buffers of every posted WR
-stay registered. On top of them:
+**S2, no local misuse.** Every verb the library calls meets M's precondition.
+- *Spec.* The preconditions are M's `require`s. The NIC's own steps never invalidate one
+  (`lemma_nic_steps_keep_verbs_enabled`), and neither do other workers' verbs on their own
+  queues (`share.rs`: `lemma_rely_keeps_enabled`, `lemma_mine_is_foreign`).
+- *Worker.* Proved: every call into the NIC goes through a trusted wrapper whose
+  precondition is M's, and Verus checks each call site: queue pair creation within the
+  CQ's reservation, connection from `Reset`, doorbells on a queue pair in `Rts` or `Err`
+  with room in its queue and every WR one M accepts (scatter/gather count, operation,
+  length, registered regions), receives, polls, and destruction of a queue pair only with
+  empty queues and of a CQ only with no queue pair. Between two calls the worker's view
+  stays valid whatever the NIC and the other workers do (`lemma_rely`).
+- *Not proved:* the control path that allocates protection domains and registers and
+  deregisters regions (`buf.rs`, `pd.rs`). The worker's rely assumes it deregisters no
+  region a written WR names, which leases ensure.
 
-- `lemma_cq_never_overflows`: given the reservation `create_qp` requires, no CQ ever holds
-  more entries than its capacity (also checked as a safety condition inside the NIC steps).
-- `lemma_poll`: a polled CQE reports its own WR's `wr_id` and outcome, and retires that WR
-  and every earlier one of its queue, which were unsignaled sends that succeeded; M records
-  every retired WR's outcome.
-- `lemma_nic_steps_keep_verbs_enabled`: nothing the NIC does on its own invalidates a verb's
-  precondition, so the library may check preconditions against the state it last saw.
-- `lemma_nic_touches_registered`: the NIC only touches memory that is registered right now.
+**F1, outcome correspondence.** Each request gets at most one outcome, the one M produced
+for its own WQEs, with its own buffers.
+- *Spec.* An outcome never changes once produced, taking it returns it with exactly the
+  members the request was posted with, and a request taken never comes back
+  (`lemma_f1_outcome_fixed`, `lemma_f1_take`, `lemma_f1_taken_once`). Against M, a request
+  owns a nonempty interval of WQEs on one queue, and no other request owns any of them;
+  its outcome exists only once all of them retired, and is the first error in posting
+  order or the last WQE's success (`corollary_f1`, `lemma_aggregate`); a request whose
+  prefix retired is still in flight (`corollary_inflight`). A successful SEND or WRITE has
+  one outcome, reported or implied (`lemma_ack_outcome_unique`).
+- *Ring.* `take` returns exactly the outcome and the leases of a complete request, or of
+  one whose doorbell was refused with a flush error. Sequence numbers are never reused.
+- *Worker.* Each completion reaches the queue pair, queue and request of its own WQE
+  (`wr_id.rs` and the coupling of rings to M's queues). A receive request's result is the
+  outcome M retired for its WQE (`hw/outcomes.rs`). A send request's implied success is
+  the success M retired for its last WQE, the length of a READ included
+  (`hw/send_outcomes.rs`).
+- *Not proved:* the first error of a send batch, which the worker keeps natively, against
+  M's aggregate.
 
-**Each worker's share of M** (`share.rs`). M is one state for the whole device, while the
-library drives it from several threads: each worker owns one CQ and the queue pairs it creates
-there, and the protection domain with its regions is shared through the control path. M is
-unchanged; `share.rs` states, from M's definition, what the threads rely on and guarantee each
-other. A worker's share (`Share`) is its CQ and a set of QP names no other worker uses;
-`share_wf` says a state respects it (its QPs attached to its CQ only, no other QP attached
-there). Between two calls of a worker, M moves by the NIC's own steps and by verbs of the
-others on their own CQs and QPs, which deregister no region the worker's next verb names
-(`rely_reaches` with the `pins`). Proved: such steps keep the share well formed and leave it as
-the NIC alone would (`framed`, `lemma_rely_frame`); every verb of the worker's own
-(`mine`) that was enabled in the state it last saw is still enabled
-(`lemma_rely_keeps_enabled`, which generalizes `lemma_nic_steps_keep_verbs_enabled`); every
-rely run is a run of M (`lemma_rely_is_nic_run`); and a worker's own verbs are foreign steps
-for every disjoint share (`lemma_mine_is_foreign`, the guarantee) and keep its own share well
-formed (`lemma_mine_keeps_share_wf`).
+**R1, no leak by the library.** Every buffer handed to the library is returned or released
+once, never before the NIC is done with it.
+- *Spec.* A request in flight keeps its members unchanged until its outcome exists
+  (`lemma_r1_kept_while_in_flight`); every request lives on an existing queue pair
+  (`lemma_r1_requests_on_live_qps`); a released group handle or lease never comes back
+  (`lemma_r1_released_once`, `lemma_r1_member_released_once`), and each lease belongs to
+  one group (`lemma_member_owned_once`).
+- *Ring.* Leases stay in their slot until the request completes, is taken, refused,
+  detached or released with its queue pair, and leave it once.
+- *Worker.* A queue pair is destroyed only when neither ring has a WQE in flight, which M
+  turns into empty queues: its buffers are released after the NIC retired their WQEs.
+- *Conditional.* Release is eventual only if the device flushes. When it does not, the
+  worker keeps the queue pair and its buffers and reports `Error::NotFlushed`; this
+  retention is tested, not proved.
 
-**The refinement theorem's composition** (`refinement.rs`). `theorem_1` proves that for any
-implementation meeting the obligations of the `Refines` trait, along any execution, A's and
-M's invariants hold, every verb met its precondition (S2), and A and M stay coupled.
-`corollary_s1` and `corollary_f1` restate S1 and F1 against M: the NIC touches only memory A
-gives it, and the outcome a client takes aggregates only its own fully retired WQE
-interval. `WqeRange` enforces nonempty, disjoint intervals. `lemma_aggregate` proves that
-aggregation keeps the earliest error or the final success, and `corollary_inflight` that
-a request whose proper prefix retired is still in flight with its leases. A concrete trace
-(`example_batch_first_error`) has a remote error followed by a flush; the batch returns
-the remote error only after both WQEs retire. These are specification results; the real
-worker still needs to discharge `Refines`.
+**L1, no lost wakeup.** Once a request is complete, any waker its future registered has
+been invoked.
+- *Spec.* A complete request holds no waker, and completing one invokes the waker it holds
+  (`lemma_l1_no_waker_left`, `lemma_l1_completion_wakes`).
+- *Ring.* `complete` wakes exactly the wakers of the requests it retires.
+- *Worker.* A waker that panics is caught; the worker finishes the poll's bookkeeping, then
+  resumes the panic. Verus checks the normal path; the panicking one is tested.
 
-**Worked examples** (`examples.rs`) are concrete executions checked step by step; they show
-that the transitions can happen, so no lemma above is vacuous. A mixed group contains a
-READ destination and a frozen SEND/WRITE source whose clone remains readable by the
-program. Both ordinary completion/take/separation and cancellation preserve the individual
-permissions and aggregate the WQE interval before releasing the group.
+Liveness (that a request eventually completes) is outside the claim: it needs the NIC to
+make progress, someone to poll the CQ and the executor to poll woken tasks.
 
-#### The core
+## Tested, not proved
 
-The code of `crates/safeverbs-core` written inside `verus!` is verified with no `assume` or
-`admit`; it trusts only the items listed in `scripts/trusted.txt` (see "Trusted computing
-base" below), and the script refuses any other.
+- Failed memory-region revocation: a refused close keeps its handle,
+  `Exposed::try_reclaim` returns the still exposed owner for a retry, and a failed final
+  cleanup keeps the registration, the memory, the protection domain and the device
+  (`buf.rs` unit tests).
+- Wake panics: a caught panic keeps every polled completion and its leases, the poll's
+  bookkeeping finishes before it resumes, across queue pairs on one CQ and across refused
+  doorbells (`crates/safeverbs-core/tests/waker_unwind.rs`). Unwinding through other
+  callbacks and destructors is not covered.
+- Memory: a refused registration frees its memory; split, frozen, exposed and streamed
+  buffers free theirs once (`crates/safeverbs/tests/allocation.rs`).
+- Batches: an error stays within its own request's interval (`tests/outcome.rs`), and a
+  batch of READs reports the last READ's length (`tests/read_batch.rs`). A WRITE with
+  immediate puts no data in the receive's buffers (`tests/wc.rs`, on the model and rxe).
+- `RingBuf`'s placement and the reuse of its chunks.
+- The simulated NIC (`model.rs`) checks some of M's rules at run time: no queue pair
+  destroyed with WQEs not retired, no CQ destroyed with a queue pair attached, no work
+  posted in `Reset`. That it behaves within M is neither tested systematically nor proved.
+- The asynchronous API of the `safeverbs` crate, on the model and on soft-RoCE, and random
+  operation sequences with injected errors and flushes on the ring, the worker and the
+  public API (`docs/dev-setup.md` lists the tests).
 
-**Executable buffer ranges** (`buf/range.rs`, `buf/memory.rs`). The real `RawMut` holds
-an `OwnedRange`: a pointer, a byte length and erased `ByteRange` geometry. Frozen `Buf` views use `ElementRange`,
-which keeps the original offset/element-count representation and erases its byte
-geometry and element width; `Buf::len()` still needs only a field read. Verus proves
-checked construction, non-overflowing end calculation, exact adjacent splits, and
-bounded element slicing (including multiplication by the element size). Checked SGE
-length conversion either preserves every byte or rejects a length above `u32::MAX`.
-The ordinary buffer methods call these executable operations, rather than a separate
-copy of their arithmetic. Compile-time layout assertions keep both runtime ranges at
-two machine words. Checked lemmas identify its finite byte domain with A/M's `Span`,
-prove that slices stay within the retained range, and split an existing vstd
-`PointsToRaw` token along the exact range partition without changing provenance.
+## What is assumed
 
-**Actual allocation permissions** (`buf/memory.rs`). The fallible zeroed allocator
-returns a linear raw-byte permission and deallocation capability on success; it
-returns no permission on failure. Checked executable code carries that permission in
-the actual `RawMut` and `Frozen` contents, partitions it when splitting, and transfers
-the identical contents through freeze and successful thaw. Shared views retain the
-same frozen permission. An erased map of per-byte vstd tokens supports borrowed
-nonaliasing proofs while preserving exact token identities; no map is built at runtime.
-`Part`'s invariant ties its actual SGE to that permission's
-byte domain; `Leases` preserves this relation through guard deduplication. Alignment
-checks use the absolute pointer, including when recovering over-aligned elements.
-Failed registration returns the whole permission for checked deallocation. `RingBuf`'s
-chunks are the exception: its placement is not verified, so their permissions are
-assumed (`OwnedRange::ring_chunk`). Final Arc-driven region cleanup, registration
-lifetime, initialized typed contents and the public wrappers remain unverified. These
-tokens describe allocation ownership, not validity of arbitrary incoming bytes as `T`.
+The trusted computing base is rustc and the standard library, Verus and Z3, rdma-core
+with its provider and kernel drivers, the items of `scripts/trusted.txt`, and above all
+that the NIC behaves as M says. M is the assumption to read: every rule the library
+relies on about hardware is a transition or a precondition there, not prose.
+`docs/design.md` (section 4) lists the in-order completion rules. Four premises about
+completions and registration deserve a note:
+
+- a successful RDMA READ reports exactly the length it asked for;
+- a successful SEND or WRITE reports its status only: no length, no immediate;
+- a successful receive is either a payload within its own SGEs or the notification of a
+  peer's WRITE with immediate, whose length describes the remote write;
+- `reg_mr` asks for local write whenever it asks for remote write (a precondition of M
+  that the library's unverified control path meets).
+
+Errors report their status only: their opcode, length and immediate are undefined. Evidence
+that real NICs conform to M will come from differential testing on hardware and soft-RoCE.
 
 Where unverified code calls a verified function, that function's precondition is assumed,
-not proved: `BufMut::freeze` (the buffer fits `T`), `BufMut::into_part` (at most
-`u32::MAX` bytes, also checked at run time), `BufMut::split_at` (in bounds, also checked),
-`RingBuf::write_with` and `RingBuf::place` (a chunk's permission and base), `Region::new`'s
-failure path (`release_failed_allocation` gets what `allocate` returned) and every caller
-of `Leases::len` (the count fits `usize`).
+not proved:
 
-**Actual frozen views** (`buf/view.rs`). `Buf<T, N>` itself is verified: its native
-Arc and element range retain the same frozen permission through cloning and bounded
-slicing. The view has whole-element offsets and stays within the frozen range. Checked
-thaw returns that whole range on success, including when the handle was a subview, or
-retains the same view on failure. SGE construction uses the actual view geometry.
-The public range-syntax parser and zerocopy/slice-reference wrappers remain outside
-Verus; these geometry facts alone do not establish initialized `T` contents. The actual
-view-pointer computation proves absolute typed alignment, provenance and byte bounds
-within `isize::MAX`. Fallible `Buf::try_into_part` returns an oversize view unchanged;
-the checked successful SGE has exactly that view's bytes and readonly access.
-
-**Actual request resources** (`buf/lease.rs`). `Part` and `Leases` are no longer
-opaque to the verifier. Their actual field observations, empty construction, native
-retention/deduplication algorithm, and first-unique-resource extraction are checked.
-`Leases::view` describes physical keepers, while its erased `loans` ledger preserves
-every logical input's actual SGE, domain and operation access. An existential backing
-relation proves each logical input has a retained keeper; several overlapping shared
-inputs may use the same keeper. Incoming local writes require unique resources. `new`
-establishes the invariant and the native `push` algorithm preserves it even when dropping
-a redundant Arc. Extraction returns the first unique resource from the original sequence.
-The container's length accessor assumes its mathematical resource count fits `usize`.
-
-The erased `wqes` ledger records each WQE's actual `wr_id`, opcode, SGEs and disjoint
-interval of logical inputs. The actual collection loop in `Hw` proves the correspondence,
-including its reverse SGE order. Receive and drain paths record their footprints too.
-`fully_recorded` says every logical input belongs to a WQE. `Hw::inv` establishes both
-properties for open resources and all staged, posted, completed or refused ring payloads;
-`take` and an abort returning a kept owner export them. The ring preserves the entire
-resource value, including both ledgers, through completion, refusal, detach and waker
-changes. Layout tests show the ledgers add no native size or alignment.
-
-**Actual receive admission** (`hw/separation.rs`, `ring/separation.rs`). The real
-`post_recv` proves its unique input separated from every prior local keeper, including
-open, held and building parts and completed/refused ring owners. Success retains the
-exact logical input; failure returns the same Part. The readonly worker traversal
-preserves existing snapshots and optimizes to `retq`; no additional trusted item is
-used. This does not establish compatibility with all program-held resources or other
-workers, or a maintained global A invariant. See [unique-admission.md](unique-admission.md).
-
-**Actual receive outcomes** (`hw/outcomes.rs`). The worker invariant couples each
-native receive request's singleton interval to M. Pending requests have no outcome;
-completed requests match their own M.retired entry. Actual posting, CQ dispatch,
-result removal, wakers, control verbs and teardown preserve it. `lemma_recv_result`
-exports that concrete observation. Send-batch aggregation and the complete public
-refinement remain unfinished; see [outcome-coupling.md](outcome-coupling.md).
-
-**Actual send tails** (`hw/send_outcomes.rs`). Each request's recorded final WR
-authorizes its native inferred success and is bound to its actual WQE, first in
-the provider builder and then in M's send queue. Actual polling derives the retired
-tail's operation-valid metadata from its executed slot; subsequent operations
-preserve that history. A successful retired tail equals the native inferred value,
-including the final READ length. The native first-error cache and complete send
-aggregate are still being connected. These additions erase from ordinary builds.
-
-**Failed MR revocation (runtime behavior, tested).** `Nic::close_mr` is fallible and
-idempotent. A failed close retains its handle. `Exposed::try_reclaim` returns the still
-exposed owner for retry; successful reclaim alone returns typed access. On failed final
-cleanup, the wrapper retains the registration, backing allocation, PD and device rather
-than freeing memory the NIC can still access. Backend unwinding also retains backing
-resources. The model tests cover refusal/retry, successful release and retained dependency
-chains. These control-path routines remain outside Verus; no unconditional leak-freedom
-claim follows.
-
-**The completion ring** (`ring.rs`). `Ring::new` establishes the eight invariants of the
-module documentation (`Ring::inv`) and every operation requires and keeps them; Verus also
-rules out failures of its own indexing, assertions and arithmetic under their preconditions.
-`Hw::take` couples every returned receive outcome and its exact leases to the
-request's own M.retired entry. Receive queues contain no synthetic refusal result.
-User wake panics are now caught at the standard-library boundary. The ring restores
-its normal invariant before resuming one, and the worker delays propagation until
-all CQEs from its poll and their notifications have been processed. Model regressions
-cover caught-panic reuse, inferred requests, refusal and multiple QPs on one CQ.
-Verus checks these normal-return transitions and the accumulator; it does not yet
-provide a whole-public-API unwind theorem. Other callback/destructor unwinding remains
-outside these guarantees.
-The only run-time check added for counter bounds is one comparison in
-`has_free_slot`, which refuses a new request once the WQE or request numbers could not hold
-`max_wqes` more (after 2^64 of them; one comparison of their bitwise or covers both). Every
-operation is specified by what A sees of the ring: its requests (`Ring::req`: posted and not
-freed, in flight or complete, with waker, owner and leases), the requests written but not
-posted (`Ring::staged`), the requests whose doorbell the device refused (`Ring::refused`:
-never posted, their leases kept for their owners) and the wakers woken (`Ring::woken`, a ghost
-log). `take` returns exactly the outcome and the very leases of a complete request, or of a
-refused one with a flush error; the leases a request holds are the value `end` moved in,
-until it retires, is taken, is refused without an owner, is handed back by `abort_keeping`
-or the queue pair is destroyed.
-
-A refused doorbell (`abort`, `abort_keeping`) never makes a sequence number void: each staged
-request with an owner becomes a refused one in the window, with no WQEs (the invariants allow
-such void slots among the requests in flight, `Ring::void_ok`), which its owner takes or
-drops at any time; `retired` moves past them without a completion, and the WQE numbers the
-NIC never saw leave the accounting and go to the next requests. Wakers registered on the
-staged requests are woken (the ring's log grows by them; A, which never saw those requests,
-wakes nothing).
-
-**The ring refines A** (`refine.rs`). In every state of A where the ring's requests sit
-(`placed`: each request A sees in the ring is a request group of A, on the ring's queue
-pair, with the same phase, waker and owner; each staged or refused request's resources a
-program group of A; no two the same), each operation's change is zero or more steps of A to a state
-where they sit again: none for `begin`, `push_wqe`, `end` and `take_detached_error`;
-`post_request` (then `register` or `detach`) for each request `commit` posts; `drop` for each
-staged lease without an owner an abort releases, none for the others (their leases stay the
-program's, kept in the ring or handed back); A's `complete` for each request `complete`
-retires, in order, A's wakes growing by exactly the wakers the ring woke (L1 for the ring);
-A's `take`, `detach` and `register` for `take`, `detach` and `set_waker`, none for taking a
-refused request and `drop` for detaching one; and for `release_all` a flush, `detach` and
-`drop` that leave nothing of the queue pair in A. The async layer's side list of results
-moved out of a clogged ring is covered as well (`with_side`): moving a result there is no
-step, taking it is A's `take` with the outcome and leases the ring gave (no step for a
-refused one). This is the ring's share of the obligations of `Refines`.
-
-`Permissions<L>` supplies a ghost interpretation indexed by request sequence and concrete
-resource value, plus each request's member directions. Equal frozen values in distinct
-requests can therefore have distinct member names without a native ID counter. Placement requires
-that correspondence, and every ring/side-list adapter preserves it. Concrete ghost views
-exercise these contracts with mixed permissions and repeated equal source values. Mapping
-the worker's leases onto A's groups (spans, exclusivity, fresh names) is still open.
-
-The ring also states its WQE accounting (`spec_wqe_retired`, `spec_wqe_committed`,
-`spec_wqe_posted`, `lemma_wqes`): `push_wqe` hands out the next number, `commit` commits every
-number handed out, an abort takes the uncommitted ones back, `complete` retires no WQE past the
-one completed, and the other operations leave the numbers alone. The worker needs this to
-relate a ring to its queue in M.
-
-**The `wr_id`** (`wr_id.rs`). `wr_id` packs a QP's index, the queue and the low 47 bits of a
-WQE number; `index_of`, `is_recv` and `wqe_of` are proved to recover them, `wqe_of` for every
-WQE at most 2^47 after the oldest in flight (`lemma_wr_id_fields`, `lemma_low_bits_determine`,
-bit-vector proofs).
-
-**The worker's hardware side** (`hw.rs`). Everything of a worker that M sees lives in `Hw`: its
-CQ, each QP's hardware handle with the rings of its two queues, the WQE a request holds back
-with its parts, and the worker's token (`NicToken`: M's state as the worker last saw it and its
-share of M). The unverified `Worker` (`worker.rs`) drives it through its public methods only,
-each of which requires and keeps the invariant `Hw::inv`:
-
-- every call into the NIC goes through a trusted verb of `trusted.rs` whose precondition is
-  M's, so Verus checks S2 at each call: `create_qp` (M's reservation: the CQ's reserved count
-  in M is exactly `Hw::reserved`, and a QP is created only if its depths fit, so no CQ can
-  overrun), `connect` (from `Reset` only), `to_error`, the doorbell (only on a QP M sees in
-  `Rts` or `Err`, with room in the queue from the ring's accounting and every WR M accepts:
-  its scatter/gather count, operation, length and registered regions), `post_recv`, `poll`,
-  `destroy_qp` and `destroy_cq`;
-- the coupling: QP `i` of the table is M's QP `id`, M's queue holds the ring's WQEs from at or
-  after the oldest in flight to the last committed, and the `k`-th has the `wr_id` of index
-  `i`, its queue and number `head + k`; the phase the worker knows is M's state;
-- routing (`progress`, `dispatch`): each completion `ibv_poll_cq` reports is the CQE M's
-  `poll_cq` pops (`lemma_poll_steps` takes a poll apart), which names a live QP of the
-  worker's share; its `wr_id` decodes to exactly that QP's index, queue and WQE, which the ring
-  retires while M retires it too: the request a completion reaches is that WQE's;
-- teardown: `start_drain` moves a QP with work in flight to `Err`, `post_drain` writes the
-  drain WQE (a signaled SEND of nothing, which M accepts in `Err`), and `destroy` destroys a QP
-  only when neither ring has a WQE in flight, which the coupling turns into M's empty queues,
-  `destroy_qp`'s precondition; `finish` destroys the CQ only with no QP left;
-- under rely, the invariant survives whatever the NIC and the other workers do between two
-  calls (`lemma_rely`).
-
-**The trusted verbs** (`trusted.rs`). The core's calls into the NIC have contracts taken from
-M: each requires M's precondition, on the token's own share, and ensures that M moved by rely
-steps and then by the verb's step (`doorbell` posts the WRs written since `start` as one
-`post_send`; `poll` reports the CQE each `poll_cq` step pops; `connect` is three `modify_qp`
-steps). The token is one worker's and only these wrappers make or change it: `create_cq` makes
-a token over a fresh share. These are trusted, not proved.
-
-### Stated, not yet proved
-
-- **Theorem 1 for the real library.** The obligations of `Refines` (start states; every API
-  call is zero or more steps of A and of M; the invariant couples A and M) are what
-  `safeverbs-core` must prove. Today:
-  - **M's side is proved for the worker** (`hw.rs`): every verb the worker calls meets M's
-    precondition (S2) in the state the worker last saw, which under rely means it does when it
-    happens; M stays in states its invariants hold in; and the rings stay coupled to M's
-    queues, so the completion routed to a request is its own WQE's (F1's routing half) and the
-    reservation keeps the CQ from overrunning. This holds for every operation of the
-    synchronous worker, the event loop's and the futures' alike, since both go through `Hw`.
-  - **A's side is proved for the ring** (`refine.rs`), not yet for the worker: the worker has
-    no ghost map from its rings' requests to A's leases (`ids`, `dirs` of `placed`), and so no
-    `impl Refines`. What that needs: the ghost state of A (which leases the program holds) in
-    the worker, which only the buffers can supply (next point).
-  - **Buffers.** Actual mutable/frozen ranges and frozen views now carry the allocator's
-    byte permissions through checked geometry, splitting, freeze/thaw and SGE construction.
-    The typed wrappers in `buf.rs` remain outside `verus!`. Initialized contents,
-    zerocopy contracts, `RingBuf`, exposure/revocation and final
-    cleanup remain unfinished; registration lifetime is still trusted through
-    `registered` and `registered_all`.
-  - **Concrete grouped permissions.** The checked loan ledger accounts for shared
-    deduplication, operation access and each WQE's SGEs. `Hw` retains that invariant
-    through its rings and returns it with owned results, and the keepers prove nonaliasing
-    within each request. Mapping requests onto A's groups (fresh names, arbitrary-byte
-    validity, cross-request compatibility, placement) remains unfinished.
-  - **Composition.** Each worker's view is coupled to M under rely, and every worker verb is a
-    foreign step for the others (`lemma_mine_is_foreign`). How several workers compose
-    into one device history is open: tokens are not split from one global token;
-    `create_cq` makes each. The control path (allocating
-    PDs, registering and deregistering regions in `buf.rs` and `pd.rs`) is not verified; rely
-    assumes it deregisters no region a worker's written WR names, which leases ensure.
-  - **Operation-specific outcomes.** The earlier SEND/WRITE `byte_len` mismatch is
-    resolved by projecting undefined fields away: `CompletionKind::StatusOnly` carries
-    only status. `lemma_ack_outcome_unique` proves the observed and implied successes
-    agree. READ outcomes carry read length; receive payloads are bounded by receive
-    SGEs; WRITE_WITH_IMM notifications are not. This resolves that particular obstruction,
-    but does not construct the missing worker-to-A map or discharge `impl Refines`.
-
-  Until then Theorem 1 holds for any implementation that discharges the obligations; the core
-  discharges M's side for the worker and A's side for the ring.
-- **Theorem 2**, two SafeVerbs endpoints under assume-guarantee (no receiver-not-ready or
-  remote access errors; every error completion due to a fault). It is stated in
-  `refinement.rs` and `design.md` only.
-
-### Assumed
-
-The trusted base is listed in `design.md`, section 4: rustc and std, Verus and Z3,
-rdma-core with the provider and kernel drivers, the NIC behaving as M says, and the bodies
-of the trusted verbs wrappers. M is the assumption users should read: every rule the
-library relies on about hardware is a transition or precondition there, not prose. Evidence
-that real NICs conform will come from differential testing on hardware and soft-RoCE.
+- `BufMut::freeze` relies on its buffer fitting `T` (`Buf::from_frozen`);
+- `BufMut::into_part` on at most `u32::MAX` bytes (`Part::unique`; also checked at run
+  time), and `BufMut::split_at` on an index in bounds (also checked);
+- `RingBuf` builds its chunks with byte permissions it does not prove
+  (`OwnedRange::ring_chunk`) and relies on their base when placing them;
+- the failure path of `Region::new` hands `release_failed_allocation` what `allocate`
+  returned;
+- every caller of `Leases::len` relies on the count fitting `usize`.
 
 ### Trusted computing base
 
 Beyond the toolchain and M, the verified core trusts exactly the items of
-`scripts/trusted.txt`; `scripts/verify.sh` fails if an `external_body` or external
-specification appears anywhere else in `crates/safeverbs-core`, or if a listed item no longer
-exists. Each of them, and why it is trusted:
+`scripts/trusted.txt`. `scripts/verify.sh` fails if an `external_body` or external
+specification appears anywhere else in `crates/safeverbs-core`, or if a listed item no
+longer exists.
 
 | Item (`crates/safeverbs-core/src/`) | What Verus takes on trust |
 | --- | --- |
 | `ring.rs` `ExWaker` | `core::task::Waker` is an opaque type |
 | `ring/wake.rs` `ExWakePanic` | std's boxed panic payload is opaque |
-| `ring/wake.rs` `try_wake` | std `catch_unwind` catches an unwind from `Waker::wake`; it does not unwind itself. The ring logs the attempted notification. |
-| `ring/wake.rs` `resume` | std `resume_unwind` never returns |
-| `ring.rs` `will_wake` | `Waker::will_wake`: when it says two wakers wake the same task, they share a name in A (`waker_id`) |
+| `ring/wake.rs` `try_wake` | `catch_unwind` catches an unwind from `Waker::wake` and does not unwind itself |
+| `ring/wake.rs` `resume` | `resume_unwind` never returns |
+| `ring.rs` `will_wake` | when `Waker::will_wake` says two wakers wake the same task, they have one name in A |
 | `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name |
 | `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
 | `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
-| `buf/memory.rs` `ExRegion` | registration and final Arc-driven cleanup remain opaque; actual buffer ranges and permissions are verified |
-| `buf/memory.rs` `allocate_zeroed_raw` | fallible `alloc_zeroed`, with vstd-compatible address, layout, provenance and linear allocation/deallocation permissions on success; no initialized-content claim |
-| `buf/memory.rs` `arc_try_unwrap` | std Arc returns its exact contents on success, or an Arc to the same contents on failure; no promised success condition |
-| `buf/lease.rs` `same_frozen_arc` | std Arc pointer equality implies that both references retain the same frozen allocation |
+| `buf/memory.rs` `ExRegion` | a registered region is opaque: registration and its final cleanup are not verified |
+| `buf/memory.rs` `allocate_zeroed_raw` | the fallible zeroed allocator returns the address, layout, provenance and linear permissions vstd expects, or nothing; no claim about initialized contents |
+| `buf/memory.rs` `arc_try_unwrap` | `Arc::try_unwrap` returns the exact contents, or an `Arc` to the same contents |
+| `buf/lease.rs` `same_frozen_arc` | `Arc::ptr_eq` means both hold the same frozen allocation |
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
-| `trusted.rs` `device_caps` | the device's limits as the library reads them are M's (`caps_model`) |
-| `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a name never used, after whatever happened before, in a state where M's invariants hold; the new worker's share is that CQ and QP names nobody uses (this is where tokens come from) |
+| `trusted.rs` `device_caps` | the device's limits as the library reads them are M's |
+| `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a fresh name, in a state where M's invariants hold; the new worker's share is that CQ and queue pair names nobody uses (this is where tokens come from) |
 | `trusted.rs` `alloc_domain` | thread domains change which locks the driver takes, not what the NIC does (no contract) |
-| `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these verbs are M's `create_qp` (with the attributes `qp_attr` says), three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or (on error) nothing, after rely steps |
-| `trusted.rs` `qp_num_of`, `qp_lock_free` | facts of no meaning in M (no contract) |
-| `trusted.rs` `no_qp` | panics: a key that names no QP never returns |
-| `trusted.rs` `pd_id_of` | the PD's runtime identity matches its observation in the model |
-| `trusted.rs` `registered`, `registered_all` | a part's lease promises its region is registered in its domain (writable if the part is unique) and stays so while the lease lives (`buf.rs`'s `Region`); learning it moves the view to the present |
-| `trusted.rs` `start`, `post`, `abort` | `ibv_wr_start`, `ibv_wr_*`, `ibv_wr_abort`: writing WRs changes nothing in M until the doorbell; an abort discards them |
-| `trusted.rs` `doorbell` | `ibv_wr_complete` is M's `post_send` of the WRs written since the start (after rely steps), or nothing on error |
+| `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these are M's `create_qp`, three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or nothing on error, after rely steps |
+| `trusted.rs` `qp_num_of`, `qp_lock_free` | facts that mean nothing in M (no contract) |
+| `trusted.rs` `no_qp` | a key that names no queue pair panics and never returns |
+| `trusted.rs` `pd_id_of` | the protection domain's run-time identity is its identity in the model |
+| `trusted.rs` `registered`, `registered_all` | a part's region is registered in its domain (writable if the part is unique) and stays so while the part lives |
+| `trusted.rs` `start`, `post`, `abort` | `ibv_wr_start`, `ibv_wr_*`, `ibv_wr_abort`: writing WRs changes nothing in M until the doorbell, and an abort discards them |
+| `trusted.rs` `doorbell` | `ibv_wr_complete` is M's `post_send` of the WRs written since the start, after rely steps, or nothing on error |
 | `trusted.rs` `post_recv` | `ibv_post_recv` of one WR is M's `post_recv`, or nothing on error |
 | `trusted.rs` `poll` | each CQE `ibv_poll_cq` returns is the one M's `poll_cq` pops, with its `wr_id` and outcome |
 
-Every wrapper's rely pins the regions the worker's written WRs name (`pinned`): their leases
-are held (by the hardware side, for the WQE a request holds back and its parts), so no other
-thread deregisters them meanwhile.
+Each wrapper requires M's precondition on the worker's token and ensures that M moved by
+rely steps (the NIC's own, and other workers' on their own queues) and then by the verb.
+The rely pins the regions the worker's written WRs name, whose leases the worker holds.
+Some modelling choices sit in these contracts: M has no atomics, and the contracts treat a
+fetch-and-add or compare-and-swap like an RDMA READ (the NIC writes the local buffer); a
+`Wc`'s status maps onto M's six as `Status::model` says; M has one scatter/gather limit per
+queue pair, the smaller of its send and receive limits; and the library posts no inline
+data, so M sees a queue pair's inline limit as zero.
 
-Modelling choices sit in these contracts: M has no atomics, and the contracts treat a
-fetch-and-add or compare-and-swap as an RDMA READ (locally both have the NIC write the local
-buffer); a `Wc`'s status maps to M's six statuses as `Status::model` says; M has one limit of
-scatter/gather elements per QP, the smaller of the QP's send and receive limits (the worker
-holds every WQE to it); and safeverbs posts no inline data, so M sees a QP's inline limit as
-zero.
+## Remaining
 
-The listed standard-library adapters and verbs wrappers are the bodies the proofs
-call without checking. `ring/wake.rs` verifies the panic accumulator itself; catching
-and resuming unwinding remain narrow trusted standard-library boundaries.
-The rest of `safeverbs-core` (`buf.rs` apart from its verified range/resource helpers, `worker.rs`,
-`verbs.rs`, `model.rs`, `pd.rs`) is
-outside `verus!`: not trusted by the proofs, but not verified either. `worker.rs` holds no
-state M sees (keys, the event loop's cursors, the drain's clock): it cannot break the coupling,
-only misuse the API, which `Hw` handles. The futures layer (`safeverbs`) is safe Rust on top
-of the worker, outside Verus.
-
-Liveness is outside the claim: that every request eventually completes needs the NIC to
-make progress, the executor to poll woken tasks and someone to poll the CQ.
+- **The worker's `impl Refines`.** Map each ring request onto a group of A, with fresh
+  names, each member's direction and the check that groups stay compatible, and couple
+  them to M (`coupled`): the WQE interval of every request, and the first error of a send
+  batch against M's aggregate.
+- **Buffers.** The typed wrappers of `buf.rs` are outside `verus!`; initialized contents
+  and the zerocopy contracts, `RingBuf`, exposure and revocation and the final cleanup of a
+  region are not verified, and the registration lifetime is trusted (`registered`,
+  `registered_all`). The preconditions listed above, which unverified callers rely on,
+  should become proved.
+- **Several workers.** Each worker's view of M is proved under rely, and each worker's
+  verbs are foreign steps for the others, but one device history for all workers is not
+  built: `create_cq` makes each token rather than splitting one. Worker creation and
+  destruction, and moving buffers between workers, are part of this. This will be
+  designed with the tokens.
+- **The public API.** Connect the futures, sinks and streams of `safeverbs` to the
+  verified worker, and state exactly which public operations the theorem covers, including
+  reuse after a caught panic. Keep conditional release distinct from leak freedom.
+- **Theorem 2**, for two endpoints that both run SafeVerbs, is stated in `refinement.rs`
+  and `design.md` only.
+- **M.** Gather evidence that real NICs conform (differential tests on hardware and
+  soft-RoCE), and give out-of-order transports and shared receive queues their own rules.
+- **Performance.** Compare the CPU paths with native ibverbs on real NICs; soft-RoCE is
+  functional evidence only.
 
 ## Running the proofs
 
-Install a Verus release (the binary release from GitHub, or on Arch Linux the AUR package
-`verus-bin`) so that `verus` and `cargo-verus` are on `PATH`, and install the Rust toolchain
-it names. The core is verified in the main workspace, which needs the rdma-core submodule
-and what building `safeverbs-sys` needs (`docs/dev-setup.md`); `VERIFY_SPEC_ONLY=1` checks
+Install a Verus release (the binary release from GitHub, or the AUR package `verus-bin`
+on Arch Linux) so that `verus` and `cargo-verus` are on `PATH`, and the Rust toolchain it
+names. The core is verified in the main workspace, which needs the rdma-core submodule and
+what building `safeverbs-sys` needs (`docs/dev-setup.md`); `VERIFY_SPEC_ONLY=1` checks
 only the specification crate, which needs neither.
 
 ```console
@@ -426,153 +251,49 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 173 verified, 0 errors
-safeverbs-core: verification results:: 290 verified, 0 errors
+safeverbs-spec: verification results:: 154 verified, 0 errors
+safeverbs-core: verification results:: 389 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only
-the listed items, then, for each crate, builds it with plain `cargo` (it must compile with
-its ghost code erased, as users build it) and runs `cargo verus verify` on it with the
-toolchain Verus names (whatever `rust-toolchain.toml` pins). It always re-verifies the crates
-while vstd stays cached, runs under a memory cap when `systemd-run` is available
-(`VERIFY_MEMORY_MAX`, default `6G`), and exits non-zero on any failure. The first run also verifies vstd itself (about
-1900 items); after that a run takes a few seconds. Extra arguments go to Verus, for example
-`scripts/verify.sh --rlimit 2`, which still passes: the proofs are not at the edge of the
-solver's resource limit.
-
-For quick iteration, the crate can also be checked without cargo:
-
-```console
-$ cd crates/safeverbs-spec && verus --crate-type=lib src/lib.rs
-```
+the listed items. Then, for each crate, it builds it with plain `cargo` (its ghost code
+must erase, as users build it) and runs `cargo verus verify` with the toolchain Verus
+names. It re-verifies the crates every time while vstd stays cached, runs under a memory
+cap when `systemd-run` is available (`VERIFY_MEMORY_MAX`, default `6G`; `VERIFY_JOBS` sets
+the build jobs) and exits non-zero on any failure. The first run also verifies vstd
+itself; after that a run takes a few minutes. Extra arguments go to Verus, for example
+`scripts/verify.sh --rlimit 2`. For quick iteration on the specification alone:
+`cd crates/safeverbs-spec && verus --crate-type=lib src/lib.rs`.
 
 ## Building `verus!` code with plain cargo
 
-Parts of `safeverbs-core` are written inside `verus!` and must still build with plain `cargo`
-for users who never install Verus. We tried this with a crate shaped like the core (exec code
-whose contracts use this crate's ghost types, a trusted `external_body` wrapper, a tracked
-token, `#![no_std]` and `#![forbid(unsafe_code)]`), verified with `cargo verus verify` and
-built and tested with plain `cargo test` on stable Rust. What we found:
+Parts of `safeverbs-core` are written inside `verus!` and still build with plain `cargo`
+for users who never install Verus.
 
-- **Dependencies.** A crate that uses `verus!` depends on `vstd` from crates.io. vstd is
-  published for every Verus build with a date version; pin the one that belongs to your
-  Verus release (it is the version in that release's `source/vstd/Cargo.toml`), here
-  `vstd = { version = "=0.0.0-2026-10-25-0158", default-features = false }`
-  (`default-features = false` gives a `no_std` vstd; a crate whose verified code uses `Vec`
-  adds `features = ["alloc"]`, as the core does). `state_machine!` is not re-exported by
-  vstd: a crate that defines state machines also depends on `verus_state_machines_macros` of
-  the same version and puts `state_machine!` outside `verus!`.
-- **Erasure.** Without Verus, the `verus!` macro erases ghost code: `spec` and `proof`
-  functions disappear, `requires` and `ensures` are dropped, and `Ghost<T>` and `Tracked<T>`
-  values and ghost fields become zero-sized. So a `use` of a spec or proof function fails to
-  compile without Verus; call it by its path inside the proof instead, import it with a glob
-  (globs tolerate missing items), or guard the `use` with `#[cfg(verus_only)]`. An external
-  type or trait specification is a real item after erasure; the core puts it under
-  `#[cfg(verus_keep_ghost)]` so that a plain build has none. A plain build produces the code it would produce
-  without Verus. It also checks nothing: a function with a false `ensures` compiles. Proofs
-  are checked only by `cargo verus verify` (or `scripts/verify.sh`), which CI must run.
-- **Ghost parameters stay in signatures.** A `Tracked<T>` or `Ghost<T>` parameter is still a
-  parameter after erasure (of a zero-sized type), so code outside Verus has to pass one
-  (`Tracked::assume_new()`). The core's public API should therefore keep its tokens inside
-  its structs and take no ghost parameters.
-- **Toolchain.** vstd's macro dependencies use edition 2024 and need Cargo 1.85 or newer
-  (Rust 1.82, which the repository pinned before, cannot build them). We built with stable
-  1.98.1 and with 1.99.1, which Verus uses and the repository now pins.
-- **Workspace.** `safeverbs-spec` is its own workspace, so that it verifies on a plain clone:
-  the main workspace needs the rdma-core submodule even for
-  `cargo metadata`. `safeverbs-core` can be a member of the main workspace and depend on it
-  by path.
-- **Verification through cargo.** `cargo verus verify` builds with `RUSTC_WRAPPER=verus`
-  and verifies every crate whose `Cargo.toml` has `[package.metadata.verus] verify = true`,
-  importing what each verified dependency exports. It runs `cargo metadata` with the
-  toolchain of the current directory, so in this repository it needs
-  `RUSTUP_TOOLCHAIN` set to Verus's toolchain (the script does this). Verus-relevant cargo
-  options such as `--manifest-path` and `-p` must come before generic ones such as `-j`.
-- **Across crates, state machines need wrappers.** The copy of a crate that its dependents
-  compile against is built without `cfg(verus_keep_ghost_body)`, and `state_machine!` emits
-  its transition relations, `invariant()` and `*_enabled` predicates only under that cfg. A
-  dependent crate therefore cannot name `Nic::State::poll_cq` or `s.invariant()`. This crate
-  exports plain spec functions instead, which do cross: `nic_inv`, `nic_init`, `nic_next`,
-  `nic_step(pre, post, step)` and `nic_enabled(pre, step)` for M, `abs_inv`, `abs_init`,
-  `abs_next` and `abs_step` for A, with lemmas that a step is a step of its machine. A
-  negative check (a false assertion about M in the dependent crate) fails as it should, so
-  their meaning crosses too.
-- **Lints.** Verus sets `cfg(verus_only)` and `cfg(verus_keep_ghost)`; declare them in
-  `[lints.rust] unexpected_cfgs` to silence warnings, and allow `non_snake_case` for the
-  modules `state_machine!` generates.
-
-The `Cargo.toml` of `safeverbs-core` has, besides its other dependencies:
-
-```toml
-[dependencies]
-safeverbs-spec = { version = "0.1.0", path = "../safeverbs-spec" }
-vstd = { version = "=0.0.0-2026-10-25-0158", default-features = false, features = ["alloc"] }
-
-[package.metadata.verus]
-verify = true
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
-```
-
-## How the core connects to the model
-
-The completed refinement needs a tracked token whose view is M's state, a map from
-requests to WQE intervals, and A's lease permissions. The token and separate component
-proofs exist (`trusted.rs`, `hw.rs`, `refine.rs`); the worker-level request map, permission
-integration and `impl Refines` remain to be constructed. Proof-only hardware entry points
-are crate-private, so ordinary Rust callers cannot bypass their verified preconditions.
-
-**Trusted verbs wrappers** (`trusted.rs`). Each verb is one small function with an
-`external_body` and a contract taken from M. The precondition is checked by Verus at every
-call site, which is S2; the postcondition says the verb happened after rely steps (the NIC's
-own, and the other workers' on their own shares), which `share::lemma_rely_keeps_enabled`
-shows is consistent. The WRs written since `start` are kept in the token and posted together
-by the doorbell:
-
-```rust
-pub fn doorbell<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracked<&mut NicToken>)
-    -> (r: Result<()>)
-    requires
-        qp_of(*old(qp)) == q,
-        old(token).started(q),
-        nic_inv(old(token).nic()),
-        share_wf(old(token).nic(), old(token).share()),
-        old(token).share().owns.contains(q),
-        nic_enabled(old(token).nic(), Nic::Step::post_send(q, old(token).written(q))),
-    ensures
-        r is Ok ==> exists|mid: Nic::State|
-            rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid)
-                && nic_step(mid, final(token).nic(), Nic::Step::post_send(q, old(token).written(q))),
-        // ...
-```
-
-**The hardware side** (`hw.rs`). A ghost token cannot cross unverified code (a caller
-outside `verus!` cannot pass a `Tracked` argument without assuming it), so the token lives
-inside `Hw`, a verified struct with private fields, next to everything the token describes:
-the CQ, the QPs' handles and rings, the held WQE and its parts. Its public methods require and
-keep `Hw::inv`; nothing outside the module can touch its fields, so the invariant holds
-whenever the unverified worker calls in.
-
-**Leases.** The ring tracks each request's leases as the value itself: the `L` A sees a
-request hold is the one `end` moved into its slot, and `take` or `abort_keeping` hands back
-that value (`refine.rs`). Its ghost `Permissions<L>` interpretation preserves the exact
-ordered members and their access directions through the ring and side list, and the
-worker retains each request's complete WQE provenance. The maps from sequence numbers to
-A's groups, typed validity and global byte compatibility still need the buffer and worker
-integration before requests can be placed in A.
-
-**Memory as linear ghost permissions (partly integrated).** The real buffer payloads
-carry the fallible allocator's byte permissions through `OwnedRange`, `RawMut`, frozen
-Arc contents and bounded `Buf` views. Actual requests retain those payloads. Native
-WQE provenance links each local SGE to its retained loan and keeper. Global nonaliasing,
-A placement, initialized typed access and final release are still needed for S1 of the
-whole implementation. `registered` continues to supply the registration-lifetime
-assumption used by the verbs contracts. These remaining obligations are not discharged
-by having allocation tokens in the structs.
-
-**The `Refines` implementation (not done).** The core would implement `refinement::Refines`
-for a worker's state (its `Hw`, with A's state as the worker last saw it), relate each public
-function's postcondition to `step`, and prove the three obligations; `theorem_1` does the
-rest. The M obligations are what `Hw`'s methods prove; the ring's lemmas in `refine.rs`
-(`lemma_ring_*`) are the steps of A for each call's ring part.
+- **Dependencies.** A crate that uses `verus!` depends on the `vstd` of its Verus release,
+  pinned (`vstd = { version = "=0.0.0-2026-10-25-0158", default-features = false }`, with
+  `features = ["alloc"]` for verified code that uses `Vec`). `state_machine!` comes from
+  `verus_state_machines_macros` of the same version, outside `verus!`.
+- **Erasure.** Without Verus, `verus!` drops `spec` and `proof` functions, `requires` and
+  `ensures`, and `Ghost<T>` and `Tracked<T>` values become zero-sized. So a `use` of a spec
+  or proof function fails to compile without Verus: call it by its path inside the proof,
+  or import it with a glob. Verus sets `cfg(verus_keep_ghost)` when it compiles a crate;
+  the core puts external type specifications under it, and the exec code that exists only
+  to give the proofs their facts (the traversals that prove buffers disjoint), so a plain
+  build has none of it. A plain build checks nothing: proofs are checked only by
+  `scripts/verify.sh`.
+- **Ghost parameters stay in signatures**, as zero-sized values, so code outside Verus has
+  to pass one (`Tracked::assume_new()`). The public API therefore keeps its tokens inside
+  its structs and takes no ghost parameters.
+- **Workspaces.** `safeverbs-spec` is a workspace of its own, so that it verifies on a plain
+  clone; `cargo verus verify` runs `cargo metadata` with the current directory's toolchain,
+  so the script sets `RUSTUP_TOOLCHAIN` to Verus's. Options such as `--manifest-path` and
+  `-p` must come before generic ones such as `-j`.
+- **State machines across crates.** The copy of a crate its dependents compile against is
+  built without `cfg(verus_keep_ghost_body)`, under which `state_machine!` emits its
+  transition relations and invariants. So the specification exports plain spec functions
+  that do cross: `nic_inv`, `nic_init`, `nic_next`, `nic_step` and `nic_enabled` for M,
+  `abs_inv`, `abs_init`, `abs_next` and `abs_step` for A.
+- **Lints.** Declare `cfg(verus_only)`, `cfg(verus_keep_ghost)` and
+  `cfg(verus_keep_ghost_body)` in `[lints.rust] unexpected_cfgs`, and allow
+  `non_snake_case` for the modules `state_machine!` generates.
