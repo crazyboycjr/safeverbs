@@ -150,6 +150,8 @@ the tests use.
 ```sh
 scripts/rxe.sh up
 cargo test --workspace
+# or, naming the device and the GID (here the ones scripts/rxe.sh creates):
+SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
 ```
 
 - `safeverbs-sys` (`crates/safeverbs-sys/tests/loopback.rs`): smoke tests
@@ -171,6 +173,14 @@ cargo test --workspace
   NIC's CQ is never overrun. The simulated NIC also checks M's rules the
   library must follow: no QP destroyed with a WQE not retired by a polled
   completion, no CQ destroyed with a QP attached, no work posted in RESET.
+  Also on the simulated NIC (`crates/safeverbs-core/tests/`): an error
+  stays within its own request's WQE interval (`outcome.rs`), a batch of
+  READs reports its last READ's length (`read_batch.rs`), and a waker's
+  panic keeps every polled completion and resumes only after the poll's
+  bookkeeping (`waker_unwind.rs`); `wc.rs` checks, on the simulated NIC and
+  on a device, that a WRITE with immediate fills no receive buffer.
+- `safeverbs` (`crates/safeverbs/tests/allocation.rs`): every buffer's
+  memory is freed exactly once, after a refused registration too.
 - `safeverbs` (`crates/safeverbs/tests/model.rs`): the public API on the
   simulated NIC (`Model`), which needs no device: every operation, the sink
   and the stream, dropped futures, errors and flushes, QPs sharing one

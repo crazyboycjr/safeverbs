@@ -19,8 +19,8 @@ For a smaller asynchronous application, read the
 Keep three units distinct:
 
 - A **WQE** is one hardware work item.
-- A **request** may own several WQEs, but has one sequence number, result and resource
-  group. A batch completes only after its entire WQE interval retires.
+- A **request** may own several WQEs, but has one sequence number, result and group of
+  leases. A batch completes only after its entire WQE interval retires.
 - A **worker** owns one shared CQ and several QPs. Each QP still has its own send and
   receive rings; sharing the CQ does not merge their completion accounting.
 
@@ -53,7 +53,7 @@ consumers on one worker can consume results a future is waiting for.
 
 Read [`buf.rs`](../crates/safeverbs-core/src/buf.rs), especially `Region`,
 `BufMut` and `Exposed`, then
-[`buf/memory.rs`](../crates/safeverbs-core/src/buf/memory.rs) for actual `RawMut`/`Frozen`
+[`buf/memory.rs`](../crates/safeverbs-core/src/buf/memory.rs) for `RawMut`/`Frozen`
 ownership and [`buf/view.rs`](../crates/safeverbs-core/src/buf/view.rs) for frozen `Buf`
 views. Continue with
 [`buf/lease.rs`](../crates/safeverbs-core/src/buf/lease.rs) for `Part` and `Leases`:
@@ -75,9 +75,9 @@ For remote access, `Exposed::try_reclaim` revokes the remote registration before
 typed access. A refused close returns its owner for retry; a failed final cleanup retains
 the allocation and dependency chain.
 
-[`buf/range.rs`](../crates/safeverbs-core/src/buf/range.rs) is the verified executable
-arithmetic these buffers use for splits and frozen views. `memory.rs` ties that geometry
-to the allocator's permissions; `permissions.rs` is the erased linear-token bookkeeping.
+[`buf/range.rs`](../crates/safeverbs-core/src/buf/range.rs) is the arithmetic these
+buffers use for splits and frozen views. `memory.rs` ties that geometry to the allocator's
+permissions; `permissions.rs` keeps the per-byte linear tokens, which a plain build erases.
 
 Then read [`wc.rs`](../crates/safeverbs-core/src/wc.rs): its accessors expose only
 operation-defined metadata. SEND/WRITE do not report a byte count; READ and receive
@@ -104,20 +104,17 @@ Start with [verification.md](verification.md), then:
 1. [`guarantees.rs`](../crates/safeverbs-spec/src/guarantees.rs): the precise S1, F1,
    R1 and L1 statements; S2 belongs to the implementation's legal calls into M.
 2. [`abs.rs`](../crates/safeverbs-spec/src/abs.rs): A, the abstract ownership and
-   request machine, including mixed resource groups and cancellation.
+   request machine, including groups that mix unique and shared leases, and
+   cancellation.
 3. [`nic.rs`](../crates/safeverbs-spec/src/nic.rs): M, the hardware behavior and verb
    preconditions being assumed.
 4. [`refinement.rs`](../crates/safeverbs-spec/src/refinement.rs): the `Refines`
-   obligations, WQE interval/outcome coupling and conditional Theorem 1.
+   obligations, the coupling of requests to WQE intervals and outcomes, and Theorem 1.
 5. [`examples.rs`](../crates/safeverbs-spec/src/examples.rs): concrete checked traces.
 6. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the ring-to-A adapters;
    return to `Hw::inv` and [`trusted.rs`](../crates/safeverbs-core/src/trusted.rs)
    for the hardware-facing contracts. `share.rs` provides the hardware worker framing
    rules.
 
-The executable test backend
-[`model.rs`](../crates/safeverbs-core/src/model.rs) is different from the formal model
-M. Tests use it to move real bytes and inject failures; agreement with M is not itself
-proved. The real worker's complete `impl Refines`, concrete byte-permission integration
-and global thread composition remain unfinished. Component proof counts do not imply
-the entire library has been verified.
+The executable test backend [`model.rs`](../crates/safeverbs-core/src/model.rs) is not
+the formal model M: tests use it to move real bytes and inject failures.
