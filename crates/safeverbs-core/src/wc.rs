@@ -382,6 +382,13 @@ impl Wc {
         }
     }
 
+    /// The outcome is a success exactly when the completion is.
+    pub proof fn lemma_outcome_ok(&self)
+        ensures
+            self.outcome().status is Success <==> self.spec_ok(),
+    {
+    }
+
     /// Discarding undefined metadata always gives a canonical outcome.
     pub proof fn lemma_outcome_canonical(&self)
         ensures

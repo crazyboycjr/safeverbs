@@ -21,6 +21,13 @@
 //!   WQE retains its parts directly. Refused results never authorize DMA,
 //!   even when their WQE numbers are reused. The byte lemmas expose the
 //!   corresponding source/destination loan and physical lifetime guard.
+//! - **Outcomes.** A receive request's result is the outcome M retired for
+//!   its WQE (`outcomes`). A send request, one WQE or a batch, caches the
+//!   first error M retired in its interval while it is in flight, and
+//!   completes with M's aggregate of the interval: the first error in
+//!   posting order, else the last WQE's success (`send_outcomes`).
+//!   [`Hw::take`] hands back exactly that, or a flush error for a request
+//!   whose doorbell was refused, which M never saw.
 //! - **Capacity.** The CQ's entries reserved in M are exactly what the
 //!   worker counts ([`Hw::reserved`]); a QP is created only if its depths fit
 //!   ([`Hw::create_qp`]), and each ring keeps at most its depth of WQEs in
@@ -549,110 +556,6 @@ proof fn lemma_resources_completed<N: Device>(pre: Ring<Leases<N>>, post: Ring<L
     lemma_resources_kept(pre, post);
 }
 
-/// The native cached first error interpreted over exactly the retired prefix
-/// of this request's own M interval. A proper prefix does not complete it.
-spec fn prefix_outcome(
-    range: WqeRange, cut: nat, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
-    seen: Option<safeverbs_spec::types::Outcome>,
-) -> bool {
-    &&& range.wf() && range.first <= cut <= range.end
-    &&& forall|s: nat| range.first <= s < cut ==> retired.contains_key(#[trigger] range.at(s))
-    &&& match seen {
-        None => forall|s: nat| range.first <= s < cut
-            ==> (#[trigger] retired[range.at(s)]).status is Success,
-        Some(o) => o.status.is_err() && exists|s: nat| range.first <= s < cut
-            && #[trigger] range.first_error(retired, s) && retired[range.at(s)] == o,
-    }
-}
-
-proof fn lemma_prefix_same(
-    range: WqeRange, cut: nat, before: IMap<WqeRef, safeverbs_spec::types::Outcome>,
-    after: IMap<WqeRef, safeverbs_spec::types::Outcome>, seen: Option<safeverbs_spec::types::Outcome>,
-)
-    requires prefix_outcome(range, cut, before, seen),
-        forall|s: nat| range.first <= s < cut ==> after.contains_key(#[trigger] range.at(s))
-            && after[range.at(s)] == before[range.at(s)],
-    ensures prefix_outcome(range, cut, after, seen),
-{
-    match seen {
-        Some(o) => {
-            let s = choose|s: nat| range.first <= s < cut && range.first_error(before, s)
-                && before[range.at(s)] == o;
-            assert(range.first_error(after, s));
-        },
-        None => {},
-    }
-}
-
-/// Additional successes leave the prior first error, if any, unchanged.
-proof fn lemma_prefix_successes(
-    range: WqeRange, cut: nat, to: nat, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
-    seen: Option<safeverbs_spec::types::Outcome>,
-)
-    requires prefix_outcome(range, cut, retired, seen), cut <= to <= range.end,
-        forall|s: nat| cut <= s < to ==> retired.contains_key(#[trigger] range.at(s))
-            && retired[range.at(s)].status is Success,
-    ensures prefix_outcome(range, to, retired, seen),
-{
-    match seen {
-        Some(o) => {
-            let s = choose|s: nat| range.first <= s < cut && range.first_error(retired, s)
-                && retired[range.at(s)] == o;
-            assert(range.first <= s < to);
-        },
-        None => {},
-    }
-}
-
-/// Once an error was observed, later errors or successes cannot replace it.
-proof fn lemma_prefix_error_kept(
-    range: WqeRange, cut: nat, to: nat, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
-    error: safeverbs_spec::types::Outcome,
-)
-    requires prefix_outcome(range, cut, retired, Some(error)), cut <= to <= range.end,
-        forall|s: nat| cut <= s < to ==> retired.contains_key(#[trigger] range.at(s)),
-    ensures prefix_outcome(range, to, retired, Some(error)),
-{
-    let s = choose|s: nat| range.first <= s < cut && range.first_error(retired, s)
-        && retired[range.at(s)] == error;
-    assert(range.first <= s < to);
-}
-
-/// The CQE at the end of a newly retired prefix supplies its first failure.
-proof fn lemma_prefix_first_error(
-    range: WqeRange, cut: nat, at: nat, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
-    error: safeverbs_spec::types::Outcome,
-)
-    requires prefix_outcome(range, cut, retired, None), cut <= at < range.end,
-        forall|s: nat| cut <= s < at ==> retired.contains_key(#[trigger] range.at(s))
-            && retired[range.at(s)].status is Success,
-        retired.contains_key(range.at(at)), retired[range.at(at)] == error, error.status.is_err(),
-    ensures prefix_outcome(range, at + 1, retired, Some(error)),
-{
-    assert(range.first_error(retired, at));
-}
-
-/// The completed native cache agrees with M's existing interval aggregate.
-proof fn lemma_prefix_aggregate(
-    range: WqeRange, retired: IMap<WqeRef, safeverbs_spec::types::Outcome>,
-    seen: Option<safeverbs_spec::types::Outcome>,
-)
-    requires prefix_outcome(range, range.end, retired, seen),
-    ensures range.all_retired(retired),
-        seen is Some ==> range.aggregate(retired) == seen->0,
-        seen is None ==> range.aggregate(retired) == retired[range.last()]
-            && range.aggregate(retired).status is Success,
-{
-    match seen {
-        Some(o) => {
-            let s = choose|s: nat| range.first <= s < range.end && range.first_error(retired, s)
-                && retired[range.at(s)] == o;
-            lemma_aggregate_first_error(range, retired, s);
-        },
-        None => { lemma_aggregate_success(range, retired); },
-    }
-}
-
 /// A derived execution-history invariant, not an additional assumption of M.
 /// M's existing execution transitions choose only operation-valid outcomes.
 spec fn queued_outcomes_ok(m: Nic::State, q: QpId) -> bool {
@@ -915,9 +818,9 @@ impl<N: Device> HwQp<N> {
         &&& sq_linked(self.send, index, qp)
         &&& rq_linked(self.recv, index, qp)
         &&& outcomes::recv_outcomes(self.recv, m, self.id())
+        &&& send_outcomes::send_results(self.send, m, self.id())
         &&& send_outcomes::send_implied(self.send, self.send_tails@)
         &&& send_outcomes::tail_bound(self.send, self.send_tails@, index, qp, written)
-        &&& send_outcomes::tail_history(self.send, self.send_tails@, m, self.id())
         &&& ring_resources_ok(self.send)
         &&& ring_resources_ok(self.recv)
         &&& queued_outcomes_ok(m, self.id@)
@@ -1097,7 +1000,7 @@ impl<N: Device> HwQp<N> {
         let (a, b) = (m.qps[q], n.qps[q]);
         assert(qp_kept(a, b));
         outcomes::lemma_recv_framed(self.recv, m, n, q);
-        send_outcomes::lemma_history_framed(self.send, self.send_tails@, m, n, q);
+        send_outcomes::lemma_results_framed(self.send, m, n, q);
         assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
             index,
             false,
@@ -1312,7 +1215,7 @@ proof fn lemma_ok_same<N: Device>(
 {
     let qp = m1.qps[e.id()];
     outcomes::lemma_recv_framed(e.recv, m1, m2, e.id());
-    send_outcomes::lemma_history_framed(e.send, e.send_tails@, m1, m2, e.id());
+    send_outcomes::lemma_results_framed(e.send, m1, m2, e.id());
     assert forall|j: int| 0 <= j < written.len() implies m2.send_wr_ok(qp.attr, #[trigger] written[j]) by {
         assert(m1.send_wr_ok(qp.attr, written[j]));
     }
@@ -1608,7 +1511,7 @@ impl<N: Device> Hw<N> {
             assert forall|s: int| self.qps@[index as int]->0.send.meta(s) is Some implies false by {
                 self.qps@[index as int]->0.send.lemma_meta(s);
             }
-            send_outcomes::lemma_history_empty(self.qps@[index as int]->0.send, n, q);
+            send_outcomes::lemma_results_empty(self.qps@[index as int]->0.send, n, q);
             broadcast use vstd::multiset::group_multiset_axioms;
             // The new QP is not one of the table's: those exist in M already.
             assert forall|i: int| 0 <= i < before.qps@.len() && #[trigger] before.qps@[i] is Some implies before.qps@[i]->0.id() != q by {
@@ -1917,7 +1820,7 @@ impl<N: Device> Hw<N> {
                     assert(mid.send_wr_ok(mid.qps[q].attr, written[j]));
                 }
                 outcomes::lemma_recv_framed(e.recv, mid, n, q);
-                send_outcomes::lemma_history_framed(e.send, e.send_tails@, mid, n, q);
+                send_outcomes::lemma_results_framed(e.send, mid, n, q);
                 assert(self.entry_ok(index as int, t, n));
                 self.lemma_touch_one(&start, t, mid, n, index as int);
             } else {
@@ -1969,7 +1872,7 @@ impl<N: Device> Hw<N> {
                     let (a, b) = (m.qps[p], n.qps[p]);
                     assert(qp_kept(a, b));
                     outcomes::lemma_recv_framed(e.recv, m, n, p);
-                    send_outcomes::lemma_history_framed(e.send, e.send_tails@, m, n, p);
+                    send_outcomes::lemma_results_framed(e.send, m, n, p);
                     assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
                         i as u16,
                         false,
@@ -2135,7 +2038,7 @@ impl<N: Device> Hw<N> {
             assert(rq_linked(e.recv, index as u16, b));
             assert(writing_ok(e.send, index as u16, n, b.attr, t0.started(q), written, e.held is Some));
             outcomes::lemma_recv_framed(e.recv, m0, n, q);
-            send_outcomes::lemma_history_framed(e.send, e.send_tails@, m0, n, q);
+            send_outcomes::lemma_results_framed(e.send, m0, n, q);
             assert(self.entry_ok(index as int, t0, n));
             self.lemma_but_one(&start, t0, m0, n, index as int);
             self.lemma_same_token(t0, t, n);
@@ -2365,7 +2268,7 @@ impl<N: Device> Hw<N> {
                     written_backed(e, e.send.spec_wqe_committed() + j, #[trigger] t1.written(q)[j]) by {
                     lemma_written_kept(e1, e, e1.send.spec_wqe_committed() + j, t1.written(q)[j]);
                 }
-                send_outcomes::lemma_history_framed(e.send, e.send_tails@, mid, n, q);
+                send_outcomes::lemma_results_framed(e.send, mid, n, q);
                 assert(self.entry_ok(index as int, t1, n));
                 self.lemma_touch_one(&mid1, t1, mid, n, index as int);
                 self.lemma_same_token(t1, t, n);
@@ -2854,8 +2757,8 @@ impl<N: Device> Hw<N> {
                 outcomes::lemma_recv_framed(e.recv, mid, n, q);
                 send_outcomes::lemma_bound_committed(e0.send, e.send, e.send_tails@,
                     index as u16, a, b, wrs);
-                send_outcomes::lemma_history_kept(e0.send, e.send, e.send_tails@, mid, q);
-                send_outcomes::lemma_history_framed(e.send, e.send_tails@, mid, n, q);
+                send_outcomes::lemma_results_committed(e0.send, e.send, mid, q);
+                send_outcomes::lemma_results_framed(e.send, mid, n, q);
                 assert(self.entry_ok(index as int, t, n));
                 self.lemma_commit_frame(&start, t0, t, mid, n, index as int);
             } else {
@@ -2867,7 +2770,7 @@ impl<N: Device> Hw<N> {
                     n.qps[q], n.qps[q], t0.written(q));
                 send_outcomes::lemma_bound_no_written(e.send, e.send_tails@, index as u16,
                     n.qps[q], t0.written(q));
-                send_outcomes::lemma_history_kept(e0.send, e.send, e.send_tails@, n, q);
+                send_outcomes::lemma_results_refused(e0.send, e.send, n, q);
                 assert(self.entry_ok(index as int, t, n));
                 self.lemma_commit_frame(&start, t0, t, n, n, index as int);
             }
@@ -3110,8 +3013,7 @@ impl<N: Device> Hw<N> {
                     e.send.lemma_meta(seq as int);
                     send_outcomes::lemma_bound_added(e1.send, e.send, e1.send_tails@, index as u16,
                         m1.qps[q], t1.written(q), self.token@.written(q), seq as int, held_wr(h, signaled));
-                    send_outcomes::lemma_history_added(e1.send, e.send, e1.send_tails@,
-                        seq as int, held_wr(h, signaled), m1, q);
+                    send_outcomes::lemma_results_kept(e1.send, e.send, m1, q);
                 }
                 e.held = None;
                 e.held_bytes = 0;
@@ -3655,7 +3557,7 @@ impl<N: Device> Hw<N> {
             assert(total <= m3.caps.max_msg);
             assert(held_ok(e.held->0, e.held_parts@, index as u16, e.send.spec_wqe_committed() + written.len(), attr, e.pd_id@, m3.caps.max_msg));
             lemma_resources_kept(e3.send, e.send);
-            send_outcomes::lemma_history_kept(e3.send, e.send, e.send_tails@, m3, q);
+            send_outcomes::lemma_results_kept(e3.send, e.send, m3, q);
             assert(self.entry_ok(index as int, t4, m3));
             self.lemma_commit_frame(&s3, t3, t4, m3, m3, index as int);
         }
@@ -3747,6 +3649,8 @@ impl<N: Device> Hw<N> {
             r matches Some((_, leases)) ==> leases.inv() && leases.fully_recorded(),
             side is Recv ==> (r matches Some((wc, leases))
                 ==> old(self).recv_taken_matches(index, seq, wc, leases)),
+            side is Send ==> (r matches Some((wc, leases))
+                ==> old(self).send_taken_matches(index, seq, wc, leases)),
     {
         if index >= self.qps.len() {
             return None;
@@ -3766,9 +3670,10 @@ impl<N: Device> Hw<N> {
         };
         proof {
             if start.qps@[index as int] is Some {
-                if side is Recv {
-                    if r is Some {
-                        start.lemma_recv_taken(index, seq, (r->0).0, (r->0).1);
+                if r is Some {
+                    match side {
+                        Side::Recv => start.lemma_recv_taken(index, seq, (r->0).0, (r->0).1),
+                        Side::Send => start.lemma_send_taken(index, seq, (r->0).0, (r->0).1),
                     }
                 }
                 let old_e = start.qps@[index as int]->0;
@@ -3779,7 +3684,7 @@ impl<N: Device> Hw<N> {
                 let post = self.qps@[index as int]->0;
                 lemma_queues_kept(pre, post, m.qps[pre.id()]);
                 outcomes::lemma_recv_kept(pre.recv, post.recv, m, pre.id());
-                send_outcomes::lemma_history_kept(pre.send, post.send, pre.send_tails@, m, pre.id());
+                send_outcomes::lemma_results_kept(pre.send, post.send, m, pre.id());
                 post.send.lemma_wqes();
                 assert forall|j: int| 0 <= j < t.written(pre.id()).len()
                     implies written_backed(post, post.send.spec_wqe_committed() + j,
@@ -3828,7 +3733,7 @@ impl<N: Device> Hw<N> {
                 let post = self.qps@[index as int]->0;
                 lemma_queues_kept(pre, post, m.qps[pre.id()]);
                 outcomes::lemma_recv_kept(pre.recv, post.recv, m, pre.id());
-                send_outcomes::lemma_history_kept(pre.send, post.send, pre.send_tails@, m, pre.id());
+                send_outcomes::lemma_results_kept(pre.send, post.send, m, pre.id());
                 post.send.lemma_wqes();
                 assert forall|j: int| 0 <= j < t.written(pre.id()).len()
                     implies written_backed(post, post.send.spec_wqe_committed() + j,
@@ -3884,7 +3789,7 @@ impl<N: Device> Hw<N> {
                 let post = self.qps@[index as int]->0;
                 lemma_queues_kept(pre, post, m.qps[pre.id()]);
                 outcomes::lemma_recv_kept(pre.recv, post.recv, m, pre.id());
-                send_outcomes::lemma_history_kept(pre.send, post.send, pre.send_tails@, m, pre.id());
+                send_outcomes::lemma_results_kept(pre.send, post.send, m, pre.id());
                 post.send.lemma_wqes();
                 assert forall|j: int| 0 <= j < t.written(pre.id()).len()
                     implies written_backed(post, post.send.spec_wqe_committed() + j,
@@ -3928,7 +3833,7 @@ impl<N: Device> Hw<N> {
                 let pre = start.qps@[index as int]->0;
                 let post = self.qps@[index as int]->0;
                 lemma_queues_kept(pre, post, m.qps[pre.id()]);
-                send_outcomes::lemma_history_kept(pre.send, post.send, pre.send_tails@, m, pre.id());
+                send_outcomes::lemma_results_kept(pre.send, post.send, m, pre.id());
                 post.send.lemma_wqes();
                 assert forall|j: int| 0 <= j < t.written(pre.id()).len()
                     implies written_backed(post, post.send.spec_wqe_committed() + j,
@@ -4136,7 +4041,7 @@ impl<N: Device> Hw<N> {
                     send_outcomes::lemma_bound_kept(before_abort, e.send, e.send_tails@, index as u16,
                         m0.qps[q], m0.qps[q], t0.written(q));
                     send_outcomes::lemma_bound_no_written(e.send, e.send_tails@, index as u16, m0.qps[q], t0.written(q));
-                    send_outcomes::lemma_history_kept(before_abort, e.send, e.send_tails@, m0, q);
+                    send_outcomes::lemma_results_refused(before_abort, e.send, m0, q);
                 }
                 let ghost s1 = e.send;
                 let mut seq = e.send.head();
@@ -4144,7 +4049,7 @@ impl<N: Device> Hw<N> {
                     invariant
                         e.send.inv(),
                         send_outcomes::send_implied(e.send, e.send_tails@),
-                        send_outcomes::tail_history(e.send, e.send_tails@, m0, q),
+                        send_outcomes::send_results(e.send, m0, q),
                         send_outcomes::tail_bound(e.send, e.send_tails@, index as u16, m0.qps[q], Seq::empty()),
                         ring_resources_ok(e.send),
                         e.send.same_wqes(&s1),
@@ -4157,7 +4062,7 @@ impl<N: Device> Hw<N> {
                     e.send.detach(seq);
                     proof {
                         lemma_resources_kept(before_detach, e.send);
-                        send_outcomes::lemma_history_kept(before_detach, e.send, e.send_tails@, m0, q);
+                        send_outcomes::lemma_results_kept(before_detach, e.send, m0, q);
                     }
                     seq += 1;
                 }
@@ -4203,7 +4108,7 @@ impl<N: Device> Hw<N> {
             assert(start.entry_ok(index as int, t0, n));
             lemma_queues_kept(e0, e, n.qps[q]);
             outcomes::lemma_recv_framed(e.recv, m0, n, q);
-            send_outcomes::lemma_history_framed(e.send, e.send_tails@, m0, n, q);
+            send_outcomes::lemma_results_framed(e.send, m0, n, q);
             assert(self.entry_ok(index as int, t, n));
             self.lemma_commit_frame(&start, t0, t, n, n, index as int);
         }
@@ -4318,8 +4223,7 @@ impl<N: Device> Hw<N> {
                     send_outcomes::lemma_bound_added(e0.send, e.send, e0.send_tails@, index as u16,
                         m0.qps[q], t0.written(q), self.token@.written(q), _seq as int,
                         send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@));
-                    send_outcomes::lemma_history_added(e0.send, e.send, e0.send_tails@,
-                        _seq as int, send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@), m0, q);
+                    send_outcomes::lemma_results_kept(e0.send, e.send, m0, q);
                     assert(none@ =~= Seq::<Sge>::empty());
                     let wr = send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@);
                     assert(wr.sges =~= Seq::<safeverbs_spec::nic::Sge>::empty());

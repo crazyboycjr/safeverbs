@@ -18,7 +18,8 @@ impl<N: Device> HwQp<N> {
 
     /// Hands the completion `wc` of this QP, the one `before`'s `poll_cq` step pops, to the
     /// ring of the queue its `wr_id` names, which retires every request it ends; whether one
-    /// retired.
+    /// retired. The send ring's results stay M's (`send_outcomes`), and so do the receive
+    /// ring's (`outcomes`).
     #[inline(always)]
     #[verifier::spinoff_prover]
     pub(super) fn complete_cqe(
@@ -47,6 +48,7 @@ impl<N: Device> HwQp<N> {
             safeverbs_spec::nic_proofs::lemma_head_is_first(before, c);
             lemma_poll(before, after, c);
             lemma_wr_id_fields(i as u16, e.queue is Recv, e.seq as u64);
+            assert(before.qp_wf(qp));
             if e.queue is Send {
                 assert(qp.sq[e.seq - qp.sq_head].wr.wr_id == spec_wr_id(i as u16, false, e.seq as u64));
             } else {
@@ -83,6 +85,7 @@ impl<N: Device> HwQp<N> {
             let wqe = wqe_of(wc.wr_id, self.send.wqe_retired());
             proof {
                 assert(wqe == e.seq);
+                assert(e0.send.spec_wqe_retired() <= wqe < e0.send.spec_wqe_committed());
             }
             let _known = self.send.complete_with_wakes(wqe, *wc, wakes);
             proof {
@@ -178,12 +181,18 @@ impl<N: Device> HwQp<N> {
                 implies after.retired.contains_key(w) && after.retired[w] == before.retired[w] by {
                 reveal(retires);
             }
-            send_outcomes::lemma_history_poll(e0.send, en.send, e0.send_tails@, i as u16,
-                before, after, q, t.written(q), c);
-            if e.queue is Recv {
-                outcomes::lemma_recv_completed(e0.recv, en.recv, before, after, q, e.seq as u64, *wc);
-            } else {
+            if e.queue is Send {
+                send_outcomes::lemma_results_polled(e0.send, en.send, e0.send_tails@, i as u16,
+                    t.written(q), before, after, c, q, e.seq as u64, *wc);
                 outcomes::lemma_recv_framed(en.recv, before, after, q);
+            } else {
+                assert forall|w: WqeRef| w.qp == q && w.queue is Send && w.seq < qp.sq_head
+                    && #[trigger] before.retired.contains_key(w)
+                    implies after.retired.contains_key(w) && after.retired[w] == before.retired[w] by {
+                    reveal(retires);
+                }
+                send_outcomes::lemma_results_framed(en.send, before, after, q);
+                outcomes::lemma_recv_completed(e0.recv, en.recv, before, after, q, e.seq as u64, *wc);
             }
             assert(self.ok(i as u16, after, sh, t.pd(), t.started(q), t.written(q)));
         }
