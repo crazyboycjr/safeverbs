@@ -2404,6 +2404,27 @@ impl<L> Ring<L> {
         }
     }
 
+    /// After WQE `wqe` completed with `wc`, each request still in flight caches `wc` if it
+    /// is an error inside its interval and none was cached, and keeps its cache otherwise.
+    #[verifier::opaque]
+    pub open spec fn pending_cache(&self, pre: Self, wqe: u64, wc: Wc) -> bool {
+        forall|s: int| #[trigger] self.req(s) is Some && self.req(s)->0.phase is InFlight
+            ==> self.meta(s)->0.seen == if pre.meta(s)->0.seen is None
+                && !wc.spec_ok() && pre.meta(s)->0.first <= wqe {
+                Some(wc)
+            } else { pre.meta(s)->0.seen }
+    }
+
+    /// [`Ring::pending_cache`] for request `s`.
+    pub proof fn lemma_pending_cache_observation(&self, pre: Self, wqe: u64, wc: Wc, s: int)
+        requires self.pending_cache(pre, wqe, wc),
+            self.req(s) is Some, self.req(s)->0.phase is InFlight,
+        ensures self.meta(s)->0.seen == if pre.meta(s)->0.seen is None
+            && !wc.spec_ok() && pre.meta(s)->0.first <= wqe {
+            Some(wc)
+        } else { pre.meta(s)->0.seen },
+    { reveal(Ring::pending_cache); }
+
     /// Records the completion of WQE `wqe` (its `wr_id`): retires every
     /// committed request whose WQEs all lie at or before it.
     ///
@@ -2447,6 +2468,8 @@ impl<L> Ring<L> {
             forall|s: int| old(self).spec_retired() <= s < final(self).spec_retired()
                 && #[trigger] old(self).req(s) is Some
                 ==> old(self).meta(s)->0.end as int <= wqe as int + 1,
+            known && wqe >= old(self).spec_wqe_retired()
+                ==> final(self).pending_cache(*old(self), wqe, wc),
     {
         let mut wakes = WakeBatch::new();
         let result = self.complete_with_wakes(wqe, wc, &mut wakes);
@@ -2488,7 +2511,10 @@ impl<L> Ring<L> {
             forall|s: int| old(self).spec_retired() <= s < final(self).spec_retired()
                 && #[trigger] old(self).req(s) is Some
                 ==> old(self).meta(s)->0.end as int <= wqe as int + 1,
+            known && wqe >= old(self).spec_wqe_retired()
+                ==> final(self).pending_cache(*old(self), wqe, wc),
     {
+        proof { reveal(Ring::pending_cache); }
         if wqe >= self.wqe_committed {
             proof { self.lemma_ignored_meta(wqe, wc); }
             return false;
@@ -2635,6 +2661,18 @@ impl<L> Ring<L> {
                 implies self.meta(s)->0.end > wqe as int + 1 by {
                 assert(self.live_ok(s));
                 if self.retired < s { self.lemma_ordered(self.retired as int, s); }
+            }
+            assert forall|s: int| #[trigger] self.req(s) is Some && self.req(s)->0.phase is InFlight
+                implies self.meta(s)->0.seen == if pre.meta(s)->0.seen is None
+                    && !wc.spec_ok() && pre.meta(s)->0.first <= wqe {
+                    Some(wc)
+                } else { pre.meta(s)->0.seen } by {
+                pre.lemma_completion_observation(s, wqe, wc, self.retired as int);
+                assert(self.live_ok(s));
+                if self.retired < s {
+                    self.lemma_ordered(self.retired as int, s);
+                    assert(pre.meta(s)->0.first > wqe);
+                }
             }
         }
         true
