@@ -1,4 +1,4 @@
-//! The actual request-resource container, verified independently of the allocation
+//! What keeps a request's buffers alive, verified independently of the allocation
 //! boundary. Shared deduplication preserves the retained frozen allocation; unique
 //! resources move unchanged into and out of the container.
 //!
@@ -64,7 +64,7 @@ impl<N: Nic> Lease<N> {
         }
     }
 
-    /// Borrow actual owners to establish separation without changing either keeper.
+    /// Borrow both owners to establish separation without changing either keeper.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]
     fn disjoint(&mut self, other: &mut Self)
@@ -108,7 +108,7 @@ impl<N: Nic> Resource<N> {
     /// Whether this physical keeper owns its bytes exclusively.
     pub closed spec fn unique(self) -> bool { self.resource is Unique }
 
-    /// The byte permission retained by this actual physical keeper.
+    /// The byte permission retained by this physical keeper.
     pub closed spec fn byte_domain(self) -> Set<int> {
         match self.resource {
             Lease::Unique(raw) => raw.byte_domain(),
@@ -141,7 +141,7 @@ impl<N: Nic> Resource<N> {
 #[verifier::reject_recursive_types(N)]
 #[allow(dead_code)]
 pub ghost struct Loan<N: Nic> {
-    /// The actual input metadata and resource, captured before deduplication.
+    /// The input's metadata and resource, captured before deduplication.
     pub part: Part<N>,
     /// None for a standalone, unposted resource group.
     pub access: Option<Dir>,
@@ -207,7 +207,7 @@ pub struct Part<N: Nic = Verbs> {
 }
 
 impl<N: Nic> Part<N> {
-    /// The actual SGE byte set is covered by the permission of its retained owner.
+    /// The SGE's bytes are covered by the permission of its retained owner.
     #[verifier::type_invariant]
     pub closed spec fn inv(self) -> bool {
         match self.lease {
@@ -243,7 +243,7 @@ impl<N: Nic> Part<N> {
         Part { sge: Sge { addr: raw.ptr().addr() as u64, length, lkey }, pd, lease: Lease::Unique(raw) }
     }
 
-    /// A shared SGE is a bounded view of the frozen owner's actual permission.
+    /// A shared SGE is a bounded view of the frozen owner's permission.
     #[inline]
     pub(super) fn shared(frozen: Arc<Frozen<N>>, offset: usize, len: usize, lkey: u32, pd: u64) -> (r: Self)
         requires offset <= (*frozen).byte_len(), len <= (*frozen).byte_len() - offset,
@@ -270,7 +270,7 @@ impl<N: Nic> Part<N> {
         part
     }
 
-    /// Bridge the SGE footprint to the actual linear owner, without registration assumptions.
+    /// Bridge the SGE footprint to its linear owner, without registration assumptions.
     pub proof fn lemma_byte_backing(self)
         requires self.inv(),
         ensures self.byte_domain().subset_of(self.resource().byte_domain()),
@@ -291,7 +291,7 @@ impl<N: Nic> Part<N> {
     /// Whether the resource is exclusive.
     pub closed spec fn spec_writable(self) -> bool { self.lease is Unique }
 
-    /// The actual resource moved into a request.
+    /// The resource moved into a request.
     pub closed spec fn resource(self) -> Resource<N> { self.lease.observation() }
 
     pub(crate) proof fn lemma_fields(self)
@@ -300,7 +300,7 @@ impl<N: Nic> Part<N> {
             self.resource() == self.lease.observation(),
     {}
 
-    /// Borrow one actual keeper without changing the incoming Part or its token.
+    /// Borrow one keeper without changing the incoming Part or its token.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]
     pub(crate) fn separate_unique_lease(&mut self, other: &Lease<N>)
@@ -315,7 +315,7 @@ impl<N: Nic> Part<N> {
         proof { self.lemma_byte_backing(); }
     }
 
-    /// A unique Part is separated from another actual Part, including shared views.
+    /// A unique Part is separated from any other Part, including shared views.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]
     pub(crate) fn separate_unique_part(&mut self, other: &Self)
@@ -358,7 +358,7 @@ pub struct Leases<N: Nic = Verbs> {
 }
 
 impl<N: Nic> Leases<N> {
-    /// The actual retained resources, in their original order.
+    /// The retained resources, in their original order.
     pub(super) closed spec fn raw_view(self) -> Seq<Lease<N>> {
         (match self.first { Some(first) => seq![first], None => Seq::empty() }) + self.rest@
     }
@@ -372,7 +372,7 @@ impl<N: Nic> Leases<N> {
         self.first is Some || self.rest@.len() == 0
     }
 
-    /// The actual input parts, including logically distinct shared borrows.
+    /// The input parts, including logically distinct shared borrows.
     pub closed spec fn loans(self) -> Seq<Loan<N>> { self.loans@ }
 
     /// The posted or staged WQEs whose guards this request retains.
@@ -414,7 +414,7 @@ impl<N: Nic> Leases<N> {
         }
     }
 
-    /// Actual keepers exclude these bytes. Checked logical loans inherit that fact.
+    /// The keepers exclude these bytes, and with the invariant so do the loans.
     pub open spec fn separated_from(self, bytes: Set<int>) -> bool {
         &&& forall|i: int| 0 <= i < self.view().len()
             ==> (#[trigger] self.view()[i]).byte_domain().disjoint(bytes)
@@ -483,7 +483,7 @@ impl<N: Nic> Leases<N> {
             },
     {}
 
-    /// Actual unique ownership separates each SGE from every other request input.
+    /// Unique ownership separates each SGE from every other input of the request.
     pub proof fn lemma_disjoint(self)
         requires self.inv(),
         ensures forall|i: int, j: int| #![trigger self.loans()[i], self.loans()[j]]
@@ -606,7 +606,7 @@ impl<N: Nic> Leases<N> {
         }
     }
 
-    /// Every recorded SGE is covered by an actual retained raw-byte permission.
+    /// Every recorded SGE is covered by a retained raw-byte permission.
     pub proof fn lemma_byte_backing(self)
         requires self.inv(),
         ensures forall|i: int| 0 <= i < self.loans().len() ==> {
@@ -748,7 +748,7 @@ impl<N: Nic> Leases<N> {
             final(self).wqes() == old(self).wqes(),
     { self.push_loan(part, Ghost(None)); }
 
-    /// Record the actual operation's access without storing it at runtime.
+    /// Record the operation's access without storing it at run time.
     #[inline]
     pub(crate) fn push_access(&mut self, part: Part<N>, Ghost(access): Ghost<Dir>)
         requires access is In ==> part.spec_writable(),

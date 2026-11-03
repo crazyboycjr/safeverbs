@@ -208,7 +208,7 @@ impl<L> ReqView<L> {
     }
 }
 
-/// Native interval and outcome bookkeeping of one actual ring request.
+/// The interval and outcome bookkeeping of one ring request.
 /// This observation creates neither an abstract request nor a WQE identity.
 pub ghost struct RequestMeta {
     /// First WQE of this native request, inclusive.
@@ -718,7 +718,7 @@ impl<L> Ring<L> {
         }
     }
 
-    /// The actual live request retaining WQE `w`. Refused and retired slots
+    /// The live request retaining WQE `w`. Refused and retired slots
     /// never authorize DMA, even when a refused WQE number is reused.
     pub closed spec fn dma(&self, s: int, w: int) -> Option<L> {
         if self.head <= s < self.posted
@@ -745,7 +745,7 @@ impl<L> Ring<L> {
         forall|s: int, w: int| #[trigger] self.dma(s, w) == pre.dma(s, w)
     }
 
-    /// A DMA observer names an actual in-flight or staged request, with its
+    /// A DMA observer names an in-flight or staged request, with its
     /// exact resources, and never a result retained after refusal.
     pub proof fn lemma_dma(&self, s: int, w: int)
         requires self.inv(), self.dma(s, w) is Some,

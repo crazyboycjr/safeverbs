@@ -1,4 +1,4 @@
-//! Unique receive admission against every buffer the actual worker retains.
+//! Unique receive admission against every buffer the worker retains.
 //!
 //! The immutable worker borrow preserves its rings and resource snapshots exactly.
 //! Only the incoming unique byte permission is mutably borrowed, with its identity
@@ -10,7 +10,7 @@ use super::*;
 verus! {
 
 impl<N: Device> Hw<N> {
-    /// One actual QP's closed rings, open leases and not-yet-written parts exclude
+    /// One QP's closed rings, open leases and not-yet-written parts exclude
     /// the incoming unique SGE's bytes. Completed/refused owners are included.
     closed spec fn entry_separated_from(&self, index: int, incoming: Part<N>) -> bool {
         self.qps@[index] is Some ==> {
@@ -25,7 +25,7 @@ impl<N: Device> Hw<N> {
         }
     }
 
-    /// Admission-time separation against all actual local worker storage.
+    /// Admission-time separation against everything the worker stores.
     /// This says nothing about other workers or untracked program-held groups.
     pub closed spec fn admission_separated_from(&self, incoming: Part<N>) -> bool {
         forall|i: int| 0 <= i < self.qps@.len()
@@ -43,7 +43,7 @@ impl<N: Device> Hw<N> {
         }
     }
 
-    /// Export the private receive observation after the actual ring update.
+    /// Export the private receive observation after the ring update.
     pub(super) proof fn lemma_recv_holds_input(&self, index: usize, seq: RingSeq, part: Part<N>)
         requires self.has_qp(index as int),
             self.qps@[index as int]->0.recv.req(seq as int) is Some,
@@ -54,7 +54,7 @@ impl<N: Device> Hw<N> {
         ensures self.recv_holds_input(index, seq, part),
     {}
 
-    /// The actual traversal is read-only on the worker, preserving every snapshot.
+    /// The traversal is read-only on the worker, preserving every snapshot.
     /// There is no native byte comparison; the linear token proofs are erased.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]

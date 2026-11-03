@@ -41,7 +41,7 @@ impl BytePermission {
                 && self.bytes[address].ptr()@.provenance == self.source
     }
 
-    /// Consume an actual raw allocation range into its per-byte permissions.
+    /// Consume a raw allocation range into its per-byte permissions.
     pub(crate) proof fn from_raw(
         tracked raw: PointsToRaw,
         start: usize,

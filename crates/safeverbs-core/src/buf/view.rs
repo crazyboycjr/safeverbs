@@ -1,4 +1,4 @@
-//! Actual frozen views, with geometry tied to the retained byte permission.
+//! Frozen views, with geometry tied to the retained byte permission.
 //!
 //! These checks concern ownership and layout. Initialized `T` values, the
 //! zerocopy trait contracts and the public slice-reference bridge are separate.
@@ -28,7 +28,7 @@ pub struct Buf<T, N: Nic = Verbs> {
 }
 
 impl<T, N: Nic> Buf<T, N> {
-    /// Bounded whole-element geometry backed by the actual frozen permission.
+    /// Bounded whole-element geometry backed by the frozen permission.
     #[verifier::type_invariant]
     pub closed spec fn inv(self) -> bool {
         &&& (*self.frozen).inv()
@@ -47,7 +47,7 @@ impl<T, N: Nic> Buf<T, N> {
     /// The retained native element count.
     pub closed spec fn element_len(self) -> usize { self.view.spec_len() }
 
-    /// Every byte in the view is owned by its actual frozen allocation keeper.
+    /// Every byte in the view is owned by its frozen allocation.
     pub(super) proof fn lemma_byte_backing(&self)
         requires self.inv(),
         ensures self.byte_domain().subset_of((*self.frozen).byte_domain()),
@@ -129,7 +129,7 @@ impl<T, N: Nic> Buf<T, N> {
         Buf { frozen: self.frozen.clone(), view: self.view, _t: PhantomData }
     }
 
-    /// The actual slice constructor. Rust range syntax is normalized by the caller.
+    /// The slice constructor; the caller normalizes Rust's range syntax.
     #[inline]
     pub(super) fn slice_elements(&self, start: usize, end: usize) -> (r: Option<Self>)
         ensures
@@ -173,7 +173,7 @@ impl<T, N: Nic> Buf<T, N> {
         }
     }
 
-    /// Builds the SGE only from the checked view and its actual frozen keeper.
+    /// Builds the SGE only from the checked view and its frozen keeper.
     /// The caller supplies registration metadata, not byte geometry.
     #[inline]
     pub(super) fn try_part_with_keys(self, lkey: u32, pd: u64) -> (r: Result<Part<N>, Self>)

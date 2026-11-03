@@ -15,8 +15,8 @@
 //!   (`crate::wr_id::spec_wr_id`); the same for the receive queue. So the
 //!   completion M's `poll_cq` pops names the QP, the queue and the WQE that
 //!   [`Hw::progress`] routes it to.
-//! - **Local memory.** Every actual SQ/RQ WQE matches its live native
-//!   request interval's exact opcode and SGE ledger. Written WRs retain
+//! - **Local memory.** Every SQ/RQ WQE matches its live request
+//!   interval's exact opcode and SGE ledger. Written WRs retain
 //!   their guards in staged requests or the open ledger; the final held
 //!   WQE retains its parts directly. Refused results never authorize DMA,
 //!   even when their WQE numbers are reused. The byte lemmas expose the
@@ -135,7 +135,7 @@ pub struct HwQp<N: Device> {
     open_leases: Leases<N>,
     /// The local byte count of the final held WQE, for inferred success.
     held_bytes: u64,
-    /// The actual final WR written for each native send request (erased).
+    /// The final WR written for each send request (erased).
     #[allow(dead_code)]
     send_tails: Ghost<Map<int, SendWr>>,
 }
@@ -149,7 +149,7 @@ struct Held {
     n: usize,
 }
 
-/// Exact logical inputs appended by the native pop loop, in its actual order.
+/// The logical inputs the pop loop appends, in its order.
 pub(crate) open spec fn collected_parts<N: Device>(
     parts: Seq<Part<N>>, remaining: int, access: safeverbs_spec::abs::Dir,
 ) -> Seq<crate::buf::Loan<N>> {
@@ -346,7 +346,7 @@ proof fn lemma_ledger_entry<N: Device>(leases: Leases<N>, j: int)
     assert(leases.wqes()[j] == leases.wqes()[j]);
 }
 
-/// A WQE is retained by its actual live request interval, never by a refused
+/// A WQE is retained by its live request's interval, never by a refused
 /// result whose historical WQE number happens to match.
 pub(crate) open spec fn ring_backed<N: Device>(
     r: Ring<Leases<N>>, w: int, id: u64,
@@ -664,7 +664,7 @@ spec fn queued_outcomes_ok(m: Nic::State, q: QpId) -> bool {
     }
 }
 
-/// Every actual M step preserves validity of already executed local metadata.
+/// Every M step keeps the metadata of executed WQEs valid.
 proof fn lemma_queued_outcomes_step(m: Nic::State, n: Nic::State, step: Nic::Step, q: QpId)
     requires nic_inv(m), nic_step(m, n, step), queued_outcomes_ok(m, q),
     ensures queued_outcomes_ok(n, q),
@@ -796,7 +796,7 @@ pub open spec fn writes(t: NicToken, q: QpId) -> bool {
     t.started(q) || t.written(q).len() > 0
 }
 
-/// The local byte footprint of each actual M WQE has a concrete keeper.
+/// The local byte footprint of each WQE in M has a keeper.
 spec fn queues_backed<N: Device>(e: HwQp<N>, qp: Qp) -> bool {
     &&& forall|k: int| 0 <= k < qp.sq.len() ==> {
         let wr = (#[trigger] qp.sq[k]).wr;
@@ -1155,7 +1155,7 @@ impl<N: Device> Hw<N> {
 }
 
 impl<N: Device> Hw<N> {
-    /// An actual local WQE in this worker's M state can access byte `a`.
+    /// A local WQE in this worker's M state can access byte `a`.
     /// Remote-rkey access belongs to the separate registration authority.
     pub(crate) closed spec fn local_access(&self, index: int, recv: bool, k: int, a: int) -> bool {
         self.has_qp(index) && {
@@ -1166,8 +1166,8 @@ impl<N: Device> Hw<N> {
         }
     }
 
-    /// The actual live request `s`, its retained keeper and the operation's
-    /// local role back this byte of the actual WQE in M.
+    /// The live request `s`, its retained keeper and the operation's
+    /// local role back this byte of the WQE in M.
     pub(crate) closed spec fn local_guarded(&self, index: int, recv: bool, k: int, a: int, s: int) -> bool {
         let e = self.qps@[index]->0;
         let qp = self.nic().qps[e.id()];
@@ -1182,7 +1182,7 @@ impl<N: Device> Hw<N> {
         &&& byte_backed(r.dma(s, w)->0, a)
     }
 
-    /// Every NIC access through this worker's actual SQ/RQ WQEs has a
+    /// Every NIC access through this worker's SQ/RQ WQEs has a
     /// retained source/destination guard in its unique live request interval.
     pub(crate) proof fn lemma_local_guard(&self, index: int, recv: bool, k: int, a: int) -> (s: int)
         requires self.inv(), self.local_access(index, recv, k, a),
@@ -1218,7 +1218,7 @@ impl<N: Device> Hw<N> {
     }
 
     /// A written WR retains its byte either in a staged native request or in
-    /// the open request at the ring's actual next request sequence number.
+    /// the open request at the ring's next request sequence number.
     pub(crate) closed spec fn written_guarded(&self, index: int, j: int, a: int, s: int) -> bool {
         let e = self.qps@[index]->0;
         let wr = self.token@.written(e.id())[j];

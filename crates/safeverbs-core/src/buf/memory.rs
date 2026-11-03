@@ -1,4 +1,4 @@
-//! Linear raw-byte permissions carried by the actual buffer ranges.
+//! Linear raw-byte permissions carried by the buffer ranges.
 //!
 //! The allocator is one primitive boundary; splitting is checked bookkeeping. These
 //! tokens describe domains and provenance, not initialized typed contents or the final
@@ -59,7 +59,7 @@ fn allocate_zeroed_raw(size: usize, align: usize) -> (r: Option<(
     }
 }
 
-/// An actual unique range and the linear permission for precisely its bytes.
+/// A unique range and the linear permission for precisely its bytes.
 pub(super) struct OwnedRange {
     ptr: *mut u8,
     len: usize,
@@ -124,7 +124,7 @@ impl OwnedRange {
         ensures r == self.geometry().spec_offset() + self.geometry().spec_len(),
     { self.ptr.addr() - base.addr() + self.len }
 
-    /// The runtime split also consumes and partitions the actual permission.
+    /// The runtime split also consumes and partitions the permission.
     #[inline]
     pub(super) fn split_at(self, at: usize) -> (r: (Self, Self))
         requires self.inv(), at <= self.geometry().spec_len(),
@@ -155,7 +155,7 @@ impl OwnedRange {
     }
 }
 
-/// A registered lifetime keeper with the actual unique byte-range permission.
+/// A registered lifetime keeper with the unique byte-range permission.
 #[verifier::reject_recursive_types(N)]
 pub(crate) struct RawMut<N: Nic> {
     pub(super) region: Arc<Region<N>>,
@@ -198,7 +198,7 @@ impl<N: Nic> RawMut<N> {
         self.range.fits(core::mem::size_of::<T>(), core::mem::align_of::<T>())
     }
 
-    /// Freezing moves the actual linear permission into shared Arc contents.
+    /// Freezing moves the linear permission into shared Arc contents.
     #[inline]
     pub(super) fn freeze(self) -> (r: Arc<Frozen<N>>)
         ensures (*r).inv(), r.raw == self,
@@ -206,7 +206,7 @@ impl<N: Nic> RawMut<N> {
         Arc::new(Frozen::new(self))
     }
 
-    /// Splitting the actual RawMut moves its token and preserves its native keeper.
+    /// Splitting divides the token between the halves; both keep the region.
     #[inline]
     pub(super) fn split_at(self, at: usize) -> (r: (Self, Self))
         requires self.inv(), at <= self.byte_len(),
@@ -306,7 +306,7 @@ pub(super) fn thaw<N: Nic>(frozen: Arc<Frozen<N>>) -> (r: core::result::Result<R
     }
 }
 
-/// Actual allocation plus permission creation, with no new token minted by callers.
+/// Allocation and its permission, with no token minted by callers.
 #[allow(clippy::question_mark)] // Keep the fallible ownership transfer explicit for Verus.
 pub(super) fn allocate(size: usize, align: usize) -> (r: Option<(
     *mut u8, OwnedRange, Tracked<Dealloc>,

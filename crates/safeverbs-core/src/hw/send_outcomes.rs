@@ -1,10 +1,10 @@
-//! Actual send requests infer success from the final WR's operation and SGEs.
+//! A send request infers its success from its final WR's operation and SGEs.
 #![allow(unused_imports)]
 use super::*;
 
 verus! {
 
-/// The recorded actual final WR authorizes precisely the native inferred success.
+/// The recorded final WR authorizes exactly the inferred success.
 /// Refused results have no metadata and never authorize a reused WQE number.
 pub(super) open spec fn send_implied<L>(r: Ring<L>, tails: Map<int, SendWr>) -> bool {
     forall|s: int| #[trigger] r.meta(s) is Some ==> {
@@ -14,7 +14,7 @@ pub(super) open spec fn send_implied<L>(r: Ring<L>, tails: Map<int, SendWr>) -> 
     }
 }
 
-/// The recorded final WR is the actual last native WQE, in M or not yet rung.
+/// The recorded final WR is the request's last WQE, in M or not yet rung.
 pub(super) open spec fn tail_bound<L>(
     r: Ring<L>, tails: Map<int, SendWr>, index: u16, qp: Qp, written: Seq<SendWr>,
 ) -> bool {
@@ -309,7 +309,7 @@ pub(super) proof fn lemma_history_poll<L>(
 }
 
 
-/// A successful actual retired tail has exactly the native inferred metadata.
+/// A successful retired tail has exactly the inferred metadata.
 pub(super) proof fn lemma_inferred_success<L>(
     r: Ring<L>, tails: Map<int, SendWr>, m: Nic::State, q: QpId, s: int,
 )

@@ -1,4 +1,4 @@
-//! Unique admission against actual retained slot payloads, without modifying a ring. The
+//! Unique admission against the payloads a ring's slots retain, without changing it. The
 //! traversal changes nothing, so it exists in Verus builds alone (`cfg(verus_keep_ghost)`).
 
 use super::*;
@@ -10,7 +10,7 @@ use crate::nic::Nic;
 verus! {
 
 impl<L> Ring<L> {
-    /// Every public payload observation comes from the actual indexed slot.
+    /// Every public payload observation comes from its indexed slot.
     proof fn lemma_payload_coverage(&self, s: int, w: int)
         requires self.inv(),
         ensures
@@ -35,7 +35,7 @@ impl<L> Ring<L> {
 }
 
 impl<N: Nic> Ring<Leases<N>> {
-    /// Spatial exclusion proved for every actual slot retaining a payload.
+    /// Spatial exclusion proved for every slot retaining a payload.
     pub(crate) closed spec fn retained_separated_from(&self, incoming: Part<N>) -> bool {
         forall|i: int| 0 <= i < self.slots@.len()
             && (#[trigger] self.slots@[i]).leases is Some

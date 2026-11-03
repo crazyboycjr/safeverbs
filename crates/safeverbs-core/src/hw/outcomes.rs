@@ -1,4 +1,4 @@
-//! Receive-result coupling to the actual retired WQEs of M.
+//! Receive results coupled to the WQEs M retired.
 //!
 //! Each receive request has one WQE. Unlike send batches, it never infers a
 //! success from a later request's CQE, so its result must be that WQE's outcome.
@@ -86,7 +86,7 @@ pub(super) proof fn lemma_recv_no_staged<L>(r: Ring<L>)
     assert forall|s: int| #[trigger] r.staged(s) is None by { r.lemma_meta(s); }
 }
 
-/// Actual receive admission adds one pending singleton and preserves prior results.
+/// Posting a receive adds one pending singleton and preserves prior results.
 pub(super) proof fn lemma_recv_added<L>(pre: Ring<L>, post: Ring<L>, m: Nic::State, q: QpId, added: int)
     requires recv_outcomes(pre, m, q),
         forall|s: int| #[trigger] post.refused(s) is Some ==> pre.refused(s) is Some,
@@ -182,7 +182,7 @@ pub(super) proof fn lemma_recv_completed<L>(
 }
 
 impl<N: Device> Hw<N> {
-    /// A completed actual receive request's observed result, before it is taken.
+    /// A completed receive request's observed result, before it is taken.
     pub closed spec fn recv_result(&self, index: usize, seq: RingSeq) -> Option<safeverbs_spec::types::Outcome> {
         if !self.has_qp(index as int) { None } else {
             match self.qps@[index as int]->0.recv.req(seq as int) {
@@ -195,7 +195,7 @@ impl<N: Device> Hw<N> {
         }
     }
 
-    /// The actual singleton WQE named by a receive request, not a synthetic ID.
+    /// The one WQE a receive request names, not a synthetic ID.
     pub closed spec fn recv_wqe(&self, index: usize, seq: RingSeq) -> Option<WqeRef> {
         if !self.has_qp(index as int) { None } else {
             let e = self.qps@[index as int]->0;
@@ -206,7 +206,7 @@ impl<N: Device> Hw<N> {
         }
     }
 
-    /// The actual receive result and resource value removed by `take`.
+    /// The receive result and resource value removed by `take`.
     pub closed spec fn recv_taken_matches(&self, index: usize, seq: RingSeq, wc: Wc, leases: Leases<N>) -> bool {
         &&& self.has_qp(index as int)
         &&& self.qps@[index as int]->0.recv.req(seq as int) is Some
