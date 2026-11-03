@@ -3,8 +3,8 @@
 //!
 //! This module is bookkeeping only: no FFI, no `unsafe`, no closures or
 //! iterator chains. It is written inside `verus!` and proved: Verus checks
-//! that every operation keeps the invariants below, never panics and never
-//! overflows (`scripts/verify.sh`; a plain `cargo build` erases the proofs).
+//! that every normal return keeps the invariants below and that arithmetic
+//! and indexing never panic or overflow (`scripts/verify.sh`; a plain `cargo build` erases the proofs).
 //! The worker (`crate::worker`) drives it next to the hardware queue.
 //!
 //! # Requests, WQEs and sequence numbers
@@ -110,7 +110,9 @@
 //! of them, which no NIC reaches). The proofs also rely on a few facts about wakers that
 //! Verus takes on trust: [`core::task::Waker`] is opaque to them, and waking,
 //! comparing and cloning one are the standard library's (see the TCB in
-//! `docs/verification.md`).
+//! `docs/verification.md`). User wake panics are retained until the ring operation
+//! finishes; a worker shares that retention across the whole already-polled CQ batch.
+//! The panic then propagates with the bookkeeping consistent.
 
 use core::task::Waker;
 
@@ -120,6 +122,9 @@ use vstd::prelude::*;
 use crate::wc::Wc;
 
 mod separation;
+pub(crate) mod wake;
+
+use wake::WakeBatch;
 
 verus! {
 
@@ -137,12 +142,6 @@ pub struct ExWaker(Waker);
 
 /// The name A gives a waker: wakers of the same task share it.
 pub uninterp spec fn waker_id(waker: Waker) -> WakerId;
-
-/// Wakes the task `waker` belongs to.
-#[verifier::external_body]
-fn wake(waker: Waker) {
-    waker.wake();
-}
 
 /// Whether `a` and `b` would wake the same task (then they share a name).
 #[verifier::external_body]
@@ -1839,9 +1838,44 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] final(self).meta(s) ==
                 if old(self).staged(s) is Some { None } else { old(self).meta(s) },
     {
+        let mut wakes = WakeBatch::new();
+        let result = self.abort_with_wakes(&mut wakes);
+        wakes.finish();
+        result
+    }
+
+    pub(crate) fn abort_with_wakes(&mut self, wakes: &mut WakeBatch) -> (dropped: u64)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            !final(self).is_open(),
+            final(self).spec_posted() == old(self).spec_posted(),
+            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
+            forall|s: int| #[trigger] final(self).staged(s) is None,
+            forall|s: int|
+                #[trigger] final(self).refused(s) == if old(self).staged(s) is Some && !old(
+                    self,
+                ).staged(s)->0.detached {
+                    Some(old(self).staged(s)->0.leases)
+                } else {
+                    old(self).refused(s)
+                },
+            final(self).woken() == old(self).woken() + old(self).wakers(
+                old(self).spec_committed() as int,
+                old(self).spec_posted() as int,
+            ),
+            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) ==
+                if old(self).staged(s) is Some { None } else { old(self).meta(s) },
+    {
         let dropped = self.posted - self.committed;
         // No request is staged at `posted`: none is handed back.
-        let _kept = self.abort_keeping(self.posted);
+        let _kept = self.abort_keeping_with_wakes(self.posted, wakes);
         dropped
     }
 
@@ -1854,6 +1888,48 @@ impl<L> Ring<L> {
     /// becomes a flush error of that request (it was not executed), so that
     /// the loss is reported, not taken for success.
     pub fn abort_keeping(&mut self, keep: Seq) -> (kept: Option<L>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            !final(self).is_open(),
+            final(self).spec_posted() == old(self).spec_posted(),
+            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
+            forall|s: int| #[trigger] final(self).staged(s) is None,
+            forall|s: int|
+                #[trigger] final(self).refused(s) == if old(self).staged(s) is Some && s != keep
+                    && !old(self).staged(s)->0.detached {
+                    Some(old(self).staged(s)->0.leases)
+                } else {
+                    old(self).refused(s)
+                },
+            final(self).woken() == old(self).woken() + old(self).wakers(
+                old(self).spec_committed() as int,
+                old(self).spec_posted() as int,
+            ),
+            kept == match old(self).staged(keep as int) {
+                Some(r) => Some(r.leases),
+                None => None,
+            },
+            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            final(self).spec_detached_error() is None ==> forall|s: int|
+                #[trigger] old(self).staged(s) is Some && s != keep ==> !old(self).staged(
+                    s,
+                )->0.detached,
+            final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) ==
+                if old(self).staged(s) is Some { None } else { old(self).meta(s) },
+    {
+        let mut wakes = WakeBatch::new();
+        let result = self.abort_keeping_with_wakes(keep, &mut wakes);
+        wakes.finish();
+        result
+    }
+
+    pub(crate) fn abort_keeping_with_wakes(&mut self, keep: Seq, wakes: &mut WakeBatch) -> (kept: Option<L>)
         requires
             old(self).inv(),
         ensures
@@ -1974,7 +2050,7 @@ impl<L> Ring<L> {
                 assert(self.woken() =~= pre.woken() + pre.wakers(pre.committed as int, seq + 1));
             }
             if let Some(waker) = waker {
-                wake(waker);
+                wakes.wake(waker);
             }
             seq += 1;
         }
@@ -2370,6 +2446,47 @@ impl<L> Ring<L> {
                 && #[trigger] old(self).req(s) is Some
                 ==> old(self).meta(s)->0.end as int <= wqe as int + 1,
     {
+        let mut wakes = WakeBatch::new();
+        let result = self.complete_with_wakes(wqe, wc, &mut wakes);
+        wakes.finish();
+        result
+    }
+
+    pub(crate) fn complete_with_wakes(&mut self, wqe: u64, wc: Wc, wakes: &mut WakeBatch) -> (known: bool)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            known == (wqe < old(self).spec_wqe_committed()),
+            old(self).spec_retired() <= final(self).spec_retired() <= old(self).spec_committed(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if old(self).spec_retired() <= s < final(self).spec_retired() {
+                    old(self).retired_view(s, old(self).retire_outcome(s, wqe, wc))
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int| #[trigger] final(self).staged(s) == old(self).staged(s),
+            forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
+            final(self).woken() == old(self).woken() + old(self).wakers(
+                old(self).spec_retired() as int,
+                final(self).spec_retired() as int,
+            ),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            old(self).spec_wqe_retired() <= final(self).spec_wqe_retired(),
+            wqe >= old(self).spec_wqe_retired() ==> final(self).spec_wqe_retired() <= wqe + 1,
+            final(self).same_open(old(self)),
+            final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) ==
+                old(self).completion_meta(s, wqe, wc, final(self).spec_retired() as int),
+            known && wqe >= old(self).spec_wqe_retired() ==> forall|s: int|
+                #[trigger] final(self).req(s) is Some && final(self).req(s)->0.phase is InFlight
+                ==> final(self).meta(s)->0.end > wqe as int + 1,
+            forall|s: int| old(self).spec_retired() <= s < final(self).spec_retired()
+                && #[trigger] old(self).req(s) is Some
+                ==> old(self).meta(s)->0.end as int <= wqe as int + 1,
+    {
         if wqe >= self.wqe_committed {
             proof { self.lemma_ignored_meta(wqe, wc); }
             return false;
@@ -2463,7 +2580,7 @@ impl<L> Ring<L> {
                     },
                 };
                 let ghost before = *self;
-                self.retire(i, outcome);
+                self.retire(i, outcome, wakes);
                 proof {
                     assert(pre.wakers(pre.retired as int, r + 1) == match pre.slot(r).waker {
                         Some(w) => pre.wakers(pre.retired as int, r).push(waker_id(w)),
@@ -2587,7 +2704,7 @@ impl<L> Ring<L> {
     }
 
     /// Retires the oldest in-flight request, in slot `i`, with `outcome`.
-    fn retire(&mut self, i: usize, outcome: Wc)
+    fn retire(&mut self, i: usize, outcome: Wc, wakes: &mut WakeBatch)
         requires
             old(self).inv_body(),
             old(self).retired < old(self).committed,
@@ -2659,7 +2776,7 @@ impl<L> Ring<L> {
             self.lemma_retire(&pre, outcome);
         }
         if let Some(waker) = waker {
-            wake(waker);
+            wakes.wake(waker);
         }
     }
 

@@ -219,7 +219,13 @@ module documentation (`Ring::inv`) and every operation requires and keeps them; 
 rules out failures of its own indexing, assertions and arithmetic under their preconditions.
 `Hw::take` couples every returned receive outcome and its exact leases to the
 request's own M.retired entry. Receive queues contain no synthetic refusal result.
-External callbacks/destructors and unwinding remain outside these normal-return guarantees.
+User wake panics are now caught at the standard-library boundary. The ring restores
+its normal invariant before resuming one, and the worker delays propagation until
+all CQEs from its poll and their notifications have been processed. Model regressions
+cover caught-panic reuse, inferred requests, refusal and multiple QPs on one CQ.
+Verus checks these normal-return transitions and the accumulator; it does not yet
+provide a whole-public-API unwind theorem. Other callback/destructor unwinding remains
+outside these guarantees.
 The only run-time check added for counter bounds is one comparison in
 `has_free_slot`, which refuses a new request once the WQE or request numbers could not hold
 `max_wqes` more (after 2^64 of them; one comparison of their bitwise or covers both). Every
@@ -375,7 +381,9 @@ exists. Each of them, and why it is trusted:
 | Item (`crates/safeverbs-core/src/`) | What Verus takes on trust |
 | --- | --- |
 | `ring.rs` `ExWaker` | `core::task::Waker` is an opaque type |
-| `ring.rs` `wake` | `Waker::wake` wakes the task (no contract: the ring logs the waker's name itself) |
+| `ring/wake.rs` `ExWakePanic` | std's boxed panic payload is opaque |
+| `ring/wake.rs` `try_wake` | std `catch_unwind` catches an unwind from `Waker::wake`; it does not unwind itself. The ring logs the attempted notification. |
+| `ring/wake.rs` `resume` | std `resume_unwind` never returns |
 | `ring.rs` `will_wake` | `Waker::will_wake`: when it says two wakers wake the same task, they share a name in A (`waker_id`) |
 | `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name |
 | `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
@@ -409,7 +417,9 @@ scatter/gather elements per QP, the smaller of the QP's send and receive limits 
 holds every WQE to it); and safeverbs posts no inline data, so M sees a QP's inline limit as
 zero.
 
-`Waker::wake` and the wrappers' bodies are the only code the proofs call without checking it.
+The listed standard-library adapters and verbs wrappers are the bodies the proofs
+call without checking. `ring/wake.rs` verifies the panic accumulator itself; catching
+and resuming unwinding remain narrow trusted standard-library boundaries.
 The rest of `safeverbs-core` (`buf.rs` apart from its verified range/resource helpers, `worker.rs`,
 `verbs.rs`, `model.rs`, `pd.rs`) is
 outside `verus!`: not trusted by the proofs, but not verified either. `worker.rs` holds no

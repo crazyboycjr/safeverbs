@@ -59,6 +59,7 @@ use crate::nic::{
     ConnectAttr, DeviceCaps, Endpoint, Nic as Device, NicCq, NicQp, QpCaps, QpType, Sge, WrOp,
 };
 use crate::pd::Pd;
+use crate::ring::wake::WakeBatch;
 use crate::ring::{Ring, Seq as RingSeq};
 use crate::trusted::*;
 use crate::wc::{Opcode, Wc};
@@ -2470,7 +2471,7 @@ impl<N: Device> Hw<N> {
     /// its QP's ring: its `wr_id` names the QP's index, the queue and the
     /// WQE, which the ring retires (with every earlier request it ends).
     #[verifier::spinoff_prover]
-    fn dispatch(&mut self, wc: &Wc, Ghost(t): Ghost<NicToken>, Ghost(before): Ghost<Nic::State>, Ghost(after): Ghost<Nic::State>)
+    fn dispatch(&mut self, wc: &Wc, wakes: &mut WakeBatch, Ghost(t): Ghost<NicToken>, Ghost(before): Ghost<Nic::State>, Ghost(after): Ghost<Nic::State>)
         requires
             old(self).inv_with(t, before),
             nic_step(before, after, Nic::Step::poll_cq(t.share().cq)),
@@ -2528,7 +2529,7 @@ impl<N: Device> Hw<N> {
                     proof {
                         assert(wqe == e.seq);
                     }
-                    let _known = qp_entry.recv.complete(wqe, *wc);
+                    let _known = qp_entry.recv.complete_with_wakes(wqe, *wc, wakes);
                     proof { lemma_resources_completed(e0.recv, qp_entry.recv, wqe, *wc); }
                     changed = qp_entry.recv.retired() != retired;
                     proof {
@@ -2543,7 +2544,7 @@ impl<N: Device> Hw<N> {
                     proof {
                         assert(wqe == e.seq);
                     }
-                    let _known = qp_entry.send.complete(wqe, *wc);
+                    let _known = qp_entry.send.complete_with_wakes(wqe, *wc, wakes);
                     proof { lemma_resources_completed(e0.send, qp_entry.send, wqe, *wc); }
                     changed = qp_entry.send.retired() != retired;
                     proof {
@@ -2734,6 +2735,7 @@ impl<N: Device> Hw<N> {
             final(self).inv(),
             final(self).same_table(old(self)),
     {
+        let mut wakes = WakeBatch::new();
         let mut wcs = [EMPTY_WC; POLL_BATCH];
         let ghost t0 = self.token@;
         let ghost m0 = t0.nic();
@@ -2779,7 +2781,7 @@ impl<N: Device> Hw<N> {
                 assert(nic_step(befores[i as int], afters[i as int], Nic::Step::poll_cq(t0.share().cq)));
                 assert(reports(wcs@[i as int], befores[i as int].cqs[t0.share().cq].entries[0]));
             }
-            self.dispatch(&wcs[i], Ghost(t0), Ghost(befores[i as int]), Ghost(afters[i as int]));
+            self.dispatch(&wcs[i], &mut wakes, Ghost(t0), Ghost(befores[i as int]), Ghost(afters[i as int]));
             i += 1;
         }
         proof {
@@ -2790,6 +2792,7 @@ impl<N: Device> Hw<N> {
             }
             self.lemma_same_token(t0, t, m2);
         }
+        wakes.finish();
         n
     }
 }
@@ -2832,6 +2835,7 @@ impl<N: Device> Hw<N> {
         if !started || open {
             return Ok(());
         }
+        let mut wakes = WakeBatch::new();
         let ghost start = *self;
         let ghost t0 = self.token@;
         let ghost m0 = t0.nic();
@@ -2854,9 +2858,9 @@ impl<N: Device> Hw<N> {
                         },
                         Err(err) => {
                             let kept = match keep {
-                                Some(seq) => e.send.abort_keeping(seq),
+                                Some(seq) => e.send.abort_keeping_with_wakes(seq, &mut wakes),
                                 None => {
-                                    e.send.abort();
+                                    e.send.abort_with_wakes(&mut wakes);
                                     None
                                 },
                             };
@@ -2866,9 +2870,9 @@ impl<N: Device> Hw<N> {
                 } else {
                     abort(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                     let kept = match keep {
-                        Some(seq) => e.send.abort_keeping(seq),
+                        Some(seq) => e.send.abort_keeping_with_wakes(seq, &mut wakes),
                         None => {
-                            e.send.abort();
+                            e.send.abort_with_wakes(&mut wakes);
                             None
                         },
                     };
@@ -2946,6 +2950,7 @@ impl<N: Device> Hw<N> {
                 self.lemma_commit_frame(&start, t0, t, n, n, index as int);
             }
         }
+        wakes.finish();
         r
     }
 }
@@ -4159,6 +4164,7 @@ impl<N: Device> Hw<N> {
             final(self).inv(),
             final(self).same_table(old(self)),
     {
+        let mut wakes = WakeBatch::new();
         let ghost start = *self;
         let ghost t0 = self.token@;
         let ghost m0 = t0.nic();
@@ -4187,7 +4193,7 @@ impl<N: Device> Hw<N> {
                 // Nothing staged or open is posted: refused (their owners are
                 // gone too).
                 let ghost before_abort = e.send;
-                e.send.abort();
+                e.send.abort_with_wakes(&mut wakes);
                 proof { lemma_resources_kept(before_abort, e.send); }
                 let ghost s1 = e.send;
                 let mut seq = e.send.head();
@@ -4251,6 +4257,7 @@ impl<N: Device> Hw<N> {
             assert(self.entry_ok(index as int, t, n));
             self.lemma_commit_frame(&start, t0, t, n, n, index as int);
         }
+        wakes.finish();
         busy
     }
 

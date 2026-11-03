@@ -313,6 +313,10 @@ impl<N: Nic> Worker<N> {
     /// (and waking the wakers registered there); returns the number of
     /// completions. Owners take their results by sequence number
     /// ([`Worker::take_send`], [`Worker::take_recv`]).
+    ///
+    /// If a registered waker panics, every CQE already polled is still
+    /// recorded and every registered notification is attempted before the
+    /// panic resumes. Catching that panic does not lose those results.
     pub fn progress(&mut self) -> usize {
         self.hw.progress()
     }
@@ -531,6 +535,8 @@ impl<N: Nic> Worker<N> {
     /// [`Worker::take_send_error`] as a flush error. Sequence numbers are
     /// never reused. [`Request::submit`] and [`Worker::commit_or_take`] hand
     /// the buffers of their own request back with the error instead.
+    /// A waker panic during refusal propagates only after all staged
+    /// requests have their refusal result and notifications are attempted.
     pub fn commit<T: Transport>(&mut self, qp: QpKey<T>) -> Result<()> {
         self.hw.commit(qp.index(), None).map_err(|(e, _)| e)
     }

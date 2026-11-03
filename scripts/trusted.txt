@@ -5,7 +5,9 @@
 
 # Wakers: the standard library's, opaque to the proofs.
 crates/safeverbs-core/src/ring.rs ExWaker
-crates/safeverbs-core/src/ring.rs wake
+crates/safeverbs-core/src/ring/wake.rs ExWakePanic
+crates/safeverbs-core/src/ring/wake.rs try_wake
+crates/safeverbs-core/src/ring/wake.rs resume
 crates/safeverbs-core/src/ring.rs will_wake
 crates/safeverbs-core/src/ring.rs clone_waker
 
