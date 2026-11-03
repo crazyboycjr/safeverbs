@@ -115,29 +115,36 @@ connected queue pair to the error state at any moment without telling anyone, so
 allowed in `Rts` *or* `Err`. M also proves that no step the NIC takes on its own invalidates
 a precondition the library checked earlier (`lemma_nic_steps_keep_verbs_enabled`).
 
-**F1, completion correspondence.** Each request gets at most one outcome, aggregating M
-over its own WQE interval (status and only operation-defined metadata), and it is returned together with the
-request's own buffers. For an unsignaled WR the outcome is "success": M's in-order rule
-implies that a WR retired by a later CQE executed without error, and M proves it
+<!-- REVIEW: F1 reworded on 2026-11-03 to say what is proved (at most one outcome per
+request, aggregating its own WQE interval) and to state the batch rules. -->
+**F1, completion correspondence.** Each request gets at most one outcome, and it is
+returned together with the request's own buffers. A request owns an interval of WQEs on
+one queue: one WQE, or several for a batch. Its outcome exists only once all of them
+retired, and it is the first error in posting order or, if none failed, the success of the
+last WQE: a batch of READs reports the length of its last READ, and SEND and WRITE
+successes report their status only. A proper prefix of a batch may retire, even with an
+error, while the batch keeps its buffers. For an unsignaled WR the outcome is "success":
+M's in-order rule implies that a WR retired by a later CQE executed without error
 (`lemma_poll`). In A: an outcome, once produced, never changes (`lemma_f1_outcome_fixed`);
-taking it returns exactly that outcome and the bytes the request was posted with
+taking it returns exactly that outcome and the members the request was posted with
 (`lemma_f1_take`); ids are never reused, so nothing is taken twice (`lemma_f1_taken_once`).
-Against M: all of the request's WQEs have retired before its outcome exists; it keeps the
-first error in posting order, or the final success if none failed. No other request owns
-any WQE in that interval (`corollary_f1`). A proper prefix may retire, including with an
-error, while the batch still holds its buffers. Eventual completion requires progress.
+Against M, in a state coupled to A, the outcome is that aggregate of the request's own
+interval, no other request owns a WQE of it, and a request whose prefix retired is still
+in flight (`corollary_f1`, `corollary_inflight`). Eventual completion requires progress.
 
-**R1, no leak by the library.** Every buffer handed to the library is returned or dropped
-at most once, never before the NIC is done with it. Return or release is eventual only
-when the device quiesces and the driver makes progress. If teardown cannot establish that
-DMA has stopped, the implementation retains the QP and its dependencies; `NotFlushed`
-reports this condition. Unconditional leak freedom against a permanently stuck device is
-not a claim. Queue pairs are destroyed only after their WRs are retired, which happens before
-their buffers are freed. In A: an in-flight request keeps its lease, unchanged, until its
-outcome exists (`lemma_r1_kept_while_in_flight`); every request lives on a queue pair that
-exists (`lemma_r1_requests_on_live_qps`); a released lease never comes back
-(`lemma_r1_released_once`). Leaks the user causes with `mem::forget` are out of scope, as
-they are for the standard library.
+<!-- REVIEW: R1 reworded on 2026-11-03 to say what is proved: release at most once and
+never early, and eventual only if the device quiesces. -->
+**R1, no leak by the library.** Every buffer handed to the library is returned or released
+at most once, and never before the NIC is done with it: a queue pair is destroyed only
+after its WRs retired, and their buffers are released after that. Return or release is
+eventual only if the device quiesces (flushes its work) and the driver makes progress.
+When teardown cannot establish that DMA stopped, the library keeps the queue pair and its
+buffers and reports `NotFlushed`: leak freedom against a device that never flushes is not
+a claim. In A: an in-flight request keeps its members, unchanged, until its outcome exists
+(`lemma_r1_kept_while_in_flight`); every request lives on a queue pair that exists
+(`lemma_r1_requests_on_live_qps`); a released group or lease never comes back
+(`lemma_r1_released_once`, `lemma_r1_member_released_once`). Leaks the user causes with
+`mem::forget` are out of scope, as they are for the standard library.
 
 **L1, no lost wakeup.** Once a request is complete, any waker its future registered has
 been invoked. This is a safety invariant: a complete request holds no waker
@@ -178,7 +185,10 @@ The trusted computing base is:
   is copied when it is posted; that the NIC never accesses memory outside the scatter/gather
   lists of posted WRs and the regions exposed for remote access; that after `ibv_dereg_mr`
   returns, the region's rkey stops working and the NIC no longer accesses it; and that a CQ
-  with enough reserved capacity never overflows.
+  with enough reserved capacity never overflows. About what completions report, we assume
+  that a successful READ reports exactly the length it asked for, a successful SEND or
+  WRITE its status only, and a successful receive either a payload within its own
+  scatter/gather list or the notification of a peer's WRITE with immediate.
 - **The trusted wrappers' bodies.** Each verb is called through a small wrapper whose
   contract is M (it requires the verb's precondition and ensures the matching M step); its
   body is the FFI call and is not verified.
@@ -258,7 +268,7 @@ monomorphized, so the abstraction costs nothing at run time.
 The ring and the ownership logic are written inside `verus!`, so the proofs live with the
 code they are about. Ghost state is erased by a normal build: a plain `cargo build` produces
 the same machine code it would without Verus. The model came first: `safeverbs-spec` (this
-step) holds M, A and the theorem's interface; the core is written against it next.
+holds M, A and the theorem's interface; the core is written against it.
 
 ## 8. Completion model and transports
 
@@ -296,6 +306,11 @@ They share queue accounting but differ in memory access and completion semantics
 | WRITE_WITH_IMM | Reads source | Writes rkey region and consumes receive WQE for notification | Status; peer gets write notification and immediate |
 | READ | Writes destination | Reads rkey-authorized region; no receive WQE consumed | Read transfer length; no immediate |
 
+A batch is one request of several WQEs. It reports the outcome of the first of them that
+failed or, if none did, the success of its last WQE: a batch of READs reports the length
+of its last READ, not a sum. An error completion's opcode, length and immediate are
+undefined, so an error reports its status only.
+
 A WRITE_WITH_IMM notification length describes the remote write. It is independent of
 receive SGE capacity and never a length to use when slicing the returned receive buffer.
 The safe completion API exposes `received_len()` only for an ordinary receive payload;
@@ -308,8 +323,8 @@ M's `Outcome` contains a `CompletionKind`. Status-only outcomes canonically carr
 length and no immediate; zero there is bookkeeping, not a hardware-reported byte count.
 `lemma_ack_outcome_unique` proves that a successful SEND/WRITE inferred from a later CQE
 is exactly the same observable outcome as its own successful CQE. READ retains its
-transfer semantics. This repairs F1's earlier comparison of undefined send lengths
-without assuming that those hardware fields equal the posted length.
+transfer semantics. So F1 never compares a send length the hardware leaves undefined, and
+assumes nothing about those fields.
 
 Local completion permits local source reuse; it does not promise that a remote
 application has processed the data. UC success also does not promise remote delivery.
@@ -342,12 +357,13 @@ the program's until the rkey is revoked) and is registered on its own, so that t
 reaches exactly that buffer and nothing next to it. These are exactly the rules of A's
 `post_request` and `expose`.
 
-In A, a request owns an ordered group of resources. Each member keeps its own identity,
-byte range and access permission: a batch may contain exclusive READ destinations and
-shared SEND/WRITE sources without making those sources exclusive. The group has one
-completion lifetime, outcome and waker. Ghost joining and separation preserve the member
-permissions and add no runtime work. The concrete projection must describe retained
-leases, including shared-reference deduplication, rather than assume one lease per WQE.
+In A, a request owns an ordered group of leases, its members. Each member keeps its own
+identity, byte range and access permission: a batch may contain exclusive READ
+destinations and shared SEND/WRITE sources without making those sources exclusive. The
+group has one completion lifetime, outcome and waker. Joining and separating groups are
+ghost steps and add no runtime work. Mapping the core's requests onto groups must account
+for the leases it actually retains, which deduplicate shared references, rather than
+assume one lease per WQE.
 
 The executable range operations in `buf/range.rs` are verified separately from the
 ownership permissions: they bound the unique ranges and frozen views and preserve the
@@ -490,12 +506,13 @@ async style of the API carry over.
 - Theorem 1 for the worker: each worker's share of M is settled by rely and guarantee
   (`safeverbs-spec/src/share.rs`), and M's side of the refinement is proved for the worker's
   hardware side (`safeverbs-core/src/hw.rs`). Open: A's side for the worker (the map from
-  its requests to A's grouped resources), the buffers as linear ghost permissions,
-  and concrete thread composition. Undefined SEND/WRITE lengths are already projected
+  its requests to A's groups), the rest of the buffers (the typed wrappers, `RingBuf`,
+  exposure) and how several workers compose. Undefined SEND/WRITE lengths are already projected
   out of outcomes; READ and receive metadata have operation-specific contracts (section 8).
 - Whether a request should say who takes its result (the event loop or its owner), so that
   futures and the event loop can share a worker.
 - Out-of-order transports and SRQs need their own completion rules in M before the core
   supports them.
-- The simulated NIC already runs the integration scenarios and injected-error cases;
-  its agreement with M is tested, not yet a refinement theorem.
+- The simulated NIC runs the integration scenarios and injected-error cases, and checks some
+  of M's rules at run time; that it behaves within M is neither tested systematically nor
+  proved.
