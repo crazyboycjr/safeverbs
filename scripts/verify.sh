@@ -26,7 +26,7 @@ if ! command -v verus >/dev/null || ! command -v cargo-verus >/dev/null; then
 fi
 
 # The specification proves everything it states: no escape hatches.
-if grep -rnE '\b(assume|admit)\(|verifier::external|external_body|assume_specification' \
+if grep -rnE '\b(assume|admit|assume_)\(|\bassume_new|verifier::external|external_body|assume_specification' \
     "$spec/src" --include='*.rs' | grep -vE '^[^:]+:[0-9]+:\s*//'; then
     echo "verify.sh: the lines above skip verification; crates/safeverbs-spec must not" >&2
     exit 1
@@ -34,7 +34,8 @@ fi
 
 # The core assumes nothing either, and trusts only the items listed in scripts/trusted.txt
 # (each the line `<file> <item>`): every `external_body`, `external` or external
-# specification must sit on one of them, and every listed item must still exist.
+# specification must sit on one of them, every listed item must still exist, and ghost
+# state may be conjured only inside them.
 if grep -rnE '\b(assume|admit)\(' "$core/src" --include='*.rs' | grep -vE '^[^:]+:[0-9]+:\s*//'; then
     echo "verify.sh: the lines above assume what they should prove" >&2
     exit 1
@@ -63,6 +64,32 @@ if [ -n "$unlisted" ]; then
 fi
 if [ -n "$stale" ]; then
     printf 'verify.sh: scripts/trusted.txt lists items that are no longer trusted:\n%s\n' "$stale" >&2
+    exit 1
+fi
+# Code outside `verus!` can conjure ghost state as well (`Tracked::assume_new()`,
+# `Ghost::assume_new()`, their `_fallback` forms, the builtin `assume_`): anywhere in the
+# core's sources, each must sit inside a listed item, here the nearest `fn` before it.
+conjured="$(
+    cd "$root"
+    awk '
+        FNR == 1 { item = "-" }
+        /^[[:space:]]*\/\// { next }
+        match($0, /(^|[^A-Za-z0-9_])fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
+            item = substr($0, RSTART, RLENGTH)
+            sub(/^.*fn[[:space:]]+/, "", item)
+        }
+        /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?(const|static|struct|enum|union|trait|type|impl|mod)([[:space:]<]|$)/ \
+            && !/(^|[^A-Za-z0-9_])fn[[:space:]]/ {
+            item = "-"
+        }
+        /(^|[^A-Za-z0-9_])assume_new(_fallback)?([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])assume_[[:space:]]*\(/ {
+            print FILENAME " " item
+        }
+    ' $(cd "$root" && find crates/safeverbs-core/src -name '*.rs' | sort) | sort -u
+)"
+outside="$(comm -23 <(printf '%s\n' "$conjured" | sed '/^$/d') <(printf '%s\n' "$listed"))"
+if [ -n "$outside" ]; then
+    printf 'verify.sh: ghost state conjured outside the items of scripts/trusted.txt (file, enclosing fn):\n%s\n' "$outside" >&2
     exit 1
 fi
 

@@ -1,7 +1,8 @@
 # The trusted items of the verified core: every item of crates/safeverbs-core that Verus
 # takes on trust (`external_body`, an external specification) is listed here, one per line
-# as `<file> <item>`, and scripts/verify.sh refuses any other. docs/verification.md (section
-# "Trusted computing base") says why each is trusted.
+# as `<file> <item>`, and scripts/verify.sh refuses any other. Ghost state conjured with an
+# `assume_new` constructor may appear only inside these items. docs/verification.md
+# (section "Trusted computing base") says why each is trusted.
 
 # Wakers: the standard library's, opaque to the proofs.
 crates/safeverbs-core/src/ring.rs ExWaker
@@ -31,6 +32,8 @@ crates/safeverbs-core/src/buf/lease.rs same_frozen_arc
 crates/safeverbs-core/src/buf/memory.rs allocate_zeroed_raw
 # The std Arc ownership extraction not yet covered by this vstd's Rc binding.
 crates/safeverbs-core/src/buf/memory.rs arc_try_unwrap
+# A streaming ring's chunk permissions: RingBuf's placement is not verified.
+crates/safeverbs-core/src/buf/memory.rs ring_chunk
 # The NIC traits, declared without specifications (the wrappers carry them).
 crates/safeverbs-core/src/trusted.rs ExNic
 crates/safeverbs-core/src/trusted.rs ExNicQp

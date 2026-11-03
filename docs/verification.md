@@ -158,8 +158,8 @@ not proved:
 - `BufMut::freeze` relies on its buffer fitting `T` (`Buf::from_frozen`);
 - `BufMut::into_part` on at most `u32::MAX` bytes (`Part::unique`; also checked at run
   time), and `BufMut::split_at` on an index in bounds (also checked);
-- `RingBuf` builds its chunks with byte permissions it does not prove
-  (`OwnedRange::ring_chunk`) and relies on their base when placing them;
+- `RingBuf` relies on its chunks' base when placing them (their byte permissions are
+  trusted: `ring_chunk` below);
 - the failure path of `Region::new` hands `release_failed_allocation` what `allocate`
   returned;
 - every caller of `Leases::len` relies on the count fitting `usize`.
@@ -168,8 +168,9 @@ not proved:
 
 Beyond the toolchain and M, the verified core trusts exactly the items of
 `scripts/trusted.txt`. `scripts/verify.sh` fails if an `external_body` or external
-specification appears anywhere else in `crates/safeverbs-core`, or if a listed item no
-longer exists.
+specification appears anywhere else in `crates/safeverbs-core`, if a listed item no longer
+exists, or if ghost state is conjured (`Tracked::assume_new()`, `Ghost::assume_new()` and
+their kin) anywhere in the core's sources, inside `verus!` or not, outside a listed item.
 
 | Item (`crates/safeverbs-core/src/`) | What Verus takes on trust |
 | --- | --- |
@@ -184,6 +185,7 @@ longer exists.
 | `buf/memory.rs` `ExRegion` | a registered region is opaque: registration and its final cleanup are not verified |
 | `buf/memory.rs` `allocate_zeroed_raw` | the fallible zeroed allocator returns the address, layout, provenance and linear permissions vstd expects, or nothing; no claim about initialized contents |
 | `buf/memory.rs` `arc_try_unwrap` | `Arc::try_unwrap` returns the exact contents, or an `Arc` to the same contents |
+| `buf/memory.rs` `ring_chunk` | a `RingBuf` chunk comes with the byte permission for exactly its bytes: the ring's placement, which is not verified, keeps its chunks apart |
 | `buf/lease.rs` `same_frozen_arc` | `Arc::ptr_eq` means both hold the same frozen allocation |
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's |

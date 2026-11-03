@@ -3,7 +3,7 @@
 //! The allocator is one primitive boundary; splitting is checked bookkeeping. These
 //! tokens describe domains and provenance, not initialized typed contents or the final
 //! Arc-driven deallocation protocol. A streaming ring's chunks are the exception: their
-//! placement is not verified, so their permissions are assumed (`OwnedRange::ring_chunk`).
+//! placement is not verified, so their permissions are trusted (`OwnedRange::ring_chunk`).
 #![allow(unused_imports)]
 
 use core::alloc::Layout;
@@ -152,6 +152,22 @@ impl OwnedRange {
             OwnedRange { ptr: self.ptr, len: at, geometry: Ghost(left), base: self.base, permission: Tracked(p) },
             OwnedRange { ptr: right_ptr, len: self.len - at, geometry: Ghost(right), base: self.base, permission: Tracked(q) },
         )
+    }
+
+    /// The chunk `geometry` of a streaming ring's region at `base`, with the byte permission
+    /// for exactly its bytes. `RingBuf` places its chunks without a proof that they are
+    /// disjoint, so this permission is taken on trust (`scripts/trusted.txt`).
+    #[verifier::external_body]
+    pub(super) fn ring_chunk(base: *mut u8, geometry: ByteRange) -> (r: Self)
+        ensures r.inv(), r.base() == base, r.geometry() == geometry,
+    {
+        OwnedRange {
+            ptr: base.with_addr(base.addr() + geometry.offset()),
+            len: geometry.len(),
+            geometry: Ghost(geometry),
+            base: Ghost(base),
+            permission: Tracked::assume_new(),
+        }
     }
 }
 
@@ -362,21 +378,6 @@ pub(super) fn release_failed_allocation(
 }
 
 } // verus!
-
-impl OwnedRange {
-    /// A chunk of a streaming ring's region at `geometry`. `RingBuf` places its chunks
-    /// without a proof that they are disjoint, so their byte permissions are assumed here,
-    /// not proved (`docs/verification.md`).
-    pub(super) fn ring_chunk(base: *mut u8, geometry: ByteRange) -> OwnedRange {
-        OwnedRange {
-            ptr: base.with_addr(base.addr() + geometry.offset()),
-            len: geometry.len(),
-            geometry: Ghost::assume_new(),
-            base: Ghost::assume_new(),
-            permission: Tracked::assume_new(),
-        }
-    }
-}
 
 // SAFETY: this is an owner of untyped bytes, not a typed reference. Its pointer
 // is only observed as metadata here; typed buffers impose their element type's
