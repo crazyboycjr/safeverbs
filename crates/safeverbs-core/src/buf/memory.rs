@@ -252,9 +252,8 @@ impl<N: Nic> RawMut<N> {
 
     /// A unique owner and any separately borrowed owner have disjoint bytes.
     /// The borrowed token proof preserves the exact native and ghost contents.
+    #[cfg(verus_keep_ghost)]
     #[inline(always)]
-    #[allow(dead_code)] // The request-level permission adapter uses this bridge.
-    #[allow(unused_variables)] // The borrowed permission proof is entirely erased.
     pub(crate) fn disjoint(&mut self, other: &Self)
         requires old(self).inv(), other.inv(),
         ensures *final(self) == *old(self),

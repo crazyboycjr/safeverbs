@@ -2192,8 +2192,12 @@ impl<N: Device> Hw<N> {
         }
         let ghost admitted = part;
         let ghost admission = *self;
-        let mut part = part;
-        self.separate_unique_input(&mut part);
+        #[cfg(verus_keep_ghost)]
+        let part = {
+            let mut part = part;
+            self.separate_unique_input(&mut part);
+            part
+        };
         proof { assert(admission.admission_separated_from(admitted)); }
         let ghost start = *self;
         let ghost t0 = self.token@;

@@ -1,7 +1,10 @@
-//! Unique admission against actual retained slot payloads, without modifying a ring.
+//! Unique admission against actual retained slot payloads, without modifying a ring. The
+//! traversal changes nothing, so it exists in Verus builds alone (`cfg(verus_keep_ghost)`).
 
 use super::*;
-use crate::buf::{Leases, Part};
+use crate::buf::Leases;
+#[cfg(verus_keep_ghost)] // Named by the proofs alone.
+use crate::buf::Part;
 use crate::nic::Nic;
 
 verus! {
@@ -41,6 +44,7 @@ impl<N: Nic> Ring<Leases<N>> {
 
     /// Check a unique incoming Part against all real payloads, including results
     /// waiting after retirement or refusal. The input and every ring snapshot stay exact.
+    #[cfg(verus_keep_ghost)]
     #[inline(always)]
     pub(crate) fn separate_unique_input(&self, incoming: &mut Part<N>)
         requires self.inv(), old(incoming).spec_writable(),
@@ -94,21 +98,3 @@ impl<N: Nic> Ring<Leases<N>> {
 }
 
 } // verus!
-
-#[cfg(all(test, not(verus_keep_ghost)))]
-mod native {
-    use super::*;
-    use crate::model::Model;
-
-    #[unsafe(no_mangle)]
-    #[inline(never)]
-    pub fn unique_admission_leases(leases: &Leases<Model>, incoming: &mut Part<Model>) {
-        leases.separate_unique_input(incoming);
-    }
-
-    #[unsafe(no_mangle)]
-    #[inline(never)]
-    pub fn unique_admission_ring(ring: &Ring<Leases<Model>>, incoming: &mut Part<Model>) {
-        ring.separate_unique_input(incoming);
-    }
-}

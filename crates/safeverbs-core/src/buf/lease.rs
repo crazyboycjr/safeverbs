@@ -1,6 +1,10 @@
 //! The actual request-resource container, verified independently of the allocation
 //! boundary. Shared deduplication preserves the retained frozen allocation; unique
 //! resources move unchanged into and out of the container.
+//!
+//! The traversals that prove inputs disjoint (`Leases::disjoint_incoming` and the receive
+//! admission's `separate_unique_*`) only borrow linear permissions and change nothing, so
+//! they exist in Verus builds alone (`cfg(verus_keep_ghost)`); plain builds have no such code.
 
 use safeverbs_spec::abs::Dir;
 use std::sync::Arc;
@@ -33,6 +37,7 @@ impl<N: Nic> Lease<N> {
     pub(crate) closed spec fn observation(self) -> Resource<N> { Resource { resource: self } }
 
     /// A unique incoming owner is separated from a readonly retained keeper.
+    #[cfg(verus_keep_ghost)]
     #[inline(always)]
     fn separate_unique_input(&self, incoming: &mut Self)
         requires *old(incoming) is Unique,
@@ -60,6 +65,7 @@ impl<N: Nic> Lease<N> {
     }
 
     /// Borrow actual owners to establish separation without changing either keeper.
+    #[cfg(verus_keep_ghost)]
     #[inline(always)]
     fn disjoint(&mut self, other: &mut Self)
         ensures
@@ -295,6 +301,7 @@ impl<N: Nic> Part<N> {
     {}
 
     /// Borrow one actual keeper without changing the incoming Part or its token.
+    #[cfg(verus_keep_ghost)]
     #[inline(always)]
     pub(crate) fn separate_unique_lease(&mut self, other: &Lease<N>)
         requires old(self).spec_writable(),
@@ -309,6 +316,7 @@ impl<N: Nic> Part<N> {
     }
 
     /// A unique Part is separated from another actual Part, including shared views.
+    #[cfg(verus_keep_ghost)]
     #[inline(always)]
     pub(crate) fn separate_unique_part(&mut self, other: &Self)
         requires old(self).spec_writable(),
@@ -415,6 +423,7 @@ impl<N: Nic> Leases<N> {
     }
 
     /// Traverse only readonly native keepers, mutating just the incoming permission.
+    #[cfg(verus_keep_ghost)]
     #[inline(always)]
     pub(crate) fn separate_unique_input(&self, incoming: &mut Part<N>)
         requires old(incoming).spec_writable(),
@@ -493,6 +502,7 @@ impl<N: Nic> Leases<N> {
     }
 
     /// Only references are traversed; the inlined native bodies have no effects.
+    #[cfg(verus_keep_ghost)]
     #[inline(always)]
     fn disjoint_incoming(&mut self, incoming: &mut Lease<N>)
         ensures
@@ -758,8 +768,13 @@ impl<N: Nic> Leases<N> {
         proof { use_type_invariant(&part); }
         let ghost before = *self;
         let ghost incoming = part;
-        let mut lease = part.lease;
-        self.disjoint_incoming(&mut lease);
+        let lease = part.lease;
+        #[cfg(verus_keep_ghost)]
+        let lease = {
+            let mut lease = lease;
+            self.disjoint_incoming(&mut lease);
+            lease
+        };
         proof { if before.inv() { self.lemma_incoming(incoming); } }
         self.push_resource(lease);
         self.loans = Ghost(before.loans().push(Loan { part: incoming, access }));
@@ -898,10 +913,6 @@ impl<N: Nic> Leases<N> {
 
 } // verus!
 
-#[cfg(all(test, not(verus_keep_ghost)))]
-#[path = "nonalias_erasure.rs"]
-mod nonalias_erasure;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +928,35 @@ mod tests {
         }
         assert_eq!(size_of::<Leases<Model>>(), size_of::<NativeShape>());
         assert_eq!(align_of::<Leases<Model>>(), align_of::<NativeShape>());
+    }
+
+    #[test]
+    fn split_unique_and_overlapping_shared_inputs_retain_their_owners() {
+        let model = Model::new(108);
+        let pd = Context::new(model.clone()).alloc_pd().unwrap();
+        let mut allocation = pd.alloc::<u8>(64).unwrap();
+        for (i, value) in allocation.iter_mut().enumerate() {
+            *value = i as u8;
+        }
+        let (unique, shared) = allocation.split_at(16);
+        let address = unique.as_ptr();
+        let shared = shared.freeze();
+        let mut leases = Leases::new();
+        leases.push(shared.slice(..24).into_part());
+        leases.push(shared.slice(8..32).into_part());
+        leases.push(unique.into_part());
+        leases.push(shared.slice(16..40).into_part());
+        leases.push(shared.slice(24..48).into_part());
+        assert_eq!(leases.len(), 3);
+        let unique = leases.into_buf_mut::<u8>().unwrap();
+        assert_eq!(unique.as_ptr(), address);
+        assert_eq!(&unique[..], &(0..16u8).collect::<Vec<_>>()[..]);
+        let shared = shared.try_thaw().unwrap();
+        assert_eq!(&shared[..], &(16..64u8).collect::<Vec<_>>()[..]);
+        drop(unique);
+        assert_eq!(model.registered(), 1);
+        drop(shared);
+        assert_eq!(model.registered(), 0);
     }
 
     #[test]

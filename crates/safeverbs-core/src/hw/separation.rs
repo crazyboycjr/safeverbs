@@ -2,7 +2,8 @@
 //!
 //! The immutable worker borrow preserves its rings and resource snapshots exactly.
 //! Only the incoming unique byte permission is mutably borrowed, with its identity
-//! preserved. The native reference traversal must disappear under optimization.
+//! preserved. The traversal changes nothing, so it exists in Verus builds alone
+//! (`cfg(verus_keep_ghost)`).
 
 use super::*;
 
@@ -55,6 +56,7 @@ impl<N: Device> Hw<N> {
 
     /// The actual traversal is read-only on the worker, preserving every snapshot.
     /// There is no native byte comparison; the linear token proofs are erased.
+    #[cfg(verus_keep_ghost)]
     #[inline(always)]
     pub(super) fn separate_unique_input(&self, incoming: &mut Part<N>)
         requires self.inv(), old(incoming).spec_writable(),
@@ -107,15 +109,3 @@ impl<N: Device> Hw<N> {
 }
 
 } // verus!
-
-#[cfg(all(test, not(verus_keep_ghost)))]
-mod native {
-    use super::*;
-    use crate::model::Model;
-
-    #[unsafe(no_mangle)]
-    #[inline(never)]
-    pub fn unique_admission_worker(worker: &Hw<Model>, incoming: &mut Part<Model>) {
-        worker.separate_unique_input(incoming);
-    }
-}
