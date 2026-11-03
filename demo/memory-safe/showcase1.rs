@@ -15,7 +15,7 @@
 mod common;
 
 use futures::executor::block_on;
-use safeverbs::{Context, Nic, RC};
+use safeverbs::{Context, Nic, RC, Received};
 
 const MSG: &[u8] = b"Hello, SafeVerbs";
 
@@ -40,13 +40,11 @@ impl common::Demo for Showcase {
         // buf[0] = b'X'; // does not compile: `Buf` is read only, and `buf` is gone
         drop(send); // even the future: the SEND goes on, the lease stays in its slot
 
-        let (wc, got) = block_on(recv)?;
-        println!(
-            "received {:?}",
-            std::str::from_utf8(
-                &got[..wc.received_len().expect("a successful SEND receive") as usize]
-            )?
-        );
+        let (received, got) = block_on(recv)?;
+        let Received::Message { len, .. } = received else {
+            panic!("a SEND comes as a message");
+        };
+        println!("received {:?}", std::str::from_utf8(&got[..len as usize])?);
         assert_eq!(&got[..MSG.len()], MSG);
         Ok(())
     }

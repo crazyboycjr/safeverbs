@@ -5,19 +5,19 @@ use core::task::{Context, Poll};
 use std::collections::VecDeque;
 
 use futures_core::Stream;
-use safeverbs_core::{BufError, BufMut, Error, Seq, Wc};
+use safeverbs_core::{BufError, BufMut, CompletionError, Error, Received, Seq};
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::op::Side;
+use crate::op::{Side, received};
 use crate::qp::QueueAccess;
 
 /// A [`Stream`] of receives on a QP, from
-/// [`LocalQp::receiver`](crate::LocalQp::receiver): each item is a
-/// completion and the buffer it filled, in completion order.
+/// [`LocalQp::receiver`](crate::LocalQp::receiver): each item is what a
+/// receive got, or why not, and its buffer, in completion order.
 ///
-/// Items with an error status (flush errors after the QP failed) hand their
-/// buffers back too; once the QP has failed, [`Receiver::repost`] refuses
-/// and the stream ends when every receive is back. Dropping the receiver
+/// Items with an error (flush errors after the QP failed) hand their buffers
+/// back too; once the QP has failed, [`Receiver::repost`] refuses and the
+/// stream ends when every receive is back. Dropping the receiver
 /// leaves its receives posted: their buffers come back to the QP and are
 /// released when they complete (at the latest when the QP is removed,
 /// which flushes them first).
@@ -64,13 +64,16 @@ impl<'q, Q: QueueAccess, U: FromBytes + IntoBytes> Receiver<'q, Q, U> {
                     buf,
                 });
             }
-            match w.post_recv(qp, buf.into_part(), false) {
+            match w.post_recv(qp, buf.into_part(), ()) {
                 Ok(seq) => {
                     self.posted.push_back(seq);
                     Ok(())
                 }
                 Err(e) => {
-                    let buf = e.buf.into_buf_mut().expect("a receive buffer comes back");
+                    let buf = e
+                        .leases
+                        .into_buf_mut()
+                        .expect("a receive buffer comes back");
                     if e.error == Error::QueueFull {
                         self.spare.push(buf);
                         Ok(())
@@ -89,7 +92,7 @@ impl<'q, Q: QueueAccess, U: FromBytes + IntoBytes> Receiver<'q, Q, U> {
 impl<Q: QueueAccess, U> Unpin for Receiver<'_, Q, U> {}
 
 impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
-    type Item = (Wc, BufMut<U, Q::N>);
+    type Item = (Result<Received, CompletionError>, BufMut<U, Q::N>);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -101,11 +104,14 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
             while !this.spare.is_empty() && w.recv_ring(qp).can_post() && !w.recv_ring(qp).failed()
             {
                 let buf = this.spare.pop().expect("a spare buffer");
-                match w.post_recv(qp, buf.into_part(), false) {
+                match w.post_recv(qp, buf.into_part(), ()) {
                     Ok(seq) => this.posted.push_back(seq),
                     Err(e) => {
-                        this.spare
-                            .push(e.buf.into_buf_mut().expect("a receive buffer comes back"));
+                        this.spare.push(
+                            e.leases
+                                .into_buf_mut()
+                                .expect("a receive buffer comes back"),
+                        );
                         break;
                     }
                 }
@@ -114,10 +120,10 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
             let failed = w.recv_ring(qp).failed();
             match this.posted.front() {
                 Some(&seq) => match s.take_request(Side::Recv, seq) {
-                    Some((wc, leases)) => {
+                    Some((result, leases)) => {
                         this.posted.pop_front();
                         let buf = leases.into_buf_mut().expect("a receive holds its buffer");
-                        Poll::Ready(Some((wc, buf)))
+                        Poll::Ready(Some((result.map(received), buf)))
                     }
                     None => {
                         s.set_waker(Side::Recv, seq, cx.waker());

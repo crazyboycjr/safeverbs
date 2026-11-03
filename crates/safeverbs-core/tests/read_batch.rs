@@ -1,15 +1,17 @@
 //! A request's inferred READ result describes its final WQE, as a CQE does.
 
 use safeverbs_core::model::Model;
-use safeverbs_core::{Access, ConnectAttr, Context, Opcode, QpCaps, RC, Wc, Worker, WrOp};
+use safeverbs_core::{
+    Access, Completed, CompletionError, ConnectAttr, Context, QpCaps, RC, Worker, WrOp,
+};
 
-fn two_read_result(signal: bool) -> Wc {
+fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
     const FIRST: usize = 17;
     const LAST: usize = 31;
     const TAIL: usize = 7;
     let model = Model::new(83);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let mut worker = Worker::new(&pd, 32).unwrap();
+    let mut worker: Worker<(), _> = Worker::new(&pd, 32).unwrap();
     let caps = QpCaps {
         max_send_wr: 8,
         max_recv_wr: 8,
@@ -60,7 +62,7 @@ fn two_read_result(signal: bool) -> Wc {
             last.into_part(),
         )
         .unwrap();
-    let batch = request.submit(signal).unwrap().unwrap();
+    let batch = request.submit(signal, ()).unwrap();
     assert_eq!(model.run(), 2);
 
     if signal {
@@ -77,31 +79,26 @@ fn two_read_result(signal: bool) -> Wc {
                 pd.alloc::<u8>(TAIL).unwrap().into_part(),
             )
             .unwrap();
-        let tail = request.submit(true).unwrap().unwrap();
+        let tail = request.submit(true, ()).unwrap();
         assert_eq!(model.run(), 1);
         assert_eq!(worker.progress(), 1);
-        let (wc, leases) = worker.take_send(local, tail).unwrap();
-        assert!(wc.is_ok(), "{wc:?}");
-        assert_eq!(wc.opcode(), Some(Opcode::RDMA_READ));
-        assert_eq!(wc.byte_len(), Some(TAIL as u32));
+        let done = worker.take_send(local, tail).unwrap();
+        assert_eq!(done.result, Ok(Completed::Read { len: TAIL as u32 }));
         assert_eq!(
-            &*leases.into_buf_mut::<u8>().unwrap(),
+            &*done.leases.into_buf_mut::<u8>().unwrap(),
             &payload[89..89 + TAIL]
         );
     }
 
-    let (wc, leases) = worker.take_send(local, batch).unwrap();
-    assert!(wc.is_ok(), "{wc:?}");
-    assert_eq!(wc.opcode(), Some(Opcode::RDMA_READ));
-    assert_eq!(wc.byte_len(), Some(LAST as u32));
-    assert_eq!(wc.received_len(), None);
-    assert_eq!(wc.imm(), None);
+    let done = worker.take_send(local, batch).unwrap();
+    let result = done.result;
+    assert_eq!(result, Ok(Completed::Read { len: LAST as u32 }));
     assert_eq!(
-        leases.len(),
+        done.leases.len(),
         2,
         "both disjoint destinations returned together"
     );
-    let first = leases.into_buf_mut::<u8>().unwrap();
+    let first = done.leases.into_buf_mut::<u8>().unwrap();
     assert_eq!(first.as_ptr(), first_ptr);
     assert_eq!(&*first, &payload[..FIRST]);
     assert!(worker.take_send(local, batch).is_none());
@@ -112,15 +109,10 @@ fn two_read_result(signal: bool) -> Wc {
     assert_eq!(&*source, payload.as_slice());
     drop(source);
     assert_eq!(model.registered(), 0);
-    wc
+    result
 }
 
 #[test]
 fn inferred_and_signaled_read_batches_report_the_final_wqe_length() {
-    let signaled = two_read_result(true);
-    let inferred = two_read_result(false);
-    assert_eq!(inferred.status, signaled.status);
-    assert_eq!(inferred.opcode(), signaled.opcode());
-    assert_eq!(inferred.byte_len(), signaled.byte_len());
-    assert_eq!(inferred.imm(), signaled.imm());
+    assert_eq!(two_read_result(false), two_read_result(true));
 }

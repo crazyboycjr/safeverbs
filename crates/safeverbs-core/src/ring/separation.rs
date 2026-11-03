@@ -2,7 +2,6 @@
 //! traversal changes nothing, so it exists in Verus builds alone (`cfg(verus_keep_ghost)`).
 
 use super::*;
-use crate::buf::Leases;
 #[cfg(verus_keep_ghost)] // Named by the proofs alone.
 use crate::buf::Part;
 use crate::nic::Nic;
@@ -34,12 +33,12 @@ impl<L> Ring<L> {
     }
 }
 
-impl<N: Nic> Ring<Leases<N>> {
+impl<C, N: Nic> Ring<Payload<C, N>> {
     /// Spatial exclusion proved for every slot retaining a payload.
     pub(crate) closed spec fn retained_separated_from(&self, incoming: Part<N>) -> bool {
         forall|i: int| 0 <= i < self.slots@.len()
             && (#[trigger] self.slots@[i]).leases is Some
-            ==> self.slots@[i].leases->0.separated_from(incoming.byte_domain())
+            ==> self.slots@[i].leases->0.leases.separated_from(incoming.byte_domain())
     }
 
     /// Check a unique incoming Part against all real payloads, including results
@@ -52,13 +51,13 @@ impl<N: Nic> Ring<Leases<N>> {
             *final(incoming) == *old(incoming),
             self.retained_separated_from(*final(incoming)),
             forall|s: int| self.req(s) is Some ==>
-                (#[trigger] self.req(s))->0.leases.separated_from(final(incoming).byte_domain()),
+                (#[trigger] self.req(s))->0.leases.leases.separated_from(final(incoming).byte_domain()),
             forall|s: int| self.staged(s) is Some ==>
-                (#[trigger] self.staged(s))->0.leases.separated_from(final(incoming).byte_domain()),
+                (#[trigger] self.staged(s))->0.leases.leases.separated_from(final(incoming).byte_domain()),
             forall|s: int| self.refused(s) is Some ==>
-                (#[trigger] self.refused(s))->0.separated_from(final(incoming).byte_domain()),
+                (#[trigger] self.refused(s))->0.leases.separated_from(final(incoming).byte_domain()),
             forall|s: int, w: int| self.dma(s, w) is Some ==>
-                (#[trigger] self.dma(s, w))->0.separated_from(final(incoming).byte_domain()),
+                (#[trigger] self.dma(s, w))->0.leases.separated_from(final(incoming).byte_domain()),
     {
         let mut i = 0;
         while i < self.slots.len()
@@ -67,30 +66,30 @@ impl<N: Nic> Ring<Leases<N>> {
                 *incoming == *old(incoming),
                 i <= self.slots@.len(),
                 forall|j: int| 0 <= j < i && (#[trigger] self.slots@[j]).leases is Some
-                    ==> self.slots@[j].leases->0.separated_from(incoming.byte_domain()),
+                    ==> self.slots@[j].leases->0.leases.separated_from(incoming.byte_domain()),
             decreases self.slots@.len() - i,
         {
-            if let Some(leases) = self.slots[i].leases.as_ref() {
-                leases.separate_unique_input(incoming);
+            if let Some(payload) = self.slots[i].leases.as_ref() {
+                payload.leases.separate_unique_input(incoming);
             }
             i += 1;
         }
         proof {
             assert(self.retained_separated_from(*incoming));
             assert forall|s: int| self.req(s) is Some implies
-                (#[trigger] self.req(s))->0.leases.separated_from(incoming.byte_domain()) by {
+                (#[trigger] self.req(s))->0.leases.leases.separated_from(incoming.byte_domain()) by {
                 self.lemma_payload_coverage(s, 0);
             }
             assert forall|s: int| self.staged(s) is Some implies
-                (#[trigger] self.staged(s))->0.leases.separated_from(incoming.byte_domain()) by {
+                (#[trigger] self.staged(s))->0.leases.leases.separated_from(incoming.byte_domain()) by {
                 self.lemma_payload_coverage(s, 0);
             }
             assert forall|s: int| self.refused(s) is Some implies
-                (#[trigger] self.refused(s))->0.separated_from(incoming.byte_domain()) by {
+                (#[trigger] self.refused(s))->0.leases.separated_from(incoming.byte_domain()) by {
                 self.lemma_payload_coverage(s, 0);
             }
             assert forall|s: int, w: int| self.dma(s, w) is Some implies
-                (#[trigger] self.dma(s, w))->0.separated_from(incoming.byte_domain()) by {
+                (#[trigger] self.dma(s, w))->0.leases.separated_from(incoming.byte_domain()) by {
                 self.lemma_payload_coverage(s, w);
             }
         }

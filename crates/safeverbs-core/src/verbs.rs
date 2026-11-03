@@ -229,7 +229,6 @@ impl NicCq for VerbsCq {
                     byte_len: 0,
                     imm: None,
                     vendor_err: 0,
-                    qp_num: ((*cq).read_qp_num.unwrap_unchecked())(cq),
                 };
                 if status.is_ok() {
                     wc.opcode = Opcode(((*cq).read_opcode.unwrap_unchecked())(cq));
@@ -710,14 +709,14 @@ mod tests {
     use core::mem::ManuallyDrop;
 
     use super::*;
+    use crate::wc::{Completed, CompletionError, Received};
 
     const OPCODE: u32 = 1;
     const LENGTH: u32 = 2;
     const FLAGS: u32 = 4;
     const IMMEDIATE: u32 = 8;
     const VENDOR: u32 = 16;
-    const QP: u32 = 32;
-    const END: u32 = 64;
+    const END: u32 = 32;
 
     /// A provider whose read callbacks record every field accessed.
     #[repr(C)]
@@ -742,7 +741,6 @@ mod tests {
                     read_wc_flags: Some(read_flags),
                     read_imm_data: Some(read_immediate),
                     read_vendor_err: Some(read_vendor),
-                    read_qp_num: Some(read_qp),
                     ..Default::default()
                 },
                 opcode,
@@ -755,7 +753,7 @@ mod tests {
             // This is a Rust-owned test provider, not an allocated verbs
             // resource: its CQ must not call ibv_destroy_cq on drop.
             let mut cq = ManuallyDrop::new(VerbsCq { cq: &mut self.cq });
-            let mut out = [Wc::success(Opcode::SEND, 0); 2];
+            let mut out = [Wc::default(); 2];
             assert_eq!(cq.poll(&mut out), 1);
             out[0]
         }
@@ -806,12 +804,6 @@ mod tests {
         7
     }
 
-    unsafe extern "C" fn read_qp(cq: *mut ffi::ibv_cq_ex) -> u32 {
-        // SAFETY: repr(C) puts cq first in the live TestCq passed to poll.
-        unsafe { (*cq.cast::<TestCq>()).reads |= QP };
-        9
-    }
-
     #[test]
     fn poll_reads_only_defined_success_fields() {
         let with_imm = ffi::ibv_wc_flags::IBV_WC_WITH_IMM.0;
@@ -828,13 +820,26 @@ mod tests {
             for flags in [0, with_imm] {
                 let mut provider = TestCq::new(opcode, Status::SUCCESS, flags);
                 let wc = provider.poll();
-                assert_eq!(wc.opcode(), Some(opcode));
-                assert_eq!(wc.byte_len(), has_len.then_some(4096));
-                assert_eq!(wc.received_len(), (opcode == Opcode::RECV).then_some(4096));
-                assert_eq!(wc.imm(), (recv && flags != 0).then_some(0x1234_5678));
-                assert_eq!((wc.wr_id, wc.qp_num, wc.vendor_err), (42, 9, 0));
+                let imm = (flags != 0).then_some(0x1234_5678);
+                assert_eq!(
+                    wc.result(),
+                    Ok(match opcode {
+                        Opcode::RDMA_READ | Opcode::COMP_SWAP | Opcode::FETCH_ADD => {
+                            Completed::Read { len: 4096 }
+                        }
+                        Opcode::RECV => Completed::Received(Received::Message { len: 4096, imm }),
+                        Opcode::RECV_RDMA_WITH_IMM => {
+                            Completed::Received(Received::WriteNotification {
+                                imm: imm.unwrap_or(0),
+                                len: 4096,
+                            })
+                        }
+                        _ => Completed::Sent,
+                    }),
+                    "{opcode:?} flags {flags}"
+                );
+                assert_eq!((wc.wr_id, wc.vendor_err), (42, 0));
                 let expected = OPCODE
-                    | QP
                     | END
                     | if has_len { LENGTH } else { 0 }
                     | if recv { FLAGS } else { 0 }
@@ -849,13 +854,16 @@ mod tests {
         for status in (1..=21).map(Status).chain([Status(u32::MAX)]) {
             let mut provider = TestCq::new(Opcode::RECV, status, u32::MAX);
             let wc = provider.poll();
-            assert_eq!(wc.status, status);
-            assert_eq!((wc.wr_id, wc.qp_num, wc.vendor_err), (42, 9, 7));
-            assert_eq!(wc.opcode(), None);
-            assert_eq!(wc.byte_len(), None);
-            assert_eq!(wc.received_len(), None);
-            assert_eq!(wc.imm(), None);
-            assert_eq!(provider.reads, QP | VENDOR | END);
+            assert_eq!(wc.wr_id, 42);
+            assert_eq!(
+                wc.result(),
+                Err(CompletionError::Failed {
+                    status,
+                    vendor_err: 7,
+                    position: 0
+                })
+            );
+            assert_eq!(provider.reads, VENDOR | END);
         }
     }
 }

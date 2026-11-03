@@ -24,13 +24,17 @@
 //!   share its completion queue, which every future of the thread polls.
 //! - Post: every operation ([`LocalQp::send`], [`LocalQp::write`],
 //!   [`LocalQp::read`], [`LocalQp::recv`], atomics, [`LocalQp::batch`]) is
-//!   posted when called and returns a future of its outcome; a
+//!   posted when called and returns a future of its outcome: `()` for what
+//!   the NIC reports nothing else of, the buffer for a READ, and what it got
+//!   ([`Received`]) with the buffer for a receive. A
 //!   [`LocalQp::sink`] streams WRITEs with as few completions as the queue
-//!   allows; a [`LocalQp::receiver`] is a stream of receives.
+//!   allows; a [`LocalQp::receiver`] is a stream of receives. Errors say what
+//!   happened ([`CompletionError`]) and hand buffers back.
 //! - Or drive the [`sync`] layer yourself: a [`Worker`](sync::Worker) is a
 //!   completion queue with its QPs, one value that moves between threads;
-//!   post into the rings, commit, and poll the CQ for each request's
-//!   completion and buffers, in a loop of your own.
+//!   post into the rings with a context of your own type, commit, and poll
+//!   the CQ for each request's context, result and buffers, in a loop of your
+//!   own.
 //!
 //! Awaiting a future polls its worker's completion queue: there is no
 //! background task, and a pending future asks to be polled again (busy
@@ -44,7 +48,7 @@
 //!
 //! ```
 //! use futures::{StreamExt, executor::block_on};
-//! use safeverbs::{Context, Model, QueuePairBuilder, RC};
+//! use safeverbs::{Context, Model, QueuePairBuilder, RC, Received};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let ctx = Context::new(Model::new(1));
@@ -65,8 +69,8 @@
 //!     qp.write(buf.slice(..), dst.remote()).await?;
 //!     qp.send(buf.slice(..64)).await?;
 //!
-//!     let (wc, got) = rx.next().await.expect("a receive");
-//!     assert_eq!(wc.received_len(), Some(64));
+//!     let (received, got) = rx.next().await.expect("a receive");
+//!     assert_eq!(received, Ok(Received::Message { len: 64, imm: None }));
 //!     assert!(got.iter().all(|&b| b == 42));
 //!     rx.repost(got)?;
 //!     let copy = dst.reclaim(); // the completed WRITE is the only remote writer
@@ -85,7 +89,7 @@
 //!
 //! ```no_run
 //! # use futures::{SinkExt, StreamExt};
-//! # use safeverbs::{BufMut, LocalQp, Pd, RC, RemoteBuf, WriteOp};
+//! # use safeverbs::{BufMut, LocalQp, Pd, RC, Received, RemoteBuf, WriteOp};
 //! # async fn f(pd: Pd, qp: LocalQp<RC>, dst: RemoteBuf, bufs: Vec<BufMut<u8>>) -> Result<(), Box<dyn std::error::Error>> {
 //! let mut buf = pd.alloc::<u8>(1 << 20)?; // BufMut
 //! buf.fill(42);
@@ -103,9 +107,11 @@
 //! let mut ops = futures::stream::iter((0..1000u64).map(|i| Ok(WriteOp::new(buf.slice(..64), dst.offset(i % 128 * 64)))));
 //! tx.send_all(&mut ops).await?;
 //! let mut rx = qp.receiver(bufs);
-//! while let Some((wc, buf)) = rx.next().await {
-//!     if let Some(len) = wc.received_len() {
-//!         println!("received {len} bytes");
+//! while let Some((received, buf)) = rx.next().await {
+//!     match received {
+//!         Ok(Received::Message { len, .. }) => println!("received {:?}", &buf[..len as usize]),
+//!         Ok(Received::WriteNotification { imm, len }) => println!("{len} bytes written, {imm}"),
+//!         Err(error) => println!("a receive failed: {error}"),
 //!     }
 //!     rx.repost(buf)?;
 //! }
@@ -219,8 +225,9 @@ pub use receiver::Receiver;
 pub use safeverbs_core::model::Model;
 pub use safeverbs_core::verbs::{Verbs, devices};
 pub use safeverbs_core::{
-    Access, Buf, BufError, BufMut, Chunks, Context, Endpoint, Error, Exposed, Gid, GidEntry, Nic,
-    Opcode, Pd, PortInfo, RC, Reliable, RemoteBuf, Result, RingBuf, Status, Transport, UC, Wc,
+    Access, Buf, BufError, BufMut, Chunks, Completed, CompletionError, Context, Endpoint, Error,
+    Exposed, Gid, GidEntry, Nic, Pd, PortInfo, RC, Received, Reliable, RemoteBuf, Result, RingBuf,
+    Status, Transport, UC,
 };
 pub use sink::{WriteOp, WriteSink};
 pub use worker::LocalWorker;
@@ -229,33 +236,46 @@ pub use worker::LocalWorker;
 /// completion queue and the QPs attached to it, one value that is `Send`
 /// but not `Sync`; its QPs' requests are written into completion rings and
 /// the hardware queues together, committed with one doorbell, and come back
-/// (completion and buffers) when the CQ is polled.
+/// (context, result and buffers) when the CQ is polled.
 ///
 /// This is the zero-cost core: a thread's loop polls its worker, dispatches
-/// each completion and posts new work. Lend buffers with
-/// [`Buf::into_part`] and [`BufMut::into_part`]; get them back with
+/// each completion by its context and posts new work. Lend buffers with
+/// [`Buf::into_part`] and [`BufMut::into_part`], or let [`Worker::send`] and its
+/// kin do it; get them back with
 /// [`Leases::into_buf_mut`](sync::Leases::into_buf_mut).
 ///
 /// ```no_run
-/// # use safeverbs::{Buf, Pd, RC, RemoteBuf};
+/// # use safeverbs::{Buf, Completed, Pd, RC, RemoteBuf};
 /// # use safeverbs::sync::{QpCaps, Worker, WrOp};
+/// /// What each request is for: the loop's own type.
+/// enum Job {
+///     Write { client: u32 },
+///     Stats,
+/// }
+///
 /// # fn f(pd: Pd, buf: Buf<u8>, dst: RemoteBuf) -> safeverbs::Result<()> {
 /// let caps = QpCaps { max_send_wr: 128, max_recv_wr: 128, max_send_sge: 1, max_recv_sge: 1, max_inline_data: 0 };
-/// let mut w = Worker::new(&pd, 4096)?;
+/// let mut w: Worker<Job> = Worker::new(&pd, 4096)?;
 /// let qps: Vec<_> = (0..8).map(|_| w.create_qp::<RC>(caps, 32)).collect::<Result<_, _>>()?;
 /// // ... exchange endpoints (`w.endpoint(qp, ..)`) and `w.connect(qp, ..)` each ...
-/// for &qp in &qps {
-///     let mut req = w.request(qp);
-///     req.push(WrOp::Write(dst), buf.slice(..64).into_part())?;
-///     req.submit(true);
+/// for (client, &qp) in qps.iter().enumerate() {
+///     w.write(qp, buf.slice(..64), dst, Job::Write { client: client as u32 })?;
 /// }
+/// // One context per request, whatever the number of WQEs.
+/// let mut req = w.request(qps[0]);
+/// req.push(WrOp::Write(dst), buf.slice(..64).into_part()).map_err(|e| e.error)?;
+/// req.push(WrOp::Write(dst), buf.slice(64..128).into_part()).map_err(|e| e.error)?;
+/// req.submit(true, Job::Stats)?;
 /// loop {
-///     w.poll(|w, c| {
-///         // `c.qp` is the QP's index, `c.wc` the outcome, `c.leases` the buffers.
-///         let qp = qps[c.qp];
-///         let mut req = w.request(qp);
-///         let _ = req.push(WrOp::Write(dst), buf.slice(..64).into_part());
-///         req.submit(true);
+///     w.poll(|w, c| match (c.ctx, c.result) {
+///         (Job::Write { client }, Ok(Completed::Sent)) => {
+///             let _ = w.write(qps[c.qp], buf.slice(..64), dst, Job::Write { client });
+///         }
+///         (Job::Stats, Ok(_)) => {}
+///         // Before the error's position every WQE completed; from it on, none did,
+///         // and what those did at the peer is unknown.
+///         (_, Err(error)) => eprintln!("request failed: {error}"),
+///         (_, Ok(other)) => unreachable!("{other:?}"),
 ///     });
 /// }
 /// # }
@@ -264,7 +284,7 @@ pub mod sync {
     pub use safeverbs_core::nic::QpCaps;
     pub use safeverbs_core::ring::{Ring, State};
     pub use safeverbs_core::worker::{
-        Completion, MAX_QPS, MAX_SGES, QpKey, Queue, Request, Worker,
+        Completion, DetachedError, MAX_QPS, MAX_SGES, PostError, QpKey, Queue, Request, Worker,
     };
     pub use safeverbs_core::{ConnectAttr, Endpoint, Leases, Part, Seq, WrOp};
 }

@@ -15,8 +15,8 @@
 //!   without FFI or `unsafe`, verified with Verus; [`refine`] proves that
 //!   it refines the abstract machine of `safeverbs-spec`;
 //! - the internal `trusted` module: verbs with contracts from the NIC model;
-//! - [`wr_id`]: the `wr_id` of a WQE and how a completion is routed back by
-//!   it, verified;
+//! - the internal `wr_id` module: the `wr_id` of a WQE and how a completion is
+//!   routed back by it, verified;
 //! - the internal `hw` module: the hardware side of a worker (its CQ, its QPs' queues and
 //!   rings, its share of the NIC model), verified against the trusted verbs:
 //!   every verb meets the model's precondition, the rings stay coupled to the
@@ -24,7 +24,7 @@
 //! - [`worker`]: a completion queue and the queue pairs attached to it,
 //!   driven synchronously ([`Worker`]): post requests into the rings and the
 //!   hardware queues, commit them with one doorbell, poll the CQ, and get
-//!   each request's completion and buffers back.
+//!   each request's context, result and buffers back.
 //!
 //! # Soundness in one paragraph
 //!
@@ -57,7 +57,7 @@ pub(crate) mod trusted;
 pub mod verbs;
 pub mod wc;
 pub mod worker;
-pub mod wr_id;
+pub(crate) mod wr_id;
 
 pub use buf::{Buf, BufError, BufMut, Chunks, Exposed, Leases, Part, RingBuf};
 pub use error::{Error, Result};
@@ -67,5 +67,5 @@ pub use nic::{
 pub use pd::{Context, Pd};
 pub use ring::Seq;
 pub use transport::{RC, Reliable, Transport, UC};
-pub use wc::{Opcode, Status, Wc};
-pub use worker::{Completion, QpKey, Queue, Request, Worker};
+pub use wc::{Completed, CompletionError, Received, Status, Wc};
+pub use worker::{Completion, DetachedError, PostError, QpKey, Queue, Request, Worker};

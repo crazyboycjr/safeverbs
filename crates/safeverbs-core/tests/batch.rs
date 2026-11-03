@@ -1,6 +1,6 @@
 //! Batches on the model NIC and on a real device (Soft-RoCE, `scripts/rxe.sh up`): an error
-//! in the middle of a batch is its outcome, the WQEs after it flush, and its buffers come
-//! back once; a batch of READs reports the length of its last READ.
+//! in a batch is its outcome, with its position, the WQEs after it flush, and its context and
+//! buffers come back once; a batch of READs reports the length of its last READ.
 //!
 //! The rxe tests pass without doing anything when the host has no rxe device;
 //! `SAFEVERBS_TEST_DEVICE` picks another device and `SAFEVERBS_TEST_GID_INDEX` a GID.
@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use safeverbs_core::model::Model;
 use safeverbs_core::verbs::Verbs;
 use safeverbs_core::{
-    Access, Buf, ConnectAttr, Context, Leases, Nic, Opcode, Pd, QpCaps, QpKey, RC, Seq, Status, Wc,
-    Worker, WrOp,
+    Access, Buf, Completed, Completion, CompletionError, ConnectAttr, Context, Nic, Pd, QpCaps,
+    QpKey, RC, Seq, Status, Worker, WrOp,
 };
 
 /// How long a request may take to complete on a real device.
@@ -31,7 +31,7 @@ fn rxe() -> Option<Context<Verbs>> {
 }
 
 /// A worker on `ctx` with two RC QPs connected to each other; the first.
-fn connected<N: Nic>(ctx: &Context<N>) -> (Pd<N>, Worker<N>, QpKey<RC>) {
+fn connected<C, N: Nic>(ctx: &Context<N>) -> (Pd<N>, Worker<C, N>, QpKey<RC>) {
     let pd = ctx.alloc_pd().unwrap();
     let caps = QpCaps {
         max_send_wr: 16,
@@ -70,8 +70,8 @@ fn connected<N: Nic>(ctx: &Context<N>) -> (Pd<N>, Worker<N>, QpKey<RC>) {
     (pd, worker, local)
 }
 
-/// Polls until request `seq` of `qp`'s send queue completes; its outcome and buffers.
-fn wait_send<N: Nic>(worker: &mut Worker<N>, qp: QpKey<RC>, seq: Seq) -> (Wc, Leases<N>) {
+/// Polls until request `seq` of `qp`'s send queue completes.
+fn wait_send<C, N: Nic>(worker: &mut Worker<C, N>, qp: QpKey<RC>, seq: Seq) -> Completion<C, N> {
     let start = Instant::now();
     loop {
         worker.progress();
@@ -85,12 +85,13 @@ fn wait_send<N: Nic>(worker: &mut Worker<N>, qp: QpKey<RC>, seq: Seq) -> (Wc, Le
     }
 }
 
-/// A batch of four WRITEs whose third has a bad rkey, then one more WRITE: the first two
-/// execute, the third fails, and the rest flush. The batch reports the third's error with
-/// its four buffers, once; the WRITE after it reports a flush.
-fn error_in_the_middle<N: Nic>(ctx: Context<N>) {
+/// A batch of four WRITEs, the one at `bad` with a bad rkey, then one more WRITE: those before
+/// it execute, it fails, and the rest flush. The batch reports that error at its position, with
+/// its context and its four buffers, once; the WRITE after it reports a flush at position 0,
+/// its own first WQE.
+fn error_in_a_batch<N: Nic>(ctx: Context<N>, bad: usize) {
     const LEN: usize = 8;
-    let (pd, mut worker, local) = connected(&ctx);
+    let (pd, mut worker, local) = connected::<&'static str, N>(&ctx);
     let target = pd.alloc::<u8>(4 * LEN).unwrap().expose().unwrap();
     let slot = |i: usize| {
         target
@@ -108,61 +109,117 @@ fn error_in_the_middle<N: Nic>(ctx: Context<N>) {
     let mut request = worker.request(local);
     for (i, src) in sources.iter().enumerate() {
         let mut dst = slot(i);
-        if i == 2 {
+        if i == bad {
             dst.rkey ^= 0x5a5a_0000;
         }
         request
             .push(WrOp::Write(dst), src.slice(..).into_part())
             .unwrap();
     }
-    let batch = request.finish(true, false).unwrap();
+    let batch = request.finish(true, "the batch").unwrap();
     let mut request = worker.request(local);
     request
         .push(WrOp::Write(slot(3)), sources[1].slice(..).into_part())
         .unwrap();
-    let after = request.finish(true, false).unwrap();
+    let after = request.finish(true, "the WRITE after it").unwrap();
     worker.commit(local).unwrap();
 
-    let (wc, leases) = wait_send(&mut worker, local, batch);
+    let done = wait_send(&mut worker, local, batch);
+    assert_eq!(done.ctx, "the batch");
+    let Err(CompletionError::Failed {
+        status, position, ..
+    }) = done.result
+    else {
+        panic!("the batch completed with {:?}", done.result);
+    };
     assert_eq!(
-        wc.status,
+        status,
         Status::REM_ACCESS_ERR,
         "the first error, not the flush after it"
     );
-    assert_eq!(wc.opcode(), None);
-    assert_eq!(wc.byte_len(), None);
-    assert_eq!(leases.len(), 4, "every buffer of the batch");
+    assert_eq!(position as usize, bad, "the WQE that failed");
+    assert_eq!(done.leases.len(), 4, "every buffer of the batch");
     assert!(worker.take_send(local, batch).is_none(), "taken once");
-    drop(leases);
-    let (wc, leases) = wait_send(&mut worker, local, after);
-    assert_eq!(wc.status, Status::WR_FLUSH_ERR);
-    drop(leases);
+    drop(done);
+    let done = wait_send(&mut worker, local, after);
+    assert_eq!(done.ctx, "the WRITE after it");
+    assert_eq!(
+        done.result.unwrap_err().status(),
+        Some(Status::WR_FLUSH_ERR)
+    );
+    assert!(
+        matches!(
+            done.result,
+            Err(CompletionError::Failed { position: 0, .. })
+        ),
+        "the earlier request's error did not spill into it"
+    );
+    drop(done);
     assert_eq!(worker.send_ring(local).in_flight_wqes(), 0);
     for src in sources {
         assert!(src.try_thaw().is_ok(), "nothing holds the buffer any more");
     }
     drop(worker);
     let target = target.try_reclaim().unwrap();
-    assert_eq!(&target[..LEN], &[1; LEN]);
-    assert_eq!(&target[LEN..2 * LEN], &[2; LEN]);
-    assert_eq!(
-        &target[2 * LEN..],
-        &[0; 2 * LEN],
-        "the failed and flushed WRITEs did not execute"
-    );
+    for i in 0..4 {
+        // Only what these devices do here: an error says nothing of the remote effects
+        // of the WQEs from it on, which M leaves unknown.
+        let want = if i < bad { i as u8 + 1 } else { 0 };
+        assert_eq!(&target[i * LEN..(i + 1) * LEN], &[want; LEN], "slot {i}");
+    }
 }
 
 #[test]
-fn error_in_the_middle_of_a_batch_model() {
-    let model = Model::new(91);
-    error_in_the_middle(Context::new(model.clone()));
-    assert_eq!(model.registered(), 0);
+fn error_in_a_batch_model() {
+    for bad in [0, 2, 3] {
+        let model = Model::new(91);
+        error_in_a_batch(Context::new(model.clone()), bad);
+        assert_eq!(model.registered(), 0);
+    }
 }
 
 #[test]
-fn error_in_the_middle_of_a_batch_rxe() {
-    let Some(ctx) = rxe() else { return };
-    error_in_the_middle(ctx);
+fn error_in_a_batch_rxe() {
+    for bad in [0, 2, 3] {
+        let Some(ctx) = rxe() else { return };
+        error_in_a_batch(ctx, bad);
+    }
+}
+
+/// An error injected after the first WQEs of a batch ran: the position counts the ones that
+/// completed, unsignaled and with no completion of their own.
+#[test]
+fn position_counts_the_wqes_that_completed() {
+    for done in 0..4 {
+        let model = Model::new(92);
+        model.set_pace(0, 1);
+        let ctx = Context::new(model.clone());
+        let (pd, mut worker, local) = connected::<(), Model>(&ctx);
+        let target = pd.alloc::<u8>(8).unwrap().expose().unwrap();
+        let source = pd.alloc::<u8>(8).unwrap().freeze();
+        let mut request = worker.request(local);
+        for _ in 0..4 {
+            request
+                .push(WrOp::Write(target.remote()), source.slice(..).into_part())
+                .unwrap();
+        }
+        let batch = request.submit(true, ()).unwrap();
+        // Each poll executes one WQE, leaving a CQE only for an error or the signaled last.
+        for _ in 0..done {
+            assert_eq!(worker.progress(), 0);
+        }
+        model.inject_error(worker.qp_num(local), Status::REM_OP_ERR);
+        let finished = wait_send(&mut worker, local, batch);
+        assert!(
+            matches!(
+                finished.result,
+                Err(CompletionError::Failed { status, position, .. })
+                    if status == Status::REM_OP_ERR && position == done
+            ),
+            "{:?} after {done} WQEs",
+            finished.result
+        );
+    }
 }
 
 /// A batch of two READs of different lengths. Signaled, its own CQE reports the last READ's
@@ -172,7 +229,7 @@ fn read_batch<N: Nic>(ctx: Context<N>, signal: bool) {
     const FIRST: usize = 17;
     const LAST: usize = 31;
     const TAIL: usize = 7;
-    let (pd, mut worker, local) = connected(&ctx);
+    let (pd, mut worker, local) = connected::<(), N>(&ctx);
     let payload: Vec<u8> = (0..128).map(|i| (i * 29 + 7) as u8).collect();
     let mut source = pd.alloc::<u8>(payload.len()).unwrap();
     source.copy_from_slice(&payload);
@@ -191,7 +248,7 @@ fn read_batch<N: Nic>(ctx: Context<N>, signal: bool) {
             last.into_part(),
         )
         .unwrap();
-    let batch = request.submit(signal).unwrap().unwrap();
+    let batch = request.submit(signal, ()).unwrap();
     if !signal {
         let mut request = worker.request(local);
         request
@@ -200,22 +257,23 @@ fn read_batch<N: Nic>(ctx: Context<N>, signal: bool) {
                 pd.alloc::<u8>(TAIL).unwrap().into_part(),
             )
             .unwrap();
-        let tail = request.submit(true).unwrap().unwrap();
-        let (wc, leases) = wait_send(&mut worker, local, tail);
-        assert!(wc.is_ok(), "{wc:?}");
-        assert_eq!(wc.byte_len(), Some(TAIL as u32));
+        let tail = request.submit(true, ()).unwrap();
+        let done = wait_send(&mut worker, local, tail);
+        assert_eq!(done.result, Ok(Completed::Read { len: TAIL as u32 }));
         assert_eq!(
-            &*leases.into_buf_mut::<u8>().unwrap(),
+            &*done.leases.into_buf_mut::<u8>().unwrap(),
             &payload[89..89 + TAIL]
         );
     }
-    let (wc, leases) = wait_send(&mut worker, local, batch);
-    assert!(wc.is_ok(), "{wc:?}");
-    assert_eq!(wc.opcode(), Some(Opcode::RDMA_READ));
-    assert_eq!(wc.byte_len(), Some(LAST as u32), "the last READ's length");
-    assert_eq!(leases.len(), 2, "both destinations, together");
+    let done = wait_send(&mut worker, local, batch);
+    assert_eq!(
+        done.result,
+        Ok(Completed::Read { len: LAST as u32 }),
+        "the last READ's length"
+    );
+    assert_eq!(done.leases.len(), 2, "both destinations, together");
     assert!(worker.take_send(local, batch).is_none(), "taken once");
-    let first = leases.into_buf_mut::<u8>().unwrap();
+    let first = done.leases.into_buf_mut::<u8>().unwrap();
     assert_eq!(&*first, &payload[..FIRST]);
     drop(first);
     drop(worker);

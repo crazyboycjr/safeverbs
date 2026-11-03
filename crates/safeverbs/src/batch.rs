@@ -27,13 +27,13 @@ pub struct Batch<'a, T: Transport, N: Nic = Verbs> {
 #[allow(clippy::large_enum_variant)]
 enum Target<'a, T: Transport, N: Nic> {
     /// Written into the send queue as added.
-    Direct(Request<'a, T, N>),
+    Direct(Request<'a, T, (), N>),
     /// Collected for later.
     Collect(Vec<(WrOp, Part<N>)>),
 }
 
 impl<'a, T: Transport, N: Nic> Batch<'a, T, N> {
-    pub(crate) fn direct(req: Request<'a, T, N>) -> Self {
+    pub(crate) fn direct(req: Request<'a, T, (), N>) -> Self {
         Batch {
             target: Target::Direct(req),
             error: None,
@@ -61,9 +61,8 @@ impl<'a, T: Transport, N: Nic> Batch<'a, T, N> {
                 let _ = req.submit_detached();
                 Err((error, Leases::default()))
             }
-            None => req
-                .submit(true)
-                .unwrap_or(Err((Error::Invalid("an empty batch"), Leases::default()))),
+            None if req.is_empty() => Err((Error::Invalid("an empty batch"), Leases::default())),
+            None => req.submit(true, ()).map_err(|e| (e.error, e.leases)),
         }
     }
 

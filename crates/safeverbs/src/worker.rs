@@ -11,7 +11,9 @@ use crate::qp::State;
 
 /// A worker for one thread: a CQ and the QPs attached to it
 /// ([`Worker`](safeverbs_core::Worker)), behind a reference-counted
-/// `RefCell`. Neither `Send` nor `Sync`; cheap to clone (a handle).
+/// `RefCell`. Neither `Send` nor `Sync`; cheap to clone (a handle). Its
+/// requests have no context (`Worker<()>`): each future is its own request's
+/// identity.
 ///
 /// Build QPs on it with
 /// [`QueuePairBuilder::build_on`](crate::QueuePairBuilder::build_on). Every
@@ -70,7 +72,7 @@ impl<N: Nic> LocalWorker<N> {
     ///
     /// If called from inside a method of one of its QPs (the `RefCell` is
     /// borrowed).
-    pub fn with<R>(&self, f: impl FnOnce(&mut Worker<N>) -> R) -> R {
+    pub fn with<R>(&self, f: impl FnOnce(&mut Worker<(), N>) -> R) -> R {
         f(&mut self.state.borrow_mut().worker)
     }
 

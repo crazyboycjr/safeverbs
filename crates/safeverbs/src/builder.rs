@@ -190,7 +190,7 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
     /// peer reaches it, and the attributes to connect it with
     /// ([`Worker::connect`]) once the peer's endpoint is known. Fails as
     /// [`QueuePairBuilder::build_on`] does.
-    pub fn build_in(&self, w: &mut Worker<N>) -> Result<(QpKey<T>, Endpoint, ConnectAttr)> {
+    pub fn build_in<C>(&self, w: &mut Worker<C, N>) -> Result<(QpKey<T>, Endpoint, ConnectAttr)> {
         let ctx = self.pd.context();
         let port = ctx.port(self.port)?;
         let gid_index = match self.gid_index {

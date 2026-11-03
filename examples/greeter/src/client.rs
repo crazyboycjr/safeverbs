@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut buf = pd.alloc::<u8>(MSG.len())?;
     buf.copy_from_slice(MSG.as_bytes());
-    let wc = block_on(qp.send(buf.freeze()))?;
-    println!("{wc:?}");
+    block_on(qp.send(buf.freeze()))?;
+    println!("Sent.");
     Ok(())
 }

@@ -9,7 +9,7 @@ use super::*;
 
 verus! {
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// One QP's closed rings, open leases and not-yet-written parts exclude
     /// the incoming unique SGE's bytes. Completed/refused owners are included.
     closed spec fn entry_separated_from(&self, index: int, incoming: Part<N>) -> bool {
@@ -37,7 +37,7 @@ impl<N: Device> Hw<N> {
         self.has_qp(index as int) && {
             let req = self.qps@[index as int]->0.recv.req(seq as int);
             req is Some && req->0.phase is InFlight
-                && req->0.leases.loans() == seq![crate::buf::Loan {
+                && req->0.leases.leases.loans() == seq![crate::buf::Loan {
                     part, access: Some(safeverbs_spec::abs::Dir::In),
                 }]
         }
@@ -48,7 +48,7 @@ impl<N: Device> Hw<N> {
         requires self.has_qp(index as int),
             self.qps@[index as int]->0.recv.req(seq as int) is Some,
             self.qps@[index as int]->0.recv.req(seq as int)->0.phase is InFlight,
-            self.qps@[index as int]->0.recv.req(seq as int)->0.leases.loans() == seq![crate::buf::Loan {
+            self.qps@[index as int]->0.recv.req(seq as int)->0.leases.leases.loans() == seq![crate::buf::Loan {
                 part, access: Some(safeverbs_spec::abs::Dir::In),
             }],
         ensures self.recv_holds_input(index, seq, part),

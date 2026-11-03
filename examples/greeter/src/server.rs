@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::time::Instant;
 
 use futures::executor::block_on;
-use safeverbs::UcQueuePairBuilder;
+use safeverbs::{Received, UcQueuePairBuilder};
 
 mod config;
 
@@ -28,14 +28,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config::sync(&mut stream)?;
 
     let start = Instant::now();
-    let (wc, buf) = block_on(recv)?;
-    println!("{wc:?}");
-    println!(
-        "{}",
-        std::str::from_utf8(
-            &buf[..wc.received_len().expect("a successful SEND receive") as usize]
-        )?
-    );
+    let (received, buf) = block_on(recv)?;
+    println!("{received:?}");
+    match received {
+        Received::Message { len, .. } => {
+            println!("{}", std::str::from_utf8(&buf[..len as usize])?);
+        }
+        Received::WriteNotification { .. } => println!("A WRITE, not a message."),
+    }
     println!("Duration: {:?}", start.elapsed());
     Ok(())
 }

@@ -7,7 +7,9 @@ use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use safeverbs_core::{BufError, BufMut, Error, Leases, Nic, Seq, Wc};
+use safeverbs_core::{
+    BufError, BufMut, Completed, CompletionError, Error, Leases, Nic, Received, Seq,
+};
 use zerocopy::FromBytes;
 
 use crate::backlog::{Posted, Work};
@@ -20,28 +22,31 @@ pub(crate) enum Side {
     Recv,
 }
 
-/// What a finished operation yields, made from its completion and the
-/// buffers it gets back.
+/// What a request that retired reports: what it did, or why it did not.
+pub(crate) type TakenResult = Result<Completed, CompletionError>;
+
+/// What a finished operation yields, made from its result and the buffers it
+/// gets back.
 pub trait Outcome<N: Nic> {
     /// The future's output.
     type Output;
-    /// The request retired with `wc` (success or error).
-    fn done(wc: Wc, leases: Leases<N>) -> Self::Output;
+    /// The request retired with `result`.
+    fn done(result: Result<Completed, CompletionError>, leases: Leases<N>) -> Self::Output;
     /// The request could not be posted; `back` holds its buffers.
     fn failed(error: Error, back: Leases<N>) -> Self::Output;
 }
 
 /// SEND and RDMA WRITE (and batches of them): the buffers were frozen, the
-/// caller keeps its own copies; yields the completion.
+/// caller keeps its own copies; yields nothing, since the NIC reports nothing
+/// but the status of these operations.
 pub struct Sent;
 
 impl<N: Nic> Outcome<N> for Sent {
-    type Output = Result<Wc, Error>;
-    fn done(wc: Wc, _leases: Leases<N>) -> Self::Output {
-        if wc.is_ok() {
-            Ok(wc)
-        } else {
-            Err(Error::Completion(wc))
+    type Output = Result<(), Error>;
+    fn done(result: TakenResult, _leases: Leases<N>) -> Self::Output {
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(Error::Completion(error)),
         }
     }
     fn failed(error: Error, _back: Leases<N>) -> Self::Output {
@@ -55,15 +60,14 @@ pub struct Read<T>(PhantomData<T>);
 
 impl<T: FromBytes, N: Nic> Outcome<N> for Read<T> {
     type Output = Result<BufMut<T, N>, BufError<BufMut<T, N>>>;
-    fn done(wc: Wc, leases: Leases<N>) -> Self::Output {
+    fn done(result: TakenResult, leases: Leases<N>) -> Self::Output {
         let buf = leases.into_buf_mut().expect("a READ holds its buffer");
-        if wc.is_ok() {
-            Ok(buf)
-        } else {
-            Err(BufError {
-                error: Error::Completion(wc),
+        match result {
+            Ok(_) => Ok(buf),
+            Err(error) => Err(BufError {
+                error: Error::Completion(error),
                 buf,
-            })
+            }),
         }
     }
     fn failed(error: Error, back: Leases<N>) -> Self::Output {
@@ -74,21 +78,29 @@ impl<T: FromBytes, N: Nic> Outcome<N> for Read<T> {
     }
 }
 
-/// A receive into a `BufMut<T>`: yields the completion and the buffer, or
-/// the error with the buffer.
+/// What a successful receive reports (M allows it nothing else).
+pub(crate) fn received(done: Completed) -> Received {
+    match done {
+        Completed::Received(received) => received,
+        other => unreachable!("a receive completed as {other:?}"),
+    }
+}
+
+/// A receive into a `BufMut<T>`: yields what it got (a message or the
+/// notification of a peer's WRITE) and the buffer, or the error with the
+/// buffer.
 pub struct Recv<T>(PhantomData<T>);
 
 impl<T: FromBytes, N: Nic> Outcome<N> for Recv<T> {
-    type Output = Result<(Wc, BufMut<T, N>), BufError<BufMut<T, N>>>;
-    fn done(wc: Wc, leases: Leases<N>) -> Self::Output {
+    type Output = Result<(Received, BufMut<T, N>), BufError<BufMut<T, N>>>;
+    fn done(result: TakenResult, leases: Leases<N>) -> Self::Output {
         let buf = leases.into_buf_mut().expect("a receive holds its buffer");
-        if wc.is_ok() {
-            Ok((wc, buf))
-        } else {
-            Err(BufError {
-                error: Error::Completion(wc),
+        match result {
+            Ok(done) => Ok((received(done), buf)),
+            Err(error) => Err(BufError {
+                error: Error::Completion(error),
                 buf,
-            })
+            }),
         }
     }
     fn failed(error: Error, back: Leases<N>) -> Self::Output {
@@ -183,9 +195,9 @@ impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
 
 impl<Q: QueueAccess, K: Outcome<Q::N>> Unpin for Op<'_, Q, K> {}
 
-/// A retired request's completion and buffers, or why it was not posted
-/// and its buffers.
-type Finished<N> = Result<(Wc, Leases<N>), (Error, Leases<N>)>;
+/// A retired request's result and buffers, or why it was not posted and its
+/// buffers.
+type Finished<N> = Result<(TakenResult, Leases<N>), (Error, Leases<N>)>;
 
 /// One poll of a request: its outcome if it retired, else `None` with the
 /// waker registered.
@@ -229,7 +241,7 @@ impl<Q: QueueAccess, K: Outcome<Q::N>> Future for Op<'_, Q, K> {
         let side = this.side;
         let outcome = this.q.with_state(|s| poll_request(s, side, &mut state, cx));
         match outcome {
-            Some(Ok((wc, leases))) => Poll::Ready(K::done(wc, leases)),
+            Some(Ok((result, leases))) => Poll::Ready(K::done(result, leases)),
             Some(Err((error, back))) => Poll::Ready(K::failed(error, back)),
             None => {
                 this.state = state;

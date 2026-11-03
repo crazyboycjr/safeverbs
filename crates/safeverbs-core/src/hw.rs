@@ -25,9 +25,11 @@
 //!   its WQE (`outcomes`). A send request, one WQE or a batch, caches the
 //!   first error M retired in its interval while it is in flight, and
 //!   completes with M's aggregate of the interval: the first error in
-//!   posting order, else the last WQE's success (`send_outcomes`).
-//!   [`Hw::take`] hands back exactly that, or a flush error for a request
-//!   whose doorbell was refused, which M never saw.
+//!   posting order, at its position in the interval, else the last WQE's
+//!   success (`send_outcomes`). [`Hw::take`] hands back exactly that, with
+//!   the request's own context and buffers, or says that its doorbell was
+//!   refused, which M never saw. A detached request's first error is held to
+//!   the same ([`Hw::take_send_error`]).
 //! - **Capacity.** The CQ's entries reserved in M are exactly what the
 //!   worker counts ([`Hw::reserved`]); a QP is created only if its depths fit
 //!   ([`Hw::create_qp`]), and each ring keeps at most its depth of WQEs in
@@ -67,9 +69,10 @@ use crate::nic::{
 };
 use crate::pd::Pd;
 use crate::ring::wake::WakeBatch;
-use crate::ring::{Ring, Seq as RingSeq};
+use crate::ring::{Payload, Ring, Seq as RingSeq, Taken};
 use crate::trusted::*;
-use crate::wc::{Opcode, Wc};
+use crate::verbs::Verbs;
+use crate::wc::{Completed, CompletionError, Opcode, Wc};
 use crate::wr_id::*;
 
 mod completion;
@@ -89,6 +92,43 @@ pub const MAX_QPS: usize = 0x1_0000;
 /// stack).
 pub const MAX_SGES: usize = 16;
 
+/// One of a QP's two work queues.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Side {
+    /// The send queue: SENDs, WRITEs, READs, atomics.
+    Send,
+    /// The receive queue.
+    Recv,
+}
+
+/// A request that retired, as [`Worker::poll`](crate::worker::Worker::poll) and
+/// [`Worker::take_send`](crate::worker::Worker::take_send) hand it out.
+#[verifier::reject_recursive_types(N)]
+pub struct Completion<C = (), N: Device = Verbs> {
+    /// The QP's index in the worker
+    /// ([`QpKey::index`](crate::worker::QpKey::index)).
+    pub qp: usize,
+    /// The queue it was posted on.
+    pub queue: Side,
+    /// Its sequence number in that queue.
+    pub seq: RingSeq,
+    /// The context it was posted with.
+    pub ctx: C,
+    /// What it did, or why it did not.
+    pub result: core::result::Result<Completed, CompletionError>,
+    /// Its buffers.
+    pub leases: Leases<N>,
+}
+
+/// The first error of a send request without an owner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DetachedError {
+    /// The request.
+    pub seq: RingSeq,
+    /// Why it did not complete successfully.
+    pub error: CompletionError,
+}
+
 /// What the worker knows of a hardware QP's state: it decides which verbs
 /// the worker may call (M's preconditions: work is posted only in RTS or
 /// ERR, and a QP connects from RESET).
@@ -105,11 +145,12 @@ pub enum Phase {
 }
 
 /// A QP of a worker: its hardware handle and the rings of its queues.
+#[verifier::reject_recursive_types(C)]
 #[verifier::reject_recursive_types(N)]
-pub struct HwQp<N: Device> {
+pub struct HwQp<C, N: Device> {
     hw: N::Qp,
-    send: Ring<Leases<N>>,
-    recv: Ring<Leases<N>>,
+    send: Ring<Payload<C, N>>,
+    recv: Ring<Payload<C, N>>,
     caps: QpCaps,
     qp_type: QpType,
     /// Atomics are allowed (a reliable connection on a device with them).
@@ -266,13 +307,14 @@ spec fn held_ok<N: Device>(h: Held, parts: Seq<Part<N>>, index: u16, num: int, a
 }
 
 /// The hardware side of a worker: its CQ, its QPs and its share of M.
+#[verifier::reject_recursive_types(C)]
 #[verifier::reject_recursive_types(N)]
-pub struct Hw<N: Device> {
+pub struct Hw<C, N: Device> {
     cq: N::Cq,
     pd: Pd<N>,
     domain: Option<N::Domain>,
     caps: DeviceCaps,
-    qps: Vec<Option<HwQp<N>>>,
+    qps: Vec<Option<HwQp<C, N>>>,
     /// The QPs with retired requests the event loop has not handed out.
     dirty: Vec<u16>,
     /// Entries of the CQ.
@@ -322,10 +364,24 @@ pub open spec fn rq_linked<L>(r: Ring<L>, index: u16, qp: Qp) -> bool {
 
 /// Every concrete resource value held by the ring has its checked logical loan
 /// and WQE provenance. Refused requests keep their original, unposted ledger.
-pub(crate) open spec fn ring_resources_ok<N: Device>(r: Ring<Leases<N>>) -> bool {
-    &&& forall|s: int| #[trigger] r.req(s) is Some ==> request_resources_ok(r.req(s)->0.leases)
-    &&& forall|s: int| #[trigger] r.staged(s) is Some ==> request_resources_ok(r.staged(s)->0.leases)
-    &&& forall|s: int| #[trigger] r.refused(s) is Some ==> request_resources_ok(r.refused(s)->0)
+pub(crate) open spec fn ring_resources_ok<C, N: Device>(r: Ring<Payload<C, N>>) -> bool {
+    &&& forall|s: int| #[trigger] r.req(s) is Some ==> payload_ok(r.req(s)->0.leases, r.req(s)->0.detached)
+    &&& forall|s: int| #[trigger] r.staged(s) is Some ==> payload_ok(r.staged(s)->0.leases, r.staged(s)->0.detached)
+    &&& forall|s: int| #[trigger] r.refused(s) is Some ==> payload_ok(r.refused(s)->0, false)
+}
+
+/// A request's payload: its checked buffers and, exactly if it has an owner, a
+/// context. So a request without an owner runs no user destructor as it retires.
+pub(crate) open spec fn payload_ok<C, N: Device>(p: Payload<C, N>, detached: bool) -> bool {
+    &&& request_resources_ok(p.leases)
+    &&& (p.ctx is Some) == !detached
+}
+
+/// Every live WQE stays with its request and that request's buffers; the
+/// context may have gone with the owner.
+pub(crate) open spec fn keeps_leases<C, N: Device>(post: Ring<Payload<C, N>>, pre: Ring<Payload<C, N>>) -> bool {
+    forall|s: int, w: int| pre.dma(s, w) is Some && post.spec_wqe_retired() <= w < post.spec_closed_end()
+        ==> #[trigger] post.dma(s, w) is Some && post.dma(s, w)->0.leases == pre.dma(s, w)->0.leases
 }
 
 pub(crate) open spec fn request_resources_ok<N: Device>(leases: Leases<N>) -> bool {
@@ -356,25 +412,25 @@ proof fn lemma_ledger_entry<N: Device>(leases: Leases<N>, j: int)
 
 /// A WQE is retained by its live request's interval, never by a refused
 /// result whose historical WQE number happens to match.
-pub(crate) open spec fn ring_backed<N: Device>(
-    r: Ring<Leases<N>>, w: int, id: u64,
+pub(crate) open spec fn ring_backed<C, N: Device>(
+    r: Ring<Payload<C, N>>, w: int, id: u64,
     op: Option<safeverbs_spec::nic::Opcode>, sges: Seq<safeverbs_spec::nic::Sge>,
 ) -> bool {
     exists|s: int| #[trigger] r.dma(s, w) is Some
-        && ledger_has(r.dma(s, w)->0, id, op, sges)
+        && ledger_has(r.dma(s, w)->0.leases, id, op, sges)
 }
 
-proof fn lemma_backed_kept<N: Device>(
-    pre: Ring<Leases<N>>, post: Ring<Leases<N>>, w: int, id: u64,
+proof fn lemma_backed_kept<C, N: Device>(
+    pre: Ring<Payload<C, N>>, post: Ring<Payload<C, N>>, w: int, id: u64,
     op: Option<safeverbs_spec::nic::Opcode>, sges: Seq<safeverbs_spec::nic::Sge>,
 )
-    requires post.keeps_dma(&pre), post.spec_wqe_retired() <= w < post.spec_closed_end(),
+    requires keeps_leases(post, pre), post.spec_wqe_retired() <= w < post.spec_closed_end(),
         ring_backed(pre, w, id, op, sges),
     ensures ring_backed(post, w, id, op, sges),
 {
     let s = choose|s: int| pre.dma(s, w) is Some
-        && ledger_has(pre.dma(s, w)->0, id, op, sges);
-    assert(post.dma(s, w) == pre.dma(s, w));
+        && ledger_has(pre.dma(s, w)->0.leases, id, op, sges);
+    assert(post.dma(s, w)->0.leases == pre.dma(s, w)->0.leases);
 }
 
 /// The operation-specific local role, including receive destinations.
@@ -483,61 +539,61 @@ pub(crate) proof fn lemma_ledger_guards<N: Device>(
 
 /// Resolve a real WQE to its live request sequence and exact retained guards.
 /// Refused results cannot be selected, even if they have equal WQE metadata.
-pub(crate) proof fn lemma_ring_guards<N: Device>(
-    r: Ring<Leases<N>>, w: int, id: u64,
+pub(crate) proof fn lemma_ring_guards<C, N: Device>(
+    r: Ring<Payload<C, N>>, w: int, id: u64,
     op: Option<safeverbs_spec::nic::Opcode>, sges: Seq<safeverbs_spec::nic::Sge>,
 ) -> (s: int)
     requires r.inv(), ring_resources_ok(r), ring_backed(r, w, id, op, sges),
-    ensures r.dma(s, w) is Some, request_resources_ok(r.dma(s, w)->0),
+    ensures r.dma(s, w) is Some, request_resources_ok(r.dma(s, w)->0.leases),
         r.refused(s) is None,
         (r.req(s) is Some && r.req(s)->0.phase is InFlight
             && r.req(s)->0.leases == r.dma(s, w)->0)
             || (r.staged(s) is Some && r.staged(s)->0.leases == r.dma(s, w)->0),
         forall|i: int| 0 <= i < sges.len()
-            ==> retained_sge(r.dma(s, w)->0, local_role(op), #[trigger] sges[i]),
+            ==> retained_sge(r.dma(s, w)->0.leases, local_role(op), #[trigger] sges[i]),
 {
-    let s = choose|s: int| r.dma(s, w) is Some && ledger_has(r.dma(s, w)->0, id, op, sges);
+    let s = choose|s: int| r.dma(s, w) is Some && ledger_has(r.dma(s, w)->0.leases, id, op, sges);
     r.lemma_dma(s, w);
-    lemma_ledger_guards(r.dma(s, w)->0, id, op, sges);
+    lemma_ledger_guards(r.dma(s, w)->0.leases, id, op, sges);
     s
 }
 
-/// A resource at a sequence keeps its identity across the three ring views.
-pub(crate) open spec fn resource_at<N: Device>(r: Ring<Leases<N>>, s: int, l: Leases<N>) -> bool {
-    ||| r.req(s) is Some && r.req(s)->0.leases == l
-    ||| r.staged(s) is Some && r.staged(s)->0.leases == l
-    ||| r.refused(s) == Some(l)
+/// A resource at a sequence keeps its identity, and its owner, across the three ring views.
+pub(crate) open spec fn resource_at<C, N: Device>(r: Ring<Payload<C, N>>, s: int, l: Payload<C, N>, detached: bool) -> bool {
+    ||| r.req(s) is Some && r.req(s)->0.leases == l && r.req(s)->0.detached == detached
+    ||| r.staged(s) is Some && r.staged(s)->0.leases == l && r.staged(s)->0.detached == detached
+    ||| r.refused(s) == Some(l) && !detached
 }
 
-proof fn lemma_resources_kept<N: Device>(pre: Ring<Leases<N>>, post: Ring<Leases<N>>)
+proof fn lemma_resources_kept<C, N: Device>(pre: Ring<Payload<C, N>>, post: Ring<Payload<C, N>>)
     requires ring_resources_ok(pre),
-        forall|s: int| #[trigger] post.req(s) is Some ==> resource_at(pre, s, post.req(s)->0.leases),
-        forall|s: int| #[trigger] post.staged(s) is Some ==> resource_at(pre, s, post.staged(s)->0.leases),
-        forall|s: int| #[trigger] post.refused(s) is Some ==> resource_at(pre, s, post.refused(s)->0),
+        forall|s: int| #[trigger] post.req(s) is Some ==> resource_at(pre, s, post.req(s)->0.leases, post.req(s)->0.detached),
+        forall|s: int| #[trigger] post.staged(s) is Some ==> resource_at(pre, s, post.staged(s)->0.leases, post.staged(s)->0.detached),
+        forall|s: int| #[trigger] post.refused(s) is Some ==> resource_at(pre, s, post.refused(s)->0, false),
     ensures ring_resources_ok(post),
 {
-    assert forall|s: int| #[trigger] post.req(s) is Some implies request_resources_ok(post.req(s)->0.leases) by {}
-    assert forall|s: int| #[trigger] post.staged(s) is Some implies request_resources_ok(post.staged(s)->0.leases) by {}
-    assert forall|s: int| #[trigger] post.refused(s) is Some implies request_resources_ok(post.refused(s)->0) by {}
+    assert forall|s: int| #[trigger] post.req(s) is Some implies payload_ok(post.req(s)->0.leases, post.req(s)->0.detached) by {}
+    assert forall|s: int| #[trigger] post.staged(s) is Some implies payload_ok(post.staged(s)->0.leases, post.staged(s)->0.detached) by {}
+    assert forall|s: int| #[trigger] post.refused(s) is Some implies payload_ok(post.refused(s)->0, false) by {}
 }
 
-proof fn lemma_resources_added<N: Device>(pre: Ring<Leases<N>>, post: Ring<Leases<N>>, seq: int, leases: Leases<N>)
-    requires ring_resources_ok(pre), request_resources_ok(leases),
-        forall|s: int| #[trigger] post.req(s) is Some ==> resource_at(pre, s, post.req(s)->0.leases),
+proof fn lemma_resources_added<C, N: Device>(pre: Ring<Payload<C, N>>, post: Ring<Payload<C, N>>, seq: int, leases: Payload<C, N>, detached: bool)
+    requires ring_resources_ok(pre), payload_ok(leases, detached),
+        forall|s: int| #[trigger] post.req(s) is Some ==> resource_at(pre, s, post.req(s)->0.leases, post.req(s)->0.detached),
         forall|s: int| #[trigger] post.staged(s) is Some
-            ==> (s == seq && post.staged(s)->0.leases == leases)
-                || resource_at(pre, s, post.staged(s)->0.leases),
-        forall|s: int| #[trigger] post.refused(s) is Some ==> resource_at(pre, s, post.refused(s)->0),
+            ==> (s == seq && post.staged(s)->0.leases == leases && post.staged(s)->0.detached == detached)
+                || resource_at(pre, s, post.staged(s)->0.leases, post.staged(s)->0.detached),
+        forall|s: int| #[trigger] post.refused(s) is Some ==> resource_at(pre, s, post.refused(s)->0, false),
     ensures ring_resources_ok(post),
 {
-    assert forall|s: int| #[trigger] post.req(s) is Some implies request_resources_ok(post.req(s)->0.leases) by {}
-    assert forall|s: int| #[trigger] post.staged(s) is Some implies request_resources_ok(post.staged(s)->0.leases) by {}
-    assert forall|s: int| #[trigger] post.refused(s) is Some implies request_resources_ok(post.refused(s)->0) by {}
+    assert forall|s: int| #[trigger] post.req(s) is Some implies payload_ok(post.req(s)->0.leases, post.req(s)->0.detached) by {}
+    assert forall|s: int| #[trigger] post.staged(s) is Some implies payload_ok(post.staged(s)->0.leases, post.staged(s)->0.detached) by {}
+    assert forall|s: int| #[trigger] post.refused(s) is Some implies payload_ok(post.refused(s)->0, false) by {}
 }
 
 /// Completion changes outcomes and ownership, while surviving requests retain
 /// the exact resource value that was staged and committed.
-proof fn lemma_resources_completed<N: Device>(pre: Ring<Leases<N>>, post: Ring<Leases<N>>, wqe: u64, wc: Wc)
+proof fn lemma_resources_completed<C, N: Device>(pre: Ring<Payload<C, N>>, post: Ring<Payload<C, N>>, wqe: u64, wc: Wc)
     requires pre.inv(), ring_resources_ok(pre),
         pre.spec_retired() <= post.spec_retired() <= pre.spec_committed(),
         forall|s: int| #[trigger] post.req(s) == if pre.spec_retired() <= s < post.spec_retired() {
@@ -548,12 +604,39 @@ proof fn lemma_resources_completed<N: Device>(pre: Ring<Leases<N>>, post: Ring<L
     ensures ring_resources_ok(post),
 {
     assert forall|s: int| #[trigger] post.req(s) is Some
-        implies resource_at(pre, s, post.req(s)->0.leases) by {
+        implies resource_at(pre, s, post.req(s)->0.leases, post.req(s)->0.detached) by {
         if pre.spec_retired() <= s < post.spec_retired() {
             pre.lemma_retired_view(s, pre.retire_outcome(s, wqe, wc));
         }
     }
     lemma_resources_kept(pre, post);
+}
+
+/// Giving up a request's owner takes its context with it, and nothing else.
+proof fn lemma_resources_given_up<C, N: Device>(pre: Ring<Payload<C, N>>, post: Ring<Payload<C, N>>, seq: int)
+    requires ring_resources_ok(pre),
+        forall|s: int| #[trigger] post.req(s) == if s == seq && pre.req(s) is Some {
+            if pre.req(s)->0.phase is Complete {
+                None
+            } else {
+                Some(crate::ring::ReqView { leases: pre.req(s)->0.leases.without_ctx(), ..pre.req(s)->0.detach() })
+            }
+        } else { pre.req(s) },
+        forall|s: int| #[trigger] post.staged(s) == if s == seq && pre.staged(s) is Some {
+            Some(crate::ring::ReqView { leases: pre.staged(s)->0.leases.without_ctx(), ..pre.staged(s)->0.detach() })
+        } else { pre.staged(s) },
+        forall|s: int| #[trigger] post.refused(s) == if s == seq { None } else { pre.refused(s) },
+    ensures ring_resources_ok(post),
+{
+    assert forall|s: int| #[trigger] post.req(s) is Some implies payload_ok(post.req(s)->0.leases, post.req(s)->0.detached) by {
+        assert(pre.req(s) is Some);
+    }
+    assert forall|s: int| #[trigger] post.staged(s) is Some implies payload_ok(post.staged(s)->0.leases, post.staged(s)->0.detached) by {
+        assert(pre.staged(s) is Some);
+    }
+    assert forall|s: int| #[trigger] post.refused(s) is Some implies payload_ok(post.refused(s)->0, false) by {
+        assert(pre.refused(s) is Some);
+    }
 }
 
 /// A derived execution-history invariant, not an additional assumption of M.
@@ -701,7 +784,7 @@ pub open spec fn writes(t: NicToken, q: QpId) -> bool {
 }
 
 /// The local byte footprint of each WQE in M has a keeper.
-spec fn queues_backed<N: Device>(e: HwQp<N>, qp: Qp) -> bool {
+spec fn queues_backed<C, N: Device>(e: HwQp<C, N>, qp: Qp) -> bool {
     &&& forall|k: int| 0 <= k < qp.sq.len() ==> {
         let wr = (#[trigger] qp.sq[k]).wr;
         &&& !wr.inline
@@ -713,9 +796,9 @@ spec fn queues_backed<N: Device>(e: HwQp<N>, qp: Qp) -> bool {
     }
 }
 
-proof fn lemma_queues_kept<N: Device>(pre: HwQp<N>, post: HwQp<N>, qp: Qp)
+proof fn lemma_queues_kept<C, N: Device>(pre: HwQp<C, N>, post: HwQp<C, N>, qp: Qp)
     requires queues_backed(pre, qp),
-        post.send.keeps_dma(&pre.send), post.recv.keeps_dma(&pre.recv),
+        keeps_leases(post.send, pre.send), keeps_leases(post.recv, pre.recv),
         post.send.spec_wqe_retired() <= qp.sq_head,
         qp.sq_head + qp.sq.len() <= post.send.spec_wqe_committed(),
         post.recv.spec_wqe_retired() <= qp.rq_head,
@@ -744,7 +827,7 @@ proof fn lemma_queues_kept<N: Device>(pre: HwQp<N>, post: HwQp<N>, qp: Qp)
 
 /// Written WQEs belong either to a closed staged request or to the open
 /// request's ledger. The final held WQE is backed separately by held_parts.
-spec fn written_backed<N: Device>(e: HwQp<N>, w: int, wr: SendWr) -> bool {
+spec fn written_backed<C, N: Device>(e: HwQp<C, N>, w: int, wr: SendWr) -> bool {
     &&& !wr.inline
     &&& (ring_backed(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges)
         || (e.send.spec_is_open()
@@ -770,9 +853,9 @@ proof fn lemma_ledger_extended<N: Device>(
     assert(post.wqes()[j] == pre.wqes()[j]);
 }
 
-proof fn lemma_written_kept<N: Device>(pre: HwQp<N>, post: HwQp<N>, w: int, wr: SendWr)
+proof fn lemma_written_kept<C, N: Device>(pre: HwQp<C, N>, post: HwQp<C, N>, w: int, wr: SendWr)
     requires written_backed(pre, w, wr), pre.send.inv(), post.send.inv(),
-        post.send.keeps_dma(&pre.send), post.send.spec_wqe_retired() <= w,
+        keeps_leases(post.send, pre.send), post.send.spec_wqe_retired() <= w,
         post.send.spec_closed_end() == pre.send.spec_closed_end(),
         pre.send.spec_wqe_posted() <= post.send.spec_wqe_posted(),
         pre.send.spec_is_open() ==> post.send.spec_is_open(),
@@ -783,7 +866,7 @@ proof fn lemma_written_kept<N: Device>(pre: HwQp<N>, post: HwQp<N>, w: int, wr: 
 {
     if ring_backed(pre.send, w, wr.wr_id, Some(wr.opcode), wr.sges) {
         let s = choose|s: int| pre.send.dma(s, w) is Some
-            && ledger_has(pre.send.dma(s, w)->0, wr.wr_id, Some(wr.opcode), wr.sges);
+            && ledger_has(pre.send.dma(s, w)->0.leases, wr.wr_id, Some(wr.opcode), wr.sges);
         pre.send.lemma_dma(s, w);
         lemma_backed_kept(pre.send, post.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
     } else {
@@ -791,7 +874,7 @@ proof fn lemma_written_kept<N: Device>(pre: HwQp<N>, post: HwQp<N>, w: int, wr: 
     }
 }
 
-impl<N: Device> HwQp<N> {
+impl<C, N: Device> HwQp<C, N> {
     /// M's name of the QP.
     pub closed spec fn id(&self) -> QpId {
         self.id@
@@ -854,7 +937,7 @@ impl<N: Device> HwQp<N> {
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// The worker's token.
     pub closed spec fn token(&self) -> NicToken {
         self.token@
@@ -980,7 +1063,7 @@ proof fn lemma_written_pinned(t: NicToken, q: QpId, j: int)
     }
 }
 
-impl<N: Device> HwQp<N> {
+impl<C, N: Device> HwQp<C, N> {
     /// Coupling survives steps that do not touch the worker's share.
     proof fn lemma_framed(
         &self,
@@ -1023,7 +1106,7 @@ impl<N: Device> HwQp<N> {
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// The invariant survives steps that do not touch the worker's share
     /// (nor the regions its written WRs name).
     proof fn lemma_rely(&self, t: NicToken, m: Nic::State, n: Nic::State)
@@ -1058,7 +1141,7 @@ impl<N: Device> Hw<N> {
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// A local WQE in this worker's M state can access byte `a`.
     /// Remote-rkey access belongs to the separate registration authority.
     pub(crate) closed spec fn local_access(&self, index: int, recv: bool, k: int, a: int) -> bool {
@@ -1082,8 +1165,8 @@ impl<N: Device> Hw<N> {
         &&& r.req(s) is Some && r.req(s)->0.phase is InFlight
         &&& r.req(s)->0.leases == r.dma(s, w)->0
         &&& r.refused(s) is None
-        &&& retained_byte(r.dma(s, w)->0, dir, a)
-        &&& byte_backed(r.dma(s, w)->0, a)
+        &&& retained_byte(r.dma(s, w)->0.leases, dir, a)
+        &&& byte_backed(r.dma(s, w)->0.leases, a)
     }
 
     /// Every NIC access through this worker's SQ/RQ WQEs has a
@@ -1100,14 +1183,14 @@ impl<N: Device> Hw<N> {
             let w = qp.rq_head + k;
             let s = lemma_ring_guards(e.recv, w, wr.wr_id, None, wr.sges);
             e.recv.lemma_dma(s, w);
-            lemma_covered_guard(e.recv.dma(s, w)->0, local_role(None), wr.sges, a);
+            lemma_covered_guard(e.recv.dma(s, w)->0.leases, local_role(None), wr.sges, a);
             s
         } else {
             let wr = qp.sq[k].wr;
             let w = qp.sq_head + k;
             let s = lemma_ring_guards(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
             e.send.lemma_dma(s, w);
-            lemma_covered_guard(e.send.dma(s, w)->0, local_role(Some(wr.opcode)), wr.sges, a);
+            lemma_covered_guard(e.send.dma(s, w)->0.leases, local_role(Some(wr.opcode)), wr.sges, a);
             s
         }
     }
@@ -1130,8 +1213,8 @@ impl<N: Device> Hw<N> {
         let dir = local_role(Some(wr.opcode));
         ||| e.send.dma(s, w) is Some && e.send.staged(s) is Some
             && e.send.staged(s)->0.leases == e.send.dma(s, w)->0
-            && retained_byte(e.send.dma(s, w)->0, dir, a)
-            && byte_backed(e.send.dma(s, w)->0, a)
+            && retained_byte(e.send.dma(s, w)->0.leases, dir, a)
+            && byte_backed(e.send.dma(s, w)->0.leases, a)
         ||| s == e.send.spec_posted() && e.send.spec_is_open()
             && e.send.spec_closed_end() <= w < e.send.spec_wqe_posted()
             && retained_byte(e.open_leases, dir, a)
@@ -1151,7 +1234,7 @@ impl<N: Device> Hw<N> {
         if ring_backed(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges) {
             let s = lemma_ring_guards(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
             e.send.lemma_dma(s, w);
-            lemma_covered_guard(e.send.dma(s, w)->0, local_role(Some(wr.opcode)), wr.sges, a);
+            lemma_covered_guard(e.send.dma(s, w)->0.leases, local_role(Some(wr.opcode)), wr.sges, a);
             s
         } else {
             lemma_ledger_guards(e.open_leases, wr.wr_id, Some(wr.opcode), wr.sges);
@@ -1191,8 +1274,8 @@ impl<N: Device> Hw<N> {
 
 /// Coupling depends only on the QP's state in M, M's limits and its
 /// regions.
-proof fn lemma_ok_same<N: Device>(
-    e: HwQp<N>,
+proof fn lemma_ok_same<C, N: Device>(
+    e: HwQp<C, N>,
     index: u16,
     m1: Nic::State,
     m2: Nic::State,
@@ -1221,7 +1304,7 @@ proof fn lemma_ok_same<N: Device>(
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Two tokens of the same worker with the same writing give the same
     /// invariant.
     proof fn lemma_same_token(&self, t1: NicToken, t2: NicToken, m: Nic::State)
@@ -1280,7 +1363,7 @@ impl<N: Device> Hw<N> {
 
     /// A worker of `pd` with a CQ of `cq_size` entries, on a thread domain
     /// of its own where the device has them.
-    pub fn new(pd: Pd<N>, cq_size: u32) -> (r: Result<Hw<N>>)
+    pub fn new(pd: Pd<N>, cq_size: u32) -> (r: Result<Hw<C, N>>)
         ensures
             r matches Ok(hw) ==> hw.inv() && hw.spec_reserved() == 0 && hw.spec_cq_size() == cq_size,
     {
@@ -1358,7 +1441,7 @@ impl<N: Device> Hw<N> {
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Creates a QP of type `qp_type` (in the RESET state) with queues of
     /// `caps` and requests of at most `max_batch` WQEs, attached to the
     /// worker's CQ; returns its index.
@@ -1687,7 +1770,7 @@ proof fn lemma_modified(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// After a step that changed only entry `index`'s QP in M (and the
     /// entry), the invariant holds again.
     #[verifier::spinoff_prover]
@@ -1834,7 +1917,7 @@ impl<N: Device> Hw<N> {
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// After steps that frame the share but QP `q` of entry `index` (and a
     /// change of that entry), the invariant holds again.
     #[verifier::spinoff_prover]
@@ -2047,13 +2130,14 @@ impl<N: Device> Hw<N> {
     }
 }
 
-impl<N: Device> Hw<N> {
-    /// Posts a receive into `part`, a unique buffer, on QP `index`;
-    /// `detached` if nobody will take it back by its sequence number.
-    /// Refused when the QP takes no work (`Error::NotConnected`), the part is
-    /// of another protection domain or frozen, or the receive queue is full.
+impl<C, N: Device> Hw<C, N> {
+    /// Posts a receive into `part`, a unique buffer, on QP `index`, with
+    /// `ctx` for its owner; without one if nobody will take it back by its
+    /// sequence number. Refused, `part` and `ctx` handed back, when the QP
+    /// takes no work (`Error::NotConnected`), the part is of another
+    /// protection domain or frozen, or the receive queue is full.
     #[verifier::spinoff_prover]
-    pub fn post_recv(&mut self, index: usize, part: Part<N>, detached: bool) -> (r: core::result::Result<RingSeq, BufError<Part<N>>>)
+    pub fn post_recv(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: core::result::Result<RingSeq, (BufError<Part<N>>, Option<C>)>)
         requires
             old(self).inv(),
         ensures
@@ -2061,11 +2145,11 @@ impl<N: Device> Hw<N> {
             final(self).same_table(old(self)),
             r matches Ok(seq) ==> old(self).admission_separated_from(part)
                 && final(self).recv_holds_input(index, seq, part),
-            r matches Err(error) ==> error.buf == part,
+            r matches Err((error, back)) ==> error.buf == part && back == ctx,
     {
         if index >= self.qps.len() {
             no_qp(index);
-            return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
+            return Err((BufError { error: Error::Invalid("no such QP"), buf: part }, ctx));
         }
         proof {
             assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
@@ -2078,13 +2162,13 @@ impl<N: Device> Hw<N> {
             },
         };
         if !ready {
-            return Err(BufError { error: Error::NotConnected, buf: part });
+            return Err((BufError { error: Error::NotConnected, buf: part }, ctx));
         }
         if part_pd_of(&part) != pd_id_of(&self.pd) {
-            return Err(BufError { error: Error::PdMismatch, buf: part });
+            return Err((BufError { error: Error::PdMismatch, buf: part }, ctx));
         }
         if !part_writable_of(&part) {
-            return Err(BufError { error: Error::Invalid("receive into a frozen buffer"), buf: part });
+            return Err((BufError { error: Error::Invalid("receive into a frozen buffer"), buf: part }, ctx));
         }
         if !room {
             let error = if clogged {
@@ -2092,7 +2176,7 @@ impl<N: Device> Hw<N> {
             } else {
                 Error::QueueFull
             };
-            return Err(BufError { error, buf: part });
+            return Err((BufError { error, buf: part }, ctx));
         }
         let ghost admitted = part;
         let ghost admission = *self;
@@ -2166,17 +2250,19 @@ impl<N: Device> Hw<N> {
                         leases.record_wqe(Ghost(crate::buf::WqeLoans {
                             wr_id: id, opcode: None, sges: sges@, first: 0,
                         }));
-                        let ghost resource = leases;
                         proof {
                             lemma_ledger_entry(leases, 0);
-                            assert(resource.loans() == seq![crate::buf::Loan {
+                            assert(leases.loans() == seq![crate::buf::Loan {
                                 part: admitted, access: Some(safeverbs_spec::abs::Dir::In),
                             }]);
                         }
+                        let detached = ctx.is_none();
+                        let payload = Payload { ctx, leases };
+                        let ghost resource = payload;
                         let ghost before_end = e.recv;
                         proof { lemma_resources_kept(e1.recv, e.recv); }
-                        e.recv.end(true, detached, implied, leases);
-                        proof { lemma_resources_added(before_end, e.recv, seq as int, resource); }
+                        e.recv.end(true, detached, implied, payload);
+                        proof { lemma_resources_added(before_end, e.recv, seq as int, resource, detached); }
                         let ghost staged = e.recv;
                         proof {
                             staged.lemma_wqes();
@@ -2192,7 +2278,7 @@ impl<N: Device> Hw<N> {
                         proof {
                             let wr = recv_wr(id, sges@);
                             assert(e.recv.dma(seq as int, wqe as int) == Some(resource));
-                            assert(ledger_has(resource, id, None, wr.sges));
+                            assert(ledger_has(resource.leases, id, None, wr.sges));
                             assert(ring_backed(e.recv, wqe as int, id, None, wr.sges));
                             assert(e.recv.req(seq as int) is Some);
                             assert(e.recv.req(seq as int)->0.phase is InFlight);
@@ -2207,13 +2293,13 @@ impl<N: Device> Hw<N> {
                     Err(error) => {
                         e.recv.abort();
                         proof { lemma_resources_kept(e1.recv, e.recv); }
-                        Err(BufError { error, buf: part })
+                        Err((BufError { error, buf: part }, ctx))
                     },
                 }
             },
             None => {
                 no_qp(index);
-                Err(BufError { error: Error::Invalid("no such QP"), buf: part })
+                Err((BufError { error: Error::Invalid("no such QP"), buf: part }, ctx))
             },
         };
         proof {
@@ -2255,7 +2341,7 @@ impl<N: Device> Hw<N> {
                     } else {
                         let s = e1.recv.spec_posted() as int;
                         assert(e.recv.dma(s, b.rq_head + k) is Some);
-                        assert(ledger_has(e.recv.dma(s, b.rq_head + k)->0, wr.wr_id, None, wr.sges));
+                        assert(ledger_has(e.recv.dma(s, b.rq_head + k)->0.leases, wr.wr_id, None, wr.sges));
                     }
                 }
                 let written = t1.written(q);
@@ -2314,7 +2400,6 @@ pub(crate) const EMPTY_WC: Wc = Wc {
     byte_len: 0,
     imm: None,
     vendor_err: 0,
-    qp_num: 0,
 };
 
 /// The steps of a poll that gave `wcs`, in order: for each completion, the
@@ -2389,7 +2474,7 @@ proof fn lemma_poll_steps(sh: Share, pins: ISet<Key>, m: Nic::State, m2: Nic::St
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Routes one completion, the one `before`'s `poll_cq` step reports, to
     /// its QP's ring: its `wr_id` names the QP's index, the queue and the
     /// WQE, which the ring retires (with every earlier request it ends).
@@ -2619,7 +2704,7 @@ impl<N: Device> Hw<N> {
 // =============================================================================
 // Doorbells
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Rings QP `index`'s doorbell for every request written since the last
     /// one; with `keep`, hands back the leases of that staged request if the
     /// device refuses. If the device refuses (or the QP takes no work, which
@@ -2627,13 +2712,13 @@ impl<N: Device> Hw<N> {
     /// of them is posted: each with an owner retires at once with a flush
     /// error, each without releases its leases.
     #[verifier::spinoff_prover]
-    pub fn commit(&mut self, index: usize, keep: Option<RingSeq>) -> (r: core::result::Result<(), (Error, Option<Leases<N>>)>)
+    pub fn commit(&mut self, index: usize, keep: Option<RingSeq>) -> (r: core::result::Result<(), (Error, Option<Payload<C, N>>)>)
         requires
             old(self).inv(),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
-            r matches Err((_, Some(leases))) ==> leases.inv() && leases.fully_recorded(),
+            r matches Err((_, Some(kept))) ==> kept.leases.inv() && kept.leases.fully_recorded(),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -2779,7 +2864,7 @@ impl<N: Device> Hw<N> {
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// After a step that changed only entry `index`'s QP in M, the entry,
     /// and the token's writing of that QP (now done), the invariant holds
     /// again.
@@ -2905,7 +2990,7 @@ proof fn lemma_held_wr_ok<N: Device>(h: Held, parts: Seq<Part<N>>, index: u16, n
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Whether QP `index` has a request open (between its first WQE and
     /// [`Hw::close`]).
     pub fn is_open(&self, index: usize) -> bool
@@ -2925,19 +3010,21 @@ impl<N: Device> Hw<N> {
     }
 
     /// Closes QP `index`'s open request: stages it in the ring and writes its
-    /// last WQE, signaled if `signal` or if the ring says so; `detached` if
-    /// nobody will take it back. Returns its sequence number, `None` without
-    /// an open request. It goes out at the next doorbell.
+    /// last WQE, signaled if `signal` or if the ring says so, with `ctx` for
+    /// its owner; without one if nobody will take it back. Returns its
+    /// sequence number; without an open request, `ctx` back. It goes out at
+    /// the next doorbell.
     #[verifier::spinoff_prover]
-    pub fn close(&mut self, index: usize, signal: bool, detached: bool) -> (r: Option<RingSeq>)
+    pub fn close(&mut self, index: usize, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
         requires
             old(self).inv(),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
+            r matches Err(back) ==> back == ctx,
     {
         if index >= self.qps.len() {
-            return None;
+            return Err(ctx);
         }
         proof {
             assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
@@ -2947,7 +3034,7 @@ impl<N: Device> Hw<N> {
             None => false,
         };
         if !open {
-            return None;
+            return Err(ctx);
         }
         let ghost start = *self;
         let ghost t0 = self.token@;
@@ -2977,7 +3064,7 @@ impl<N: Device> Hw<N> {
                     Some(h) => h,
                     None => {
                         proof { assert(false); }
-                        return None;
+                        return Err(ctx);
                     },
                 };
                 let ghost footprint = crate::buf::WqeLoans {
@@ -2990,14 +3077,13 @@ impl<N: Device> Hw<N> {
                 let bytes = e.held_bytes as u32;
                 let implied = Wc::success(opcode_of(&h.op), bytes);
                 proof {
-                    assert(implied.spec_byte_len() == if opcode_model(h.op).writes_local() {
-                        Some(sges_len(h.sges@.take(h.n as int)) as u32)
-                    } else { None });
                     e1.send.lemma_wqes();
                 }
-                let ghost resource = leases;
-                let (seq, signaled) = e.send.end(signal, detached, implied, leases);
-                proof { lemma_resources_added(e1.send, e.send, seq as int, resource); }
+                let detached = ctx.is_none();
+                let payload = Payload { ctx, leases };
+                let ghost resource = payload;
+                let (seq, signaled) = e.send.end(signal, detached, implied, payload);
+                proof { lemma_resources_added(e1.send, e.send, seq as int, resource, detached); }
                 if !e.started {
                     crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                     e.started = true;
@@ -3035,20 +3121,20 @@ impl<N: Device> Hw<N> {
                             if ring_backed(e1.send, w, wr.wr_id, Some(wr.opcode), wr.sges) {
                                 lemma_backed_kept(e1.send, e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
                             } else {
-                                lemma_ledger_extended(e1.open_leases, resource, wr.wr_id, Some(wr.opcode), wr.sges);
+                                lemma_ledger_extended(e1.open_leases, resource.leases, wr.wr_id, Some(wr.opcode), wr.sges);
                                 assert(e.send.dma(seq as int, w) == Some(resource));
                             }
                         } else {
                             assert(wr == held_wr(h, signaled));
                             assert(e.send.dma(seq as int, w) == Some(resource));
-                            assert(resource.wqes().last() == footprint);
-                            assert(ledger_has(resource, wr.wr_id, Some(wr.opcode), wr.sges));
+                            assert(resource.leases.wqes().last() == footprint);
+                            assert(ledger_has(resource.leases, wr.wr_id, Some(wr.opcode), wr.sges));
                         }
                     }
                 }
-                Some(seq)
+                Ok(seq)
             },
-            None => None,
+            None => Err(ctx),
         };
         proof {
             let t = self.token@;
@@ -3085,7 +3171,7 @@ proof fn lemma_sges_len_step(s: Seq<Sge>, i: int)
 }
 
 /// `same_table` is transitive.
-proof fn lemma_same_table_trans<N: Device>(a: &Hw<N>, b: &Hw<N>, c: &Hw<N>)
+proof fn lemma_same_table_trans<C, N: Device>(a: &Hw<C, N>, b: &Hw<C, N>, c: &Hw<C, N>)
     requires
         a.same_table(b),
         b.same_table(c),
@@ -3108,7 +3194,7 @@ proof fn lemma_same_table_trans<N: Device>(a: &Hw<N>, b: &Hw<N>, c: &Hw<N>)
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Whether QP `index`'s send ring could take a request of one WQE now.
     closed spec fn room(&self, index: int) -> bool {
         let r = self.qps@[index]->0.send;
@@ -3400,7 +3486,7 @@ impl<N: Device> Hw<N> {
         };
         if !open || wqe_room == 0 {
             if open {
-                self.close(index, true, true);
+                let _ = self.close(index, true, None);
             }
             if let Err(error) = self.make_send_room(index) {
                 let back = Self::give_back(&mut parts);
@@ -3567,16 +3653,7 @@ impl<N: Device> Hw<N> {
 // =============================================================================
 // The rings, for their owners and the event loop
 
-/// Which ring of a QP.
-#[derive(Clone, Copy)]
-pub enum Side {
-    /// The send queue's.
-    Send,
-    /// The receive queue's.
-    Recv,
-}
-
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Whether `index` names a QP of the worker (not one being removed).
     pub fn is_qp(&self, index: usize) -> (b: bool)
         requires
@@ -3592,7 +3669,7 @@ impl<N: Device> Hw<N> {
     }
 
     /// QP `index`'s ring of `side`, if it is a QP of the worker.
-    pub fn ring(&self, index: usize, side: Side) -> Option<&Ring<Leases<N>>>
+    pub fn ring(&self, index: usize, side: Side) -> Option<&Ring<Payload<C, N>>>
         requires
             self.inv(),
     {
@@ -3605,6 +3682,17 @@ impl<N: Device> Hw<N> {
                 Side::Recv => Some(&e.recv),
             },
             None => None,
+        }
+    }
+
+    /// Request `seq` of QP `index`'s ring of `side` holds a result for its owner: complete, or
+    /// refused. [`Hw::take`] then hands it back: nothing an owner waits for is lost.
+    pub closed spec fn takeable(&self, index: usize, side: Side, seq: RingSeq) -> bool {
+        self.has_qp(index as int) && {
+            let e = self.qps@[index as int]->0;
+            let r = if side is Send { e.send } else { e.recv };
+            ||| r.req(seq as int) is Some && r.req(seq as int)->0.phase is Complete
+            ||| r.refused(seq as int) is Some
         }
     }
 
@@ -3637,20 +3725,21 @@ impl<N: Device> Hw<N> {
         }
     }
 
-    /// Takes the outcome and leases of retired (or refused) request `seq`
-    /// of QP `index`'s ring of `side`.
+    /// Takes the result, context and buffers of retired (or refused) request
+    /// `seq` of QP `index`'s ring of `side`.
+    #[inline(always)]
     #[verifier::spinoff_prover]
-    pub fn take(&mut self, index: usize, side: Side, seq: RingSeq) -> (r: Option<(Wc, Leases<N>)>)
+    pub fn take(&mut self, index: usize, side: Side, seq: RingSeq) -> (r: Option<Completion<C, N>>)
         requires
             old(self).inv(),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
-            r matches Some((_, leases)) ==> leases.inv() && leases.fully_recorded(),
-            side is Recv ==> (r matches Some((wc, leases))
-                ==> old(self).recv_taken_matches(index, seq, wc, leases)),
-            side is Send ==> (r matches Some((wc, leases))
-                ==> old(self).send_taken_matches(index, seq, wc, leases)),
+            r matches Some(c) ==> c.qp == index && c.queue == side && c.seq == seq
+                && c.leases.inv() && c.leases.fully_recorded(),
+            side is Recv ==> (r matches Some(c) ==> old(self).recv_taken_matches(index, seq, c)),
+            side is Send ==> (r matches Some(c) ==> old(self).send_taken_matches(index, seq, c)),
+            old(self).takeable(index, side, seq) ==> r is Some,
     {
         if index >= self.qps.len() {
             return None;
@@ -3661,7 +3750,7 @@ impl<N: Device> Hw<N> {
         proof {
             assert(start.entry_ok(index as int, t, m));
         }
-        let r = match &mut self.qps[index] {
+        let taken = match &mut self.qps[index] {
             Some(e) => match side {
                 Side::Send => e.send.take(seq),
                 Side::Recv => e.recv.take(seq),
@@ -3670,12 +3759,6 @@ impl<N: Device> Hw<N> {
         };
         proof {
             if start.qps@[index as int] is Some {
-                if r is Some {
-                    match side {
-                        Side::Recv => start.lemma_recv_taken(index, seq, (r->0).0, (r->0).1),
-                        Side::Send => start.lemma_send_taken(index, seq, (r->0).0, (r->0).1),
-                    }
-                }
                 let old_e = start.qps@[index as int]->0;
                 let e = self.qps@[index as int]->0;
                 lemma_resources_kept(old_e.send, e.send);
@@ -3698,13 +3781,43 @@ impl<N: Device> Hw<N> {
                 self.lemma_inv_fields(&start, t, m);
             }
         }
-        r
+        let ghost done = taken->0;
+        // Field by field: nothing of the request is copied twice on its way out.
+        match taken {
+            Some(Taken { wc: outcome, refused: never_posted, first_wqe: first, leases: Payload { ctx: Some(ctx), leases: kept } }) => {
+                let result = match side {
+                    Side::Send => send_outcomes::send_result_of::<C, N>(&outcome, never_posted, first, Ghost(start), Ghost(index), Ghost(seq), Ghost(done)),
+                    Side::Recv => outcomes::recv_result_of::<C, N>(&outcome, Ghost(start), Ghost(index), Ghost(seq), Ghost(done)),
+                };
+                let c = Completion { qp: index, queue: side, seq, ctx, result, leases: kept };
+                proof {
+                    match side {
+                        Side::Send => start.lemma_send_finished(index, seq, done, c),
+                        Side::Recv => start.lemma_recv_finished(index, seq, done, c),
+                    }
+                }
+                Some(c)
+            },
+            _ => {
+                // A request with an owner holds a context, so nothing is lost here.
+                proof {
+                    if taken is Some {
+                        match side {
+                            Side::Send => start.lemma_send_taken(index, seq, done),
+                            Side::Recv => start.lemma_recv_taken(index, seq, done),
+                        }
+                        assert(false);
+                    }
+                }
+                None
+            },
+        }
     }
 
-    /// Gives up request `seq` of QP `index`'s ring of `side`: its leases are
-    /// released when it retires (now, if it has).
+    /// Gives up request `seq` of QP `index`'s ring of `side`: its buffers are
+    /// released when it retires (now, if it has). Its context comes back.
     #[verifier::spinoff_prover]
-    pub fn detach(&mut self, index: usize, side: Side, seq: RingSeq)
+    pub fn detach(&mut self, index: usize, side: Side, seq: RingSeq) -> (ctx: Option<C>)
         requires
             old(self).inv(),
         ensures
@@ -3712,7 +3825,7 @@ impl<N: Device> Hw<N> {
             final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
-            return;
+            return None;
         }
         let ghost start = *self;
         let ghost t = self.token@;
@@ -3720,13 +3833,28 @@ impl<N: Device> Hw<N> {
         proof {
             assert(start.entry_ok(index as int, t, m));
         }
-        match &mut self.qps[index] {
-            Some(e) => match side {
-                Side::Send => e.send.detach(seq),
-                Side::Recv => e.recv.detach(seq),
+        let ctx = match &mut self.qps[index] {
+            Some(e) => {
+                let ghost send = e.send;
+                let ghost recv = e.recv;
+                let ctx = match side {
+                    Side::Send => e.send.give_up(seq),
+                    Side::Recv => e.recv.give_up(seq),
+                };
+                proof {
+                    match side {
+                        Side::Send => {
+                            lemma_resources_given_up(send, e.send, seq as int);
+                        },
+                        Side::Recv => {
+                            lemma_resources_given_up(recv, e.recv, seq as int);
+                        },
+                    }
+                }
+                ctx
             },
-            None => {},
-        }
+            None => None,
+        };
         proof {
             if start.qps@[index as int] is Some {
                 let pre = start.qps@[index as int]->0;
@@ -3747,6 +3875,7 @@ impl<N: Device> Hw<N> {
                 self.lemma_inv_fields(&start, t, m);
             }
         }
+        ctx
     }
 
     /// Wakes `waker` when request `seq` of QP `index`'s ring of `side`
@@ -3805,15 +3934,17 @@ impl<N: Device> Hw<N> {
         }
     }
 
-    /// The first error completion of a send request without an owner on QP
-    /// `index`, once.
+    /// The first error of a send request without an owner on QP `index`,
+    /// once: M's first error among that request's WQEs, at its position, or a
+    /// refusal, which M never saw.
     #[verifier::spinoff_prover]
-    pub fn take_send_error(&mut self, index: usize) -> (r: Option<Wc>)
+    pub fn take_send_error(&mut self, index: usize) -> (r: Option<DetachedError>)
         requires
             old(self).inv(),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
+            r matches Some(error) ==> old(self).detached_taken_matches(index, error),
     {
         if index >= self.qps.len() {
             return None;
@@ -3824,7 +3955,7 @@ impl<N: Device> Hw<N> {
         proof {
             assert(start.entry_ok(index as int, t, m));
         }
-        let r = match &mut self.qps[index] {
+        let record = match &mut self.qps[index] {
             Some(e) => e.send.take_detached_error(),
             None => None,
         };
@@ -3847,7 +3978,10 @@ impl<N: Device> Hw<N> {
                 self.lemma_inv_fields(&start, t, m);
             }
         }
-        r
+        match record {
+            Some(d) => Some(send_outcomes::detached_error_of::<C, N>(d, Ghost(start), Ghost(index))),
+            None => None,
+        }
     }
 
     /// The next QP listed with requests for the event loop to hand out,
@@ -3904,7 +4038,7 @@ impl<N: Device> Hw<N> {
 // =============================================================================
 // Removing QPs, and the worker
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Starts removing QP `index` (see `crate::worker`, "Removing QPs"):
     /// discards the request being written and the WQEs written since the
     /// last doorbell, gives up every request (each releases its buffers once
@@ -4053,15 +4187,17 @@ impl<N: Device> Hw<N> {
                         send_outcomes::tail_bound(e.send, e.send_tails@, index as u16, m0.qps[q], Seq::empty()),
                         ring_resources_ok(e.send),
                         e.send.same_wqes(&s1),
-                        e.send.same_dma(&s1),
+                        keeps_leases(e.send, before_abort),
                         e.send.same_open(&s1),
                         e.send.spec_posted() == s1.spec_posted(),
                     decreases e.send.spec_posted() - seq,
                 {
                     let ghost before_detach = e.send;
-                    e.send.detach(seq);
+                    // A context's destructor is the user's: it runs here, between
+                    // two consistent states, never during a poll.
+                    let _ctx = e.send.give_up(seq);
                     proof {
-                        lemma_resources_kept(before_detach, e.send);
+                        lemma_resources_given_up(before_detach, e.send, seq as int);
                         send_outcomes::lemma_results_kept(before_detach, e.send, m0, q);
                     }
                     seq += 1;
@@ -4074,15 +4210,15 @@ impl<N: Device> Hw<N> {
                         outcomes::recv_outcomes(e.recv, m0, q),
                         ring_resources_ok(e.recv),
                         e.recv.same_wqes(&r1),
-                        e.recv.same_dma(&r1),
+                        keeps_leases(e.recv, r1),
                         e.recv.same_open(&r1),
                         e.recv.spec_posted() == r1.spec_posted(),
                     decreases e.recv.spec_posted() - seq,
                 {
                     let ghost before_detach = e.recv;
-                    e.recv.detach(seq);
+                    let _ctx = e.recv.give_up(seq);
                     proof {
-                        lemma_resources_kept(before_detach, e.recv);
+                        lemma_resources_given_up(before_detach, e.recv, seq as int);
                         outcomes::lemma_recv_kept(before_detach, e.recv, m0, q);
                     }
                     seq += 1;
@@ -4136,7 +4272,7 @@ impl<N: Device> Hw<N> {
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Writes QP `index`'s drain WQE, if it waits for one and has room: a
     /// signaled SEND of nothing, without an owner. Whether it was written
     /// (it goes out at the next doorbell).
@@ -4195,15 +4331,16 @@ impl<N: Device> Hw<N> {
                     opcode: Some(safeverbs_spec::nic::Opcode::Send),
                     sges: Seq::empty(), first: 0,
                 }));
-                let ghost resource = leases;
                 proof {
                     lemma_ledger_entry(leases, 0);
                     assert(leases.wqes()[0].sges.map_values(|s: Sge| sge_model(s)) =~= Seq::empty());
                 }
+                let payload = Payload { ctx: None, leases };
+                let ghost resource = payload;
                 let ghost before_end = e.send;
                 proof { lemma_resources_kept(e0.send, e.send); }
-                let (_seq, signaled) = e.send.end(true, true, implied, leases);
-                proof { lemma_resources_added(before_end, e.send, _seq as int, resource); }
+                let (_seq, signaled) = e.send.end(true, true, implied, payload);
+                proof { lemma_resources_added(before_end, e.send, _seq as int, resource, true); }
                 if !e.started {
                     crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                     e.started = true;
@@ -4230,7 +4367,7 @@ impl<N: Device> Hw<N> {
                     assert(m0.send_wr_ok(m0.qps[q].attr, wr));
                     let w = e0.send.spec_wqe_posted() as int;
                     assert(e.send.dma(_seq as int, w) == Some(resource));
-                    assert(ledger_has(resource, wr.wr_id, Some(wr.opcode), wr.sges));
+                    assert(ledger_has(resource.leases, wr.wr_id, Some(wr.opcode), wr.sges));
                     assert(ring_backed(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges));
                 }
             },
@@ -4389,7 +4526,7 @@ impl<N: Device> Hw<N> {
         if !idle {
             return false;
         }
-        let mut slot: Option<HwQp<N>> = None;
+        let mut slot: Option<HwQp<C, N>> = None;
         core::mem::swap(&mut slot, &mut self.qps[index]);
         let entry = match slot {
             Some(entry) => entry,
@@ -4480,7 +4617,7 @@ impl<N: Device> Hw<N> {
     }
 }
 
-impl<N: Device> Hw<N> {
+impl<C, N: Device> Hw<C, N> {
     /// Drops the parts gathered on QP `index` for a WQE that will not be
     /// pushed.
     #[verifier::spinoff_prover]

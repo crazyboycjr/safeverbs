@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use futures::executor::block_on;
 use futures::{SinkExt, StreamExt};
-use safeverbs::{Context, Endpoint, RemoteBuf, UcQueuePairBuilder, WriteOp};
+use safeverbs::{Context, Endpoint, Received, RemoteBuf, UcQueuePairBuilder, WriteOp};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -163,13 +163,13 @@ fn run_receiver(args: &Args) -> anyhow::Result<()> {
     block_on(async {
         loop {
             match futures::poll!(rx.next()) {
-                Poll::Ready(Some((wc, buf))) => {
-                    if !wc.is_ok() {
-                        anyhow::bail!("receive failed: {wc:?}");
-                    }
-                    if let Some(seq) = wc.imm() {
-                        println!("{seq}");
-                        received += 1;
+                Poll::Ready(Some((got, buf))) => {
+                    match got.map_err(safeverbs::Error::from)? {
+                        Received::WriteNotification { imm, .. } => {
+                            println!("{imm}");
+                            received += 1;
+                        }
+                        Received::Message { .. } => anyhow::bail!("a message on a WRITE channel"),
                     }
                     rx.repost(buf)?;
                 }

@@ -2,15 +2,22 @@
 
 use core::fmt;
 
-use crate::wc::{Status, Wc};
+use crate::wc::{CompletionError, Status};
 
 /// What went wrong.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
     /// A verb failed with this `errno`.
     Os(i32),
-    /// A work request completed with an error.
-    Completion(Wc),
+    /// A request did not complete successfully.
+    Completion(CompletionError),
+    /// An item sent through a sink did not complete successfully.
+    SinkItem {
+        /// Its position among the items sent through that sink, from 0.
+        item: u64,
+        /// Why.
+        error: CompletionError,
+    },
     /// A buffer is registered in another protection domain than the QP's.
     PdMismatch,
     /// More scatter/gather elements than the QP allows.
@@ -60,10 +67,10 @@ pub enum Error {
 }
 
 impl Error {
-    /// The completion status, for a work request that failed.
+    /// The completion status of the WQE that failed, if the NIC reported one.
     pub fn status(&self) -> Option<Status> {
         match self {
-            Error::Completion(wc) => Some(wc.status),
+            Error::Completion(error) | Error::SinkItem { error, .. } => error.status(),
             _ => None,
         }
     }
@@ -78,7 +85,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Os(errno) => write!(f, "{}", std::io::Error::from_raw_os_error(*errno)),
-            Error::Completion(wc) => write!(f, "work request {} failed: {}", wc.wr_id, wc.status),
+            Error::Completion(error) => write!(f, "{error}"),
+            Error::SinkItem { item, error } => write!(f, "item {item} of the sink: {error}"),
             Error::PdMismatch => f.write_str("buffer registered in another protection domain"),
             Error::TooManySges { got, max } => {
                 write!(f, "{got} scatter/gather elements, at most {max}")
@@ -102,6 +110,12 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<CompletionError> for Error {
+    fn from(error: CompletionError) -> Error {
+        Error::Completion(error)
+    }
+}
 
 impl From<Error> for std::io::Error {
     fn from(e: Error) -> std::io::Error {

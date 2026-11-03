@@ -5,7 +5,6 @@ use core::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Mutex;
 
-use safeverbs_core::Wc;
 use safeverbs_core::worker::MAX_SGES;
 use safeverbs_core::{
     Buf, BufMut, Endpoint, Error, Leases, Nic, Part, Pd, QpKey, Reliable, RemoteBuf, Result, Seq,
@@ -16,7 +15,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::Verbs;
 use crate::backlog::{self, Backlog, Posted, Work};
 use crate::batch::Batch;
-use crate::op::{Flush, Op, Read, Recv, Sent, Side};
+use crate::op::{Flush, Op, Read, Recv, Sent, Side, TakenResult};
 use crate::receiver::Receiver;
 use crate::sink::WriteSink;
 use crate::worker::LocalWorker;
@@ -32,20 +31,20 @@ pub(crate) struct Queues<N: Nic> {
     recvs: Backlog<N>,
     /// Results moved out of the send ring to free their slots (see
     /// [`QpState::unclog`]).
-    sends_done: Vec<(Seq, Wc, Leases<N>)>,
+    sends_done: Vec<(Seq, TakenResult, Leases<N>)>,
     /// Results moved out of the receive ring.
-    recvs_done: Vec<(Seq, Wc, Leases<N>)>,
+    recvs_done: Vec<(Seq, TakenResult, Leases<N>)>,
 }
 
 /// What a worker of the asynchronous layer holds: the synchronous worker
 /// and, by the index of each of its QPs, the futures' share of it.
 pub(crate) struct State<N: Nic> {
-    pub(crate) worker: Worker<N>,
+    pub(crate) worker: Worker<(), N>,
     queues: Vec<Option<Queues<N>>>,
 }
 
 impl<N: Nic> State<N> {
-    pub(crate) fn new(worker: Worker<N>) -> Self {
+    pub(crate) fn new(worker: Worker<(), N>) -> Self {
         State {
             worker,
             queues: Vec::new(),
@@ -96,7 +95,7 @@ impl<N: Nic> State<N> {
 /// worker's other QPs, and its rings) and the work waiting for room in
 /// each of its queues.
 pub struct QpState<'a, T: Transport, N: Nic> {
-    w: &'a mut Worker<N>,
+    w: &'a mut Worker<(), N>,
     q: &'a mut Queues<N>,
     key: QpKey<T>,
 }
@@ -104,7 +103,7 @@ pub struct QpState<'a, T: Transport, N: Nic> {
 impl<T: Transport, N: Nic> QpState<'_, T, N> {
     /// The synchronous worker the QP is on. Work posted there on the QP
     /// goes ahead of work the futures queued while the queue was full.
-    pub fn worker(&mut self) -> &mut Worker<N> {
+    pub fn worker(&mut self) -> &mut Worker<(), N> {
         self.w
     }
 
@@ -137,32 +136,36 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
         while self.w.send_ring(k).is_clogged() {
             let seq = self.w.send_ring(k).head();
             match self.w.take_send(k, seq) {
-                Some((wc, leases)) => self.q.sends_done.push((seq, wc, leases)),
+                Some(c) => self.q.sends_done.push((seq, c.result, c.leases)),
                 None => break,
             }
         }
         while self.w.recv_ring(k).is_clogged() {
             let seq = self.w.recv_ring(k).head();
             match self.w.take_recv(k, seq) {
-                Some((wc, leases)) => self.q.recvs_done.push((seq, wc, leases)),
+                Some(c) => self.q.recvs_done.push((seq, c.result, c.leases)),
                 None => break,
             }
         }
     }
 
-    /// Takes the outcome and buffers of retired request `seq`, from its
-    /// slot or the side list.
-    pub(crate) fn take_request(&mut self, side: Side, seq: Seq) -> Option<(Wc, Leases<N>)> {
+    /// Takes the result and buffers of retired request `seq`, from its slot
+    /// or the side list.
+    pub(crate) fn take_request(
+        &mut self,
+        side: Side,
+        seq: Seq,
+    ) -> Option<(TakenResult, Leases<N>)> {
         let (taken, done) = match side {
             Side::Send => (self.w.take_send(self.key, seq), &mut self.q.sends_done),
             Side::Recv => (self.w.take_recv(self.key, seq), &mut self.q.recvs_done),
         };
-        if taken.is_some() {
-            return taken;
+        if let Some(c) = taken {
+            return Some((c.result, c.leases));
         }
         let i = done.iter().position(|d| d.0 == seq)?;
-        let (_, wc, leases) = done.swap_remove(i);
-        Some((wc, leases))
+        let (_, result, leases) = done.swap_remove(i);
+        Some((result, leases))
     }
 
     /// Wakes `waker` when request `seq` retires.
@@ -218,13 +221,13 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
             Side::Recv => &mut self.q.recvs_done,
         };
         if let Some(i) = done.iter().position(|d| d.0 == seq) {
-            done.swap_remove(i);
+            let _ = done.swap_remove(i);
             return;
         }
-        match side {
+        let _ = match side {
             Side::Send => self.w.detach_send(self.key, seq),
             Side::Recv => self.w.detach_recv(self.key, seq),
-        }
+        };
     }
 }
 
@@ -246,7 +249,7 @@ pub trait QueueAccess: sealed::Sealed {
     fn with_state<R>(&self, f: impl FnOnce(&mut QpState<'_, Self::T, Self::N>) -> R) -> R;
 
     /// Runs `f` on the synchronous worker and the QP's key.
-    fn with_qp<R>(&self, f: impl FnOnce(&mut Worker<Self::N>, QpKey<Self::T>) -> R) -> R {
+    fn with_qp<R>(&self, f: impl FnOnce(&mut Worker<(), Self::N>, QpKey<Self::T>) -> R) -> R {
         self.with_state(|s| {
             let key = s.key;
             f(s.w, key)
@@ -449,7 +452,7 @@ macro_rules! qp_api {
             /// sequence number ([`Worker::progress`],
             /// [`Worker::take_send`]), not with [`Worker::poll`], which would
             /// hand out the futures' results too.
-            pub fn with<R>(&self, f: impl FnOnce(&mut Worker<N>, QpKey<T>) -> R) -> R {
+            pub fn with<R>(&self, f: impl FnOnce(&mut Worker<(), N>, QpKey<T>) -> R) -> R {
                 self.with_qp(f)
             }
 
@@ -511,8 +514,8 @@ macro_rules! qp_api {
                 )
             }
 
-            /// Posts a receive into `buf`; yields the completion and the
-            /// buffer.
+            /// Posts a receive into `buf`; yields what it got (a message or the
+            /// notification of a peer's WRITE) and the buffer.
             pub fn recv<U: FromBytes + IntoBytes>(
                 &self,
                 buf: BufMut<U, N>,
@@ -539,7 +542,7 @@ macro_rules! qp_api {
             }
 
             /// A [`futures_core::Stream`] of receives into `bufs`: each item
-            /// is a completion (successful or not) and its buffer, in the
+            /// is what the receive got, or why not, and its buffer, in the
             /// order the receives complete; [`Receiver::repost`] gives a
             /// buffer back. Buffers that do not fit in the receive queue
             /// wait for room.

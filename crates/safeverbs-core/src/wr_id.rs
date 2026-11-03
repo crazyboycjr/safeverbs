@@ -20,9 +20,6 @@ use vstd::prelude::*;
 
 verus! {
 
-/// Bits of a `wr_id` that hold the WQE's number.
-pub const WQE_BITS: u32 = 47;
-
 /// The mask of the WQE's number in a `wr_id`.
 pub const WQE_MASK: u64 = 0x7fff_ffff_ffff;
 

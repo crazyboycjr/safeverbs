@@ -1,6 +1,9 @@
 //! Work completions as plain data: what the completion queue reports for a
 //! work request, independent of the NIC behind it.
 
+// Verus generates undocumented field accessors for the public enums below.
+#![cfg_attr(verus_keep_ghost, allow(missing_docs))]
+
 use core::fmt;
 
 use vstd::prelude::*;
@@ -21,7 +24,7 @@ impl Status {
     pub const LOC_QP_OP_ERR: Status = Status(2);
     /// Local protection error: a local key or address the NIC refused.
     pub const LOC_PROT_ERR: Status = Status(4);
-    /// The QP entered the error state before this work request ran.
+    /// The QP was in the error state when the NIC came to this work request.
     pub const WR_FLUSH_ERR: Status = Status(5);
     /// Bad response from the remote side.
     pub const BAD_RESP_ERR: Status = Status(7);
@@ -122,28 +125,27 @@ impl fmt::Display for Status {
 
 verus! {
 
-/// What a completed work request did (`enum ibv_wc_opcode`).
-///
-/// Only meaningful for successful completions: the NIC leaves it undefined
-/// on an error.
+/// What a completed work request did (`enum ibv_wc_opcode`), as the NIC
+/// reports it. Only meaningful for successful completions: the NIC leaves it
+/// undefined on an error.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Opcode(pub u32);
+pub(crate) struct Opcode(pub u32);
 
 impl Opcode {
     /// A SEND (with or without immediate data).
-    pub const SEND: Opcode = Opcode(0);
+    pub(crate) const SEND: Opcode = Opcode(0);
     /// An RDMA WRITE (with or without immediate data).
-    pub const RDMA_WRITE: Opcode = Opcode(1);
+    pub(crate) const RDMA_WRITE: Opcode = Opcode(1);
     /// An RDMA READ.
-    pub const RDMA_READ: Opcode = Opcode(2);
+    pub(crate) const RDMA_READ: Opcode = Opcode(2);
     /// An atomic compare and swap.
-    pub const COMP_SWAP: Opcode = Opcode(3);
+    pub(crate) const COMP_SWAP: Opcode = Opcode(3);
     /// An atomic fetch and add.
-    pub const FETCH_ADD: Opcode = Opcode(4);
+    pub(crate) const FETCH_ADD: Opcode = Opcode(4);
     /// A receive that a SEND consumed.
-    pub const RECV: Opcode = Opcode(128);
+    pub(crate) const RECV: Opcode = Opcode(128);
     /// A receive that an RDMA WRITE with immediate data consumed.
-    pub const RECV_RDMA_WITH_IMM: Opcode = Opcode(129);
+    pub(crate) const RECV_RDMA_WITH_IMM: Opcode = Opcode(129);
 
     /// Whether a successful completion defines a transferred byte count.
     pub(crate) const fn has_byte_len(self) -> (has: bool)
@@ -162,38 +164,152 @@ impl Opcode {
     }
 }
 
-/// A work completion: the outcome of one work request.
+/// What a receive that succeeded got.
 ///
-/// Requests posted without a completion of their own (unsignaled) and
-/// retired by a later one get a completion made up from what was posted:
-/// success and the request's opcode, with the same metadata as a signaled
-/// completion. SEND and WRITE report status only. Metadata getters return
-/// `None` wherever the NIC leaves a field undefined, including on errors.
-/// Raw metadata cannot be accessed directly:
+/// The two cases are apart because they mean different things for the
+/// receive's buffer. There is no length to misuse: a notification's `len`
+/// counts bytes that went elsewhere, and a message's is the only one to slice
+/// the buffer with.
 ///
-/// ```compile_fail
-/// use safeverbs_core::{Opcode, Wc};
-/// let wc = Wc::success(Opcode::SEND, 64);
-/// let _ = wc.byte_len;
 /// ```
-///
-/// ```compile_fail
-/// use safeverbs_core::{Opcode, Wc};
-/// let wc = Wc::success(Opcode::SEND, 64);
-/// let _ = wc.opcode;
+/// use safeverbs_core::Received;
+/// fn payload<'a>(received: Received, buf: &'a [u8]) -> &'a [u8] {
+///     match received {
+///         Received::Message { len, .. } => &buf[..len as usize],
+///         Received::WriteNotification { .. } => &[],
+///     }
+/// }
 /// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(inconsistent_fields)] // consumed by `verus!`: `imm` differs between the cases
+pub enum Received {
+    /// A SEND arrived: `len` bytes are in the receive's buffer (zero is a
+    /// message too), with immediate data if it was sent with some.
+    Message {
+        /// The bytes in the buffer.
+        len: u32,
+        /// The immediate data of a SEND with immediate.
+        imm: Option<u32>,
+    },
+    /// A peer's WRITE with immediate landed in memory it was given access to
+    /// and consumed this receive. The receive's buffer is untouched.
+    WriteNotification {
+        /// The immediate data.
+        imm: u32,
+        /// The length of the remote WRITE, which went to the exposed memory.
+        len: u32,
+    },
+}
+
+/// What a request that succeeded did: every WQE of it completed successfully,
+/// and this is what the last one reports, with only the fields its operation
+/// defines.
 ///
-/// ```compile_fail
-/// use safeverbs_core::{Opcode, Wc};
-/// let wc = Wc::success(Opcode::RECV, 64);
-/// let _ = wc.imm;
+/// A SEND has no length to read by mistake:
+///
+/// ```compile_fail,E0026
+/// use safeverbs_core::Completed;
+/// fn length(done: Completed) -> u32 {
+///     match done {
+///         Completed::Sent { len } => len,
+///         _ => 0,
+///     }
+/// }
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Completed {
+    /// A SEND or WRITE, with or without immediate data: the NIC reports its
+    /// status alone. Local completion says the source may be reused, not that
+    /// a remote application has processed the data (on an unreliable
+    /// connection, not even that it arrived).
+    Sent,
+    /// An RDMA READ or an atomic: `len` bytes landed in its buffer. A batch of
+    /// READs reports the length of its last READ, not a sum.
+    Read {
+        /// The bytes of its last WQE.
+        len: u32,
+    },
+    /// A receive.
+    Received(Received),
+}
+
+impl Completed {
+    /// The outcome the formal model M names for it.
+    pub open spec fn model(self) -> safeverbs_spec::types::Outcome {
+        let (kind, byte_len, imm) = match self {
+            Completed::Sent => (safeverbs_spec::types::CompletionKind::StatusOnly, 0, None),
+            Completed::Read { len } => (safeverbs_spec::types::CompletionKind::Read, len as nat, None),
+            Completed::Received(Received::Message { len, imm }) =>
+                (safeverbs_spec::types::CompletionKind::Receive, len as nat, imm),
+            Completed::Received(Received::WriteNotification { imm, len }) =>
+                (safeverbs_spec::types::CompletionKind::WriteNotification, len as nat, Some(imm)),
+        };
+        safeverbs_spec::types::Outcome {
+            status: safeverbs_spec::types::Status::Success, kind, byte_len, imm,
+        }
+    }
+}
+
+/// Why a request did not complete successfully. Its context and buffers come
+/// back with the error all the same.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompletionError {
+    /// The NIC reported an error for the request's WQE at `position` (the
+    /// first is 0; a request of one WQE always says 0).
+    ///
+    /// The WQEs before `position` completed successfully. That WQE and those
+    /// after it did not complete successfully, and their remote effects are
+    /// unknown: a later WRITE may land at the peer before an earlier READ
+    /// fails, and a lost acknowledgement can hide a WRITE that landed. To
+    /// recover, ask the peer what it has, or write again what may be written
+    /// twice.
+    Failed {
+        /// The status of that WQE, the first in the request that failed.
+        status: Status,
+        /// The vendor's error code.
+        vendor_err: u32,
+        /// The WQE's position in its request.
+        position: u32,
+    },
+    /// The doorbell that would have posted the request was refused: the NIC
+    /// never saw it, so nothing of it happened, here or at the peer.
+    Refused,
+}
+
+impl CompletionError {
+    /// The status of the WQE that failed; `None` for a refused request, which
+    /// no status describes.
+    pub const fn status(self) -> Option<Status> {
+        match self {
+            CompletionError::Failed { status, .. } => Some(status),
+            CompletionError::Refused => None,
+        }
+    }
+}
+
+/// A work completion as the NIC's completion queue gives it: the outcome of
+/// one WQE, what the rings keep for a request, and the only place undefined
+/// fields exist. What leaves the core is a [`Completed`] or a
+/// [`CompletionError`], which have none of them.
+///
+/// Requests posted without a completion of their own (unsignaled) and retired
+/// by a later one get a completion made up from what was posted: success and
+/// the request's opcode, with the same metadata as a signaled completion.
+///
+/// The `wr_id` is the core's own, for routing: requests are told apart by their
+/// contexts.
+///
+/// ```compile_fail,E0616
+/// fn id(wc: &safeverbs_core::Wc) -> u64 {
+///     wc.wr_id
+/// }
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Wc {
-    /// The work request's id: its WQE sequence number in its queue.
-    pub wr_id: u64,
+    /// The id the WQE was posted with: its QP, queue and number, for routing.
+    pub(crate) wr_id: u64,
     /// Whether it succeeded, and if not why.
-    pub status: Status,
+    pub(crate) status: Status,
     /// What it did (successful completions only).
     pub(crate) opcode: Opcode,
     /// The NIC's byte count, meaningful only for successful receives,
@@ -202,20 +318,15 @@ pub struct Wc {
     /// The immediate data of a SEND or WRITE with immediate, on the receiver.
     pub(crate) imm: Option<u32>,
     /// The vendor's error code (error completions only).
-    pub vendor_err: u32,
-    /// The QP the work request was posted on.
-    pub qp_num: u32,
+    pub(crate) vendor_err: u32,
 }
 
 impl Wc {
     /// A successful completion of `opcode`, for work requests that retire
     /// without a completion of their own. SEND and WRITE ignore `byte_len`.
-    pub const fn success(opcode: Opcode, byte_len: u32) -> (wc: Wc)
+    pub(crate) const fn success(opcode: Opcode, byte_len: u32) -> (wc: Wc)
         ensures
             wc.spec_ok(),
-            wc.spec_opcode() == Some(opcode),
-            wc.spec_byte_len() == if opcode.0 == 2 || opcode.0 == 3 || opcode.0 == 4
-                || opcode.0 == 128 || opcode.0 == 129 { Some(byte_len) } else { None },
             wc.outcome().imm is None,
             wc.outcome().canonical(),
             wc.outcome().status is Success,
@@ -233,85 +344,63 @@ impl Wc {
             byte_len: if opcode.has_byte_len() { byte_len } else { 0 },
             imm: None,
             vendor_err: 0,
-            qp_num: 0,
         };
         proof { wc.lemma_outcome_canonical(); }
         wc
     }
 
     /// Whether the work request succeeded.
-    pub const fn is_ok(&self) -> (ok: bool)
+    pub(crate) const fn is_ok(&self) -> (ok: bool)
         ensures
             ok == self.spec_ok(),
     {
         self.status.is_ok()
     }
 
-    /// What the work request did, only when it succeeded.
-    pub const fn opcode(&self) -> (opcode: Option<Opcode>)
+    /// What a successful completion reports, as M's outcome says. A
+    /// notification carries its immediate data by M's rule for receives
+    /// (`RecvWr::allows_outcome`); without it, the proof says nothing.
+    pub(crate) const fn completed(&self) -> (done: Completed)
+        requires
+            self.spec_ok(),
         ensures
-            opcode == self.spec_opcode(),
-            (opcode is Some) == self.spec_ok(),
-            self.outcome().canonical(),
+            self.outcome().kind is WriteNotification && self.outcome().imm is None
+                || done.model() == self.outcome(),
     {
-        proof { self.lemma_outcome_canonical(); }
-        if self.status.is_ok() { Some(self.opcode) } else { None }
-    }
-
-    /// Bytes transferred by a successful receive, RDMA READ or atomic.
-    ///
-    /// For [`Opcode::RECV_RDMA_WITH_IMM`], this counts the remote WRITE,
-    /// whose data went to the remote address, not the posted receive
-    /// buffer. Use [`Self::received_len`] when slicing a receive buffer.
-    /// SEND and WRITE completions have no defined byte count.
-    pub const fn byte_len(&self) -> (len: Option<u32>)
-        ensures
-            len == self.spec_byte_len(),
-            len is Some ==> self.spec_ok(),
-            len is Some ==> self.outcome().byte_len == len->Some_0 as nat,
-            len is None ==> self.outcome().byte_len == 0,
-            self.outcome().canonical(),
-    {
-        proof { self.lemma_outcome_canonical(); }
-        if self.status.is_ok() && self.opcode.has_byte_len() {
-            Some(self.byte_len)
+        let len = self.byte_len;
+        if self.opcode.0 == 128 {
+            Completed::Received(Received::Message { len, imm: self.imm })
+        } else if self.opcode.0 == 129 {
+            let imm = match self.imm {
+                Some(imm) => imm,
+                None => 0,
+            };
+            Completed::Received(Received::WriteNotification { imm, len })
+        } else if self.opcode.0 == 2 || self.opcode.0 == 3 || self.opcode.0 == 4 {
+            Completed::Read { len }
         } else {
-            None
+            Completed::Sent
         }
     }
 
-    /// Bytes placed in the posted receive buffer by a successful SEND.
-    ///
-    /// A WRITE_WITH_IMM notification consumes a receive without writing
-    /// its buffer, so it returns `None` even if the remote WRITE has data.
-    pub const fn received_len(&self) -> (len: Option<u32>)
+    /// The error of a failed completion, of the WQE at `position` in its
+    /// request.
+    pub(crate) const fn failure(&self, position: u32) -> (error: CompletionError)
         ensures
-            len == self.spec_received_len(),
-            (len is Some) == (self.spec_ok() && self.outcome().kind is Receive),
-            len is Some ==> self.outcome().byte_len == len->Some_0 as nat,
-            self.outcome().canonical(),
+            error matches CompletionError::Failed { status, position: at, .. }
+                && status == self.spec_status() && at == position,
     {
-        proof { self.lemma_outcome_canonical(); }
-        if self.status.is_ok() && self.opcode.0 == 128 {
-            Some(self.byte_len)
-        } else {
-            None
-        }
+        CompletionError::Failed { status: self.status, vendor_err: self.vendor_err, position }
     }
 
-    /// Received immediate data, only on a successful receive carrying it.
-    pub const fn imm(&self) -> (imm: Option<u32>)
-        ensures
-            imm == self.spec_imm(),
-            imm == self.outcome().imm,
-            imm is Some ==> self.spec_ok(),
-            self.outcome().canonical(),
-    {
-        proof { self.lemma_outcome_canonical(); }
-        if self.status.is_ok() && self.opcode.is_receive() {
-            self.imm
+    /// What this completion reports on its own, for callers of the raw
+    /// [`NicCq::poll`](crate::nic::NicCq::poll): a WQE that failed is at
+    /// position 0, as it would be in a request of its own.
+    pub fn result(&self) -> Result<Completed, CompletionError> {
+        if self.is_ok() {
+            Ok(self.completed())
         } else {
-            None
+            Err(self.failure(0))
         }
     }
 
@@ -329,36 +418,8 @@ impl Wc {
     pub(crate) proof fn lemma_spec_status(&self)
         ensures
             self.spec_status() == self.status,
+            self.outcome().status == self.status.model(),
     {
-    }
-
-    /// The defined opcode, for accessor contracts.
-    pub closed spec fn spec_opcode(&self) -> Option<Opcode> {
-        if self.spec_ok() { Some(self.opcode) } else { None }
-    }
-
-    /// The defined transfer length, for accessor contracts.
-    pub closed spec fn spec_byte_len(&self) -> Option<u32> {
-        if self.spec_ok() && (self.opcode.0 == 2 || self.opcode.0 == 3
-            || self.opcode.0 == 4 || self.opcode.0 == 128 || self.opcode.0 == 129) {
-            Some(self.byte_len)
-        } else {
-            None
-        }
-    }
-
-    /// The defined posted-buffer length, for accessor contracts.
-    pub closed spec fn spec_received_len(&self) -> Option<u32> {
-        if self.spec_ok() && self.opcode.0 == 128 { Some(self.byte_len) } else { None }
-    }
-
-    /// The defined immediate data, for accessor contracts.
-    pub closed spec fn spec_imm(&self) -> Option<u32> {
-        if self.spec_ok() && (self.opcode.0 == 128 || self.opcode.0 == 129) {
-            self.imm
-        } else {
-            None
-        }
     }
 
     /// The outcome as the formal model sees it (`safeverbs_spec::types::Outcome`).
@@ -410,17 +471,31 @@ impl Wc {
 
 } // verus!
 
+impl fmt::Display for CompletionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompletionError::Failed {
+                status, position, ..
+            } => write!(f, "WQE {position} of the request failed: {status}"),
+            CompletionError::Refused => {
+                f.write_str("the doorbell was refused: the NIC never saw the request")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompletionError {}
+
+impl Default for Wc {
+    /// A placeholder for [`NicCq::poll`](crate::nic::NicCq::poll) to fill.
+    fn default() -> Wc {
+        crate::hw::EMPTY_WC
+    }
+}
+
 impl fmt::Debug for Wc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Wc")
-            .field("wr_id", &self.wr_id)
-            .field("status", &self.status)
-            .field("opcode", &self.opcode())
-            .field("byte_len", &self.byte_len())
-            .field("imm", &self.imm())
-            .field("vendor_err", &self.vendor_err)
-            .field("qp_num", &self.qp_num)
-            .finish()
+        write!(f, "Wc({:?})", self.result())
     }
 }
 
@@ -448,58 +523,48 @@ mod tests {
             byte_len: 4096,
             imm: Some(0xdead_beef),
             vendor_err: 7,
-            qp_num: 9,
         }
     }
 
     #[test]
-    fn successful_metadata_depends_on_operation() {
+    fn a_success_has_only_what_its_operation_defines() {
         for opcode in OPCODES {
-            let wc = raw(opcode, Status::SUCCESS);
-            assert_eq!(wc.opcode(), Some(opcode));
-            let len = match opcode {
-                Opcode::RDMA_READ
-                | Opcode::COMP_SWAP
-                | Opcode::FETCH_ADD
-                | Opcode::RECV
-                | Opcode::RECV_RDMA_WITH_IMM => Some(4096),
-                _ => None,
+            let expected = match opcode {
+                Opcode::RDMA_READ | Opcode::COMP_SWAP | Opcode::FETCH_ADD => {
+                    Completed::Read { len: 4096 }
+                }
+                Opcode::RECV => Completed::Received(Received::Message {
+                    len: 4096,
+                    imm: Some(0xdead_beef),
+                }),
+                Opcode::RECV_RDMA_WITH_IMM => Completed::Received(Received::WriteNotification {
+                    imm: 0xdead_beef,
+                    len: 4096,
+                }),
+                _ => Completed::Sent,
             };
-            assert_eq!(wc.byte_len(), len, "{opcode:?}");
             assert_eq!(
-                wc.received_len(),
-                if opcode == Opcode::RECV {
-                    Some(4096)
-                } else {
-                    None
-                }
-            );
-            assert_eq!(
-                wc.imm(),
-                match opcode {
-                    Opcode::RECV | Opcode::RECV_RDMA_WITH_IMM => Some(0xdead_beef),
-                    _ => None,
-                }
+                raw(opcode, Status::SUCCESS).result(),
+                Ok(expected),
+                "{opcode:?}"
             );
         }
     }
 
     #[test]
-    fn errors_hide_all_undefined_metadata() {
+    fn an_error_has_its_status_alone() {
         for opcode in OPCODES {
             for status in (1..=21).map(Status).chain([Status(u32::MAX)]) {
                 let wc = raw(opcode, status);
                 assert!(!wc.is_ok());
-                assert_eq!(wc.opcode(), None);
-                assert_eq!(wc.byte_len(), None);
-                assert_eq!(wc.received_len(), None);
-                assert_eq!(wc.imm(), None);
                 assert_eq!(
-                    (wc.wr_id, wc.status, wc.vendor_err, wc.qp_num),
-                    (42, status, 7, 9)
+                    wc.result(),
+                    Err(CompletionError::Failed {
+                        status,
+                        vendor_err: 7,
+                        position: 0
+                    })
                 );
-                let debug = format!("{wc:?}");
-                assert!(debug.contains("opcode: None, byte_len: None, imm: None"));
             }
         }
     }
@@ -513,10 +578,11 @@ mod tests {
                 ..raw(opcode, Status::SUCCESS)
             };
             assert!(inferred.is_ok());
-            assert_eq!(inferred.opcode(), signaled.opcode());
-            assert_eq!(inferred.byte_len(), signaled.byte_len());
-            assert_eq!(inferred.received_len(), signaled.received_len());
-            assert_eq!(inferred.imm(), signaled.imm());
+            // A notification always has immediate data on a real NIC; this
+            // made-up one is never inferred (a receive has its own CQE).
+            if opcode != Opcode::RECV_RDMA_WITH_IMM {
+                assert_eq!(inferred.result(), signaled.result());
+            }
             if matches!(opcode, Opcode::SEND | Opcode::RDMA_WRITE) {
                 assert_eq!(inferred.byte_len, 0);
             }
@@ -525,12 +591,16 @@ mod tests {
 
     #[test]
     fn zero_length_receive_is_distinct_from_write_notification() {
-        let recv = Wc::success(Opcode::RECV, 0);
-        assert_eq!(recv.byte_len(), Some(0));
-        assert_eq!(recv.received_len(), Some(0));
-        let notification = raw(Opcode::RECV_RDMA_WITH_IMM, Status::SUCCESS);
-        assert_eq!(notification.byte_len(), Some(4096));
-        assert_eq!(notification.received_len(), None);
-        assert_eq!(notification.imm(), Some(0xdead_beef));
+        assert_eq!(
+            Wc::success(Opcode::RECV, 0).result(),
+            Ok(Completed::Received(Received::Message { len: 0, imm: None }))
+        );
+        assert_eq!(
+            raw(Opcode::RECV_RDMA_WITH_IMM, Status::SUCCESS).result(),
+            Ok(Completed::Received(Received::WriteNotification {
+                imm: 0xdead_beef,
+                len: 4096
+            }))
+        );
     }
 }

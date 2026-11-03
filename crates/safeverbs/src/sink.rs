@@ -48,13 +48,25 @@ impl<U, N: Nic> WriteOp<U, N> {
 /// - `poll_flush` writes the held WQE signaled and rings the doorbell;
 /// - `poll_close` flushes and waits until everything sent has completed.
 ///
-/// Errors: the first error completion among the QP's requests without an
-/// owner (this sink's among them) is reported by the next call. Dropping
-/// the sink flushes it.
+/// Errors: the first error among the QP's requests without an owner (this
+/// sink's among them) is reported by the next call: as
+/// [`Error::SinkItem`](safeverbs_core::Error::SinkItem) with the failed item's
+/// position among the items sent through this sink, or
+/// [`Error::Completion`](safeverbs_core::Error::Completion) if it was another
+/// request's. Items before it completed successfully; it and those after it did
+/// not, and their remote effects are unknown (see
+/// [`CompletionError`](safeverbs_core::CompletionError)). Dropping the sink
+/// flushes it.
 pub struct WriteSink<'q, Q: QueueAccess, U: IntoBytes + Immutable> {
     q: &'q Q,
     held: Option<WriteOp<U, Q::N>>,
     last: Option<Seq>,
+    /// How many items were posted.
+    items: u64,
+    /// The runs of consecutive sequence numbers its items took, oldest first,
+    /// each from a request and its item: another request of the QP in between
+    /// starts a new run. One allocation, unless other requests come between.
+    runs: Vec<(Seq, u64)>,
 }
 
 impl<'q, Q: QueueAccess, U: IntoBytes + Immutable> WriteSink<'q, Q, U> {
@@ -63,6 +75,8 @@ impl<'q, Q: QueueAccess, U: IntoBytes + Immutable> WriteSink<'q, Q, U> {
             q,
             held: None,
             last: None,
+            items: 0,
+            runs: Vec::new(),
         }
     }
 
@@ -72,15 +86,34 @@ impl<'q, Q: QueueAccess, U: IntoBytes + Immutable> WriteSink<'q, Q, U> {
             Some(imm) => WrOp::WriteImm(op.dst, imm),
             None => WrOp::Write(op.dst),
         };
+        let item = self.items;
+        self.items += 1;
         let seq = self.q.with_qp(|w, qp| {
             let mut req = w.request(qp);
             req.push(wr, op.buf.into_part()).map_err(|e| e.error)?;
-            Ok::<_, Error>(req.finish(signal, true))
+            Ok::<_, Error>(req.finish_detached(signal))
         })?;
-        if seq.is_some() {
-            self.last = seq;
+        if let Some(seq) = seq {
+            self.last = Some(seq);
+            let follows = self
+                .runs
+                .last()
+                .is_some_and(|&(first, of)| seq - first == item - of);
+            if !follows {
+                self.runs.push((seq, item));
+            }
         }
         Ok(())
+    }
+
+    /// The item that took request `seq`, if one did.
+    fn item_of(&self, seq: Seq) -> Option<u64> {
+        let i = self.runs.partition_point(|&(first, _)| first <= seq);
+        let (first, of) = *self.runs.get(i.checked_sub(1)?)?;
+        let item = of + (seq - first);
+        // The run ends where the next one starts, or at the items posted.
+        let end = self.runs.get(i).map_or(self.items, |&(_, next)| next);
+        (item < end).then_some(item)
     }
 
     /// Writes the held WQE signaled and rings the doorbell.
@@ -93,7 +126,13 @@ impl<'q, Q: QueueAccess, U: IntoBytes + Immutable> WriteSink<'q, Q, U> {
 
     fn take_error(&self) -> Result<(), Error> {
         match self.q.with_qp(|w, qp| w.take_send_error(qp)) {
-            Some(wc) => Err(Error::Completion(wc)),
+            Some(failed) => Err(match self.item_of(failed.seq) {
+                Some(item) => Error::SinkItem {
+                    item,
+                    error: failed.error,
+                },
+                None => Error::Completion(failed.error),
+            }),
             None => Ok(()),
         }
     }

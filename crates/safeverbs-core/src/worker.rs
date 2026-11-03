@@ -44,9 +44,9 @@
 //! There are two ways to drive a worker:
 //!
 //! - **The event loop** ([`Worker::poll`]): poll the CQ, and get every
-//!   request that retired (with an owner) as a [`Completion`]: its QP, queue,
-//!   sequence number, outcome and buffers, handed to a callback that may post
-//!   new work. Nothing is allocated.
+//!   request that retired (with an owner) as a [`Completion`]: its context,
+//!   result and buffers, with its QP, queue and sequence number, handed to a
+//!   callback that may post new work. Nothing is allocated.
 //! - **Owners that take their results** ([`Worker::progress`] and
 //!   [`Worker::take_send`]): polling retires requests into their rings and
 //!   wakes their wakers; each owner takes its request's result by sequence
@@ -54,6 +54,46 @@
 //!
 //! A worker driven one way should not be driven the other: `poll` hands out
 //! the results owners would wait for.
+//!
+//! # Contexts
+//!
+//! A `Worker<C>` keeps a value of the type `C` with each request that has an
+//! owner: whatever tells the program which request just finished. It lives in
+//! the request's ring slot and comes back exactly once, with its result and
+//! its buffers:
+//!
+//! ```no_run
+//! # use safeverbs_core::{Buf, Completed, CompletionError, Pd, QpKey, RC, Worker};
+//! enum Job {
+//!     Reply { client: u32 },
+//!     Log,
+//! }
+//!
+//! # fn f(pd: Pd, qp: QpKey<RC>, buf: Buf<u8>) -> safeverbs_core::Result<()> {
+//! let mut w: Worker<Job> = Worker::new(&pd, 4096)?;
+//! w.send(qp, buf.slice(..), Job::Reply { client: 7 })?;
+//! w.poll(|w, c| match (c.ctx, c.result) {
+//!     (Job::Reply { client }, Ok(_)) => println!("replied to {client}"),
+//!     (Job::Log, Ok(_)) => {}
+//!     (job, Err(e)) => {
+//!         // The WQEs before `e`'s position completed; the others did not, and
+//!         // what they did at the peer is unknown.
+//!         let _ = (job, e);
+//!     }
+//! });
+//! # Ok(()) }
+//! ```
+//!
+//! C programs would use a `u64`, which is `Worker<u64>`. The default, `()`,
+//! costs nothing; the futures of `safeverbs` use it, being their own identity.
+//! A batch is one request, with one context ([`Request::submit`]). Requests
+//! without an owner hold none.
+//!
+//! Giving up a request hands its context back ([`Worker::detach_send`]).
+//! Removing a QP or dropping the worker gives up every request: the contexts
+//! of the requests not delivered yet are dropped then, and their buffers
+//! released once the NIC is done with them. A context's destructor is never run
+//! by a poll.
 //!
 //! # Removing QPs
 //!
@@ -83,17 +123,20 @@ use core::mem::ManuallyDrop;
 use core::task::Waker;
 use std::time::{Duration, Instant};
 
-use crate::buf::{BufError, Leases, Part};
-use crate::error::{Error, Result};
-use crate::hw::{Hw, Side};
-use crate::nic::{ConnectAttr, Endpoint, Nic, QpCaps, WrOp};
-use crate::pd::Pd;
-use crate::ring::{Ring, Seq};
-use crate::transport::Transport;
-use crate::verbs::Verbs;
-use crate::wc::Wc;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-pub use crate::hw::{MAX_QPS, MAX_SGES};
+use crate::buf::{Buf, BufError, BufMut, Leases, Part};
+use crate::error::{Error, Result};
+use crate::hw::Hw;
+use crate::nic::{ConnectAttr, Endpoint, Nic, QpCaps, RemoteBuf, WrOp};
+use crate::pd::Pd;
+use crate::ring::{Payload, Ring, Seq};
+use crate::transport::{Reliable, Transport};
+use crate::verbs::Verbs;
+#[cfg(doc)]
+use crate::wc::CompletionError;
+
+pub use crate::hw::{Completion, DetachedError, MAX_QPS, MAX_SGES, Side as Queue};
 
 /// How long removing a QP waits for a completion while the device flushes
 /// its work, before it gives up: then the QP and its buffers are kept, never
@@ -144,48 +187,64 @@ impl<T: Transport> core::fmt::Debug for QpKey<T> {
     }
 }
 
-/// One of a QP's two work queues.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Queue {
-    /// The send queue: SENDs, WRITEs, READs, atomics.
-    Send,
-    /// The receive queue.
-    Recv,
-}
-
-/// A request that retired, as [`Worker::poll`] hands it out.
-pub struct Completion<N: Nic = Verbs> {
-    /// The QP's index in the worker ([`QpKey::index`]).
-    pub qp: usize,
-    /// The queue it was posted on.
-    pub queue: Queue,
-    /// Its sequence number in that queue.
-    pub seq: Seq,
-    /// Its outcome: status, byte length, immediate data. A request whose
-    /// doorbell the device refused has a flush error.
-    pub wc: Wc,
+/// A request that could not be posted: why, and its context and buffers.
+pub struct PostError<C = (), N: Nic = Verbs> {
+    /// What went wrong.
+    pub error: Error,
+    /// The context it was given.
+    pub ctx: C,
     /// Its buffers.
     pub leases: Leases<N>,
 }
 
-/// A completion queue and the QPs attached to it (the synchronous layer).
+impl<C, N: Nic> core::fmt::Debug for PostError<C, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PostError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C, N: Nic> core::fmt::Display for PostError<C, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl<C, N: Nic> std::error::Error for PostError<C, N> {}
+
+impl<C, N: Nic> From<PostError<C, N>> for Error {
+    fn from(e: PostError<C, N>) -> Error {
+        e.error
+    }
+}
+
+impl<C, N: Nic> From<PostError<C, N>> for std::io::Error {
+    fn from(e: PostError<C, N>) -> std::io::Error {
+        e.error.into()
+    }
+}
+
+/// A completion queue and the QPs attached to it (the synchronous layer), with
+/// a context of type `C` kept with each request (see the module documentation).
 ///
 /// Dropping it drains its QPs (as [`Worker::remove_qp`] does, all at once),
-/// destroys them, releases the buffers their requests held, then destroys
-/// the CQ and the thread domain. A QP the device never flushes is leaked
-/// with its buffers, and so are the CQ and the domain.
-pub struct Worker<N: Nic = Verbs> {
+/// drops the contexts of the requests not delivered, destroys the QPs, releases
+/// the buffers their requests held, then destroys the CQ and the thread domain.
+/// A QP the device never flushes is leaked with its buffers, and so are the CQ
+/// and the domain.
+pub struct Worker<C = (), N: Nic = Verbs> {
     /// The verified hardware side; dropped by hand, in `drop`.
-    hw: ManuallyDrop<Hw<N>>,
+    hw: ManuallyDrop<Hw<C, N>>,
     /// The next request of each queue of each QP [`Worker::poll`] hands
     /// out, by index.
     cursors: Vec<(Seq, Seq)>,
 }
 
-impl<N: Nic> Worker<N> {
+impl<C, N: Nic> Worker<C, N> {
     /// A worker of `pd` with a CQ of `cq_size` entries, on a thread domain
     /// of its own where the device has them.
-    pub fn new(pd: &Pd<N>, cq_size: u32) -> Result<Worker<N>> {
+    pub fn new(pd: &Pd<N>, cq_size: u32) -> Result<Worker<C, N>> {
         Ok(Worker {
             hw: ManuallyDrop::new(Hw::new(pd.clone(), cq_size)?),
             cursors: Vec::new(),
@@ -243,8 +302,9 @@ impl<N: Nic> Worker<N> {
         })
     }
 
-    /// Removes a QP: drains it, destroys it, then releases the buffers its
-    /// requests still hold (none is handed out) and its share of the CQ.
+    /// Removes a QP: drops the contexts of its requests not delivered, drains
+    /// it, destroys it, then releases the buffers its requests still hold (none
+    /// is handed out) and its share of the CQ.
     ///
     /// The NIC may still use the buffers of the WQEs in flight, so the QP is
     /// drained first (see the module documentation): moved to the error
@@ -333,7 +393,7 @@ impl<N: Nic> Worker<N> {
     /// An unsignaled request retires with the next signaled one of its
     /// queue: a loop that posts unsignaled requests also posts signaled
     /// ones.
-    pub fn poll<F: FnMut(&mut Worker<N>, Completion<N>)>(&mut self, mut f: F) -> usize {
+    pub fn poll<F: FnMut(&mut Worker<C, N>, Completion<C, N>)>(&mut self, mut f: F) -> usize {
         let n = self.progress();
         while let Some(next) = self.hw.pop_dirty() {
             let Some((index, refused)) = next else {
@@ -350,50 +410,37 @@ impl<N: Nic> Worker<N> {
 
     /// Hands the refused requests among the ones in flight of QP `index`'s
     /// send queue to `f` (refusals are rare: the scan is too).
-    fn deliver_refused<F: FnMut(&mut Worker<N>, Completion<N>)>(
+    fn deliver_refused<F: FnMut(&mut Worker<C, N>, Completion<C, N>)>(
         &mut self,
         index: usize,
         f: &mut F,
     ) {
-        let Some(ring) = self.hw.ring(index, Side::Send) else {
+        let Some(ring) = self.hw.ring(index, Queue::Send) else {
             return;
         };
         let (from, to) = (ring.retired(), ring.committed());
         let mut seq = from;
         while seq < to {
-            let refused = match self.hw.ring(index, Side::Send) {
+            let refused = match self.hw.ring(index, Queue::Send) {
                 Some(ring) => ring.state(seq) == crate::ring::State::Refused,
                 None => return,
             };
-            if refused && let Some((wc, leases)) = self.hw.take(index, Side::Send, seq) {
-                f(
-                    self,
-                    Completion {
-                        qp: index,
-                        queue: Queue::Send,
-                        seq,
-                        wc,
-                        leases,
-                    },
-                );
+            if refused && let Some(done) = self.hw.take(index, Queue::Send, seq) {
+                f(self, done);
             }
             seq += 1;
         }
     }
 
     /// Hands the retired requests of one queue to `f`, in order.
-    fn deliver<F: FnMut(&mut Worker<N>, Completion<N>)>(
+    fn deliver<F: FnMut(&mut Worker<C, N>, Completion<C, N>)>(
         &mut self,
         index: usize,
         queue: Queue,
         f: &mut F,
     ) {
-        let side = match queue {
-            Queue::Send => Side::Send,
-            Queue::Recv => Side::Recv,
-        };
         loop {
-            let Some(ring) = self.hw.ring(index, side) else {
+            let Some(ring) = self.hw.ring(index, queue) else {
                 return;
             };
             let (head, retired) = (ring.head(), ring.retired());
@@ -413,17 +460,8 @@ impl<N: Nic> Worker<N> {
             }
             let seq = *cursor;
             *cursor += 1;
-            if let Some((wc, leases)) = self.hw.take(index, side, seq) {
-                f(
-                    self,
-                    Completion {
-                        qp: index,
-                        queue,
-                        seq,
-                        wc,
-                        leases,
-                    },
-                );
+            if let Some(done) = self.hw.take(index, queue, seq) {
+                f(self, done);
             }
         }
     }
@@ -451,16 +489,16 @@ impl<N: Nic> Worker<N> {
     }
 
     /// The send queue's ring.
-    pub fn send_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Leases<N>> {
-        match self.hw.ring(qp.index(), Side::Send) {
+    pub fn send_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Payload<C, N>> {
+        match self.hw.ring(qp.index(), Queue::Send) {
             Some(ring) => ring,
             None => panic!("no QP {} in this worker", qp.index()),
         }
     }
 
     /// The receive queue's ring.
-    pub fn recv_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Leases<N>> {
-        match self.hw.ring(qp.index(), Side::Recv) {
+    pub fn recv_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Payload<C, N>> {
+        match self.hw.ring(qp.index(), Queue::Recv) {
             Some(ring) => ring,
             None => panic!("no QP {} in this worker", qp.index()),
         }
@@ -517,9 +555,10 @@ impl<N: Nic> Worker<N> {
         self.hw.set_error(qp.index())
     }
 
-    /// Starts a request on the QP's send queue. Its WQEs go out at the next
-    /// [`Worker::commit`] of the QP.
-    pub fn request<T: Transport>(&mut self, qp: QpKey<T>) -> Request<'_, T, N> {
+    /// Starts a request on the QP's send queue: add its WQEs, then give it its
+    /// context when it is finished ([`Request::submit`], [`Request::finish`]).
+    /// Its WQEs go out at the next [`Worker::commit`] of the QP.
+    pub fn request<T: Transport>(&mut self, qp: QpKey<T>) -> Request<'_, T, C, N> {
         Request {
             w: self,
             index: qp.index(),
@@ -527,70 +566,149 @@ impl<N: Nic> Worker<N> {
         }
     }
 
+    /// One WQE as a request of its own, signaled, and the doorbell.
+    fn post_one<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        ctx: C,
+    ) -> Result<Seq, PostError<C, N>> {
+        let mut req = self.request(qp);
+        if let Err(e) = req.push(op, part) {
+            return Err(PostError {
+                error: e.error,
+                ctx,
+                leases: Leases::from(e.buf),
+            });
+        }
+        req.submit(true, ctx)
+    }
+
+    /// SENDs `buf` into the peer's next receive, as a signaled request of its
+    /// own, and rings the doorbell. `ctx` comes back with its completion.
+    pub fn send<T: Transport, U: IntoBytes + Immutable>(
+        &mut self,
+        qp: QpKey<T>,
+        buf: Buf<U, N>,
+        ctx: C,
+    ) -> Result<Seq, PostError<C, N>> {
+        self.post_one(qp, WrOp::Send, buf.into_part(), ctx)
+    }
+
+    /// [`Worker::send`] with immediate data `imm`.
+    pub fn send_imm<T: Transport, U: IntoBytes + Immutable>(
+        &mut self,
+        qp: QpKey<T>,
+        buf: Buf<U, N>,
+        imm: u32,
+        ctx: C,
+    ) -> Result<Seq, PostError<C, N>> {
+        self.post_one(qp, WrOp::SendImm(imm), buf.into_part(), ctx)
+    }
+
+    /// RDMA WRITEs `buf` to `dst` in the peer's memory, as a signaled request
+    /// of its own, and rings the doorbell. `ctx` comes back with its completion.
+    pub fn write<T: Transport, U: IntoBytes + Immutable>(
+        &mut self,
+        qp: QpKey<T>,
+        buf: Buf<U, N>,
+        dst: RemoteBuf,
+        ctx: C,
+    ) -> Result<Seq, PostError<C, N>> {
+        self.post_one(qp, WrOp::Write(dst), buf.into_part(), ctx)
+    }
+
+    /// [`Worker::write`] with immediate data `imm`, which also consumes one of
+    /// the peer's receives.
+    pub fn write_imm<T: Transport, U: IntoBytes + Immutable>(
+        &mut self,
+        qp: QpKey<T>,
+        buf: Buf<U, N>,
+        dst: RemoteBuf,
+        imm: u32,
+        ctx: C,
+    ) -> Result<Seq, PostError<C, N>> {
+        self.post_one(qp, WrOp::WriteImm(dst, imm), buf.into_part(), ctx)
+    }
+
+    /// RDMA READs `src` from the peer's memory into `buf`, as a signaled
+    /// request of its own, and rings the doorbell. `ctx` comes back with its
+    /// completion and the buffer.
+    pub fn read<T: Reliable, U: FromBytes + IntoBytes>(
+        &mut self,
+        qp: QpKey<T>,
+        buf: BufMut<U, N>,
+        src: RemoteBuf,
+        ctx: C,
+    ) -> Result<Seq, PostError<C, N>> {
+        self.post_one(qp, WrOp::Read(src), buf.into_part(), ctx)
+    }
+
+    /// Posts a receive into `buf`. `ctx` comes back with its completion and the
+    /// buffer.
+    pub fn recv<T: Transport, U: FromBytes + IntoBytes>(
+        &mut self,
+        qp: QpKey<T>,
+        buf: BufMut<U, N>,
+        ctx: C,
+    ) -> Result<Seq, PostError<C, N>> {
+        self.post_recv(qp, buf.into_part(), ctx)
+    }
+
     /// Rings the QP's doorbell for every request written since the last
     /// one. If the device refuses, none of them is posted: each one with an
-    /// owner retires at once with a flush error, which its owner takes with
-    /// its buffers ([`Worker::take_send`], or [`Worker::poll`]); each one
-    /// without an owner releases its buffers and is reported by
-    /// [`Worker::take_send_error`] as a flush error. Sequence numbers are
-    /// never reused. [`Request::submit`] and [`Worker::commit_or_take`] hand
-    /// the buffers of their own request back with the error instead.
+    /// owner retires at once as [`CompletionError::Refused`], which its owner
+    /// takes with its context and buffers ([`Worker::take_send`], or
+    /// [`Worker::poll`]); each one without an owner releases its buffers and is
+    /// reported by [`Worker::take_send_error`]. Sequence numbers are never
+    /// reused. [`Request::submit`] hands the context and buffers of its own
+    /// request back with the error instead.
     /// A waker panic during refusal propagates only after all staged
     /// requests have their refusal result and notifications are attempted.
     pub fn commit<T: Transport>(&mut self, qp: QpKey<T>) -> Result<()> {
         self.hw.commit(qp.index(), None).map_err(|(e, _)| e)
     }
 
-    /// Like [`Worker::commit`], but if the device refuses, hands back the
-    /// buffers of request `seq` (staged, with an owner) with the error
-    /// instead of keeping them for its owner.
-    pub fn commit_or_take<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        seq: Seq,
-    ) -> Result<(), (Error, Leases<N>)> {
-        self.hw
-            .commit(qp.index(), Some(seq))
-            .map_err(|(e, kept)| (e, kept.unwrap_or_default()))
-    }
-
-    /// Takes the completion and buffers of retired (or refused) send
+    /// Takes the context, result and buffers of retired (or refused) send
     /// request `seq`.
-    pub fn take_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<(Wc, Leases<N>)> {
-        self.hw.take(qp.index(), Side::Send, seq)
+    #[inline]
+    pub fn take_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<Completion<C, N>> {
+        self.hw.take(qp.index(), Queue::Send, seq)
     }
 
-    /// Takes the completion and buffer of retired receive `seq`.
-    pub fn take_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<(Wc, Leases<N>)> {
-        self.hw.take(qp.index(), Side::Recv, seq)
+    /// Takes the context, result and buffer of retired receive `seq`.
+    #[inline]
+    pub fn take_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<Completion<C, N>> {
+        self.hw.take(qp.index(), Queue::Recv, seq)
     }
 
-    /// Gives up send request `seq`: its buffers are released when it
-    /// retires (now, if it has).
-    pub fn detach_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) {
-        self.hw.detach(qp.index(), Side::Send, seq);
+    /// Gives up send request `seq`: its buffers are released when it retires
+    /// (now, if it has), and its context comes back, if it has one still.
+    pub fn detach_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<C> {
+        self.hw.detach(qp.index(), Queue::Send, seq)
     }
 
-    /// Gives up receive `seq`: its buffer is released when it retires (now,
-    /// if it has).
-    pub fn detach_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) {
-        self.hw.detach(qp.index(), Side::Recv, seq);
+    /// Gives up receive `seq`: its buffer is released when it retires (now, if
+    /// it has), and its context comes back, if it has one still.
+    pub fn detach_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<C> {
+        self.hw.detach(qp.index(), Queue::Recv, seq)
     }
 
-    /// The first error completion of a send request without an owner
-    /// (a dropped future's, a sink's, a split batch's part), once.
-    pub fn take_send_error<T: Transport>(&mut self, qp: QpKey<T>) -> Option<Wc> {
+    /// The first error of a send request without an owner (a dropped future's,
+    /// a sink's, a split batch's part), once.
+    pub fn take_send_error<T: Transport>(&mut self, qp: QpKey<T>) -> Option<DetachedError> {
         self.hw.take_send_error(qp.index())
     }
 
     /// Wakes `waker` when send request `seq` retires.
     pub fn set_send_waker<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq, waker: &Waker) {
-        self.hw.set_waker(qp.index(), Side::Send, seq, waker);
+        self.hw.set_waker(qp.index(), Queue::Send, seq, waker);
     }
 
     /// Wakes `waker` when receive `seq` retires.
     pub fn set_recv_waker<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq, waker: &Waker) {
-        self.hw.set_waker(qp.index(), Side::Recv, seq, waker);
+        self.hw.set_waker(qp.index(), Queue::Recv, seq, waker);
     }
 
     /// Waits until a new send request of at least one WQE fits on the QP:
@@ -600,23 +718,43 @@ impl<N: Nic> Worker<N> {
         self.hw.make_room(qp.index())
     }
 
-    /// Posts a receive into `part`, a unique buffer, on the QP; `detached`
-    /// if nobody will take it back by its sequence number. Refused when the
-    /// receive queue is full or the QP takes no work.
+    /// Posts a receive into `part`, a unique buffer, on the QP, with `ctx` for
+    /// its owner. Refused, with `part` and `ctx`, when the receive queue is
+    /// full or the QP takes no work.
     pub fn post_recv<T: Transport>(
         &mut self,
         qp: QpKey<T>,
         part: Part<N>,
-        detached: bool,
+        ctx: C,
+    ) -> Result<Seq, PostError<C, N>> {
+        self.hw
+            .post_recv(qp.index(), part, Some(ctx))
+            .map_err(|(e, ctx)| PostError {
+                error: e.error,
+                ctx: ctx.expect("the context it was given"),
+                leases: Leases::from(e.buf),
+            })
+    }
+
+    /// Posts a receive into `part` that nobody will take back by its sequence
+    /// number: its buffer is released when it retires. Refused, with `part`,
+    /// when the receive queue is full or the QP takes no work.
+    pub fn post_recv_detached<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        part: Part<N>,
     ) -> Result<Seq, BufError<Part<N>>> {
-        self.hw.post_recv(qp.index(), part, detached)
+        self.hw
+            .post_recv(qp.index(), part, None)
+            .map_err(|(e, _)| e)
     }
 }
 
-impl<N: Nic> Drop for Worker<N> {
-    /// Drains every QP (all at once, as [`Worker::remove_qp`] does one),
-    /// destroys the drained ones and releases their buffers, then destroys
-    /// the CQ and the thread domain. If the device does not flush some QP,
+impl<C, N: Nic> Drop for Worker<C, N> {
+    /// Drops the contexts of the requests not delivered and drains every QP
+    /// (all at once, as [`Worker::remove_qp`] does one), destroys the drained
+    /// ones and releases their buffers, then destroys the CQ and the thread
+    /// domain. If the device does not flush some QP,
     /// that QP is leaked with its buffers, and so are the CQ and the domain
     /// (destroying them would need the QP gone).
     fn drop(&mut self) {
@@ -648,13 +786,13 @@ impl<N: Nic> Drop for Worker<N> {
 /// without an owner) and the rest continues once there is room. Dropping
 /// an unfinished request finishes it without an owner. The WQEs and their
 /// buffers are kept by the worker's verified hardware side.
-pub struct Request<'w, T: Transport, N: Nic = Verbs> {
-    w: &'w mut Worker<N>,
+pub struct Request<'w, T: Transport, C = (), N: Nic = Verbs> {
+    w: &'w mut Worker<C, N>,
     index: usize,
     _t: PhantomData<fn() -> T>,
 }
 
-impl<T: Transport, N: Nic> Request<'_, T, N> {
+impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
     /// Adds a WQE doing `op` on `part`; on error nothing is added and the
     /// part is handed back.
     pub fn push(&mut self, op: WrOp, part: Part<N>) -> Result<(), BufError<Part<N>>> {
@@ -694,40 +832,65 @@ impl<T: Transport, N: Nic> Request<'_, T, N> {
         !self.w.hw.is_open(self.index)
     }
 
-    /// Finishes the request: signaled if `signal` (else only if the ring
-    /// needs it), `detached` if nobody will take it back. Returns its
-    /// sequence number, `None` if it has no WQE. It goes out at the next
-    /// commit; if the device refuses that doorbell, it retires with a flush
-    /// error (see [`Worker::commit`]).
-    pub fn finish(self, signal: bool, detached: bool) -> Option<Seq> {
-        self.w.hw.close(self.index, signal, detached)
+    /// Finishes the request, signaled if `signal` (else only if the ring needs
+    /// it), with `ctx` to come back with its completion. Returns its sequence
+    /// number, or `ctx` if it has no WQE. It goes out at the next commit; if the
+    /// device refuses that doorbell, it retires as
+    /// [`CompletionError::Refused`] (see [`Worker::commit`]).
+    pub fn finish(self, signal: bool, ctx: C) -> core::result::Result<Seq, C> {
+        self.w
+            .hw
+            .close(self.index, signal, Some(ctx))
+            .map_err(|ctx| ctx.expect("the context it was given"))
     }
 
-    /// Finishes the request with an owner and rings the doorbell. Returns
-    /// its sequence number (`None` if it has no WQE); if the device
-    /// refuses, its buffers come back with the error.
-    pub fn submit(self, signal: bool) -> Option<Result<Seq, (Error, Leases<N>)>> {
-        let seq = self.w.hw.close(self.index, signal, false)?;
-        let key = QpKey::<T> {
-            index: self.index as u16,
-            _t: PhantomData,
+    /// Finishes the request without an owner: nobody will take it back, and its
+    /// buffers are released when it retires. Returns its sequence number,
+    /// `None` if it has no WQE.
+    pub fn finish_detached(self, signal: bool) -> Option<Seq> {
+        self.w.hw.close(self.index, signal, None).ok()
+    }
+
+    /// Finishes the request with `ctx`, as [`Request::finish`], and rings the
+    /// doorbell. If the device refuses, or it has no WQE, its context and
+    /// buffers come back with the error.
+    pub fn submit(self, signal: bool, ctx: C) -> Result<Seq, PostError<C, N>> {
+        let seq = match self.w.hw.close(self.index, signal, Some(ctx)) {
+            Ok(seq) => seq,
+            Err(ctx) => {
+                return Err(PostError {
+                    error: Error::Invalid("a request without a WQE"),
+                    ctx: ctx.expect("the context it was given"),
+                    leases: Leases::default(),
+                });
+            }
         };
-        Some(self.w.commit_or_take(key, seq).map(|()| seq))
+        match self.w.hw.commit(self.index, Some(seq)) {
+            Ok(()) => Ok(seq),
+            Err((error, kept)) => {
+                let kept = kept.expect("the request just staged");
+                Err(PostError {
+                    error,
+                    ctx: kept.ctx.expect("a request with an owner has its context"),
+                    leases: kept.leases,
+                })
+            }
+        }
     }
 
     /// Finishes the request without an owner (signaled) and rings the
     /// doorbell.
     pub fn submit_detached(self) -> Result<()> {
-        self.w.hw.close(self.index, true, true);
+        let _ = self.w.hw.close(self.index, true, None);
         self.w.hw.commit(self.index, None).map_err(|(e, _)| e)
     }
 }
 
-impl<T: Transport, N: Nic> Drop for Request<'_, T, N> {
+impl<T: Transport, C, N: Nic> Drop for Request<'_, T, C, N> {
     fn drop(&mut self) {
         // An unfinished request goes out without an owner (a no-op once
         // finished).
-        self.w.hw.close(self.index, true, true);
+        let _ = self.w.hw.close(self.index, true, None);
     }
 }
 
@@ -738,7 +901,7 @@ mod tests {
     use crate::nic::{ConnectAttr, QpCaps};
     use crate::pd::Context;
     use crate::transport::RC;
-    use crate::wc::Status;
+    use crate::wc::CompletionError;
     use crate::wr_id::{WQE_MASK, index_of, is_recv, wqe_of, wr_id};
 
     fn caps(depth: u32) -> QpCaps {
@@ -831,7 +994,7 @@ mod tests {
     #[test]
     fn qps_reserve_the_cq() {
         let pd = Context::new(Model::new(3)).alloc_pd().unwrap();
-        let mut w = Worker::new(&pd, 64).unwrap();
+        let mut w: Worker<(), _> = Worker::new(&pd, 64).unwrap();
         let a = w.create_qp::<RC>(caps(16), 4).unwrap();
         let b = w.create_qp::<RC>(caps(16), 4).unwrap();
         assert_eq!(w.reserved(), 64);
@@ -847,7 +1010,7 @@ mod tests {
     }
 
     /// Two RC QPs of one worker connected to each other.
-    fn connected_pair(w: &mut Worker<Model>, depth: u32, batch: u32) -> (QpKey<RC>, QpKey<RC>) {
+    fn connected_pair(w: &mut Worker<(), Model>, depth: u32, batch: u32) -> (QpKey<RC>, QpKey<RC>) {
         let a = w.create_qp::<RC>(caps(depth), batch).unwrap();
         let b = w.create_qp::<RC>(caps(depth), batch).unwrap();
         let attr = ConnectAttr {
@@ -889,16 +1052,16 @@ mod tests {
         // Receives on both sides; the sends of `a` take two of `b`'s.
         for qp in [a, a, b, b, b] {
             let buf = pd.alloc::<u8>(64).unwrap();
-            w.post_recv(qp, buf.into_part(), false).unwrap();
+            w.post_recv(qp, buf.into_part(), ()).unwrap();
         }
         // A signaled send, then an unsignaled one: once both ran, the last
         // has no completion and only a later one could retire it.
         let mut req = w.request(a);
         req.push(WrOp::Send, frozen.slice(..8).into_part()).unwrap();
-        req.submit(true).unwrap().unwrap();
+        req.submit(true, ()).unwrap();
         let mut req = w.request(a);
         req.push(WrOp::Send, frozen.slice(..8).into_part()).unwrap();
-        req.submit(false).unwrap().unwrap();
+        req.submit(false, ()).unwrap();
         model.run();
         w.progress();
         assert_eq!(model.pending(), 3, "the sends ran, three receives wait");
@@ -924,13 +1087,13 @@ mod tests {
         let frozen = pd.alloc::<u8>(64).unwrap().freeze();
         for _ in 0..4 {
             let buf = pd.alloc::<u8>(64).unwrap();
-            w.post_recv(b, buf.into_part(), true).unwrap();
+            w.post_recv_detached(b, buf.into_part()).unwrap();
         }
         let mut req = w.request(a);
         for _ in 0..6 {
             req.push(WrOp::Send, frozen.slice(..8).into_part()).unwrap();
         }
-        req.submit(false).unwrap().unwrap();
+        req.submit(false, ()).unwrap();
         drop(w);
         assert!(frozen.try_thaw().is_ok(), "the sends' buffer is back");
         drop(pd);
@@ -950,7 +1113,7 @@ mod tests {
             let (a, b) = connected_pair(&mut w, 8, 1);
             let buf = pd.alloc::<u8>(64).unwrap();
             let ptr = buf.as_ptr() as usize;
-            w.post_recv(a, buf.into_part(), false).unwrap();
+            w.post_recv(a, buf.into_part(), ()).unwrap();
             model.halt(true);
             assert_eq!(w.remove_qp(a), Err(Error::NotFlushed));
             assert_eq!(w.reserved(), 32, "its share of the CQ stays taken");
@@ -968,39 +1131,50 @@ mod tests {
     }
 
     /// A refused doorbell drops the requests written before it: one
-    /// without an owner is reported as a flush error, one with an owner
-    /// retires with it (and `poll` hands it out), and numbers are not
-    /// reused.
+    /// without an owner is reported as refused, one with an owner retires
+    /// as refused too (and `poll` hands it out), and numbers are not reused.
     #[test]
     fn refused_doorbell_retires_staged_requests() {
         let pd = Context::new(Model::new(7)).alloc_pd().unwrap();
-        let mut w = Worker::new(&pd, 64).unwrap();
+        let mut w: Worker<u32, _> = Worker::new(&pd, 64).unwrap();
         // Not connected: the worker refuses the doorbell, as a device would.
         let qp = w.create_qp::<RC>(caps(8), 4).unwrap();
         let buf = pd.alloc::<u8>(64).unwrap().freeze();
         let mut req = w.request(qp);
         req.push(WrOp::Send, buf.clone().into_part()).unwrap();
-        assert_eq!(req.finish(false, true), Some(0));
+        assert_eq!(req.finish_detached(false), Some(0));
         let mut req = w.request(qp);
         req.push(WrOp::Send, buf.clone().into_part()).unwrap();
-        let owned = req.finish(true, false).unwrap();
+        let owned = req.finish(true, 11).unwrap();
         let mut req = w.request(qp);
         req.push(WrOp::Send, buf.into_part()).unwrap();
-        let (error, leases) = req.submit(true).unwrap().unwrap_err();
-        assert_eq!(error, Error::NotConnected);
-        assert_eq!(leases.len(), 1);
+        let refused = req.submit(true, 22).unwrap_err();
+        assert_eq!(refused.error, Error::NotConnected);
+        assert_eq!(refused.ctx, 22);
+        assert_eq!(refused.leases.len(), 1);
         assert_eq!(w.send_ring(qp).posted(), 3);
         assert_eq!(w.send_ring(qp).in_flight_wqes(), 0);
-        let wc = w
-            .take_send_error(qp)
-            .expect("the dropped request is reported");
-        assert_eq!(wc.status, Status::WR_FLUSH_ERR);
+        assert_eq!(
+            w.take_send_error(qp),
+            Some(DetachedError {
+                seq: 0,
+                error: CompletionError::Refused
+            }),
+            "the dropped request is reported"
+        );
         assert!(w.take_send_error(qp).is_none());
         let mut got = Vec::new();
-        w.poll(|_, c| got.push((c.qp, c.queue, c.seq, c.wc.status, c.leases.len())));
+        w.poll(|_, c| got.push((c.qp, c.queue, c.seq, c.ctx, c.result, c.leases.len())));
         assert_eq!(
             got,
-            [(qp.index(), Queue::Send, owned, Status::WR_FLUSH_ERR, 1)]
+            [(
+                qp.index(),
+                Queue::Send,
+                owned,
+                11,
+                Err(CompletionError::Refused),
+                1
+            )]
         );
     }
 }

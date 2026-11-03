@@ -2044,7 +2044,7 @@ pub proof fn example_mixed_resources() {
     assert(a2.nic_writes(128));
     let wc = Wc {
         wr_id: 1, status: crate::wc::Status::WR_FLUSH_ERR, opcode: crate::wc::Opcode::SEND,
-        byte_len: 0, imm: None, vendor_err: 0, qp_num: 7,
+        byte_len: 0, imm: None, vendor_err: 0,
     };
     lemma_complete_one(waiting, a2, 7, posted_ids, dirs, 0, wc);
     let done = complete_state(a2, r, wc.outcome());
@@ -2129,7 +2129,7 @@ pub proof fn example_indexed_shared_resources() {
 
     let wc = Wc {
         wr_id: 1, status: crate::wc::Status::SUCCESS, opcode: crate::wc::Opcode::SEND,
-        byte_len: 0, imm: None, vendor_err: 0, qp_num: 7,
+        byte_len: 0, imm: None, vendor_err: 0,
     };
     lemma_complete_one(in_flight, a1, 7, ids, dirs, 0, wc);
     let a2 = complete_state(a1, ids[0], wc.outcome());

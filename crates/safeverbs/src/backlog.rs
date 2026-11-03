@@ -75,7 +75,7 @@ impl<N: Nic> Backlog<N> {
     }
 
     /// Posts waiting work in order while it fits.
-    pub(crate) fn drain<T: Transport>(&mut self, w: &mut Worker<N>, qp: QpKey<T>) {
+    pub(crate) fn drain<T: Transport>(&mut self, w: &mut Worker<(), N>, qp: QpKey<T>) {
         let mut i = 0;
         while i < self.entries.len() {
             if self.entries[i].work.is_some() {
@@ -138,7 +138,7 @@ impl<N: Nic> Backlog<N> {
 /// room in the queue and for a free slot: when every slot holds a result
 /// that its future has not taken yet, it waits for those futures to be
 /// polled.
-pub(crate) fn fits<T: Transport, N: Nic>(w: &Worker<N>, qp: QpKey<T>, work: &Work<N>) -> bool {
+pub(crate) fn fits<T: Transport, N: Nic>(w: &Worker<(), N>, qp: QpKey<T>, work: &Work<N>) -> bool {
     match work {
         Work::One(..) | Work::Gather(..) => w.send_ring(qp).can_post(),
         Work::Batch(ops) => {
@@ -152,7 +152,7 @@ pub(crate) fn fits<T: Transport, N: Nic>(w: &Worker<N>, qp: QpKey<T>, work: &Wor
 
 /// Posts `work` now on QP `qp` of `w` (and rings the doorbell).
 pub(crate) fn post<T: Transport, N: Nic>(
-    w: &mut Worker<N>,
+    w: &mut Worker<(), N>,
     qp: QpKey<T>,
     work: Work<N>,
 ) -> Posted<N> {
@@ -162,14 +162,14 @@ pub(crate) fn post<T: Transport, N: Nic>(
             if let Err(e) = req.push(op, part) {
                 return Err((e.error, Leases::from(e.buf)));
             }
-            req.submit(true).expect("a WQE was added")
+            req.submit(true, ()).map_err(|e| (e.error, e.leases))
         }
         Work::Gather(op, parts) => {
             let mut req = w.request(qp);
             if let Err(e) = req.push_gather(op, parts.into_iter().flatten()) {
                 return Err((e, Leases::default()));
             }
-            req.submit(true).expect("a WQE was added")
+            req.submit(true, ()).map_err(|e| (e.error, e.leases))
         }
         Work::Batch(ops) => {
             let mut req = w.request(qp);
@@ -188,13 +188,12 @@ pub(crate) fn post<T: Transport, N: Nic>(
                     let _ = req.submit_detached();
                     Err((error, Leases::default()))
                 }
-                None => req
-                    .submit(true)
-                    .unwrap_or(Err((Error::Invalid("an empty batch"), Leases::default()))),
+                None if req.is_empty() => {
+                    Err((Error::Invalid("an empty batch"), Leases::default()))
+                }
+                None => req.submit(true, ()).map_err(|e| (e.error, e.leases)),
             }
         }
-        Work::Recv(part) => w
-            .post_recv(qp, part, false)
-            .map_err(|e| (e.error, Leases::from(e.buf))),
+        Work::Recv(part) => w.post_recv(qp, part, ()).map_err(|e| (e.error, e.leases)),
     }
 }

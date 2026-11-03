@@ -5,7 +5,7 @@ use super::*;
 
 verus! {
 
-impl<N: Device> HwQp<N> {
+impl<C, N: Device> HwQp<C, N> {
     /// The entry keeps its name in M and the configuration its typed key relies on
     /// ([`Hw::same_table`]).
     pub(super) open spec fn same_config(&self, pre: Self) -> bool {
@@ -192,6 +192,9 @@ impl<N: Device> HwQp<N> {
                     reveal(retires);
                 }
                 send_outcomes::lemma_results_framed(en.send, before, after, q);
+                // M allows a receive a message or a notification with immediate data.
+                assert(qp.rq[e.seq - qp.rq_head].outcome == Some(e.outcome));
+                assert(qp.rq[e.seq - qp.rq_head].wr.allows_outcome(e.outcome));
                 outcomes::lemma_recv_completed(e0.recv, en.recv, before, after, q, e.seq as u64, *wc);
             }
             assert(self.ok(i as u16, after, sh, t.pd(), t.started(q), t.written(q)));

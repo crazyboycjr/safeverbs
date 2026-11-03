@@ -13,8 +13,8 @@ use futures::executor::block_on;
 use futures::task::noop_waker;
 use futures::{SinkExt, StreamExt};
 use safeverbs::{
-    Buf, BufMut, Context, Error, LocalQp, LocalWorker, Model, Opcode, Pd, QueuePairBuilder, RC,
-    Status, Transport, UC, WriteOp,
+    Buf, BufMut, CompletionError, Context, Error, LocalQp, LocalWorker, Model, Pd,
+    QueuePairBuilder, RC, Received, Status, Transport, UC, WriteOp,
 };
 
 type Qp<T> = LocalQp<T, Model>;
@@ -103,14 +103,23 @@ fn send_recv_and_send_with_imm() {
         let r2 = b.recv(pd.alloc::<u8>(256).unwrap());
         a.send(src.clone()).await.unwrap();
         a.send_imm(src.slice(..100), 0xdead_beef).await.unwrap();
-        let (wc, got) = r1.await.unwrap();
+        let (received, got) = r1.await.unwrap();
         assert_eq!(
-            (wc.opcode(), wc.byte_len(), wc.imm()),
-            (Some(Opcode::RECV), Some(256), None)
+            received,
+            Received::Message {
+                len: 256,
+                imm: None
+            }
         );
         assert_eq!(&got[..], &src[..]);
-        let (wc, got) = r2.await.unwrap();
-        assert_eq!((wc.byte_len(), wc.imm()), (Some(100), Some(0xdead_beef)));
+        let (received, got) = r2.await.unwrap();
+        assert_eq!(
+            received,
+            Received::Message {
+                len: 100,
+                imm: Some(0xdead_beef)
+            }
+        );
         assert_eq!(&got[..100], &src[..100]);
     });
 }
@@ -130,11 +139,8 @@ fn write_write_imm_and_read() {
         a.write_imm(src.slice(..16), dst.remote().offset(1000), 7)
             .await
             .unwrap();
-        let (wc, _) = recv.await.unwrap();
-        assert_eq!(
-            (wc.opcode(), wc.byte_len(), wc.imm()),
-            (Some(Opcode::RECV_RDMA_WITH_IMM), Some(16), Some(7))
-        );
+        let (received, _) = recv.await.unwrap();
+        assert_eq!(received, Received::WriteNotification { imm: 7, len: 16 });
 
         let into = a
             .read(pd.alloc::<u8>(512).unwrap(), dst.remote().slice(100..612))
@@ -156,19 +162,18 @@ fn write_notification_does_not_fill_receive_buffer() {
         let mut rq = pd.alloc::<u8>(8).unwrap();
         rq.fill(0x5a);
         let recv = b.recv(rq);
-        let sent = a
+        let () = a
             .write_imm(src.clone(), dst.remote(), 0xfedc_ba98)
             .await
             .unwrap();
-        assert_eq!(sent.opcode(), Some(Opcode::RDMA_WRITE));
-        assert_eq!(sent.byte_len(), None);
-        assert_eq!(sent.received_len(), None);
-        assert_eq!(sent.imm(), None);
-        let (wc, rq) = recv.await.unwrap();
-        assert_eq!(wc.opcode(), Some(Opcode::RECV_RDMA_WITH_IMM));
-        assert_eq!(wc.byte_len(), Some(src.len() as u32));
-        assert_eq!(wc.received_len(), None);
-        assert_eq!(wc.imm(), Some(0xfedc_ba98));
+        let (received, rq) = recv.await.unwrap();
+        assert_eq!(
+            received,
+            Received::WriteNotification {
+                imm: 0xfedc_ba98,
+                len: src.len() as u32
+            }
+        );
         assert_eq!(&rq[..], &[0x5a; 8]);
         assert_eq!(&dst.reclaim()[..], &src[..]);
     });
@@ -212,7 +217,7 @@ fn batch_is_one_request() {
         let dst = pd.alloc::<u8>(128 * 64).unwrap().expose().unwrap();
         let src = filled(&pd, 64, 5);
         let posted = a.with(|w, qp| w.send_ring(qp).posted());
-        let wc = a
+        let () = a
             .batch(|b| {
                 for i in 0..128 {
                     b.write(src.slice(..), dst.remote().offset(i * 64));
@@ -220,8 +225,6 @@ fn batch_is_one_request() {
             })
             .await
             .unwrap();
-        assert_eq!(wc.opcode(), Some(Opcode::RDMA_WRITE));
-        assert_eq!(wc.byte_len(), None);
         assert_eq!(
             a.with(|w, qp| w.send_ring(qp).posted()) - posted,
             1,
@@ -294,13 +297,20 @@ fn repeated_sends_of_one_frozen_buffer_and_its_parts() {
             s.await.unwrap();
         }
         for (i, r) in recvs.into_iter().enumerate() {
-            let (wc, got) = r.await.unwrap();
+            let (received, got) = r.await.unwrap();
             let want: &[u8] = match i % 3 {
                 0 => &src[..],
                 1 => &src[4096..],
                 _ => &src[i..i + 10],
             };
-            assert_eq!(&got[..wc.received_len().unwrap() as usize], want);
+            assert_eq!(
+                received,
+                Received::Message {
+                    len: want.len() as u32,
+                    imm: None
+                }
+            );
+            assert_eq!(&got[..want.len()], want);
         }
         assert!(src.try_thaw().is_ok(), "every lease released");
     });
@@ -371,8 +381,8 @@ fn errors_hand_buffers_back() {
     b.force_error().unwrap();
     let got: Vec<_> = block_on(rx.by_ref().collect());
     assert_eq!(got.len(), 4);
-    for (wc, buf) in got {
-        assert_eq!(wc.status, Status::WR_FLUSH_ERR);
+    for (result, buf) in got {
+        assert_eq!(result.unwrap_err().status(), Some(Status::WR_FLUSH_ERR));
         let e = rx.repost(buf).unwrap_err();
         assert_eq!(e.error, Error::QpFailed);
     }
@@ -388,7 +398,14 @@ fn errors_hand_buffers_back() {
         }
     }))
     .unwrap_err();
-    assert_eq!(e.status(), Some(Status::REM_OP_ERR));
+    assert_eq!(
+        e,
+        Error::Completion(CompletionError::Failed {
+            status: Status::REM_OP_ERR,
+            vendor_err: 0,
+            position: 0
+        })
+    );
     assert!(src.try_thaw().is_ok());
     drop(m);
 }
@@ -415,14 +432,81 @@ fn sink_and_stream() {
         drop(tx);
         let mut imms = Vec::new();
         while imms.len() < 10 {
-            let (wc, buf) = rx.next().await.unwrap();
-            assert!(wc.is_ok());
-            imms.push(wc.imm().unwrap());
+            let (received, buf) = rx.next().await.unwrap();
+            let Ok(Received::WriteNotification { imm, len: 64 }) = received else {
+                panic!("{received:?}");
+            };
+            imms.push(imm);
             rx.repost(buf).unwrap();
         }
         assert_eq!(imms, (0..10).map(|i| i * 100 + 99).collect::<Vec<_>>());
         // Far fewer completions than writes.
         assert!(src.try_thaw().is_ok());
+    });
+}
+
+/// A sink's error says which item failed, counting the items sent through this sink only:
+/// a request of another future between them takes a number but is no item.
+#[test]
+fn a_sink_error_names_its_item() {
+    let (_m, pd, a, _b) = pair::<RC>(1201, 32);
+    block_on(async {
+        let dst = pd.alloc::<u8>(64).unwrap().expose().unwrap();
+        let src = filled(&pd, 8, 1);
+        let mut bad = dst.remote();
+        bad.rkey ^= 0x55aa;
+        let mut tx = a.sink();
+        for _ in 0..3 {
+            tx.feed(WriteOp::new(src.clone(), dst.remote()))
+                .await
+                .unwrap();
+        }
+        // The sink holds its last item back: only then does this go between them.
+        tx.feed(WriteOp::new(src.clone(), dst.remote()))
+            .await
+            .unwrap();
+        drop(a.write(src.clone(), dst.remote()));
+        tx.feed(WriteOp::new(src.clone(), dst.remote()))
+            .await
+            .unwrap();
+        // Item 5 fails, those after it flush.
+        tx.feed(WriteOp::new(src.clone(), bad)).await.unwrap();
+        tx.feed(WriteOp::new(src.clone(), dst.remote()))
+            .await
+            .unwrap();
+        let error = tx.close().await.unwrap_err();
+        assert_eq!(
+            error,
+            Error::SinkItem {
+                item: 5,
+                error: CompletionError::Failed {
+                    status: Status::REM_ACCESS_ERR,
+                    vendor_err: 0,
+                    position: 0
+                }
+            }
+        );
+        assert_eq!(error.status(), Some(Status::REM_ACCESS_ERR));
+    });
+}
+
+/// Another request's failure reaches a sink too, as nobody's item.
+#[test]
+fn a_sink_reports_another_requests_error_as_such() {
+    let (_m, pd, a, _b) = pair::<RC>(1202, 32);
+    block_on(async {
+        let dst = pd.alloc::<u8>(64).unwrap().expose().unwrap();
+        let src = filled(&pd, 8, 1);
+        let mut bad = dst.remote();
+        bad.rkey ^= 0x55aa;
+        let mut tx = a.sink();
+        drop(a.write(src.clone(), bad));
+        tx.feed(WriteOp::new(src.clone(), dst.remote()))
+            .await
+            .unwrap();
+        let error = tx.close().await.unwrap_err();
+        assert_eq!(error.status(), Some(Status::REM_ACCESS_ERR));
+        assert!(matches!(error, Error::Completion(_)), "{error:?}");
     });
 }
 
@@ -434,8 +518,8 @@ fn uc_drops_messages_without_a_receive() {
         a.send(src.clone()).await.unwrap();
         let recv = b.recv(pd.alloc::<u8>(32).unwrap());
         a.send(src.clone()).await.unwrap();
-        let (wc, got) = recv.await.unwrap();
-        assert_eq!(wc.received_len(), Some(32));
+        let (received, got) = recv.await.unwrap();
+        assert_eq!(received, Received::Message { len: 32, imm: None });
         assert_eq!(&got[..], &src[..]);
         let dst = pd.alloc::<u8>(32).unwrap().expose().unwrap();
         a.write(src.clone(), dst.remote()).await.unwrap();
@@ -483,8 +567,14 @@ fn ring_buf_streams_messages() {
                 a.poll();
             };
             a.send(msg).await.unwrap();
-            let (wc, buf) = rx.next().await.unwrap();
-            assert_eq!(wc.received_len().unwrap() as usize, len);
+            let (received, buf) = rx.next().await.unwrap();
+            assert_eq!(
+                received,
+                Ok(Received::Message {
+                    len: len as u32,
+                    imm: None
+                })
+            );
             assert!(buf[..len].iter().all(|&x| x == i));
             rx.repost(buf).unwrap();
         }
@@ -615,7 +705,19 @@ fn random_operations_return_every_buffer_once() {
                     let mut i = 0;
                     while i < recvs.len() {
                         match poll_once(&mut recvs[i]) {
-                            Poll::Ready(Ok((_, buf))) => give_back(buf, &mut free, &mut in_hand),
+                            Poll::Ready(Ok((received, buf))) => {
+                                assert!(
+                                    matches!(
+                                        received,
+                                        Received::Message {
+                                            len: ..=256,
+                                            imm: None
+                                        }
+                                    ),
+                                    "seed {seed}: {received:?}"
+                                );
+                                give_back(buf, &mut free, &mut in_hand);
+                            }
                             Poll::Ready(Err(e)) => give_back(e.buf, &mut free, &mut in_hand),
                             Poll::Pending => {
                                 i += 1;
@@ -713,13 +815,18 @@ fn qps_of_one_worker_share_its_cq() {
             .collect();
         let src = filled(&pd, 64, 9);
         for (i, q) in qps.iter().enumerate() {
-            let wc = q.send(src.slice(..1 + i)).await.unwrap();
-            assert_eq!(wc.byte_len(), None);
+            let () = q.send(src.slice(..1 + i)).await.unwrap();
         }
         for (i, r) in recvs.into_iter().enumerate() {
-            let (wc, got) = r.await.unwrap();
+            let (received, got) = r.await.unwrap();
             // QP i receives what its peer (i ^ 1) sent.
-            assert_eq!(wc.received_len().unwrap() as usize, 1 + (i ^ 1));
+            assert_eq!(
+                received,
+                Received::Message {
+                    len: 1 + (i ^ 1) as u32,
+                    imm: None
+                }
+            );
             assert_eq!(&got[..1 + (i ^ 1)], &src[..1 + (i ^ 1)]);
         }
     });
@@ -729,7 +836,10 @@ fn qps_of_one_worker_share_its_cq() {
     assert_eq!(worker.with(|w| w.reserved()), 2 * 2 * 16);
     let recv = qps[1].recv(pd.alloc::<u8>(8).unwrap());
     block_on(qps[0].send(filled(&pd, 8, 1))).unwrap();
-    assert_eq!(block_on(recv).unwrap().0.received_len(), Some(8));
+    assert_eq!(
+        block_on(recv).unwrap().0,
+        Received::Message { len: 8, imm: None }
+    );
     drop(qps);
     assert_eq!(worker.with(|w| w.reserved()), 0);
 }
@@ -842,16 +952,7 @@ fn random_operations_on_qps_of_one_worker() {
                 }
                 _ => {
                     // Poll every future once.
-                    sends.retain_mut(|s| match poll_once(s) {
-                        Poll::Ready(Ok(wc)) => {
-                            assert_eq!(wc.byte_len(), None, "seed {seed}");
-                            assert_eq!(wc.received_len(), None);
-                            assert_eq!(wc.imm(), None);
-                            false
-                        }
-                        Poll::Ready(Err(_)) => false,
-                        Poll::Pending => true,
-                    });
+                    sends.retain_mut(|s| poll_once(s).is_pending());
                     let mut i = 0;
                     while i < reads.len() {
                         let ptr = reads[i].1;

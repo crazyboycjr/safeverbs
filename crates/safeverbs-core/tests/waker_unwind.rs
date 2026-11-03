@@ -2,7 +2,10 @@
 
 #![forbid(unsafe_code)]
 use safeverbs_core::model::Model;
-use safeverbs_core::{Access, ConnectAttr, Context, Pd, QpCaps, QpKey, RC, Status, Worker, WrOp};
+use safeverbs_core::{
+    Access, CompletionError, ConnectAttr, Context, Pd, QpCaps, QpKey, RC, Received, Status, Worker,
+    WrOp,
+};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,7 +31,10 @@ fn waker(calls: &Arc<AtomicUsize>, panic: Option<&'static str>) -> Waker {
     }))
 }
 
-fn pair(seed: u64) -> (Model, Pd<Model>, Worker<Model>, QpKey<RC>, QpKey<RC>) {
+/// A model, its protection domain, and a worker with two QPs connected to each other.
+type Pair = (Model, Pd<Model>, Worker<(), Model>, QpKey<RC>, QpKey<RC>);
+
+fn pair(seed: u64) -> Pair {
     let model = Model::new(seed);
     model.set_pace(0, 64);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
@@ -76,14 +82,14 @@ fn caught_waker_panic_preserves_other_hardware_outcomes() {
     request
         .push(WrOp::Write(target.remote()), source.clone().into_part())
         .unwrap();
-    let first = request.finish(true, false).unwrap();
+    let first = request.finish(true, ()).unwrap();
     let mut invalid = target.remote();
     invalid.rkey ^= 0x40000000;
     let mut request = worker.request(local);
     request
         .push(WrOp::Write(invalid), source.clone().into_part())
         .unwrap();
-    let second = request.finish(true, false).unwrap();
+    let second = request.finish(true, ()).unwrap();
     worker.commit(local).unwrap();
     assert_eq!(model.run(), 2);
     let calls = Arc::new(AtomicUsize::new(0));
@@ -95,20 +101,23 @@ fn caught_waker_panic_preserves_other_hardware_outcomes() {
         2,
         "later notifications still run"
     );
-    assert!(worker.take_send(local, first).unwrap().0.is_ok());
+    assert!(worker.take_send(local, first).unwrap().result.is_ok());
     let mut request = worker.request(local);
     request
         .push(WrOp::Write(target.remote()), source.into_part())
         .unwrap();
-    let third = request.submit(true).unwrap().unwrap();
+    let third = request.submit(true, ()).unwrap();
     assert_eq!(model.run(), 1);
     worker.progress();
-    let second_result = worker.take_send(local, second).unwrap().0;
-    let third_result = worker.take_send(local, third).unwrap().0;
-    assert_eq!(third_result.status, Status::WR_FLUSH_ERR);
+    let second_result = worker.take_send(local, second).unwrap().result;
+    let third_result = worker.take_send(local, third).unwrap().result;
     assert_eq!(
-        second_result.status,
-        Status::REM_ACCESS_ERR,
+        third_result.unwrap_err().status(),
+        Some(Status::WR_FLUSH_ERR)
+    );
+    assert_eq!(
+        second_result.unwrap_err().status(),
+        Some(Status::REM_ACCESS_ERR),
         "caught user panic must not turn a consumed error CQE into inferred success"
     );
 }
@@ -127,7 +136,7 @@ fn one_cqe_finishes_every_inferred_request_before_resuming_panic() {
         request
             .push(WrOp::Write(target.remote()), source.clone().into_part())
             .unwrap();
-        let seq = request.finish(i == 2, false).unwrap();
+        let seq = request.finish(i == 2, ()).unwrap();
         seqs.push(seq);
         worker.set_send_waker(
             local,
@@ -148,9 +157,7 @@ fn one_cqe_finishes_every_inferred_request_before_resuming_panic() {
     assert_eq!(panic.downcast_ref::<&str>(), Some(&"first wake panic"));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     for seq in seqs {
-        let (wc, leases) = worker.take_send(local, seq).unwrap();
-        assert!(wc.is_ok());
-        drop(leases);
+        assert!(worker.take_send(local, seq).unwrap().result.is_ok());
         assert!(worker.take_send(local, seq).is_none());
     }
     assert_eq!(worker.send_ring(local).in_flight_wqes(), 0);
@@ -172,7 +179,7 @@ fn refused_doorbell_notifies_all_owners_and_keeps_sequence_numbers() {
         request
             .push(WrOp::Write(target.remote()), source.clone().into_part())
             .unwrap();
-        let seq = request.finish(true, false).unwrap();
+        let seq = request.finish(true, ()).unwrap();
         seqs.push(seq);
         worker.set_send_waker(
             local,
@@ -191,20 +198,20 @@ fn refused_doorbell_notifies_all_owners_and_keeps_sequence_numbers() {
     assert!(catch_unwind(AssertUnwindSafe(|| worker.commit(local))).is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     for &seq in &seqs {
-        let (wc, leases) = worker.take_send(local, seq).unwrap();
-        assert_eq!(wc.status, Status::WR_FLUSH_ERR);
-        drop(leases);
+        let done = worker.take_send(local, seq).unwrap();
+        assert_eq!(done.result, Err(CompletionError::Refused));
+        drop(done);
         assert!(worker.take_send(local, seq).is_none());
     }
     let mut request = worker.request(local);
     request
         .push(WrOp::Write(target.remote()), source.clone().into_part())
         .unwrap();
-    let next = request.submit(true).unwrap().unwrap();
+    let next = request.submit(true, ()).unwrap();
     assert!(next > seqs[1]);
     assert_eq!(model.run(), 1);
     worker.progress();
-    assert!(worker.take_send(local, next).unwrap().0.is_ok());
+    assert!(worker.take_send(local, next).unwrap().result.is_ok());
     assert!(source.try_thaw().is_ok());
     drop(worker);
     drop(target.try_reclaim().unwrap());
@@ -215,10 +222,10 @@ fn refused_doorbell_notifies_all_owners_and_keeps_sequence_numbers() {
 fn receive_wake_panic_preserves_other_qps_on_the_shared_cq() {
     let (model, pd, mut worker, local, peer) = pair(114);
     let recv_local = worker
-        .post_recv(local, pd.alloc::<u8>(1).unwrap().into_part(), false)
+        .post_recv(local, pd.alloc::<u8>(1).unwrap().into_part(), ())
         .unwrap();
     let recv_peer = worker
-        .post_recv(peer, pd.alloc::<u8>(1).unwrap().into_part(), false)
+        .post_recv(peer, pd.alloc::<u8>(1).unwrap().into_part(), ())
         .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     worker.set_recv_waker(
@@ -235,19 +242,24 @@ fn receive_wake_panic_preserves_other_qps_on_the_shared_cq() {
         request
             .push(WrOp::Send, source.freeze().into_part())
             .unwrap();
-        seqs.push((qp, request.submit(true).unwrap().unwrap()));
+        seqs.push((qp, request.submit(true, ()).unwrap()));
     }
     model.run();
     assert!(catch_unwind(AssertUnwindSafe(|| worker.progress())).is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     for (qp, seq) in seqs {
-        assert!(worker.take_send(qp, seq).unwrap().0.is_ok());
+        assert!(worker.take_send(qp, seq).unwrap().result.is_ok());
     }
     for (qp, seq, byte) in [(local, recv_local, 0x5a), (peer, recv_peer, 0xa5)] {
-        let (wc, leases) = worker.take_recv(qp, seq).unwrap();
-        assert!(wc.is_ok());
-        assert_eq!(wc.received_len(), Some(1));
-        let buf = leases.into_buf_mut::<u8>().unwrap();
+        let done = worker.take_recv(qp, seq).unwrap();
+        assert_eq!(
+            done.result,
+            Ok(safeverbs_core::Completed::Received(Received::Message {
+                len: 1,
+                imm: None
+            }))
+        );
+        let buf = done.leases.into_buf_mut::<u8>().unwrap();
         assert_eq!(&*buf, &[byte]);
         assert!(worker.take_recv(qp, seq).is_none());
     }

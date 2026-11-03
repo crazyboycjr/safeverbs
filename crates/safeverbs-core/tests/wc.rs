@@ -1,11 +1,13 @@
-//! WRITE_WITH_IMM consumes an RQ credit without putting data in its SGEs.
+//! WRITE_WITH_IMM consumes an RQ credit without putting data in its SGEs: the receive
+//! reports a notification with the WRITE's length, whatever its own buffer holds.
 
 use std::time::{Duration, Instant};
 
 use safeverbs_core::model::Model;
 use safeverbs_core::nic::{NicCq, NicQp, QpType, Sge};
 use safeverbs_core::{
-    Access, ConnectAttr, Context, Endpoint, Nic, Opcode, QpCaps, RemoteBuf, Wc, WrOp,
+    Access, Completed, ConnectAttr, Context, Endpoint, Nic, Pd, QpCaps, QpKey, RC, Received,
+    RemoteBuf, Wc, Worker, WrOp,
 };
 
 /// Uses a genuine zero-SGE receive; the public buffer API posts one SGE.
@@ -107,7 +109,7 @@ fn zero_sge_notification<N: Nic>(ctx: Context<N>) {
     let mut completions = Vec::new();
     let start = Instant::now();
     while completions.len() < 2 {
-        let mut out = [Wc::success(Opcode::SEND, 0); 2];
+        let mut out = [Wc::default(); 2];
         let n = cq.poll(&mut out);
         completions.extend_from_slice(&out[..n]);
         if start.elapsed() >= Duration::from_secs(10) && completions.len() < 2 {
@@ -117,18 +119,159 @@ fn zero_sge_notification<N: Nic>(ctx: Context<N>) {
             panic!("timed out waiting for the zero-SGE WRITE_WITH_IMM");
         }
     }
-    let sent = completions.iter().find(|wc| wc.wr_id == 1).unwrap();
-    let recv = completions.iter().find(|wc| wc.wr_id == 2).unwrap();
-    assert!(sent.is_ok(), "{sent:?}");
-    assert!(recv.is_ok(), "{recv:?}");
-    assert_eq!(sent.opcode(), Some(Opcode::RDMA_WRITE));
-    assert_eq!(sent.byte_len(), None);
-    assert_eq!(sent.imm(), None);
-    assert_eq!(recv.opcode(), Some(Opcode::RECV_RDMA_WITH_IMM));
-    assert_eq!(recv.byte_len(), Some(LEN as u32));
-    assert_eq!(recv.received_len(), None);
-    assert_eq!(recv.imm(), Some(0xfedc_ba98));
+    // Which is which is in the typed results alone: their ids stay inside the core.
+    let results: Vec<_> = completions.iter().map(Wc::result).collect();
+    assert!(results.contains(&Ok(Completed::Sent)), "{results:?}");
+    assert!(
+        results.contains(&Ok(Completed::Received(Received::WriteNotification {
+            imm: 0xfedc_ba98,
+            len: LEN as u32,
+        }))),
+        "{results:?}"
+    );
     assert_eq!(src, dst);
+}
+
+/// The attributes that connect a QP of `ctx`.
+fn attr<N: Nic>(ctx: &Context<N>) -> ConnectAttr {
+    let port = ctx.port(1).unwrap();
+    ConnectAttr {
+        port: 1,
+        access: Access::LOCAL_WRITE | Access::REMOTE_WRITE,
+        path_mtu: port.active_mtu,
+        rq_psn: 0,
+        sq_psn: 0,
+        gid_index: if port.ethernet {
+            std::env::var("SAFEVERBS_TEST_GID_INDEX")
+                .ok()
+                .map(|i| i.parse().expect("SAFEVERBS_TEST_GID_INDEX"))
+                .or(ctx.default_gid_index(1).unwrap())
+        } else {
+            None
+        },
+        traffic_class: 0,
+        timeout: 14,
+        retry_count: 7,
+        rnr_retry: 7,
+        min_rnr_timer: 12,
+        max_rd_atomic: 1,
+        max_dest_rd_atomic: 1,
+    }
+}
+
+/// A worker on `ctx` with two RC QPs connected to each other.
+fn pair<N: Nic>(ctx: &Context<N>) -> (Pd<N>, Worker<u32, N>, QpKey<RC>, QpKey<RC>) {
+    let pd = ctx.alloc_pd().unwrap();
+    let caps = QpCaps {
+        max_send_wr: 8,
+        max_recv_wr: 8,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: 0,
+    };
+    let mut worker = Worker::new(&pd, 32).unwrap();
+    let a = worker.create_qp::<RC>(caps, 1).unwrap();
+    let b = worker.create_qp::<RC>(caps, 1).unwrap();
+    let attr = attr(ctx);
+    let (ea, eb) = (
+        worker.endpoint(a, 1, attr.gid_index).unwrap(),
+        worker.endpoint(b, 1, attr.gid_index).unwrap(),
+    );
+    worker.connect(a, &attr, &eb).unwrap();
+    worker.connect(b, &attr, &ea).unwrap();
+    (pd, worker, a, b)
+}
+
+/// Every kind of receive, through the worker: a message, one with immediate data, an empty
+/// one (a message of no bytes, still), and notifications, into a buffer too small for the
+/// WRITE and into a buffer of no bytes, which is all a notification needs.
+fn every_kind_of_receive<N: Nic>(ctx: Context<N>) {
+    let (pd, mut worker, a, b) = pair(&ctx);
+    let mut small = pd.alloc::<u8>(8).unwrap();
+    small.fill(0x5a);
+    let (no_bytes, _) = pd.alloc::<u8>(8).unwrap().split_at(0);
+    let dst = pd.alloc::<u8>(4096).unwrap().expose().unwrap();
+    let mut src = pd.alloc::<u8>(4096).unwrap();
+    src.fill(0xa5);
+    let src = src.freeze();
+    worker.recv(b, pd.alloc::<u8>(64).unwrap(), 0).unwrap();
+    worker.recv(b, pd.alloc::<u8>(64).unwrap(), 1).unwrap();
+    worker.recv(b, pd.alloc::<u8>(64).unwrap(), 2).unwrap();
+    worker.recv(b, small, 3).unwrap();
+    worker.recv(b, no_bytes, 4).unwrap();
+    worker.send(a, src.slice(..16), 10).unwrap();
+    worker.send_imm(a, src.slice(..32), 77, 11).unwrap();
+    worker.send(a, src.slice(..0), 12).unwrap();
+    worker
+        .write_imm(a, src.slice(..), dst.remote(), 88, 13)
+        .unwrap();
+    worker
+        .write_imm(a, src.slice(..100), dst.remote(), 99, 14)
+        .unwrap();
+    let mut got = Vec::new();
+    let start = Instant::now();
+    while got.len() < 10 {
+        worker.poll(|_, c| got.push((c.ctx, c.result, c.leases)));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out with {} completions",
+            got.len()
+        );
+    }
+    got.sort_by_key(|g| g.0);
+    let message = |len, imm| Ok(Completed::Received(Received::Message { len, imm }));
+    let notification = |imm, len| {
+        Ok(Completed::Received(Received::WriteNotification {
+            imm,
+            len,
+        }))
+    };
+    let results: Vec<_> = got.iter().map(|g| (g.0, g.1)).collect();
+    assert_eq!(
+        results,
+        [
+            (0, message(16, None)),
+            (1, message(32, Some(77))),
+            (2, message(0, None)),
+            (3, notification(88, 4096)),
+            (4, notification(99, 100)),
+            (10, Ok(Completed::Sent)),
+            (11, Ok(Completed::Sent)),
+            (12, Ok(Completed::Sent)),
+            (13, Ok(Completed::Sent)),
+            (14, Ok(Completed::Sent)),
+        ]
+    );
+    let mut got = got.into_iter();
+    let buf = got.next().unwrap().2.into_buf_mut::<u8>().unwrap();
+    assert_eq!(&buf[..16], &src[..16]);
+    let buf = got.nth(2).unwrap().2.into_buf_mut::<u8>().unwrap();
+    assert_eq!(
+        &buf[..],
+        &[0x5a; 8],
+        "a notification leaves its buffer alone"
+    );
+    assert_eq!(got.next().unwrap().2.into_buf_mut::<u8>().unwrap().len(), 0);
+    drop(worker);
+    assert_eq!(&dst.reclaim()[..], &src[..]);
+}
+
+#[test]
+fn every_kind_of_receive_model() {
+    every_kind_of_receive(Context::new(Model::new(43)));
+}
+
+#[test]
+fn every_kind_of_receive_rxe() {
+    let names = safeverbs_core::verbs::devices().unwrap();
+    let name = std::env::var("SAFEVERBS_TEST_DEVICE")
+        .ok()
+        .or_else(|| names.into_iter().find(|n| n.contains("rxe")));
+    let Some(name) = name else {
+        eprintln!("no rxe device: skipped");
+        return;
+    };
+    every_kind_of_receive(Context::open(Some(&name)).unwrap());
 }
 
 #[test]

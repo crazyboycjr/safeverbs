@@ -37,7 +37,7 @@ fn run_loop<T: Transport>(
     dst: &mut Option<RemoteBuf>,
 ) -> anyhow::Result<f64> {
     let args = get_args();
-    let mut w = Worker::new(pd, cq_size(args.qps, args.tx_depth))?;
+    let mut w: Worker = Worker::new(pd, cq_size(args.qps, args.tx_depth))?;
     let b = builder::<T, _>(pd);
     let mut qps = Vec::new();
     let mut mine = Vec::new();
@@ -64,7 +64,7 @@ fn run_loop<T: Transport>(
     while completed < total {
         // Dispatch: every WRITE that retired comes back with its buffer.
         w.poll(|_, c| {
-            assert!(c.wc.is_ok(), "a WRITE failed: {:?}", c.wc);
+            assert!(c.result.is_ok(), "a WRITE failed: {:?}", c.result);
             completed += 1;
             if completed == args.warmup {
                 start = Instant::now();
@@ -80,7 +80,7 @@ fn run_loop<T: Transport>(
                     .map_err(|e| e.error)?;
                 posted[i] += 1;
                 let signal = posted[i] % cq_mod == 0 || posted[i] == mine;
-                req.finish(signal, false);
+                req.finish(signal, ()).expect("a WQE was added");
                 n += 1;
             }
             if n > 0 {

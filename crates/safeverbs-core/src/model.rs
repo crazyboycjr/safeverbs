@@ -101,9 +101,10 @@ struct CqRec {
     entries: VecDeque<Cqe>,
 }
 
-/// A completion waiting in a CQ, with the queue it completes.
+/// A completion waiting in a CQ, with the QP and the queue it completes.
 struct Cqe {
     wc: Wc,
+    qp: u32,
     recv: bool,
 }
 
@@ -239,19 +240,19 @@ impl Fabric {
         id
     }
 
-    /// Queues `wc`, a completion of QP `wc.qp_num`'s receive queue if
-    /// `recv`, else of its send queue.
-    fn push_cqe(&mut self, cq: u32, wc: Wc, recv: bool) {
+    /// Queues `wc`, a completion of QP `qp`'s receive queue if `recv`, else
+    /// of its send queue.
+    fn push_cqe(&mut self, cq: u32, wc: Wc, qp: u32, recv: bool) {
         if let Some(cq) = self.cqs.get_mut(&cq) {
             assert!(cq.entries.len() < cq.capacity, "model: CQ overrun");
-            cq.entries.push_back(Cqe { wc, recv });
+            cq.entries.push_back(Cqe { wc, qp, recv });
         }
     }
 
     /// Polling `cqe` retires its WQE and, on a send queue, every earlier
     /// one (unsignaled WQEs that succeeded), as M's `poll_cq` does.
     fn retire(&mut self, cqe: &Cqe) {
-        let num = cqe.wc.qp_num;
+        let num = cqe.qp;
         let qp = self
             .qps
             .get_mut(&num)
@@ -365,7 +366,7 @@ impl Fabric {
     fn fail(&mut self, num: u32, cq: u32, wr_id: u64, status: Status, recv: bool) {
         let qp = self.qps.get_mut(&num).expect("model: QP");
         qp.state = QpState::Error;
-        self.push_cqe(cq, error_wc(wr_id, status, num), recv);
+        self.push_cqe(cq, error_wc(wr_id, status), num, recv);
     }
 
     fn process(&mut self, num: u32) {
@@ -376,13 +377,15 @@ impl Fabric {
             if let Some(wqe) = qp.sq.pop_front() {
                 self.push_cqe(
                     send_cq,
-                    error_wc(wqe.wr_id, Status::WR_FLUSH_ERR, num),
+                    error_wc(wqe.wr_id, Status::WR_FLUSH_ERR),
+                    num,
                     false,
                 );
             } else if let Some(wqe) = qp.rq.pop_front() {
                 self.push_cqe(
                     recv_cq,
-                    error_wc(wqe.wr_id, Status::WR_FLUSH_ERR, num),
+                    error_wc(wqe.wr_id, Status::WR_FLUSH_ERR),
+                    num,
                     true,
                 );
             }
@@ -441,7 +444,8 @@ impl Fabric {
                         self.scatter(&recv.sges, &data);
                         self.push_cqe(
                             peer_cq,
-                            recv_wc(recv.wr_id, Opcode::RECV, len, imm, remote),
+                            recv_wc(recv.wr_id, Opcode::RECV, len, imm),
+                            remote,
                             true,
                         );
                         self.done(num, send_cq, &wqe, len);
@@ -502,13 +506,8 @@ impl Fabric {
                     // zero-SGE receive can report this remote write's length.
                     self.push_cqe(
                         peer_cq,
-                        recv_wc(
-                            recv.wr_id,
-                            Opcode::RECV_RDMA_WITH_IMM,
-                            len,
-                            Some(imm),
-                            remote,
-                        ),
+                        recv_wc(recv.wr_id, Opcode::RECV_RDMA_WITH_IMM, len, Some(imm)),
+                        remote,
                         true,
                     );
                 }
@@ -570,8 +569,7 @@ impl Fabric {
             };
             let mut wc = Wc::success(opcode, len as u32);
             wc.wr_id = wqe.wr_id;
-            wc.qp_num = num;
-            self.push_cqe(cq, wc, false);
+            self.push_cqe(cq, wc, num, false);
         }
     }
 
@@ -603,7 +601,7 @@ impl Fabric {
     }
 }
 
-fn error_wc(wr_id: u64, status: Status, qp_num: u32) -> Wc {
+fn error_wc(wr_id: u64, status: Status) -> Wc {
     Wc {
         wr_id,
         status,
@@ -611,15 +609,13 @@ fn error_wc(wr_id: u64, status: Status, qp_num: u32) -> Wc {
         byte_len: 0,
         imm: None,
         vendor_err: 0,
-        qp_num,
     }
 }
 
-fn recv_wc(wr_id: u64, opcode: Opcode, len: usize, imm: Option<u32>, qp_num: u32) -> Wc {
+fn recv_wc(wr_id: u64, opcode: Opcode, len: usize, imm: Option<u32>) -> Wc {
     Wc {
         wr_id,
         imm,
-        qp_num,
         ..Wc::success(opcode, len as u32)
     }
 }

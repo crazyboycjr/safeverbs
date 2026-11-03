@@ -6,15 +6,16 @@
 //! program keeps counters of what it posted, decodes `wr_id`s out of the
 //! CQ, and must itself keep the buffers alive and untouched until then. In
 //! Rust each operation is a future that owns its buffer until it completes
-//! and gives it back; both sides here are plain `async` code, run together
-//! on one thread.
+//! and gives it back; a receive says what it got, with only the fields that
+//! case defines. Both sides here are plain `async` code, run together on one
+//! thread.
 
 #[path = "../common.rs"]
 mod common;
 
 use futures::executor::block_on;
 use futures::future::try_join;
-use safeverbs::{BufMut, Context, LocalQp, Nic, Pd, RC};
+use safeverbs::{BufMut, Context, LocalQp, Nic, Pd, RC, Received};
 
 const ITERS: u32 = 1000;
 const SIZE: usize = 4096;
@@ -36,10 +37,13 @@ async fn side<N: Nic>(
         let frozen = msg.freeze();
         let recv = qp.recv(inbox);
         qp.send(frozen.clone()).await?;
-        let (wc, got) = recv.await?;
+        let (received, got) = recv.await?;
         assert_eq!(
-            wc.received_len().expect("a successful SEND receive") as usize,
-            SIZE
+            received,
+            Received::Message {
+                len: SIZE as u32,
+                imm: None
+            }
         );
         assert_eq!(&got[..4], &round.to_le_bytes());
         assert!(got[4..].iter().all(|&b| b != me), "the peer's message");

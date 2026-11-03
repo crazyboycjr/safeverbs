@@ -36,8 +36,8 @@
 //! `crates/safeverbs-spec` only when committed;
 //! [`Ring::commit`] rings it (all staged requests at once). [`Ring::abort`]
 //! says the device refused the doorbell: every staged request becomes
-//! *Refused*, a result that never reached the NIC, with a flush error for
-//! its owner, or is freed if it has none; sequence numbers are never
+//! *Refused*, a result that never reached the NIC, which [`Taken::refused`]
+//! says to its owner, or is freed if it has none; sequence numbers are never
 //! reused, and the WQE numbers the NIC never saw go to the next requests.
 //! *Retired* and *Refused* requests have their outcome and still hold their
 //! buffer leases until the owner takes them ([`Ring::take`]). A *detached*
@@ -121,8 +121,11 @@ use vstd::prelude::*;
 
 use crate::wc::Wc;
 
+mod payload;
 mod separation;
 pub(crate) mod wake;
+
+pub use payload::Payload;
 
 use wake::WakeBatch;
 
@@ -219,6 +222,33 @@ pub ghost struct RequestMeta {
     pub implied: Wc,
     /// Its first observed error, or its final outcome after retirement.
     pub seen: Option<Wc>,
+}
+
+/// What [`Ring::take`] hands back of a retired or refused request.
+pub struct Taken<L> {
+    /// Its outcome: a flush error if it was refused.
+    pub wc: Wc,
+    /// Its doorbell was refused: the NIC never saw it.
+    pub refused: bool,
+    /// Its first WQE, from which an error's position in it follows.
+    pub first_wqe: u64,
+    /// What it held.
+    pub leases: L,
+}
+
+/// The first error of a request without an owner, until someone takes it.
+#[derive(Clone, Copy)]
+pub struct DetachedRecord {
+    /// The request.
+    pub seq: Seq,
+    /// Its outcome: an error, a flush error if it was refused.
+    pub wc: Wc,
+    /// Its first WQE, from which the error's position in it follows.
+    pub first_wqe: u64,
+    /// One past its last WQE.
+    pub end_wqe: Ghost<u64>,
+    /// Its doorbell was refused: the NIC never saw it.
+    pub refused: bool,
 }
 
 // =============================================================================
@@ -366,7 +396,7 @@ pub struct Ring<L> {
     /// Whether an error completion has retired a request.
     failed: bool,
     /// The first error of a detached request, until someone takes it.
-    detached_error: Option<Wc>,
+    detached_error: Option<DetachedRecord>,
     /// The names of the wakers woken so far, in order (ghost).
     woken: Ghost<vstd::seq::Seq<WakerId>>,
 }
@@ -1000,6 +1030,7 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] ring.staged(s) is None,
             forall|s: int| #[trigger] ring.refused(s) is None,
             ring.woken() == vstd::seq::Seq::<WakerId>::empty(),
+            ring.spec_detached_error() is None,
     {
         assert!(slots >= 1, "a ring needs a slot");
         assert!(max_wqes >= 1 && max_wqes <= depth, "a request needs 1..=depth WQEs");
@@ -1278,12 +1309,56 @@ impl<L> Ring<L> {
     }
 
     /// The detached error waiting to be taken.
-    pub closed spec fn spec_detached_error(&self) -> Option<Wc> {
+    pub closed spec fn spec_detached_error(&self) -> Option<DetachedRecord> {
         self.detached_error
     }
 
+    /// What a refused doorbell does to the detached error: it stays or, if
+    /// there was none, a refused request without an owner has it.
+    pub open spec fn detached_refused(&self, pre: &Self) -> bool {
+        ||| self.spec_detached_error() == pre.spec_detached_error()
+        ||| pre.spec_detached_error() is None && self.spec_detached_error() is Some
+            && self.spec_detached_error()->0.refused
+            && self.spec_detached_error()->0.wc.spec_status() == crate::wc::Status::WR_FLUSH_ERR
+    }
+
+    /// What the completion of WQE `wqe` with `wc` does to the detached error,
+    /// which is `post` after it, having retired requests up to `to`: it stays
+    /// or, if there was none, one of the requests without an owner it retires
+    /// with an error has it.
+    pub open spec fn detached_completed(&self, post: Option<DetachedRecord>, wqe: u64, wc: Wc, to: int) -> bool {
+        ||| post == self.spec_detached_error()
+        ||| self.spec_detached_error() is None && post is Some && {
+            let d = post->0;
+            let s = d.seq as int;
+            &&& self.spec_retired() <= s < to
+            &&& self.req(s) is Some && self.req(s)->0.phase is InFlight && self.req(s)->0.detached
+            &&& d.wc == self.retire_outcome(s, wqe, wc)
+            &&& !d.wc.spec_ok()
+            &&& d.first_wqe == self.meta(s)->0.first
+            &&& d.end_wqe@ == self.meta(s)->0.end
+            &&& !d.refused
+        }
+    }
+
+    /// `t` is what [`Ring::take`] hands back of request `s`: a refused one
+    /// with a flush error, or a complete one with its outcome and its leases.
+    pub open spec fn taken_from(&self, s: int, t: Taken<L>) -> bool {
+        if t.refused {
+            &&& self.req(s) is None
+            &&& self.refused(s) == Some(t.leases)
+            &&& t.wc.spec_status() == crate::wc::Status::WR_FLUSH_ERR
+        } else {
+            &&& self.req(s) == Some(
+                ReqView { phase: Phase::Complete(t.wc.outcome()), waker: None, detached: false, leases: t.leases },
+            )
+            &&& self.meta(s)->0.first == t.first_wqe
+            &&& self.meta(s)->0.seen == Some(t.wc)
+        }
+    }
+
     /// The first error completion of a detached request, once.
-    pub fn take_detached_error(&mut self) -> (error: Option<Wc>)
+    pub fn take_detached_error(&mut self) -> (error: Option<DetachedRecord>)
         requires
             old(self).inv(),
         ensures
@@ -1291,6 +1366,8 @@ impl<L> Ring<L> {
             final(self).same_view(old(self)),
             final(self).same_wqes(old(self)),
             final(self).same_open(old(self)),
+            error == old(self).spec_detached_error(),
+            final(self).spec_detached_error() is None,
     {
         let error = self.detached_error.take();
         proof {
@@ -1334,6 +1411,7 @@ impl<L> Ring<L> {
             seq is None ==> *final(self) == *old(self),
             seq is Some <==> !old(self).spec_is_open() && old(self).spec_has_free_slot(),
             final(self).same_wqes(old(self)),
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         if self.open || !self.has_free_slot() {
             return None;
@@ -1410,6 +1488,7 @@ impl<L> Ring<L> {
             id is Some ==> id->0 == old(self).spec_wqe_posted() && final(self).spec_wqe_posted()
                 == old(self).spec_wqe_posted() + 1,
             id is None ==> final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         if self.wqe_room() == 0 {
             return None;
@@ -1487,24 +1566,28 @@ impl<L> Ring<L> {
                 Some(RequestMeta { first: old(self).spec_closed_end() as u64,
                     end: old(self).spec_wqe_posted(), implied, seen: None })
             } else { old(self).meta(s) },
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         assert!(self.open && self.open_wqes >= 1, "no open request with a WQE");
         let signaled = want_signal || self.must_signal();
         let seq = self.posted;
         let i = self.index(seq);
         let first_wqe = self.wqe_posted - self.open_wqes;
+        let end_wqe = self.wqe_posted;
         let ghost pre = *self;
-        self.slots[i] = Slot {
-            state: State::Staged,
-            seq,
-            first_wqe,
-            end_wqe: self.wqe_posted,
-            detached,
-            implied,
-            outcome: None,
-            leases: Some(leases),
-            waker: None,
-        };
+        proof {
+            // The slot is free: it holds no outcome, leases or waker.
+            reveal(Ring::inv_slots);
+            assert(pre.free_ok(seq as int));
+        }
+        let slot = &mut self.slots[i];
+        slot.state = State::Staged;
+        slot.seq = seq;
+        slot.first_wqe = first_wqe;
+        slot.end_wqe = end_wqe;
+        slot.detached = detached;
+        slot.implied = implied;
+        slot.leases = Some(leases);
         self.posted = seq + 1;
         if signaled {
             self.sig_end = self.wqe_posted;
@@ -1651,6 +1734,7 @@ impl<L> Ring<L> {
             !final(self).spec_is_open(),
             final(self).same_dma(old(self)),
             final(self).same_meta(old(self)),
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         assert!(!self.open, "commit with an open request");
         let ghost pre = *self;
@@ -1660,6 +1744,7 @@ impl<L> Ring<L> {
                 pre.inv(),
                 !pre.open,
                 self.same_counters(&pre),
+                self.detached_error == pre.detached_error,
                 self.slots@.len() == pre.slots@.len(),
                 pre.committed <= seq <= pre.posted,
                 forall|s: int|
@@ -1838,6 +1923,7 @@ impl<L> Ring<L> {
             final(self).keeps_dma(old(self)),
             forall|s: int| #[trigger] final(self).meta(s) ==
                 if old(self).staged(s) is Some { None } else { old(self).meta(s) },
+            final(self).detached_refused(old(self)),
     {
         let mut wakes = WakeBatch::new();
         let result = self.abort_with_wakes(&mut wakes);
@@ -1873,6 +1959,7 @@ impl<L> Ring<L> {
             final(self).keeps_dma(old(self)),
             forall|s: int| #[trigger] final(self).meta(s) ==
                 if old(self).staged(s) is Some { None } else { old(self).meta(s) },
+            final(self).detached_refused(old(self)),
     {
         let dropped = self.posted - self.committed;
         // No request is staged at `posted`: none is handed back.
@@ -1923,6 +2010,7 @@ impl<L> Ring<L> {
             final(self).keeps_dma(old(self)),
             forall|s: int| #[trigger] final(self).meta(s) ==
                 if old(self).staged(s) is Some { None } else { old(self).meta(s) },
+            final(self).detached_refused(old(self)),
     {
         let mut wakes = WakeBatch::new();
         let result = self.abort_keeping_with_wakes(keep, &mut wakes);
@@ -1965,6 +2053,7 @@ impl<L> Ring<L> {
             final(self).keeps_dma(old(self)),
             forall|s: int| #[trigger] final(self).meta(s) ==
                 if old(self).staged(s) is Some { None } else { old(self).meta(s) },
+            final(self).detached_refused(old(self)),
     {
         let ghost pre = *self;
         let wqe = self.wqe_committed;
@@ -1978,6 +2067,7 @@ impl<L> Ring<L> {
                 self.woken() == pre.woken() + pre.wakers(pre.committed as int, seq as int),
                 self.detached_error is None ==> forall|s: int|
                     pre.committed <= s < seq && s != keep ==> !(#[trigger] pre.slot(s)).detached,
+                self.detached_refused(&pre),
                 self.slots@.len() == pre.slots@.len(),
                 pre.committed <= seq <= pre.posted,
                 forall|s: int|
@@ -2020,7 +2110,13 @@ impl<L> Ring<L> {
                 // Releases the leases.
                 slot.leases = None;
                 if self.detached_error.is_none() {
-                    self.detached_error = Some(flushed);
+                    self.detached_error = Some(DetachedRecord {
+                        seq,
+                        wc: flushed,
+                        first_wqe: wqe,
+                        end_wqe: Ghost(wqe),
+                        refused: true,
+                    });
                 }
             } else {
                 slot.state = State::Refused;
@@ -2034,6 +2130,7 @@ impl<L> Ring<L> {
                 },
             );
             proof {
+                flushed.lemma_spec_status();
                 assert forall|s: int| pre.head <= s < pre.head + pre.n() implies #[trigger] self.slot(s)
                     == if s == seq {
                     refuse(pre.slot(s), s == keep, wqe)
@@ -2385,6 +2482,8 @@ impl<L> Ring<L> {
                     None => if self.meta(s)->0.end as int == wqe as int + 1 { wc }
                         else { self.meta(s)->0.implied },
                 },
+            self.spec_retired() <= s < to && self.req(s) is Some && !self.req(s)->0.detached
+                ==> self.completion_meta(s, wqe, wc, to)->0.seen == Some(self.retire_outcome(s, wqe, wc)),
     {
         self.lemma_meta(s);
         self.lemma_view();
@@ -2470,6 +2569,8 @@ impl<L> Ring<L> {
                 ==> old(self).meta(s)->0.end as int <= wqe as int + 1,
             known && wqe >= old(self).spec_wqe_retired()
                 ==> final(self).pending_cache(*old(self), wqe, wc),
+            old(self).detached_completed(final(self).spec_detached_error(), wqe, wc,
+                final(self).spec_retired() as int),
     {
         let mut wakes = WakeBatch::new();
         let result = self.complete_with_wakes(wqe, wc, &mut wakes);
@@ -2513,6 +2614,8 @@ impl<L> Ring<L> {
                 ==> old(self).meta(s)->0.end as int <= wqe as int + 1,
             known && wqe >= old(self).spec_wqe_retired()
                 ==> final(self).pending_cache(*old(self), wqe, wc),
+            old(self).detached_completed(final(self).spec_detached_error(), wqe, wc,
+                final(self).spec_retired() as int),
     {
         proof { reveal(Ring::pending_cache); }
         if wqe >= self.wqe_committed {
@@ -2563,6 +2666,7 @@ impl<L> Ring<L> {
                 forall|s: int| #[trigger] self.staged(s) == pre.staged(s),
                 forall|s: int| #[trigger] self.refused(s) == pre.refused(s),
                 self.woken() == pre.woken() + pre.wakers(pre.retired as int, self.retired as int),
+                pre.detached_completed(self.detached_error, wqe, wc, self.retired as int),
             ensures self.retired < self.committed ==> self.slot(self.retired as int).state == State::InFlight
                 && self.slot(self.retired as int).end_wqe > wqe as int + 1,
                 forall|s: int| #[trigger] self.meta(s)
@@ -2781,6 +2885,16 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] final(self).meta(s) == if s == old(self).retired {
                 old(self).completed_meta(s, outcome)
             } else { old(self).meta(s) },
+            final(self).detached_error == if old(self).detached_error is None
+                && old(self).slot(old(self).retired as int).detached && !outcome.spec_ok() {
+                Some(DetachedRecord {
+                    seq: old(self).retired,
+                    wc: outcome,
+                    first_wqe: old(self).slot(old(self).retired as int).first_wqe,
+                    end_wqe: Ghost(old(self).slot(old(self).retired as int).end_wqe),
+                    refused: false,
+                })
+            } else { old(self).detached_error },
     {
         let ghost pre = *self;
         if !outcome.is_ok() {
@@ -2791,7 +2905,13 @@ impl<L> Ring<L> {
         let waker = self.slots[i].waker.take();
         if self.slots[i].detached {
             if !outcome.is_ok() && self.detached_error.is_none() {
-                self.detached_error = Some(outcome);
+                self.detached_error = Some(DetachedRecord {
+                    seq: self.retired - 1,
+                    wc: outcome,
+                    first_wqe: self.slots[i].first_wqe,
+                    end_wqe: Ghost(pre.slot(pre.retired as int).end_wqe),
+                    refused: false,
+                });
             }
             let slot = &mut self.slots[i];
             slot.state = State::Free;
@@ -2993,6 +3113,33 @@ impl<L> Ring<L> {
         }
     }
 
+    /// Moving `head` past a free slot changes nothing A sees.
+    proof fn lemma_head_moved(&self, pre: &Self)
+        requires
+            pre.head < pre.retired,
+            pre.slot(pre.head as int).state == State::Free,
+            self.slots@ == pre.slots@,
+            self.head == pre.head + 1,
+            self.retired == pre.retired,
+            self.committed == pre.committed,
+            self.posted == pre.posted,
+            self.woken == pre.woken,
+            pre.retired <= pre.committed,
+        ensures
+            self.same_view(pre),
+    {
+        let h = pre.head as int;
+        assert forall|s: int| #[trigger] self.req(s) == pre.req(s) by {}
+        assert forall|s: int| #[trigger] self.staged(s) == pre.staged(s) by {}
+        assert forall|s: int| #[trigger] self.refused(s) == pre.refused(s) by {}
+        assert forall|s: int, w: int| #[trigger] self.dma(s, w) == pre.dma(s, w) by {}
+        assert forall|s: int| #[trigger] self.meta(s) == pre.meta(s) by {
+            if s == h {
+                assert(pre.staged(s) is None);
+            }
+        }
+    }
+
     proof fn lemma_head(&self, pre: &Self)
         requires
             pre.inv_body(),
@@ -3049,16 +3196,14 @@ impl<L> Ring<L> {
     /// Takes the outcome and leases of retired or refused request `seq`,
     /// freeing its slot; `None` unless it is retired or refused and not
     /// taken yet. A refused request's outcome is a flush error.
-    pub fn take(&mut self, seq: Seq) -> (taken: Option<(Wc, L)>)
+    #[inline]
+    pub fn take(&mut self, seq: Seq) -> (taken: Option<Taken<L>>)
         requires
             old(self).inv(),
         ensures
             final(self).inv(),
             match taken {
-                Some((outcome, leases)) => old(self).req(seq as int) == Some(
-                    ReqView { phase: Phase::Complete(outcome.outcome()), waker: None, detached: false, leases },
-                ) || (old(self).req(seq as int) is None && old(self).refused(seq as int) == Some(leases)
-                    && outcome.spec_status() == crate::wc::Status::WR_FLUSH_ERR),
+                Some(t) => old(self).taken_from(seq as int, t),
                 None => !(old(self).req(seq as int) is Some && old(self).req(
                     seq as int,
                 )->0.phase is Complete) && old(self).refused(seq as int) is None,
@@ -3083,6 +3228,7 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] final(self).meta(s) == if taken is Some && s == seq {
                 None
             } else { old(self).meta(s) },
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -3097,6 +3243,7 @@ impl<L> Ring<L> {
         }
         let i = self.index(seq);
         let slot = &mut self.slots[i];
+        let first_wqe = slot.first_wqe;
         let outcome = slot.outcome.take();
         let leases = slot.leases.take();
         proof {
@@ -3120,10 +3267,28 @@ impl<L> Ring<L> {
                 assert(pre.refused(seq as int) == Some(leases->0));
             }
         }
+        if seq == self.head && seq < self.retired {
+            // The oldest request, as usual: the head moves past the slot just freed, with no
+            // division to find it again.
+            let ghost freed = *self;
+            self.head = seq + 1;
+            proof {
+                self.lemma_head(&freed);
+                self.lemma_head_moved(&freed);
+            }
+        }
         self.advance_head();
-        match (outcome, leases) {
-            (Some(outcome), Some(leases)) => Some((outcome, leases)),
-            _ => None,
+        match outcome {
+            Some(wc) => match leases {
+                Some(leases) => Some(Taken {
+                    wc,
+                    refused: matches!(state, State::Refused),
+                    first_wqe,
+                    leases,
+                }),
+                None => None,
+            },
+            None => None,
         }
     }
 
@@ -3309,6 +3474,7 @@ impl<L> Ring<L> {
             forall|s: int| #[trigger] final(self).meta(s) == if s == seq && old(self).req(s) is Some && old(self).req(s)->0.phase is Complete {
                 None
             } else { old(self).meta(s) },
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -3487,6 +3653,7 @@ impl<L> Ring<L> {
             final(self).same_open(old(self)),
             final(self).same_dma(old(self)),
             final(self).same_meta(old(self)),
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         proof {
             self.lemma_state_views(seq as int);
@@ -3774,8 +3941,7 @@ mod tests {
         assert_eq!(ring.retired(), 3);
         // The detached request released its lease at retirement.
         assert_eq!(c.get(), 1);
-        let (wa, _) = ring.take(a).unwrap();
-        assert_eq!(wa, ok());
+        assert_eq!(ring.take(a).unwrap().wc, ok());
         assert!(ring.take(a).is_none());
         assert!(ring.take(b).is_none());
         assert!(ring.take(d).is_some());
@@ -3828,13 +3994,16 @@ mod tests {
         // An error on the second WQE of b retires a (successful).
         ring.complete(wa + 2, err(Status::REM_ACCESS_ERR));
         assert_eq!(ring.retired(), 1);
-        assert!(ring.take(a).unwrap().0.is_ok());
+        assert!(ring.take(a).unwrap().wc.is_ok());
         // The flushes of b's other WQEs, the last retires it with the error.
         ring.complete(wa + 3, err(Status::WR_FLUSH_ERR));
         assert_eq!(ring.retired(), 1);
         ring.complete(wb, err(Status::WR_FLUSH_ERR));
-        let (wc, _) = ring.take(b).unwrap();
-        assert_eq!(wc.status, Status::REM_ACCESS_ERR);
+        let taken = ring.take(b).unwrap();
+        assert_eq!(taken.wc.status, Status::REM_ACCESS_ERR);
+        assert_eq!(taken.first_wqe, wa + 1);
+        assert!(!taken.refused);
+        drop(taken);
         assert!(ring.failed());
         // Late duplicates are ignored, uncommitted WQEs refused.
         assert!(ring.complete(wa, ok()));
@@ -3862,17 +4031,18 @@ mod tests {
         assert_eq!(ring.posted(), 3);
         assert_eq!(ring.in_flight_wqes(), 1);
         assert_eq!(ring.state(owned), State::Refused);
-        assert_eq!(
-            ring.take_detached_error().unwrap().status,
-            Status::WR_FLUSH_ERR
-        );
+        let detached = ring.take_detached_error().unwrap();
+        assert_eq!(detached.wc.status, Status::WR_FLUSH_ERR);
+        assert!(detached.refused);
+        assert_eq!(detached.seq, 2);
         assert!(ring.invariant());
         let (seq, wqe, _) = post(&mut ring, &c, 1, true, false);
         assert_eq!(seq, 3);
         assert_eq!(wqe, 1, "the refused WQEs' numbers go to the next request");
-        let (wc, lease) = ring.take(owned).unwrap();
-        drop(lease);
-        assert_eq!(wc.status, Status::WR_FLUSH_ERR);
+        let taken = ring.take(owned).unwrap();
+        assert_eq!(taken.wc.status, Status::WR_FLUSH_ERR);
+        assert!(taken.refused);
+        drop(taken);
         assert!(ring.take(owned).is_none());
         assert_eq!(c.get(), 2);
         assert!(ring.invariant());
@@ -3896,8 +4066,8 @@ mod tests {
         assert_eq!(wb, wa + 1);
         assert!(ring.complete(wb, ok()));
         assert_eq!(ring.retired(), 3);
-        assert!(ring.take(a).unwrap().0.is_ok());
-        assert!(ring.take(b).unwrap().0.is_ok());
+        assert!(ring.take(a).unwrap().wc.is_ok());
+        assert!(ring.take(b).unwrap().wc.is_ok());
         assert_eq!(ring.head(), ring.posted());
         assert_eq!(c.get(), 3);
         assert!(ring.invariant());
