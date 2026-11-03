@@ -115,9 +115,8 @@ Start with [verification.md](verification.md), then:
 5. [`examples.rs`](../crates/safeverbs-spec/src/examples.rs): concrete checked traces.
 6. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the ring-to-A adapters;
    return to `Hw::inv` and [`trusted.rs`](../crates/safeverbs-core/src/trusted.rs)
-   for the hardware-facing contracts. `abs_share.rs` and `share.rs` provide the
-   abstract and hardware worker framing rules. `composition.rs` lifts coherent finite
-   interleavings; constructing that global authority from actual workers remains open.
+   for the hardware-facing contracts. `share.rs` provides the hardware worker framing
+   rules.
 
 The executable test backend
 [`model.rs`](../crates/safeverbs-core/src/model.rs) is different from the formal model

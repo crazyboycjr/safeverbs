@@ -74,25 +74,6 @@ rely run is a run of M (`lemma_rely_is_nic_run`); and a worker's own verbs are f
 for every disjoint share (`lemma_mine_is_foreign`, the guarantee) and keep its own share well
 formed (`lemma_mine_keeps_share_wf`).
 
-**Each worker's share of A** (`abs_share.rs`). A share owns QP names and historical
-group handles, not disjoint byte ranges: readonly clones may overlap across workers.
-`foreign` covers every real transition of A; `lemma_foreign_step` and `lemma_rely_frame`
-prove that foreign steps preserve local groups (including wakers and phases), posted
-members, outcomes and QPs. Fresh allocations may advance the allocator and foreign
-completions may append wakes. `lemma_mine_is_foreign` supplies the disjoint-share
-compatibility rule. `lemma_transfer` proves explicit ownership transfer for program
-leases without changing A. Concrete two-worker examples cover local in-flight state,
-foreign allocation/completion and overlapping readonly clones with transferred IDs.
-These are ghost ownership/frame proofs; they do not construct concrete buffer permission
-tokens or the real worker's simulation. A local thaw's enabledness is not preserved by
-foreign readonly cloning, so the implementation must still test uniqueness.
-
-**Finite interleavings** (`composition.rs`). Given one coherent global history of
-legal events, the checked trace lemmas lift disjoint workers' guarantees into M and A
-runs and each worker's rely/frame relation. M also preserves enabled local verbs. A
-does not promise this for thaw, which a foreign readonly clone can invalidate. These
-lemmas do not create a shared device authority from independent `NicToken`s.
-
 **The refinement theorem's composition** (`refinement.rs`). `theorem_1` proves that for any
 implementation meeting the obligations of the `Refines` trait, along any execution, A's and
 M's invariants hold, every verb met its precondition (S2), and A and M stay coupled.
@@ -337,8 +318,7 @@ a token over a fresh share. These are trusted, not proved.
   - **A's side is proved for the ring** (`refine.rs`), not yet for the worker: the worker has
     no ghost map from its rings' requests to A's leases (`ids`, `dirs` of `placed`), and so no
     `impl Refines`. What that needs: the ghost state of A (which leases the program holds) in
-    the worker, which only the buffers can supply (next point); and integration with the
-    checked A-side frame/transfer rules of `abs_share.rs`.
+    the worker, which only the buffers can supply (next point).
   - **Buffers.** Actual mutable/frozen ranges and frozen views now carry the allocator's
     byte permissions through checked geometry, splitting, freeze/thaw and SGE construction.
     The typed wrappers in `buf.rs` remain outside `verus!`. Initialized contents,
@@ -352,9 +332,8 @@ a token over a fresh share. These are trusted, not proved.
     given distinct names. Fresh global member names, arbitrary-byte validity,
     cross-request compatibility and A placement remain unfinished.
   - **Composition.** Each worker's view is coupled to M under rely, and every worker verb is a
-    foreign step for the others (`lemma_mine_is_foreign`). `composition.rs` now proves
-    finite interleavings given one coherent legal global history. Constructing that
-    authority from real workers remains open: tokens are not split from one global token;
+    foreign step for the others (`lemma_mine_is_foreign`). How several workers compose
+    into one device history is open: tokens are not split from one global token;
     `create_cq` makes each. The control path (allocating
     PDs, registering and deregistering regions in `buf.rs` and `pd.rs`) is not verified; rely
     assumes it deregisters no region a worker's written WR names, which leases ensure.
