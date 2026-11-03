@@ -1628,6 +1628,7 @@ impl<L> Ring<L> {
     ///
     /// While a request is open (checked at run time too, for callers outside
     /// the proofs).
+    #[inline(always)]
     pub fn commit(&mut self)
         requires
             old(self).inv(),

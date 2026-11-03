@@ -160,7 +160,7 @@ pub(crate) open spec fn collected_parts<N: Device>(
 
 /// Moves all SGE guards into their request without changing the native algorithm.
 /// The erased ledger records even a shared input whose redundant Arc is dropped.
-#[inline]
+#[inline(always)]
 fn keep_parts<N: Device>(
     leases: &mut Leases<N>, parts: &mut Vec<Part<N>>,
     Ghost(wqe): Ghost<crate::buf::WqeLoans>,
@@ -2876,7 +2876,6 @@ impl<N: Device> Hw<N> {
         if !started || open {
             return Ok(());
         }
-        let mut wakes = WakeBatch::new();
         let ghost start = *self;
         let ghost t0 = self.token@;
         let ghost m0 = t0.nic();
@@ -2886,7 +2885,7 @@ impl<N: Device> Hw<N> {
                 let ghost q = e.id@;
                 let ghost e0 = *e;
                 e.started = false;
-                let r = if ready {
+                let refused = if ready {
                     proof {
                         let qp = m0.qps[q];
                         e0.send.lemma_wqes();
@@ -2895,38 +2894,36 @@ impl<N: Device> Hw<N> {
                     match doorbell(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut())) {
                         Ok(()) => {
                             e.send.commit();
-                            Ok(())
+                            None
                         },
-                        Err(err) => {
-                            let kept = match keep {
-                                Some(seq) => e.send.abort_keeping_with_wakes(seq, &mut wakes),
-                                None => {
-                                    e.send.abort_with_wakes(&mut wakes);
-                                    None
-                                },
-                            };
-                            Err((err, kept))
-                        },
+                        Err(err) => Some(err),
                     }
                 } else {
                     abort(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
-                    let kept = match keep {
-                        Some(seq) => e.send.abort_keeping_with_wakes(seq, &mut wakes),
-                        None => {
-                            e.send.abort_with_wakes(&mut wakes);
-                            None
-                        },
-                    };
-                    Err((Error::NotConnected, kept))
+                    Some(Error::NotConnected)
                 };
-                if r.is_err() {
-                    e.refused = true;
-                    if !e.dirty {
-                        e.dirty = true;
-                        self.dirty.push(index as u16);
-                    }
+                match refused {
+                    None => Ok(()),
+                    Some(err) => {
+                        // Only a refused doorbell wakes anyone, its staged requests' wakers;
+                        // a waker's panic resumes once the bookkeeping is done.
+                        let mut wakes = WakeBatch::new();
+                        let kept = match keep {
+                            Some(seq) => e.send.abort_keeping_with_wakes(seq, &mut wakes),
+                            None => {
+                                e.send.abort_with_wakes(&mut wakes);
+                                None
+                            },
+                        };
+                        e.refused = true;
+                        if !e.dirty {
+                            e.dirty = true;
+                            self.dirty.push(index as u16);
+                        }
+                        wakes.finish();
+                        Err((err, kept))
+                    },
                 }
-                r
             },
             None => {
                 no_qp(index);
@@ -3000,7 +2997,6 @@ impl<N: Device> Hw<N> {
                 self.lemma_commit_frame(&start, t0, t, n, n, index as int);
             }
         }
-        wakes.finish();
         r
     }
 }

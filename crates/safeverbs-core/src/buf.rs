@@ -459,7 +459,12 @@ impl<T, N: Nic> Buf<T, N> {
     {
         match self.try_into_part() {
             Ok(part) => part,
-            Err(_) => panic!("a single SGE exceeds u32::MAX bytes"),
+            Err(view) => {
+                // Released first, so that no `Result` stays alive across the panic: the
+                // `Part` is then built in place.
+                drop(view);
+                panic!("a single SGE exceeds u32::MAX bytes")
+            }
         }
     }
 

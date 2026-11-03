@@ -747,6 +747,7 @@ impl<N: Nic> Leases<N> {
             final(self).wqes() == old(self).wqes(),
     { self.push_loan(part, Ghost(Some(access))); }
 
+    #[inline]
     fn push_loan(&mut self, part: Part<N>, Ghost(access): Ghost<Option<Dir>>)
         requires access == Some(Dir::In) ==> part.spec_writable(),
         ensures

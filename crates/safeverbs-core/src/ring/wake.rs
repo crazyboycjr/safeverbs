@@ -33,34 +33,49 @@ fn resume(panic: WakePanic)
     resume_unwind(panic.0)
 }
 
-/// A stack-local batch of wake failures, shared by all CQEs in one poll.
+/// A stack-local batch of wake failures, shared by all CQEs in one poll. It allocates
+/// only once a waker panics.
 pub(crate) struct WakeBatch {
-    panics: Vec<WakePanic>,
+    panics: Option<Vec<WakePanic>>,
 }
 
 impl WakeBatch {
+    #[inline]
     pub(crate) fn new() -> Self {
-        Self { panics: Vec::new() }
+        Self { panics: None }
     }
 
     /// Attempt every notification even if an earlier user waker panicked.
     pub(crate) fn wake(&mut self, waker: Waker) {
         if let Some(panic) = try_wake(waker) {
-            self.panics.push(panic);
+            let mut panics = self.panics.take().unwrap_or_default();
+            panics.push(panic);
+            self.panics = Some(panics);
         }
     }
 
-    /// Propagate the first wake panic only after the caller is consistent.
-    /// Secondary payload destructors also run at this safe boundary.
-    pub(crate) fn finish(mut self) {
-        if !self.panics.is_empty() {
-            let first = self.panics.remove(0);
-            {
-                // End the secondary payloads' scope before resuming the first.
-                let _secondary = self.panics;
-            }
-            resume(first);
+    /// Propagate the first wake panic only after the caller is consistent. Without one,
+    /// this is a test and nothing else.
+    #[inline]
+    pub(crate) fn finish(self) {
+        if let Some(panics) = self.panics {
+            resume_first(panics);
         }
+    }
+}
+
+/// Resume the first wake panic. The other payloads' destructors run first, here, at this
+/// safe boundary.
+#[cold]
+#[inline(never)]
+fn resume_first(mut panics: Vec<WakePanic>) {
+    if !panics.is_empty() {
+        let first = panics.remove(0);
+        {
+            // End the other payloads' scope before resuming the first.
+            let _others = panics;
+        }
+        resume(first);
     }
 }
 
