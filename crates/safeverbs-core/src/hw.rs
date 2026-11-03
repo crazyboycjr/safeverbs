@@ -65,6 +65,7 @@ use crate::trusted::*;
 use crate::wc::{Opcode, Wc};
 use crate::wr_id::*;
 
+mod completion;
 mod outcomes;
 mod send_outcomes;
 mod separation;
@@ -2524,62 +2525,15 @@ impl<N: Device> Hw<N> {
             }
         }
         let index = index_of(wc.wr_id);
-        let recv = is_recv(wc.wr_id);
         proof {
             assert(index == i);
-            assert(recv == (e.queue is Recv));
         }
         if index >= self.qps.len() {
             return;
         }
         match &mut self.qps[index] {
             Some(qp_entry) => {
-                let ghost e0 = *qp_entry;
-                let retired;
-                let changed;
-                if recv {
-                    let ghost send0 = qp_entry.send;
-                    retired = qp_entry.recv.retired();
-                    proof {
-                        e0.recv.lemma_wqes();
-                        lemma_low_bits_determine(e.seq as u64, e.seq as u64, e0.recv.spec_wqe_retired());
-                    }
-                    let wqe = wqe_of(wc.wr_id, qp_entry.recv.wqe_retired());
-                    proof {
-                        assert(wqe == e.seq);
-                    }
-                    let _known = qp_entry.recv.complete_with_wakes(wqe, *wc, wakes);
-                    proof { lemma_resources_completed(e0.recv, qp_entry.recv, wqe, *wc); }
-                    changed = qp_entry.recv.retired() != retired;
-                    proof {
-                        assert(qp_entry.send == e0.send);
-                    }
-                } else {
-                    retired = qp_entry.send.retired();
-                    proof {
-                        e0.send.lemma_wqes();
-                    }
-                    let wqe = wqe_of(wc.wr_id, qp_entry.send.wqe_retired());
-                    proof {
-                        assert(wqe == e.seq);
-                    }
-                    let _known = qp_entry.send.complete_with_wakes(wqe, *wc, wakes);
-                    proof {
-                        lemma_resources_completed(e0.send, qp_entry.send, wqe, *wc);
-                        assert forall|s: int| #[trigger] qp_entry.send.meta(s) is Some implies
-                            e0.send.meta(s) is Some
-                            && qp_entry.send.meta(s)->0.implied == e0.send.meta(s)->0.implied
-                            && qp_entry.send_tails@.contains_key(s)
-                            && qp_entry.send_tails@[s] == e0.send_tails@[s] by {
-                            e0.send.lemma_completion_observation(s, wqe, *wc, qp_entry.send.spec_retired() as int);
-                        }
-                        send_outcomes::lemma_implied_kept(e0.send, qp_entry.send, e0.send_tails@, qp_entry.send_tails@);
-                    }
-                    changed = qp_entry.send.retired() != retired;
-                    proof {
-                        assert(qp_entry.recv == e0.recv);
-                    }
-                }
+                let changed = qp_entry.complete_cqe(wc, wakes, Ghost(i), Ghost(t), Ghost(before), Ghost(after));
                 if changed && !qp_entry.dirty && !qp_entry.removed {
                     qp_entry.dirty = true;
                     self.dirty.push(index as u16);
@@ -2589,89 +2543,6 @@ impl<N: Device> Hw<N> {
         }
         proof {
             let q = e.qp;
-            let qp2 = after.qps[q];
-            let en = self.qps@[i]->0;
-            let e0 = start.qps@[i]->0;
-            let nn = (e.seq + 1 - (if e.queue is Send { qp.sq_head } else { qp.rq_head })) as int;
-            lemma_nic_step_is_next(before, after, Nic::Step::poll_cq(c));
-            lemma_step_keeps_invariant(before, after);
-            lemma_mine_keeps_share_wf(sh, ISet::empty(), before, after, Nic::Step::poll_cq(c));
-            if e.queue is Send {
-                assert forall|k: int| 0 <= k < qp2.sq.len() implies (#[trigger] qp2.sq[k]).wr.wr_id == spec_wr_id(
-                    i as u16,
-                    false,
-                    (qp2.sq_head + k) as u64,
-                ) by {
-                    assert(qp2.sq[k] == qp.sq[k + nn]);
-                }
-                assert(sq_linked(en.send, i as u16, qp2));
-                assert(rq_linked(en.recv, i as u16, qp2));
-            } else {
-                assert forall|k: int| 0 <= k < qp2.rq.len() implies (#[trigger] qp2.rq[k]).wr.wr_id == spec_wr_id(
-                    i as u16,
-                    true,
-                    (qp2.rq_head + k) as u64,
-                ) by {
-                    assert(qp2.rq[k] == qp.rq[k + nn]);
-                }
-                assert(sq_linked(en.send, i as u16, qp2));
-                assert(rq_linked(en.recv, i as u16, qp2));
-            }
-            en.send.lemma_wqes();
-            en.recv.lemma_wqes();
-            assert forall|k: int| 0 <= k < qp2.sq.len() implies {
-                let wr = (#[trigger] qp2.sq[k]).wr;
-                &&& !wr.inline
-                &&& ring_backed(en.send, qp2.sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges)
-            } by {
-                let old_k = if e.queue is Send { k + nn } else { k };
-                assert(qp2.sq[k].wr == qp.sq[old_k].wr);
-                let wr = qp2.sq[k].wr;
-                lemma_backed_kept(e0.send, en.send, qp2.sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges);
-            }
-            assert forall|k: int| 0 <= k < qp2.rq.len() implies {
-                let wr = (#[trigger] qp2.rq[k]).wr;
-                ring_backed(en.recv, qp2.rq_head + k, wr.wr_id, None, wr.sges)
-            } by {
-                let old_k = if e.queue is Recv { k + nn } else { k };
-                assert(qp2.rq[k].wr == qp.rq[old_k].wr);
-                let wr = qp2.rq[k].wr;
-                lemma_backed_kept(e0.recv, en.recv, qp2.rq_head + k, wr.wr_id, None, wr.sges);
-            }
-            let written = t.written(q);
-            assert forall|j: int| 0 <= j < written.len() implies
-                written_backed(en, en.send.spec_wqe_committed() + j, #[trigger] written[j]) by {
-                lemma_written_kept(e0, en, en.send.spec_wqe_committed() + j, written[j]);
-            }
-            assert forall|j: int| 0 <= j < written.len() implies after.send_wr_ok(qp2.attr, #[trigger] written[j]) by {
-                assert(before.send_wr_ok(qp.attr, written[j]));
-            }
-            assert forall|w: WqeRef| w.qp == q && w.queue is Recv && w.seq < qp.rq_head
-                && #[trigger] before.retired.contains_key(w)
-                implies after.retired.contains_key(w) && after.retired[w] == before.retired[w] by {
-                reveal(retires);
-            }
-            assert forall|s: int| #[trigger] en.send.meta(s) is Some implies e0.send.meta(s) is Some
-                && en.send.meta(s)->0.first == e0.send.meta(s)->0.first
-                && en.send.meta(s)->0.end == e0.send.meta(s)->0.end by {
-                if e.queue is Send {
-                    e0.send.lemma_completion_observation(s, e.seq as u64, *wc, en.send.spec_retired() as int);
-                }
-            }
-            assert forall|s: int| #[trigger] en.send.req(s) is Some implies e0.send.req(s) is Some by {
-                if e.queue is Send && e0.send.spec_retired() <= s < en.send.spec_retired() {
-                    e0.send.lemma_retired_view(s, e0.send.retire_outcome(s, e.seq as u64, *wc));
-                }
-            }
-            send_outcomes::lemma_bound_kept(e0.send, en.send, e0.send_tails@, i as u16,
-                qp, qp2, t.written(q));
-            send_outcomes::lemma_history_poll(e0.send, en.send, e0.send_tails@, i as u16,
-                before, after, q, t.written(q), c);
-            if e.queue is Recv {
-                outcomes::lemma_recv_completed(e0.recv, en.recv, before, after, q, e.seq as u64, *wc);
-            } else {
-                outcomes::lemma_recv_framed(en.recv, before, after, q);
-            }
             assert(self.entry_ok(i, t, after));
             // `poll_cq` changed only QP `q` and the CQ's entries.
             assert(after.cqs[c].reserved == before.cqs[c].reserved);
