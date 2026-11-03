@@ -8,6 +8,15 @@ use crate::error::{Error, Result};
 use crate::nic::{GidEntry, Nic, PortInfo};
 use crate::verbs::Verbs;
 
+/// Identities are never reused, including after a failed hardware allocation.
+/// Reserve `u64::MAX` as the exhausted state instead of wrapping to old PDs.
+fn reserve_pd_id(ids: &AtomicU64) -> Result<u64> {
+    ids.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        next.checked_add(1)
+    })
+    .map_err(|_| Error::Invalid("protection-domain identities exhausted"))
+}
+
 /// An open RDMA device. Cheap to clone.
 pub struct Context<N: Nic = Verbs> {
     nic: Arc<N>,
@@ -81,11 +90,12 @@ impl<N: Nic> Context<N> {
     /// Allocates a protection domain.
     pub fn alloc_pd(&self) -> Result<Pd<N>> {
         static IDS: AtomicU64 = AtomicU64::new(1);
+        let id = reserve_pd_id(&IDS)?;
         let pd = self.nic.alloc_pd()?;
         Ok(Pd {
             inner: Arc::new(PdInner {
                 pd,
-                id: IDS.fetch_add(1, Ordering::Relaxed),
+                id,
                 ctx: self.clone(),
             }),
         })
@@ -135,6 +145,19 @@ impl<N: Nic> Pd<N> {
 mod revocation_tests {
     use super::*;
     use crate::model::Model;
+
+    #[test]
+    fn exhausted_pd_identity_never_wraps_or_reuses_a_name() {
+        let ids = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(reserve_pd_id(&ids).unwrap(), u64::MAX - 1);
+        for _ in 0..2 {
+            assert_eq!(
+                reserve_pd_id(&ids),
+                Err(Error::Invalid("protection-domain identities exhausted"))
+            );
+            assert_eq!(ids.load(Ordering::Relaxed), u64::MAX);
+        }
+    }
 
     #[test]
     fn failed_base_revocation_keeps_the_pd_and_device_alive() {

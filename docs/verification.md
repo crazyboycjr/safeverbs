@@ -314,10 +314,10 @@ a token over a fresh share. These are trusted, not proved.
     `registered` and `registered_all`.
   - **Concrete grouped permissions.** The checked actual loan ledger now accounts for
     shared deduplication, operation access and exact SGE/member projection. `Hw` retains
-that invariant through its rings and returns it with owned results. Actual keepers
-now prove nonaliasing within each request, so projected groups satisfy `Group::wf`
-given distinct names. Fresh global member names, arbitrary-byte validity,
-cross-request compatibility and A placement remain unfinished.
+    that invariant through its rings and returns it with owned results. Actual keepers
+    now prove nonaliasing within each request, so projected groups satisfy `Group::wf`
+    given distinct names. Fresh global member names, arbitrary-byte validity,
+    cross-request compatibility and A placement remain unfinished.
   - **Composition.** Each worker's view is coupled to M under rely, and every worker verb is a
     foreign step for the others (`lemma_mine_is_foreign`). `composition.rs` now proves
     finite interleavings given one coherent legal global history. Constructing that
