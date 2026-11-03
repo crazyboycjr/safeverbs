@@ -477,7 +477,7 @@ says.
 | CQ size unrelated to queue depths | attachment reserves CQ capacity |
 | everything `Send + Sync`, a CQ per queue pair | a worker per thread: one CQ shared by its queue pairs, no locks; `SharedQp` when sharing is needed |
 | `unsafe` spread through the crate | all `unsafe` in `safeverbs-core`, the rest `forbid(unsafe_code)` |
-| no statement of the guarantee | Theorem 1 over M and A, checked by Verus |
+| no statement of the guarantee | a conditional Theorem 1 over M and A; the real implementation's refinement is still being completed |
 
 The typestate builder for connection setup, the reference-counted resource handles and the
 async style of the API carry over.

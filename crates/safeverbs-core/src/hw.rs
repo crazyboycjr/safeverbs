@@ -64,6 +64,8 @@ use crate::trusted::*;
 use crate::wc::{Opcode, Wc};
 use crate::wr_id::*;
 
+mod separation;
+
 verus! {
 
 global size_of usize == 8;
@@ -2125,6 +2127,9 @@ impl<N: Device> Hw<N> {
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
+            r matches Ok(seq) ==> old(self).admission_separated_from(part)
+                && final(self).recv_holds_input(index, seq, part),
+            r matches Err(error) ==> error.buf == part,
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -2157,6 +2162,11 @@ impl<N: Device> Hw<N> {
             };
             return Err(BufError { error, buf: part });
         }
+        let ghost admitted = part;
+        let ghost admission = *self;
+        let mut part = part;
+        self.separate_unique_input(&mut part);
+        proof { assert(admission.admission_separated_from(admitted)); }
         let ghost start = *self;
         let ghost t0 = self.token@;
         let ghost m0 = t0.nic();
@@ -2220,7 +2230,12 @@ impl<N: Device> Hw<N> {
                             wr_id: id, opcode: None, sges: sges@, first: 0,
                         }));
                         let ghost resource = leases;
-                        proof { lemma_ledger_entry(leases, 0); }
+                        proof {
+                            lemma_ledger_entry(leases, 0);
+                            assert(resource.loans() == seq![crate::buf::Loan {
+                                part: admitted, access: Some(safeverbs_spec::abs::Dir::In),
+                            }]);
+                        }
                         let ghost before_end = e.recv;
                         proof { lemma_resources_kept(e1.recv, e.recv); }
                         e.recv.end(true, detached, implied, leases);
@@ -2242,6 +2257,9 @@ impl<N: Device> Hw<N> {
                             assert(e.recv.dma(seq as int, wqe as int) == Some(resource));
                             assert(ledger_has(resource, id, None, wr.sges));
                             assert(ring_backed(e.recv, wqe as int, id, None, wr.sges));
+                            assert(e.recv.req(seq as int) is Some);
+                            assert(e.recv.req(seq as int)->0.phase is InFlight);
+                            assert(e.recv.req(seq as int)->0.leases == resource);
                         }
                         Ok(seq)
                     },
@@ -2324,6 +2342,13 @@ impl<N: Device> Hw<N> {
                 assert(self.entry_ok(index as int, t1, n));
                 self.lemma_touch_one(&mid1, t1, n, n, index as int);
                 self.lemma_same_token(t1, t, n);
+            }
+        }
+        proof {
+            if r is Ok {
+                assert(admission.admission_separated_from(admitted));
+                self.lemma_recv_holds_input(index, r->Ok_0, admitted);
+                assert(self.recv_holds_input(index, r->Ok_0, admitted));
             }
         }
         r

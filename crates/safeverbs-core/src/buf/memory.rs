@@ -259,6 +259,7 @@ impl<N: Nic> RawMut<N> {
         requires old(self).inv(), other.inv(),
         ensures *final(self) == *old(self),
             final(self).byte_domain().disjoint(other.byte_domain()),
+        no_unwind
     {
         proof {
             self.range.permission.borrow_mut().disjoint(other.range.permission.borrow());

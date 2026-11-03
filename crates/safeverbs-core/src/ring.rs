@@ -119,6 +119,8 @@ use vstd::prelude::*;
 
 use crate::wc::Wc;
 
+mod separation;
+
 verus! {
 
 /// A request's sequence number in its queue.

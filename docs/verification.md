@@ -189,6 +189,14 @@ The actual payload types `RawMut` and `Frozen` now carry byte permissions, but t
 projection still needs their disjointness, fresh A identities and typed validity to
 construct a well-formed A group. Registration lifetime is a separate obligation.
 
+**Actual receive admission** (`hw/separation.rs`, `ring/separation.rs`). The real
+`post_recv` proves its unique input separated from every prior local keeper, including
+open, held and building parts and completed/refused ring owners. Success retains the
+exact logical input; failure returns the same Part. The readonly worker traversal
+preserves existing snapshots and optimizes to `retq`; no additional trusted item is
+used. This does not establish compatibility with all program-held resources or other
+workers, or a maintained global A invariant. See [unique-admission.md](unique-admission.md).
+
 **Failed MR revocation (runtime behavior, tested).** `Nic::close_mr` is fallible and
 idempotent. A failed close retains its handle. `Exposed::try_reclaim` returns the still
 exposed owner for retry; successful reclaim alone returns typed access. On failed final

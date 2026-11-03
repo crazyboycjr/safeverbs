@@ -48,6 +48,12 @@ are well formed given distinct member names. Native `RingBuf` callers, typed val
 cross-request/global compatibility, exposure and final cleanup remain obligations.
 See `buf/memory.rs`, `buf/view.rs` and `docs/request-nonalias.md`.
 
+The actual receive admission now proves each incoming unique Part separated from
+all prior worker storage, including completed/refused results and open/held/building
+resources. Success retains its exact input; failure returns it unchanged. The
+worker traversal optimizes to `retq`. This is an admission result, not the maintained
+global compatibility invariant; see `docs/unique-admission.md`.
+
 Create permissions at the allocator/registration boundary and carry them in real
 buffer objects through unique splitting, freezing, cloning, slicing, thawing, exposure,
 revocation and release. Derive disjoint mutable access from linear permissions.
