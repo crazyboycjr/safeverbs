@@ -178,7 +178,10 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
   READs reports its last READ's length (`read_batch.rs`), and a waker's
   panic keeps every polled completion and resumes only after the poll's
   bookkeeping (`waker_unwind.rs`); `wc.rs` checks, on the simulated NIC and
-  on a device, that a WRITE with immediate fills no receive buffer.
+  on a device, that a WRITE with immediate fills no receive buffer, and
+  `batch.rs`, on both, that an error in the middle of a batch is its outcome
+  while the WQEs after it flush and its buffers come back once, and on a
+  device that a batch of READs reports its last READ's length.
 - `safeverbs` (`crates/safeverbs/tests/allocation.rs`): every buffer's
   memory is freed exactly once, after a refused registration too.
 - `safeverbs` (`crates/safeverbs/tests/model.rs`): the public API on the
