@@ -12,9 +12,9 @@ The guarantee is one refinement theorem: under a model **M** of the NIC
 (`theorem_1` in `refinement.rs`) is proved for every implementation that discharges the
 obligations of the `Refines` trait. **The library does not discharge them yet.** What is
 proved of it are components: the completion ring refines A, and the worker's hardware
-side keeps the NIC within M and its rings coupled to M's queues. The step that would tie
-them together, mapping the worker's requests onto A's groups, is the main open item
-(see "Remaining").
+side keeps the NIC within M, its rings coupled to M's queues and its requests' results equal
+to what M retired. The step that would tie them together, mapping the worker's requests
+onto A's groups, is the main open item (see "Remaining").
 
 `scripts/verify.sh` checks everything below that is called proved. The specification
 crate uses no `assume`, `admit`, `external_body` or assumed specification; the code of
@@ -78,11 +78,21 @@ for its own WQEs, with its own buffers.
   one whose doorbell was refused with a flush error. Sequence numbers are never reused.
 - *Worker.* Each completion reaches the queue pair, queue and request of its own WQE
   (`wr_id.rs` and the coupling of rings to M's queues). A receive request's result is the
-  outcome M retired for its WQE (`hw/outcomes.rs`). A send request's implied success is
-  the success M retired for its last WQE, the length of a READ included
-  (`hw/send_outcomes.rs`).
-- *Not proved:* the first error of a send batch, which the worker keeps natively, against
-  M's aggregate.
+  outcome M retired for its WQE (`hw/outcomes.rs`). A send request, one WQE or a batch, agrees
+  with M's retired WQEs of its interval through every worker operation (`send_results` in
+  `hw/send_outcomes.rs`, part of the worker's invariant), refused doorbells, flushes after an
+  error and the drain before a destroy included. While it is in flight, its last WQE is
+  still in M's queue and the error it caches natively is the first error among the WQEs of
+  its interval M retired, none if they all succeeded. Once it is complete, all its WQEs
+  retired and its outcome is M's aggregate: the first error in posting order, else its last
+  WQE's success, which is what that WR's operation defines (the length a READ asked for, so
+  a batch of READs reports its last READ's length; the status alone for a SEND or WRITE).
+  `Hw::take` returns that outcome with the request's own leases, or a flush error for a
+  request whose doorbell was refused, which M never saw (`send_taken_matches`).
+- *Not proved:* that the first error of a queue's requests without an owner, which
+  `Worker::take_send_error` reports (a sink's error), is M's. Such requests give back no
+  result of their own and the ring's queue-wide cache has no contract yet; their buffers
+  are covered like any request's.
 
 **R1, no leak by the library.** Every buffer handed to the library is returned or released
 once, never before the NIC is done with it.
@@ -122,9 +132,14 @@ make progress, someone to poll the CQ and the executor to poll woken tasks.
   callbacks and destructors is not covered.
 - Memory: a refused registration frees its memory; split, frozen, exposed and streamed
   buffers free theirs once (`crates/safeverbs/tests/allocation.rs`).
-- Batches: an error stays within its own request's interval (`tests/outcome.rs`), and a
-  batch of READs reports the last READ's length (`tests/read_batch.rs`). A WRITE with
-  immediate puts no data in the receive's buffers (`tests/wc.rs`, on the model and rxe).
+- Batches on the model and on rxe, through the unverified `Worker` and evidence that rxe
+  conforms to M: an error in the middle of a batch is its outcome, the WQEs after it flush
+  and its buffers come back once; on rxe a batch of READs, signaled or retired by a later
+  CQE, reports its last READ's length (`tests/batch.rs`). On the model, an error stays
+  within its own request's interval (`tests/outcome.rs`) and READ batches step through both
+  ways of completing (`tests/read_batch.rs`).
+- A WRITE with immediate puts no data in the receive's buffers (`tests/wc.rs`, on the model
+  and rxe).
 - `RingBuf`'s placement and the reuse of its chunks.
 - The simulated NIC (`model.rs`) checks some of M's rules at run time: no queue pair
   destroyed with WQEs not retired, no CQ destroyed with a queue pair attached, no work
@@ -214,8 +229,12 @@ data, so M sees a queue pair's inline limit as zero.
 
 - **The worker's `impl Refines`.** Map each ring request onto a group of A, with fresh
   names, each member's direction and the check that groups stay compatible, and couple
-  them to M (`coupled`): the WQE interval of every request, and the first error of a send
-  batch against M's aggregate.
+  them to M (`coupled`). Requests' results already agree with M (F1); what `coupled` still
+  needs from the worker is that complete requests' WQE intervals stay disjoint too (the
+  ring keeps this for requests not retired) and, for a request in flight, that M's `retired`
+  map holds nothing of the rest of its interval (`WqeRange::pending`).
+- **Detached errors.** Relate the first error of a queue's requests without an owner
+  (`Worker::take_send_error`, what a sink reports) to M, like an owned request's result.
 - **Buffers.** The typed wrappers of `buf.rs` are outside `verus!`; initialized contents
   and the zerocopy contracts, `RingBuf`, exposure and revocation and the final cleanup of a
   region are not verified, and the registration lifetime is trusted (`registered`,
@@ -254,7 +273,7 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 154 verified, 0 errors
-safeverbs-core: verification results:: 389 verified, 0 errors
+safeverbs-core: verification results:: 395 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

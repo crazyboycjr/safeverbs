@@ -114,7 +114,9 @@ Start with [verification.md](verification.md), then:
 6. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the ring-to-A adapters;
    return to `Hw::inv` and [`trusted.rs`](../crates/safeverbs-core/src/trusted.rs)
    for the hardware-facing contracts. `share.rs` provides the hardware worker framing
-   rules.
+   rules. [`hw/send_outcomes.rs`](../crates/safeverbs-core/src/hw/send_outcomes.rs) and
+   [`hw/outcomes.rs`](../crates/safeverbs-core/src/hw/outcomes.rs) tie requests' results
+   to the WQEs M retired.
 
 The executable test backend [`model.rs`](../crates/safeverbs-core/src/model.rs) is not
 the formal model M: tests use it to move real bytes and inject failures.
