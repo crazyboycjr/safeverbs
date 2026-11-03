@@ -185,9 +185,10 @@ SEND/WRITE sources remain distinct from READ destinations and receives. The adap
 constructs `Permissions<Leases<N>>` for the ring using request/member-indexed names.
 Names and arbitrary-byte validity are supplied separately; it does not establish fresh
 allocation, `Group::wf`, A placement or coupling to M's current request intervals.
-The actual payload types `RawMut` and `Frozen` now carry byte permissions, but the
-projection still needs their disjointness, fresh A identities and typed validity to
-construct a well-formed A group. Registration lifetime is a separate obligation.
+The actual payload types `RawMut` and `Frozen` now carry byte permissions, and
+request-local disjointness gives `Group::wf` under distinct names. Fresh global A
+identities, typed validity and global compatibility remain obligations. Registration
+lifetime is a separate obligation.
 
 **Actual receive admission** (`hw/separation.rs`, `ring/separation.rs`). The real
 `post_recv` proves its unique input separated from every prior local keeper, including
@@ -196,6 +197,13 @@ exact logical input; failure returns the same Part. The readonly worker traversa
 preserves existing snapshots and optimizes to `retq`; no additional trusted item is
 used. This does not establish compatibility with all program-held resources or other
 workers, or a maintained global A invariant. See [unique-admission.md](unique-admission.md).
+
+**Actual receive outcomes** (`hw/outcomes.rs`). The worker invariant couples each
+native receive request's singleton interval to M. Pending requests have no outcome;
+completed requests match their own M.retired entry. Actual posting, CQ dispatch,
+result removal, wakers, control verbs and teardown preserve it. `lemma_recv_result`
+exports that concrete observation. Send-batch aggregation and the complete public
+refinement remain unfinished; see [outcome-coupling.md](outcome-coupling.md).
 
 **Failed MR revocation (runtime behavior, tested).** `Nic::close_mr` is fallible and
 idempotent. A failed close retains its handle. `Exposed::try_reclaim` returns the still
@@ -208,8 +216,9 @@ claim follows.
 
 **The completion ring** (`ring.rs`). `Ring::new` establishes the eight invariants of the
 module documentation (`Ring::inv`) and every operation requires and keeps them; Verus also
-checks that no operation panics (indexing, the `assert!`s left for callers outside the
-proofs) or overflows. The only run-time check added for the proofs is one comparison in
+rules out failures of its own indexing, assertions and arithmetic under their preconditions.
+External callbacks/destructors and unwinding remain outside these normal-return guarantees.
+The only run-time check added for counter bounds is one comparison in
 `has_free_slot`, which refuses a new request once the WQE or request numbers could not hold
 `max_wqes` more (after 2^64 of them; one comparison of their bitwise or covers both). Every
 operation is specified by what A sees of the ring: its requests (`Ring::req`: posted and not

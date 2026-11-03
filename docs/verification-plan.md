@@ -73,7 +73,10 @@ Prove actual state transitions simulate A and M, including error and teardown pa
 Checked so far: each actual local M WQE and staged WR matches a live native request's
 exact opcode/SGEs and retained byte permissions. Refused requests cannot back a reused
 WQE number. The final held WQE retains its parts directly. Whole-worker outcome
-aggregation, abstract request placement and global compatibility remain open.
+aggregation for send batches, abstract request placement and global compatibility remain
+open. Actual receive requests now match their own singleton WQE's M.retired outcome
+through every worker operation; `Hw::lemma_recv_result` exports the concrete result.
+Unwinding and reuse after a caught callback/backend panic remain public-API obligations.
 
 One coherent device authority/history must support every worker. Conditional trace
 lemmas over disjoint shares do not construct that authority from independent tokens.

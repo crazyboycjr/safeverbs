@@ -2289,6 +2289,31 @@ impl<L> Ring<L> {
         } else { self.meta(s) }
     }
 
+    /// Public observations of the native cache and a completion's metadata frame.
+    pub proof fn lemma_completion_observation(&self, s: int, wqe: u64, wc: Wc, to: int)
+        requires self.inv(), self.spec_retired() <= to <= self.spec_committed(),
+        ensures
+            self.completion_meta(s, wqe, wc, to) is Some ==> self.meta(s) is Some
+                && self.completion_meta(s, wqe, wc, to)->0.first == self.meta(s)->0.first
+                && self.completion_meta(s, wqe, wc, to)->0.end == self.meta(s)->0.end,
+            s < self.spec_retired() ==> self.completion_meta(s, wqe, wc, to) == self.meta(s),
+            self.req(s) is Some && to <= s
+                && (wc.spec_ok() || self.meta(s)->0.seen is Some
+                    || wqe < self.meta(s)->0.first || self.meta(s)->0.end as int <= wqe as int + 1)
+                ==> self.completion_meta(s, wqe, wc, to) == self.meta(s),
+            self.req(s) is Some ==> self.retire_outcome(s, wqe, wc)
+                == match self.meta(s)->0.seen {
+                    Some(prior) => prior,
+                    None => if self.meta(s)->0.end as int == wqe as int + 1 { wc }
+                        else { self.meta(s)->0.implied },
+                },
+    {
+        self.lemma_meta(s);
+        self.lemma_view();
+        reveal(Ring::inv_slots);
+        if self.retired <= s < to { assert(self.live_ok(s)); }
+    }
+
     proof fn lemma_ignored_meta(&self, wqe: u64, wc: Wc)
         requires self.inv(), wqe >= self.spec_wqe_committed() || wqe < self.spec_wqe_retired(),
         ensures forall|s: int| #[trigger] self.meta(s)
@@ -2341,6 +2366,9 @@ impl<L> Ring<L> {
             known && wqe >= old(self).spec_wqe_retired() ==> forall|s: int|
                 #[trigger] final(self).req(s) is Some && final(self).req(s)->0.phase is InFlight
                 ==> final(self).meta(s)->0.end > wqe as int + 1,
+            forall|s: int| old(self).spec_retired() <= s < final(self).spec_retired()
+                && #[trigger] old(self).req(s) is Some
+                ==> old(self).meta(s)->0.end as int <= wqe as int + 1,
     {
         if wqe >= self.wqe_committed {
             proof { self.lemma_ignored_meta(wqe, wc); }
@@ -2379,6 +2407,8 @@ impl<L> Ring<L> {
                 pre.wqe_retired <= self.wqe_retired <= wqe + 1,
                 wqe < self.wqe_committed,
                 pre.retired <= self.retired,
+                forall|s: int| pre.retired <= s < self.retired && #[trigger] pre.req(s) is Some
+                    ==> pre.meta(s)->0.end as int <= wqe as int + 1,
                 forall|s: int|
                     #[trigger] self.req(s) == if pre.retired <= s < self.retired {
                         pre.retired_view(s, pre.retire_outcome(s, wqe, wc))

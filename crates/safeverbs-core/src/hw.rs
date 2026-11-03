@@ -64,6 +64,7 @@ use crate::trusted::*;
 use crate::wc::{Opcode, Wc};
 use crate::wr_id::*;
 
+mod outcomes;
 mod separation;
 
 verus! {
@@ -910,6 +911,7 @@ impl<N: Device> HwQp<N> {
         &&& self.atomics ==> self.qp_type == QpType::Rc
         &&& sq_linked(self.send, index, qp)
         &&& rq_linked(self.recv, index, qp)
+        &&& outcomes::recv_outcomes(self.recv, m, self.id())
         &&& ring_resources_ok(self.send)
         &&& ring_resources_ok(self.recv)
         &&& queued_outcomes_ok(m, self.id@)
@@ -1088,6 +1090,7 @@ impl<N: Device> HwQp<N> {
         let q = self.id@;
         let (a, b) = (m.qps[q], n.qps[q]);
         assert(qp_kept(a, b));
+        outcomes::lemma_recv_framed(self.recv, m, n, q);
         assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
             index,
             false,
@@ -1294,10 +1297,14 @@ proof fn lemma_ok_same<N: Device>(
         m2.qps[e.id()] == m1.qps[e.id()],
         m2.caps == m1.caps,
         m2.mrs == m1.mrs,
+        forall|w: WqeRef| w.qp == e.id() && w.queue is Recv && w.seq < m1.qps[e.id()].rq_head
+            && #[trigger] m1.retired.contains_key(w)
+            ==> m2.retired.contains_key(w) && m2.retired[w] == m1.retired[w],
     ensures
         e.ok(index, m2, sh, pd, started, written),
 {
     let qp = m1.qps[e.id()];
+    outcomes::lemma_recv_framed(e.recv, m1, m2, e.id());
     assert forall|j: int| 0 <= j < written.len() implies m2.send_wr_ok(qp.attr, #[trigger] written[j]) by {
         assert(m1.send_wr_ok(qp.attr, written[j]));
     }
@@ -1588,6 +1595,7 @@ impl<N: Device> Hw<N> {
             lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::create_qp(q, attr));
             safeverbs_spec::nic_proofs::lemma_copies(q, attr.sq_depth);
             safeverbs_spec::nic_proofs::lemma_copies(q, attr.rq_depth);
+            outcomes::lemma_recv_empty(self.qps@[index as int]->0.recv, n, q);
             broadcast use vstd::multiset::group_multiset_axioms;
             // The new QP is not one of the table's: those exist in M already.
             assert forall|i: int| 0 <= i < before.qps@.len() && #[trigger] before.qps@[i] is Some implies before.qps@[i]->0.id() != q by {
@@ -1680,6 +1688,8 @@ pub open spec fn framed_but(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::S
     &&& n.cqs[sh.cq].reserved == m.cqs[sh.cq].reserved
     &&& forall|w: WqeRef| #[trigger] sh.owns.contains(w.qp) ==> (n.retired.contains_key(w)
         <==> m.retired.contains_key(w))
+    &&& forall|w: WqeRef| #[trigger] sh.owns.contains(w.qp) && m.retired.contains_key(w)
+        ==> n.retired[w] == m.retired[w]
 }
 
 /// What `modify_qp` steps of the worker's own QP `q` (to states other than
@@ -1893,6 +1903,7 @@ impl<N: Device> Hw<N> {
                 assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(n.qps[q].attr, #[trigger] written[j]) by {
                     assert(mid.send_wr_ok(mid.qps[q].attr, written[j]));
                 }
+                outcomes::lemma_recv_framed(e.recv, mid, n, q);
                 assert(self.entry_ok(index as int, t, n));
                 self.lemma_touch_one(&start, t, mid, n, index as int);
             } else {
@@ -1943,6 +1954,7 @@ impl<N: Device> Hw<N> {
                     assert(p != q);
                     let (a, b) = (m.qps[p], n.qps[p]);
                     assert(qp_kept(a, b));
+                    outcomes::lemma_recv_framed(e.recv, m, n, p);
                     assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
                         i as u16,
                         false,
@@ -2107,6 +2119,7 @@ impl<N: Device> Hw<N> {
             assert(sq_linked(e.send, index as u16, b));
             assert(rq_linked(e.recv, index as u16, b));
             assert(writing_ok(e.send, index as u16, n, b.attr, t0.started(q), written, e.held is Some));
+            outcomes::lemma_recv_framed(e.recv, m0, n, q);
             assert(self.entry_ok(index as int, t0, n));
             self.lemma_but_one(&start, t0, m0, n, index as int);
             self.lemma_same_token(t0, t, n);
@@ -2192,6 +2205,7 @@ impl<N: Device> Hw<N> {
                 let ghost e1 = *e;
                 proof {
                     e1.recv.lemma_wqes();
+                    outcomes::lemma_recv_no_staged(e1.recv);
                 }
                 let seq = match e.recv.begin() {
                     Some(seq) => seq,
@@ -2260,6 +2274,10 @@ impl<N: Device> Hw<N> {
                             assert(e.recv.req(seq as int) is Some);
                             assert(e.recv.req(seq as int)->0.phase is InFlight);
                             assert(e.recv.req(seq as int)->0.leases == resource);
+                            assert(e.recv.meta(seq as int) is Some);
+                            assert(e.recv.meta(seq as int)->0.first == wqe);
+                            assert(e.recv.meta(seq as int)->0.end as int == wqe as int + 1);
+                            assert(e.recv.meta(seq as int)->0.seen is None);
                         }
                         Ok(seq)
                     },
@@ -2303,6 +2321,8 @@ impl<N: Device> Hw<N> {
                     }
                 }
                 assert(rq_linked(e.recv, index as u16, b));
+                outcomes::lemma_recv_framed(e1.recv, mid, n, q);
+                outcomes::lemma_recv_added(e1.recv, e.recv, n, q, r->Ok_0 as int);
                 assert forall|k: int| 0 <= k < b.rq.len() implies
                     ring_backed(e.recv, b.rq_head + k, (#[trigger] b.rq[k]).wr.wr_id,
                         None, b.rq[k].wr.sges) by {
@@ -2332,6 +2352,7 @@ impl<N: Device> Hw<N> {
                 mid1.lemma_rely(t1, m1, n);
                 assert(mid1.entry_ok(index as int, t1, n));
                 assert(rq_linked(e.recv, index as u16, n.qps[q]));
+                outcomes::lemma_recv_kept(e1.recv, e.recv, n, q);
                 lemma_queues_kept(e1, e, n.qps[q]);
                 e.send.lemma_wqes();
                 e.recv.lemma_wqes();
@@ -2595,10 +2616,24 @@ impl<N: Device> Hw<N> {
             assert forall|j: int| 0 <= j < written.len() implies after.send_wr_ok(qp2.attr, #[trigger] written[j]) by {
                 assert(before.send_wr_ok(qp.attr, written[j]));
             }
+            assert forall|w: WqeRef| w.qp == q && w.queue is Recv && w.seq < qp.rq_head
+                && #[trigger] before.retired.contains_key(w)
+                implies after.retired.contains_key(w) && after.retired[w] == before.retired[w] by {
+                reveal(retires);
+            }
+            if e.queue is Recv {
+                outcomes::lemma_recv_completed(e0.recv, en.recv, before, after, q, e.seq as u64, *wc);
+            } else {
+                outcomes::lemma_recv_framed(en.recv, before, after, q);
+            }
             assert(self.entry_ok(i, t, after));
             // `poll_cq` changed only QP `q` and the CQ's entries.
             assert(after.cqs[c].reserved == before.cqs[c].reserved);
             assert forall|w: WqeRef| #[trigger] after.retired.contains_key(w) implies before.retired.contains_key(w) || w.qp == q by {
+                reveal(retires);
+            }
+            assert forall|w: WqeRef| w.qp != q && #[trigger] before.retired.contains_key(w)
+                implies after.retired.contains_key(w) && after.retired[w] == before.retired[w] by {
                 reveal(retires);
             }
             self.lemma_poll_one(&start, t, before, after, i);
@@ -2633,6 +2668,8 @@ impl<N: Device> Hw<N> {
             n.mrs == mid.mrs,
             n.pds == mid.pds,
             forall|w: WqeRef| #[trigger] n.retired.contains_key(w) ==> mid.retired.contains_key(w) || w.qp == start.qps@[index]->0.id(),
+            forall|w: WqeRef| w.qp != start.qps@[index]->0.id() && #[trigger] mid.retired.contains_key(w)
+                ==> n.retired.contains_key(w) && n.retired[w] == mid.retired[w],
             n.cqs[t.share().cq].cap == mid.cqs[t.share().cq].cap,
             n.cqs[t.share().cq].reserved == mid.cqs[t.share().cq].reserved,
         ensures
@@ -2897,6 +2934,7 @@ impl<N: Device> Hw<N> {
                     }
                 }
                 assert(sq_linked(e.send, index as u16, b));
+                outcomes::lemma_recv_framed(e.recv, mid, n, q);
                 assert(self.entry_ok(index as int, t, n));
                 self.lemma_commit_frame(&start, t0, t, mid, n, index as int);
             } else {
@@ -3795,6 +3833,7 @@ impl<N: Device> Hw<N> {
                 let pre = start.qps@[index as int]->0;
                 let post = self.qps@[index as int]->0;
                 lemma_queues_kept(pre, post, m.qps[pre.id()]);
+                outcomes::lemma_recv_kept(pre.recv, post.recv, m, pre.id());
                 post.send.lemma_wqes();
                 assert forall|j: int| 0 <= j < t.written(pre.id()).len()
                     implies written_backed(post, post.send.spec_wqe_committed() + j,
@@ -3842,6 +3881,7 @@ impl<N: Device> Hw<N> {
                 let pre = start.qps@[index as int]->0;
                 let post = self.qps@[index as int]->0;
                 lemma_queues_kept(pre, post, m.qps[pre.id()]);
+                outcomes::lemma_recv_kept(pre.recv, post.recv, m, pre.id());
                 post.send.lemma_wqes();
                 assert forall|j: int| 0 <= j < t.written(pre.id()).len()
                     implies written_backed(post, post.send.spec_wqe_committed() + j,
@@ -3896,6 +3936,7 @@ impl<N: Device> Hw<N> {
                 let pre = start.qps@[index as int]->0;
                 let post = self.qps@[index as int]->0;
                 lemma_queues_kept(pre, post, m.qps[pre.id()]);
+                outcomes::lemma_recv_kept(pre.recv, post.recv, m, pre.id());
                 post.send.lemma_wqes();
                 assert forall|j: int| 0 <= j < t.written(pre.id()).len()
                     implies written_backed(post, post.send.spec_wqe_committed() + j,
@@ -4163,6 +4204,7 @@ impl<N: Device> Hw<N> {
                 while seq < e.recv.posted()
                     invariant
                         e.recv.inv(),
+                        outcomes::recv_outcomes(e.recv, m0, q),
                         ring_resources_ok(e.recv),
                         e.recv.same_wqes(&r1),
                         e.recv.same_dma(&r1),
@@ -4172,7 +4214,10 @@ impl<N: Device> Hw<N> {
                 {
                     let ghost before_detach = e.recv;
                     e.recv.detach(seq);
-                    proof { lemma_resources_kept(before_detach, e.recv); }
+                    proof {
+                        lemma_resources_kept(before_detach, e.recv);
+                        outcomes::lemma_recv_kept(before_detach, e.recv, m0, q);
+                    }
                     seq += 1;
                 }
                 e.send.in_flight_wqes() > 0 || e.recv.in_flight_wqes() > 0
@@ -4187,6 +4232,7 @@ impl<N: Device> Hw<N> {
             let e = self.qps@[index as int]->0;
             if e0.started {
                 start.lemma_rely(t0, m0, n);
+                lemma_rely_frame(t0.share(), pinned(t0), m0, n);
             } else {
                 assert(t == t0);
                 start.lemma_inv_fields(&start, t0, m0);
@@ -4194,6 +4240,7 @@ impl<N: Device> Hw<N> {
             assert(start.inv_with(t0, n));
             assert(start.entry_ok(index as int, t0, n));
             lemma_queues_kept(e0, e, n.qps[q]);
+            outcomes::lemma_recv_framed(e.recv, m0, n, q);
             assert(self.entry_ok(index as int, t, n));
             self.lemma_commit_frame(&start, t0, t, n, n, index as int);
         }
