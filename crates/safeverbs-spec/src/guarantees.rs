@@ -120,16 +120,16 @@ pub proof fn lemma_f1_taken_once(pre: Abs::State, post: Abs::State, r: Id)
 // =========================================================================================
 // R1: no leak, no early release.
 
-/// Whether a member identity is still held anywhere, independently of its group handle.
+/// Some group holds lease `member`, whatever its handle.
 pub open spec fn member_live(s: Abs::State, member: Id) -> bool {
     exists|i: Id, k: int| #![trigger s.groups[i].members[k]]
         s.groups.contains_key(i) && 0 <= k < s.groups[i].members.len()
             && s.groups[i].members[k].id == member
 }
 
-/// **R1, member identities.** A previously allocated member that no group holds cannot
-/// reappear. Taking or separating a group does not release its members; dropping the
-/// last group containing a member does. Fresh members always receive fresh identities.
+/// **R1, leases.** A lease that no group holds any more never reappears. Taking or
+/// separating a group does not release its leases; dropping the group that holds a lease
+/// does. New leases always get fresh identities.
 pub proof fn lemma_r1_member_released_once(pre: Abs::State, post: Abs::State, member: Id)
     requires
         pre.invariant(),
@@ -151,8 +151,8 @@ pub proof fn lemma_r1_member_released_once(pre: Abs::State, post: Abs::State, me
     }
 }
 
-/// Every live member identity has exactly one position in exactly one group. Shared
-/// clones may overlap bytes, but cloning never duplicates a resource identity.
+/// Each lease held is a member of one group, at one position. Shared clones may overlap
+/// bytes, but cloning never duplicates a lease identity.
 pub proof fn lemma_member_owned_once(s: Abs::State, i: Id, j: Id, k: int, l: int)
     requires
         s.invariant(),

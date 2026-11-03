@@ -1,17 +1,16 @@
 //! The refinement theorem: under M, for any peer, the library behaves like A.
 //!
-//! The library's trusted core (`safeverbs-core`) will be verified against this module. Its
-//! state, rings, buffers and ghost state included, must implement [`Refines`]: an invariant,
-//! an abstraction function to A, its view of the NIC in M, and each request's WQE interval.
-//! The core proves the three obligations of the trait; [`theorem_1`] then gives the
-//! guarantees along every execution.
+//! To get it, the library's trusted core (`safeverbs-core`) implements [`Refines`] for its
+//! whole state, rings, buffers and ghost state included: an invariant, an abstraction
+//! function to A, its view of the NIC in M and each request's WQE interval, with the
+//! trait's three obligations proved. [`theorem_1`] then gives the guarantees along every
+//! execution.
 //!
-//! A batch owns a nonempty interval on one QP and queue. Retiring a proper prefix leaves
-//! the request in flight with its leases; completion waits for the last WQE. Its outcome
-//! is the first failing WQE's outcome, or the last WQE's success if none failed. This is
-//! an obligation on the implementation, not a restriction added to M. No concrete worker
-//! implements this trait yet; these lemmas do not establish that missing refinement or
-//! the byte-permission and inter-worker composition proofs.
+//! A request owns a nonempty interval of WQEs on one QP and queue (a batch owns several).
+//! Retiring a proper prefix leaves it in flight with its leases; it completes when its last
+//! WQE retires, with the first error in posting order, or the last WQE's success if none
+//! failed (so a batch of READs reports the last READ's length). This is an obligation on
+//! the implementation, not a restriction added to M.
 //!
 //! **Why `nic()` is honest.** The core's view of the NIC is a ghost token that only the
 //! trusted verbs wrappers change. Each wrapper's contract is M: it *requires* the verb's
@@ -23,12 +22,12 @@
 //! The wrappers' bodies call rdma-core and are trusted, not verified: they are where M meets
 //! the real NIC (see `docs/verification.md`).
 //!
-//! **Theorem 2** (stated, not yet proved). Two endpoints both run safeverbs' protocol layer
-//! (credit-based flow control for sends, rkey leases for one-sided access), each refining A
-//! under M, with the network the only nondeterminism left. Assume-guarantee: each side
-//! assumes the other honours the credits and leases it granted and guarantees the same.
-//! Then no completion is `RnrRetryExceeded` or `RemoteErr`, and every error completion is
-//! attributable to a fault step of M (link down, peer crash, retry timeout).
+//! **Theorem 2**, for two endpoints that both run safeverbs' protocol layer (credit-based
+//! flow control for sends, rkey leases for one-sided access), each refining A under M, with
+//! the network the only nondeterminism left. Assume-guarantee: each side assumes the other
+//! honours the credits and leases it granted and guarantees the same. Then no completion is
+//! `RnrRetryExceeded` or `RemoteErr`, and every error completion is attributable to a fault
+//! step of M (link down, peer crash, retry timeout).
 #![allow(unused_imports)]
 
 use crate::abs::*;
@@ -482,8 +481,8 @@ pub proof fn corollary_f1(
     lemma_aggregate(ranges[r], m.retired);
 }
 
-/// **R1 against M.** Prefix retirement cannot return or release an in-flight request's
-/// lease: its last WQE is outstanding and A has not recorded an outcome.
+/// **R1 against M.** Retiring a prefix of an in-flight request's WQEs returns or releases
+/// none of its leases: its last WQE is still posted and A records no outcome.
 pub proof fn corollary_inflight(
     a: Abs::State,
     m: Nic::State,

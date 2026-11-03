@@ -5,8 +5,8 @@
 //! guarantees as lemmas about A, and the refinement theorem the library's core proves.
 //! Read it in this order:
 //!
-//! 1. [`abs`]: **A**, the abstract machine. Buffers are *leases* held by the program, by a
-//!    posted request or by the peer; every library call moves leases.
+//! 1. [`abs`]: **A**, the abstract machine. Buffers are *leases*, in groups held by the
+//!    program, by a posted request or by the peer; every library call moves groups.
 //! 2. [`guarantees`]: **S1** (no conflicting access between the program and the NIC),
 //!    **F1** (each request gets its own outcome, once, with its own buffers), **R1** (no
 //!    buffer released early or twice, none outliving its queue pair) and **L1** (no lost
@@ -19,7 +19,8 @@
 //!    guarantee each other.
 //! 6. [`examples`]: concrete executions of A and M.
 //!
-//! [`types`] holds what A and M share; [`nic_proofs`] holds the proofs about M.
+//! [`types`] holds what A and M share; [`abs_proofs`] and [`nic_proofs`] hold the proofs
+//! that their invariants are inductive.
 //!
 //! Everything here is ghost code: a plain `cargo build` compiles it away, and
 //! `scripts/verify.sh` checks it. `docs/verification.md` says what is proved and what is
@@ -29,6 +30,7 @@
 #![allow(non_snake_case)]
 
 pub mod abs;
+pub mod abs_proofs;
 pub mod examples;
 pub mod guarantees;
 pub mod nic;

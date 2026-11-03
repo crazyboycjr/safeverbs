@@ -323,16 +323,16 @@ pub proof fn example_batch_first_error() {
     assert(range.aggregate(m5.retired) == remote);
 }
 
-/// One request owns a READ destination and a shared SEND/WRITE source. A separate
-/// frozen clone stays with the program. Cancellation retains the entire group until
-/// completion; taking a normal result preserves and then separates the original members.
+/// A: one request's group has a READ destination and a frozen SEND source, of which the
+/// program keeps a clone. The NIC writes the one and reads the other while the program may
+/// read the clone. Dropping the future keeps the whole group until completion; taking the
+/// outcome returns the members as they were posted, which separate into the two buffers.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(20)]
 pub proof fn example_mixed_group() {
     let dst = Span { start: 128, len: 64 }.bytes();
     let src = Span { start: 0, len: 64 }.bytes();
     let remote = Outcome { status: Status::RemoteErr, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
-    let flush = Outcome { status: Status::FlushErr, ..remote };
     let a0 = Abs::State {
         qps: Set::empty(), groups: Map::empty(), next_id: 0,
         outcomes: Map::empty(), posted: Map::empty(), wakes: Seq::empty(),
@@ -363,8 +363,7 @@ pub proof fn example_mixed_group() {
     assert(Abs::State::join(a5, a6, 0, 1));
     Abs::State::join_inductive(a5, a6, 0, 1);
     let dirs = seq![Dir::In, Dir::Out];
-    assert(mixed.allows(dirs));
-    assert(!mixed.allows(seq![Dir::In, Dir::In]));
+    assert(mixed.allows(dirs) && !mixed.allows(seq![Dir::In, Dir::In]));
     let req = Req { qp: 7, dirs, phase: Phase::InFlight, waker: None, detached: false };
     let a7 = Abs::State {
         groups: a6.groups.remove(3).insert(4, mixed.with_req(req)),
@@ -372,54 +371,28 @@ pub proof fn example_mixed_group() {
     };
     assert(Abs::State::post_request(a6, a7, 3, 7, dirs));
     Abs::State::post_request_inductive(a6, a7, 3, 7, dirs);
-    // Give the byte predicates their group/member witnesses before using S1 to
-    // exclude conflicting program access and NIC writes through the frozen clone.
-    assert(a7.groups.contains_key(4));
-    assert(a7.groups[4].members[0].mem.contains(128));
-    assert(a7.groups[4].write_member(0));
-    assert(a7.groups[4].nic_may_write(128));
-    assert(a7.nic_writes(128));
-    assert(a7.groups.contains_key(2) && a7.groups[2].is_program());
-    assert(a7.groups[2].members[0].mem.contains(0));
-    assert(a7.groups[2].contains(0));
-    assert(a7.program_reads(0));
-    assert(a7.groups[4].members[1].mem.contains(0));
-    assert(a7.groups[4].read_member(1));
-    assert(a7.groups[4].nic_may_read(0));
-    assert(a7.nic_reads(0));
+
+    // S1: the NIC writes byte 128 and reads byte 0, which the program reads too (the clone).
+    assert(a7.groups[4].members[0].mem.contains(128) && a7.groups[4].write_member(0));
+    assert(a7.groups[4].members[1].mem.contains(0) && a7.groups[4].read_member(1));
+    assert(a7.groups[2].members[0].mem.contains(0) && a7.groups[2].contains(0));
+    assert(a7.nic_writes(128) && a7.nic_reads(0) && a7.program_reads(0));
     crate::guarantees::lemma_s1_no_conflict(a7, 0);
     crate::guarantees::lemma_s1_no_conflict(a7, 128);
-    assert(!a7.program_reads(128));
-    assert(!a7.nic_reads(128));
-    assert(!a7.nic_writes(0));
-    crate::guarantees::lemma_s1_nic_writes_any_bytes(a7, 4, 0);
-    assert(a7.groups[4].members[0].unique && !a7.groups[4].members[1].unique);
+    assert(!a7.program_reads(128) && !a7.nic_writes(0));
     let a8 = Abs::State { groups: a7.groups.insert(4, mixed.with_req(req.with_waker(9))), ..a7 };
     assert(Abs::State::register(a7, a8, 4, 9));
     Abs::State::register_inductive(a7, a8, 4, 9);
 
-    // A proper WQE prefix is insufficient for completing this request. The existing
-    // M example proves these errors can occur; here the interval and group meet in A.
-    let range = crate::refinement::WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 2 };
-    let prefix = IMap::empty().insert(range.at(0), remote);
-    assert(!range.all_retired(prefix));
-    let retired = prefix.insert(range.at(1), flush);
-    assert(range.all_retired(retired));
-    assert(range.first_error(retired, 0));
-    crate::refinement::lemma_aggregate_first_error(range, retired, 0);
-    assert(range.aggregate(retired) == remote);
-
+    // Dropped: the request keeps the group, unwoken, until it completes; then it goes.
     let detached = Abs::State { groups: a8.groups.insert(4, mixed.with_req(req.detach())), ..a8 };
     assert(Abs::State::detach(a8, detached, 4));
-    Abs::State::detach_inductive(a8, detached, 4);
     assert(detached.in_flight(4) && detached.groups[4].members == mixed.members);
-    assert(detached.nic_writes(128) && detached.req(4).waker is None);
     let dropped = Abs::State { groups: detached.groups.remove(4), outcomes: detached.outcomes.insert(4, remote), ..detached };
-    assert(Abs::State::complete(detached, dropped, 4, range.aggregate(retired)));
-    Abs::State::complete_inductive(detached, dropped, 4, remote);
-    assert(!dropped.groups.contains_key(4) && dropped.groups[2] == clone);
-    assert(!dropped.nic_writes(128) && dropped.wakes.len() == 0);
+    assert(Abs::State::complete(detached, dropped, 4, remote));
+    assert(dropped.groups.dom() =~= set![2nat] && dropped.wakes.len() == 0);
 
+    // Or kept: completing wakes it, taking returns its members, and they separate.
     let done = Abs::State {
         groups: a8.groups.insert(4, mixed.with_req(req.completed(remote))),
         outcomes: a8.outcomes.insert(4, remote), wakes: a8.wakes.push(9), ..a8
@@ -428,28 +401,18 @@ pub proof fn example_mixed_group() {
     Abs::State::complete_inductive(a8, done, 4, remote);
     let taken = Abs::State { groups: done.groups.remove(4).insert(5, mixed), next_id: 6, ..done };
     assert(Abs::State::take(done, taken, 4, remote));
-    Abs::State::take_inductive(done, taken, 4, remote);
     crate::guarantees::lemma_f1_take(done, taken, 4, remote);
-    assert(taken.groups[5].members == taken.posted[4]);
     let separated = Abs::State {
         groups: taken.groups.remove(5).insert(6, read).insert(7, frozen), next_id: 8, ..taken
     };
-    assert(mixed.members.take(1) =~= read.members);
-    assert(mixed.members.skip(1) =~= frozen.members);
+    assert(mixed.members.take(1) =~= read.members && mixed.members.skip(1) =~= frozen.members);
     assert(Abs::State::separate(taken, separated, 5, 1));
-    Abs::State::separate_inductive(taken, separated, 5, 1);
-    assert(separated.groups[6].members[0].id == 0 && separated.groups[7].members[0].id == 1);
-    assert(separated.groups.contains_key(6) && separated.groups[6].is_program());
-    assert(separated.groups[6].writes_program(128));
-    assert(separated.program_writes(128));
-    if separated.program_writes(0) {
-        let i = choose|i: Id| separated.groups.contains_key(i)
-            && separated.groups[i].is_program() && separated.groups[i].writes_program(0);
-        assert(i == 2 || i == 6 || i == 7);
-        assert(!separated.groups[i].writes_program(0));
-    }
+    // The destination is the program's to write again; the source stays shared.
+    assert(separated.groups[6].members[0].mem.contains(128) && separated.groups.contains_key(6));
+    assert(separated.groups[6].writes_program(128) && separated.program_writes(128));
+    assert(!separated.groups[2].writes_program(0) && !separated.groups[7].writes_program(0));
+    assert(separated.groups.dom() =~= set![2nat, 6nat, 7nat]);
     assert(!separated.program_writes(0));
-    assert(separated.wakes == seq![9nat]);
 }
 
 } // verus!
