@@ -3807,6 +3807,8 @@ impl<N: Device> Hw<N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             r matches Some((_, leases)) ==> leases.inv() && leases.fully_recorded(),
+            side is Recv ==> (r matches Some((wc, leases))
+                ==> old(self).recv_taken_matches(index, seq, wc, leases)),
     {
         if index >= self.qps.len() {
             return None;
@@ -3826,6 +3828,11 @@ impl<N: Device> Hw<N> {
         };
         proof {
             if start.qps@[index as int] is Some {
+                if side is Recv {
+                    if r is Some {
+                        start.lemma_recv_taken(index, seq, (r->0).0, (r->0).1);
+                    }
+                }
                 let old_e = start.qps@[index as int]->0;
                 let e = self.qps@[index as int]->0;
                 lemma_resources_kept(old_e.send, e.send);

@@ -12,6 +12,7 @@ verus! {
 #[verifier::opaque]
 pub(super) open spec fn recv_outcomes<L>(r: Ring<L>, m: Nic::State, q: QpId) -> bool {
     &&& m.qps.contains_key(q)
+    &&& forall|s: int| #[trigger] r.refused(s) is None
     &&& forall|s: int| #[trigger] r.req(s) is Some ==> {
         let req = r.req(s)->0;
         let meta = r.meta(s);
@@ -31,6 +32,7 @@ pub(super) open spec fn recv_outcomes<L>(r: Ring<L>, m: Nic::State, q: QpId) -> 
 /// A newly created receive ring contains no request that could have an outcome.
 pub(super) proof fn lemma_recv_empty<L>(r: Ring<L>, m: Nic::State, q: QpId)
     requires r.inv(), m.qps.contains_key(q), forall|s: int| #[trigger] r.req(s) is None,
+        forall|s: int| #[trigger] r.refused(s) is None,
     ensures recv_outcomes(r, m, q),
 {
     reveal(recv_outcomes);
@@ -70,6 +72,7 @@ pub(super) proof fn lemma_recv_framed<L>(r: Ring<L>, m: Nic::State, n: Nic::Stat
 /// Removing results or changing wakers cannot change an existing receive outcome.
 pub(super) proof fn lemma_recv_kept<L>(pre: Ring<L>, post: Ring<L>, m: Nic::State, q: QpId)
     requires recv_outcomes(pre, m, q),
+        forall|s: int| #[trigger] post.refused(s) is Some ==> pre.refused(s) is Some,
         forall|s: int| #[trigger] post.req(s) is Some ==> pre.req(s) is Some
             && post.req(s)->0.phase == pre.req(s)->0.phase && post.meta(s) == pre.meta(s),
     ensures recv_outcomes(post, m, q),
@@ -86,6 +89,7 @@ pub(super) proof fn lemma_recv_no_staged<L>(r: Ring<L>)
 /// Actual receive admission adds one pending singleton and preserves prior results.
 pub(super) proof fn lemma_recv_added<L>(pre: Ring<L>, post: Ring<L>, m: Nic::State, q: QpId, added: int)
     requires recv_outcomes(pre, m, q),
+        forall|s: int| #[trigger] post.refused(s) is Some ==> pre.refused(s) is Some,
         post.req(added) is Some, post.req(added)->0.phase is InFlight,
         post.meta(added) is Some, post.meta(added)->0.seen is None,
         post.meta(added)->0.end as int == post.meta(added)->0.first as int + 1,
@@ -116,6 +120,7 @@ pub(super) proof fn lemma_recv_completed<L>(
 )
     requires
         pre.inv(), post.inv(), recv_outcomes(pre, m, q), n.qps.contains_key(q),
+        forall|s: int| #[trigger] post.refused(s) is Some ==> pre.refused(s) is Some,
         wqe == m.qps[q].rq_head, n.qps[q].rq_head == wqe as nat + 1,
         pre.spec_wqe_retired() <= wqe < pre.spec_wqe_committed(),
         n.retired.contains_key(WqeRef { qp: q, queue: safeverbs_spec::nic::Queue::Recv, seq: wqe as nat }),
@@ -199,6 +204,32 @@ impl<N: Device> Hw<N> {
                 None => None,
             }
         }
+    }
+
+    /// The actual receive result and resource value removed by `take`.
+    pub closed spec fn recv_taken_matches(&self, index: usize, seq: RingSeq, wc: Wc, leases: Leases<N>) -> bool {
+        &&& self.has_qp(index as int)
+        &&& self.qps@[index as int]->0.recv.req(seq as int) is Some
+        &&& self.qps@[index as int]->0.recv.req(seq as int)->0.leases == leases
+        &&& self.recv_result(index, seq) == Some(wc.outcome())
+        &&& self.recv_wqe(index, seq) is Some
+        &&& self.nic().retired.contains_key(self.recv_wqe(index, seq)->0)
+        &&& self.nic().retired[self.recv_wqe(index, seq)->0] == wc.outcome()
+    }
+
+    /// A receive cannot return the synthetic refusal result of a send doorbell.
+    pub(super) proof fn lemma_recv_taken(&self, index: usize, seq: RingSeq, wc: Wc, leases: Leases<N>)
+        requires self.inv(), self.has_qp(index as int),
+            self.qps@[index as int]->0.recv.req(seq as int) == Some(crate::ring::ReqView {
+                phase: safeverbs_spec::abs::Phase::Complete(wc.outcome()), waker: None, detached: false, leases,
+            }) || (self.qps@[index as int]->0.recv.req(seq as int) is None
+                && self.qps@[index as int]->0.recv.refused(seq as int) == Some(leases)),
+        ensures self.recv_taken_matches(index, seq, wc, leases),
+    {
+        reveal(recv_outcomes);
+        assert(self.entry_ok(index as int, self.token@, self.nic()));
+        assert(self.recv_result(index, seq) == Some(wc.outcome()));
+        self.lemma_recv_result(index, seq);
     }
 
     /// Every completed native receive result equals its own retired M outcome.

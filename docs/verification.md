@@ -217,6 +217,8 @@ claim follows.
 **The completion ring** (`ring.rs`). `Ring::new` establishes the eight invariants of the
 module documentation (`Ring::inv`) and every operation requires and keeps them; Verus also
 rules out failures of its own indexing, assertions and arithmetic under their preconditions.
+`Hw::take` couples every returned receive outcome and its exact leases to the
+request's own M.retired entry. Receive queues contain no synthetic refusal result.
 External callbacks/destructors and unwinding remain outside these normal-return guarantees.
 The only run-time check added for counter bounds is one comparison in
 `has_free_slot`, which refuses a new request once the WQE or request numbers could not hold
