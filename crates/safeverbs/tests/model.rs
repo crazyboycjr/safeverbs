@@ -131,9 +131,9 @@ fn write_write_imm_and_read() {
         let dst = pd.alloc::<u8>(4096).unwrap().expose().unwrap();
         let src = filled(&pd, 4096, 9);
         a.write(src.slice(..), dst.remote()).await.unwrap();
-        let dst = dst.reclaim();
-        assert_eq!(&dst[..], &src[..]);
-        let dst = dst.expose().unwrap();
+        let mut copy = vec![0; 4096];
+        dst.copy_to_slice(&mut copy);
+        assert_eq!(&copy[..], &src[..]);
 
         let recv = b.recv(pd.alloc::<u8>(8).unwrap());
         a.write_imm(src.slice(..16), dst.remote().offset(1000), 7)
@@ -508,6 +508,48 @@ fn a_sink_reports_another_requests_error_as_such() {
         assert_eq!(error.status(), Some(Status::REM_ACCESS_ERR));
         assert!(matches!(error, Error::Completion(_)), "{error:?}");
     });
+}
+
+/// Exposed memory is read with the safe copy while it stays exposed: from any alignment, any
+/// length, as the same bytes `reclaim` would give, and with the same rkey still valid.
+#[test]
+fn exposed_memory_is_copied_while_exposed() {
+    let (_m, pd, a, _b) = pair::<RC>(1203, 16);
+    block_on(async {
+        for start in [0usize, 1, 3, 8, 13] {
+            let (_, tail) = pd.alloc::<u8>(start + 256).unwrap().split_at(start);
+            let dst = tail.expose().unwrap();
+            let src = filled(&pd, 256, start as u8);
+            a.write(src.slice(..), dst.remote()).await.unwrap();
+            for len in [0usize, 1, 7, 8, 9, 64, 255, 256] {
+                let mut copy = vec![0xee; len];
+                dst.copy_to_slice(&mut copy);
+                assert_eq!(&copy[..], &src[..len], "from {start}, {len} bytes");
+            }
+            // The same remote key still works, and the next copy sees what it wrote.
+            let again = filled(&pd, 256, 200);
+            a.write(again.slice(..), dst.remote()).await.unwrap();
+            let mut copy = vec![0; 256];
+            dst.copy_to_slice(&mut copy);
+            assert_eq!(&copy[..], &again[..]);
+            assert_eq!(&dst.reclaim()[..], &again[..]);
+        }
+        // Typed elements: any bytes are valid, with no padding to expose.
+        let mut words = pd.alloc::<u64>(4).unwrap();
+        words.copy_from_slice(&[1, 2, 3, 4]);
+        let exposed = words.expose().unwrap();
+        let mut copy = [0u64; 3];
+        exposed.copy_to_slice(&mut copy);
+        assert_eq!(copy, [1, 2, 3]);
+    });
+}
+
+#[test]
+#[should_panic(expected = "elements out of")]
+fn exposed_copy_refuses_more_than_it_holds() {
+    let pd = Context::new(Model::new(1204)).alloc_pd().unwrap();
+    let dst = pd.alloc::<u8>(8).unwrap().expose().unwrap();
+    dst.copy_to_slice(&mut [0; 9]);
 }
 
 #[test]

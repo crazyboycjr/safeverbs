@@ -34,6 +34,8 @@ crates/safeverbs-core/src/buf/memory.rs allocate_zeroed_raw
 crates/safeverbs-core/src/buf/memory.rs arc_try_unwrap
 # A streaming ring's chunk permissions: RingBuf's placement is not verified.
 crates/safeverbs-core/src/buf/memory.rs ring_chunk
+# Volatile reads of exposed memory, which a device may write at the same time.
+crates/safeverbs-core/src/buf/memory.rs volatile_copy
 # The NIC traits, declared without specifications (the wrappers carry them).
 crates/safeverbs-core/src/trusted.rs ExNic
 crates/safeverbs-core/src/trusted.rs ExNicQp

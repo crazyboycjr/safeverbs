@@ -176,6 +176,35 @@ fn write_notification_does_not_fill_receive_buffer() {
     assert_eq!(&dst.reclaim()[..], &src[..]);
 }
 
+/// A peer's WRITE with immediate into exposed memory: its notification says the data is
+/// complete, the safe copy reads it, and the same rkey still works for the next one.
+#[test]
+fn write_with_immediate_read_with_the_safe_copy() {
+    let Some(ctx) = device() else { return };
+    let (pd, a, b) = pair::<RC>(&ctx, 16);
+    let dst = pd.alloc::<u8>(8192).unwrap().expose().unwrap();
+    let remote = dst.remote();
+    let mut rx = b.receiver((0..4).map(|_| pd.alloc::<u8>(8).unwrap()));
+    for round in 0..4u8 {
+        let src = filled(&pd, 8192, round);
+        wait(a.write_imm(src.slice(..), remote, u32::from(round))).unwrap();
+        let (received, buf) = wait(rx.next()).unwrap();
+        assert_eq!(
+            received,
+            Ok(Received::WriteNotification {
+                imm: u32::from(round),
+                len: 8192
+            })
+        );
+        let mut copy = vec![0; 8192];
+        dst.copy_to_slice(&mut copy);
+        assert_eq!(&copy[..], &src[..], "round {round}");
+        assert_eq!(dst.remote(), remote, "exposed still, with its key");
+        rx.repost(buf).unwrap();
+    }
+    assert_eq!(&dst.reclaim()[..], &filled(&pd, 8192, 3)[..]);
+}
+
 #[test]
 fn rc_atomics() {
     let Some(ctx) = device() else { return };

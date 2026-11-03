@@ -524,9 +524,10 @@ impl<T, N: Nic> fmt::Debug for Buf<T, N> {
 }
 
 /// A buffer exposed to peers: they may RDMA WRITE, READ and run atomics on
-/// it with [`Exposed::remote`], so it is never readable as `[T]`; read it
-/// only after [`Exposed::reclaim`] revokes the peers' access. The unsafe
-/// [`Exposed::copy_to_slice`] escape hatch requires caller-established quiescence.
+/// it with [`Exposed::remote`], at any moment, so no reference to its bytes
+/// ever exists. [`Exposed::copy_to_slice`] copies them out while it stays
+/// exposed; [`Exposed::reclaim`] revokes the peers' access and gives it back
+/// as a [`BufMut`].
 pub struct Exposed<T, N: Nic = Verbs> {
     /// Kept together with `raw` if revocation fails.
     mr: ManuallyDrop<N::Mr>,
@@ -555,28 +556,22 @@ impl<T, N: Nic> Exposed<T, N> {
         self.raw.range.len() == 0
     }
 
-    /// Copies its current contents into `out` (the first `out.len()`
-    /// elements) with volatile reads after the caller has synchronized peer access.
+    /// Copies its first `out.len()` elements into `out` with volatile reads,
+    /// while peers keep their access and their remote key stays valid. The
+    /// bytes are read as they are: `T` accepts any bytes, so this is safe
+    /// whatever the peer does.
     ///
-    /// # Safety
-    ///
-    /// No NIC, software backend or peer may write the source bytes during
-    /// this copy. The caller must establish completion and exclude concurrent
-    /// and future writes for its duration. Volatile reads do not synchronize
-    /// with DMA or other Rust threads. Prefer [`Self::reclaim`] to revoke
-    /// remote access before using ordinary safe reads.
-    ///
-    /// ```compile_fail
-    /// use safeverbs_core::Exposed;
-    /// fn unsynchronized_copy(buf: &Exposed<u8>, out: &mut [u8]) {
-    ///     buf.copy_to_slice(out);
-    /// }
-    /// ```
+    /// The copy may be torn, if a peer writes meanwhile. A protocol learns
+    /// that data is complete from a write-with-immediate notification
+    /// ([`Received::WriteNotification`](crate::wc::Received::WriteNotification))
+    /// or a SEND, then copies; never by polling these bytes: on some transports
+    /// (MRC) data lands out of order, so a last byte that arrived says nothing
+    /// of the others.
     ///
     /// # Panics
     ///
     /// If `out` is longer than it.
-    pub unsafe fn copy_to_slice(&self, out: &mut [T])
+    pub fn copy_to_slice(&self, out: &mut [T])
     where
         T: FromBytes + IntoBytes,
     {
@@ -586,14 +581,7 @@ impl<T, N: Nic> Exposed<T, N> {
             out.len(),
             self.len()
         );
-        let dst = out.as_mut_bytes();
-        let src = self.raw.ptr();
-        let mut i = 0;
-        while i < dst.len() {
-            // SAFETY: inside the buffer and quiescent by the caller's contract.
-            dst[i] = unsafe { core::ptr::read_volatile(src.add(i)) };
-            i += 1;
-        }
+        memory::volatile_copy(self.raw.ptr(), out.as_mut_bytes());
     }
 
     /// Revokes the peers' access and gives the buffer back. A refused revocation

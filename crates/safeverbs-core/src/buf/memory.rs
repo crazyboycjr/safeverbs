@@ -59,6 +59,39 @@ fn allocate_zeroed_raw(size: usize, align: usize) -> (r: Option<(
     }
 }
 
+/// Copies `out.len()` bytes from `src` with volatile reads, word at a time where
+/// `src` is aligned. A device may write those bytes at any moment, and the copy
+/// may be torn between words or within them; volatile reads of them are defined
+/// and yield arbitrary bytes, which is why the contract says nothing about what
+/// `out` holds. No reference to the source is ever formed.
+#[verifier::external_body]
+pub(super) fn volatile_copy(src: *const u8, out: &mut [u8])
+    ensures final(out)@.len() == old(out)@.len(),
+{
+    let word = size_of::<u64>();
+    let len = out.len();
+    let head = src.align_offset(word).min(len);
+    let mut i = 0;
+    while i < head {
+        // SAFETY: the caller's `src` holds `len` bytes, zeroed at allocation, and stays
+        // allocated; `i < len`.
+        out[i] = unsafe { core::ptr::read_volatile(src.add(i)) };
+        i += 1;
+    }
+    while len - i >= word {
+        // SAFETY: as above, and `src + i` is aligned: `head` bytes aligned it and whole
+        // words followed.
+        let bytes = unsafe { core::ptr::read_volatile(src.add(i).cast::<u64>()) }.to_ne_bytes();
+        out[i..i + word].copy_from_slice(&bytes);
+        i += word;
+    }
+    while i < len {
+        // SAFETY: as above.
+        out[i] = unsafe { core::ptr::read_volatile(src.add(i)) };
+        i += 1;
+    }
+}
+
 /// A unique range and the linear permission for precisely its bytes.
 pub(super) struct OwnedRange {
     ptr: *mut u8,

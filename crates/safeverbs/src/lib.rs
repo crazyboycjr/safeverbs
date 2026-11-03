@@ -2,7 +2,7 @@
 //!
 //! safeverbs makes the contracts of libibverbs part of Rust's type system:
 //! memory the NIC uses is owned by the work request until it completes,
-//! memory a peer may write is never readable as Rust values, queues never
+//! no reference to memory a peer may write ever exists, queues never
 //! overflow, and only connected QPs post. This crate has no `unsafe` code;
 //! everything unsafe lives in `safeverbs-core` behind a small API.
 //!
@@ -16,7 +16,8 @@
 //!   or any part of it as often as wanted. [`Buf::try_thaw`] gives the
 //!   `BufMut` back once nothing holds it. [`BufMut::expose`] lets a peer
 //!   WRITE, READ and run atomics on a buffer through its
-//!   [`RemoteBuf`]; [`Exposed::reclaim`] revokes that first.
+//!   [`RemoteBuf`]; [`Exposed::copy_to_slice`] reads it meanwhile, and
+//!   [`Exposed::reclaim`] revokes that access and gives the buffer back.
 //! - Connect a QP: [`QueuePairBuilder`] → [`PreparedQp`] (exchange
 //!   [`Endpoint`]s with the peer) → [`PreparedQp::handshake`] →
 //!   [`LocalQp`] (or [`SharedQp`] for several threads). Build the QPs of a
@@ -73,7 +74,9 @@
 //!     assert_eq!(received, Ok(Received::Message { len: 64, imm: None }));
 //!     assert!(got.iter().all(|&b| b == 42));
 //!     rx.repost(got)?;
-//!     let copy = dst.reclaim(); // the completed WRITE is the only remote writer
+//!     // The SEND came after the WRITE, so what was written is complete.
+//!     let mut copy = [0u8; 4096];
+//!     dst.copy_to_slice(&mut copy); // a volatile copy; the rkey stays valid
 //!     assert!(copy.iter().all(|&b| b == 42));
 //!
 //!     // Nothing holds the frozen buffer any more: write into it again.

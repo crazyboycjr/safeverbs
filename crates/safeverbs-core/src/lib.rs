@@ -37,8 +37,9 @@
 //! error state and polled until the NIC has flushed every work request);
 //! nothing else can release them. Memory the NIC writes is lent as a unique buffer (moved into the
 //! slot, unreachable until it comes back); memory it reads is lent as a
-//! shared frozen buffer (read only until every handle is gone); memory a
-//! peer may write is never readable as Rust values. Rings never let more
+//! shared frozen buffer (read only until every handle is gone); no reference
+//! to memory a peer may write is ever formed, only a volatile copy of it into
+//! a type that accepts any bytes. Rings never let more
 //! WQEs be in flight than the queues hold, and a worker's CQ reserves room
 //! for every completion its QPs' queues may produce.
 
