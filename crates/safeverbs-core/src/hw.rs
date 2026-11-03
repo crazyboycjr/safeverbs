@@ -66,6 +66,7 @@ use crate::wc::{Opcode, Wc};
 use crate::wr_id::*;
 
 mod outcomes;
+mod send_outcomes;
 mod separation;
 
 verus! {
@@ -913,6 +914,7 @@ impl<N: Device> HwQp<N> {
         &&& sq_linked(self.send, index, qp)
         &&& rq_linked(self.recv, index, qp)
         &&& outcomes::recv_outcomes(self.recv, m, self.id())
+        &&& send_outcomes::send_implied(self.send, self.send_tails@)
         &&& ring_resources_ok(self.send)
         &&& ring_resources_ok(self.recv)
         &&& queued_outcomes_ok(m, self.id@)
@@ -1597,6 +1599,7 @@ impl<N: Device> Hw<N> {
             safeverbs_spec::nic_proofs::lemma_copies(q, attr.sq_depth);
             safeverbs_spec::nic_proofs::lemma_copies(q, attr.rq_depth);
             outcomes::lemma_recv_empty(self.qps@[index as int]->0.recv, n, q);
+            send_outcomes::lemma_implied_empty(self.qps@[index as int]->0.send);
             broadcast use vstd::multiset::group_multiset_axioms;
             // The new QP is not one of the table's: those exist in M already.
             assert forall|i: int| 0 <= i < before.qps@.len() && #[trigger] before.qps@[i] is Some implies before.qps@[i]->0.id() != q by {
@@ -2545,7 +2548,17 @@ impl<N: Device> Hw<N> {
                         assert(wqe == e.seq);
                     }
                     let _known = qp_entry.send.complete_with_wakes(wqe, *wc, wakes);
-                    proof { lemma_resources_completed(e0.send, qp_entry.send, wqe, *wc); }
+                    proof {
+                        lemma_resources_completed(e0.send, qp_entry.send, wqe, *wc);
+                        assert forall|s: int| #[trigger] qp_entry.send.meta(s) is Some implies
+                            e0.send.meta(s) is Some
+                            && qp_entry.send.meta(s)->0.implied == e0.send.meta(s)->0.implied
+                            && qp_entry.send_tails@.contains_key(s)
+                            && qp_entry.send_tails@[s] == e0.send_tails@[s] by {
+                            e0.send.lemma_completion_observation(s, wqe, *wc, qp_entry.send.spec_retired() as int);
+                        }
+                        send_outcomes::lemma_implied_kept(e0.send, qp_entry.send, e0.send_tails@, qp_entry.send_tails@);
+                    }
                     changed = qp_entry.send.retired() != retired;
                     proof {
                         assert(qp_entry.recv == e0.recv);
@@ -3181,6 +3194,10 @@ impl<N: Device> Hw<N> {
                 let sges = vstd::slice::slice_subrange(h.sges.as_slice(), 0, h.n);
                 post(&mut e.hw, h.wr_id, signaled, &h.op, sges, Ghost(q), Tracked(self.token.borrow_mut()));
                 e.send_tails = Ghost(e.send_tails@.insert(seq as int, held_wr(h, signaled)));
+                proof {
+                    send_outcomes::lemma_implied_added(e1.send, e.send, e1.send_tails@,
+                        seq as int, held_wr(h, signaled));
+                }
                 e.held = None;
                 e.held_bytes = 0;
                 proof {
@@ -4200,6 +4217,7 @@ impl<N: Device> Hw<N> {
                 while seq < e.send.posted()
                     invariant
                         e.send.inv(),
+                        send_outcomes::send_implied(e.send, e.send_tails@),
                         ring_resources_ok(e.send),
                         e.send.same_wqes(&s1),
                         e.send.same_dma(&s1),
@@ -4359,6 +4377,8 @@ impl<N: Device> Hw<N> {
                 e.send_tails = Ghost(e.send_tails@.insert(_seq as int,
                     send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@)));
                 proof {
+                    send_outcomes::lemma_implied_added(e0.send, e.send, e0.send_tails@,
+                        _seq as int, send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@));
                     assert(none@ =~= Seq::<Sge>::empty());
                     let wr = send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@);
                     assert(wr.sges =~= Seq::<safeverbs_spec::nic::Sge>::empty());

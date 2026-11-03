@@ -2371,7 +2371,8 @@ impl<L> Ring<L> {
         ensures
             self.completion_meta(s, wqe, wc, to) is Some ==> self.meta(s) is Some
                 && self.completion_meta(s, wqe, wc, to)->0.first == self.meta(s)->0.first
-                && self.completion_meta(s, wqe, wc, to)->0.end == self.meta(s)->0.end,
+                && self.completion_meta(s, wqe, wc, to)->0.end == self.meta(s)->0.end
+                && self.completion_meta(s, wqe, wc, to)->0.implied == self.meta(s)->0.implied,
             s < self.spec_retired() ==> self.completion_meta(s, wqe, wc, to) == self.meta(s),
             self.req(s) is Some && to <= s
                 && (wc.spec_ok() || self.meta(s)->0.seen is Some

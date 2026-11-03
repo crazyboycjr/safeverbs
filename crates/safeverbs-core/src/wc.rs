@@ -218,6 +218,13 @@ impl Wc {
                 || opcode.0 == 128 || opcode.0 == 129 { Some(byte_len) } else { None },
             wc.outcome().imm is None,
             wc.outcome().canonical(),
+            wc.outcome().status is Success,
+            wc.outcome().kind == if opcode.0 == 128 { safeverbs_spec::types::CompletionKind::Receive }
+                else if opcode.0 == 129 { safeverbs_spec::types::CompletionKind::WriteNotification }
+                else if opcode.0 == 2 || opcode.0 == 3 || opcode.0 == 4 { safeverbs_spec::types::CompletionKind::Read }
+                else { safeverbs_spec::types::CompletionKind::StatusOnly },
+            wc.outcome().byte_len == if opcode.0 == 2 || opcode.0 == 3 || opcode.0 == 4
+                || opcode.0 == 128 || opcode.0 == 129 { byte_len as nat } else { 0 },
     {
         let wc = Wc {
             wr_id: 0,
