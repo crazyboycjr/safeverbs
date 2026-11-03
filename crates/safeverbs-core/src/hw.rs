@@ -915,6 +915,7 @@ impl<N: Device> HwQp<N> {
         &&& rq_linked(self.recv, index, qp)
         &&& outcomes::recv_outcomes(self.recv, m, self.id())
         &&& send_outcomes::send_implied(self.send, self.send_tails@)
+        &&& send_outcomes::tail_bound(self.send, self.send_tails@, index, qp, written)
         &&& ring_resources_ok(self.send)
         &&& ring_resources_ok(self.recv)
         &&& queued_outcomes_ok(m, self.id@)
@@ -1600,6 +1601,9 @@ impl<N: Device> Hw<N> {
             safeverbs_spec::nic_proofs::lemma_copies(q, attr.rq_depth);
             outcomes::lemma_recv_empty(self.qps@[index as int]->0.recv, n, q);
             send_outcomes::lemma_implied_empty(self.qps@[index as int]->0.send);
+            assert forall|s: int| self.qps@[index as int]->0.send.meta(s) is Some implies false by {
+                self.qps@[index as int]->0.send.lemma_meta(s);
+            }
             broadcast use vstd::multiset::group_multiset_axioms;
             // The new QP is not one of the table's: those exist in M already.
             assert forall|i: int| 0 <= i < before.qps@.len() && #[trigger] before.qps@[i] is Some implies before.qps@[i]->0.id() != q by {
@@ -2635,6 +2639,20 @@ impl<N: Device> Hw<N> {
                 implies after.retired.contains_key(w) && after.retired[w] == before.retired[w] by {
                 reveal(retires);
             }
+            assert forall|s: int| #[trigger] en.send.meta(s) is Some implies e0.send.meta(s) is Some
+                && en.send.meta(s)->0.first == e0.send.meta(s)->0.first
+                && en.send.meta(s)->0.end == e0.send.meta(s)->0.end by {
+                if e.queue is Send {
+                    e0.send.lemma_completion_observation(s, e.seq as u64, *wc, en.send.spec_retired() as int);
+                }
+            }
+            assert forall|s: int| #[trigger] en.send.req(s) is Some implies e0.send.req(s) is Some by {
+                if e.queue is Send && e0.send.spec_retired() <= s < en.send.spec_retired() {
+                    e0.send.lemma_retired_view(s, e0.send.retire_outcome(s, e.seq as u64, *wc));
+                }
+            }
+            send_outcomes::lemma_bound_kept(e0.send, en.send, e0.send_tails@, i as u16,
+                qp, qp2, t.written(q));
             if e.queue is Recv {
                 outcomes::lemma_recv_completed(e0.recv, en.recv, before, after, q, e.seq as u64, *wc);
             } else {
@@ -2952,6 +2970,8 @@ impl<N: Device> Hw<N> {
                 }
                 assert(sq_linked(e.send, index as u16, b));
                 outcomes::lemma_recv_framed(e.recv, mid, n, q);
+                send_outcomes::lemma_bound_committed(e0.send, e.send, e.send_tails@,
+                    index as u16, a, b, wrs);
                 assert(self.entry_ok(index as int, t, n));
                 self.lemma_commit_frame(&start, t0, t, mid, n, index as int);
             } else {
@@ -2959,6 +2979,10 @@ impl<N: Device> Hw<N> {
                 assert(start.entry_ok(index as int, t0, n));
                 assert(sq_linked(e.send, index as u16, n.qps[q]));
                 lemma_queues_kept(e0, e, n.qps[q]);
+                send_outcomes::lemma_bound_kept(e0.send, e.send, e.send_tails@, index as u16,
+                    n.qps[q], n.qps[q], t0.written(q));
+                send_outcomes::lemma_bound_no_written(e.send, e.send_tails@, index as u16,
+                    n.qps[q], t0.written(q));
                 assert(self.entry_ok(index as int, t, n));
                 self.lemma_commit_frame(&start, t0, t, n, n, index as int);
             }
@@ -3195,8 +3219,13 @@ impl<N: Device> Hw<N> {
                 post(&mut e.hw, h.wr_id, signaled, &h.op, sges, Ghost(q), Tracked(self.token.borrow_mut()));
                 e.send_tails = Ghost(e.send_tails@.insert(seq as int, held_wr(h, signaled)));
                 proof {
+                    assert(sges@ == h.sges@.take(h.n as int));
+                    assert(self.token@.written(q) =~= t1.written(q).push(held_wr(h, signaled)));
                     send_outcomes::lemma_implied_added(e1.send, e.send, e1.send_tails@,
                         seq as int, held_wr(h, signaled));
+                    e.send.lemma_meta(seq as int);
+                    send_outcomes::lemma_bound_added(e1.send, e.send, e1.send_tails@, index as u16,
+                        m1.qps[q], t1.written(q), self.token@.written(q), seq as int, held_wr(h, signaled));
                 }
                 e.held = None;
                 e.held_bytes = 0;
@@ -4211,13 +4240,19 @@ impl<N: Device> Hw<N> {
                 // gone too).
                 let ghost before_abort = e.send;
                 e.send.abort_with_wakes(&mut wakes);
-                proof { lemma_resources_kept(before_abort, e.send); }
+                proof {
+                    lemma_resources_kept(before_abort, e.send);
+                    send_outcomes::lemma_bound_kept(before_abort, e.send, e.send_tails@, index as u16,
+                        m0.qps[q], m0.qps[q], t0.written(q));
+                    send_outcomes::lemma_bound_no_written(e.send, e.send_tails@, index as u16, m0.qps[q], t0.written(q));
+                }
                 let ghost s1 = e.send;
                 let mut seq = e.send.head();
                 while seq < e.send.posted()
                     invariant
                         e.send.inv(),
                         send_outcomes::send_implied(e.send, e.send_tails@),
+                        send_outcomes::tail_bound(e.send, e.send_tails@, index as u16, m0.qps[q], Seq::empty()),
                         ring_resources_ok(e.send),
                         e.send.same_wqes(&s1),
                         e.send.same_dma(&s1),
@@ -4377,8 +4412,15 @@ impl<N: Device> Hw<N> {
                 e.send_tails = Ghost(e.send_tails@.insert(_seq as int,
                     send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@)));
                 proof {
+                    assert(none@ =~= Seq::<Sge>::empty());
+                    assert(self.token@.written(q) =~= t0.written(q).push(
+                        send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@)));
                     send_outcomes::lemma_implied_added(e0.send, e.send, e0.send_tails@,
                         _seq as int, send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@));
+                    e.send.lemma_meta(_seq as int);
+                    send_outcomes::lemma_bound_added(e0.send, e.send, e0.send_tails@, index as u16,
+                        m0.qps[q], t0.written(q), self.token@.written(q), _seq as int,
+                        send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@));
                     assert(none@ =~= Seq::<Sge>::empty());
                     let wr = send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@);
                     assert(wr.sges =~= Seq::<safeverbs_spec::nic::Sge>::empty());
