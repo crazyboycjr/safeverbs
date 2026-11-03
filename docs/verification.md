@@ -205,6 +205,14 @@ result removal, wakers, control verbs and teardown preserve it. `lemma_recv_resu
 exports that concrete observation. Send-batch aggregation and the complete public
 refinement remain unfinished; see [outcome-coupling.md](outcome-coupling.md).
 
+**Actual send tails** (`hw/send_outcomes.rs`). Each request's recorded final WR
+authorizes its native inferred success and is bound to its actual WQE, first in
+the provider builder and then in M's send queue. Actual polling derives the retired
+tail's operation-valid metadata from its executed slot; subsequent operations
+preserve that history. A successful retired tail equals the native inferred value,
+including the final READ length. The native first-error cache and complete send
+aggregate are still being connected. These additions erase from ordinary builds.
+
 **Failed MR revocation (runtime behavior, tested).** `Nic::close_mr` is fallible and
 idempotent. A failed close retains its handle. `Exposed::try_reclaim` returns the still
 exposed owner for retry; successful reclaim alone returns typed access. On failed final
