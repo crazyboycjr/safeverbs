@@ -1,8 +1,9 @@
 //! Linear raw-byte permissions carried by the actual buffer ranges.
 //!
-//! The allocator is one primitive boundary. Splitting and pool withdrawal/return
-//! are checked bookkeeping. These tokens describe domains and provenance, not
-//! initialized typed contents or the final Arc-driven deallocation protocol.
+//! The allocator is one primitive boundary; splitting is checked bookkeeping. These
+//! tokens describe domains and provenance, not initialized typed contents or the final
+//! Arc-driven deallocation protocol. A streaming ring's chunks are the exception: their
+//! placement is not verified, so their permissions are assumed (`OwnedRange::ring_chunk`).
 #![allow(unused_imports)]
 
 use core::alloc::Layout;
@@ -151,20 +152,6 @@ impl OwnedRange {
             OwnedRange { ptr: self.ptr, len: at, geometry: Ghost(left), base: self.base, permission: Tracked(p) },
             OwnedRange { ptr: right_ptr, len: self.len - at, geometry: Ghost(right), base: self.base, permission: Tracked(q) },
         )
-    }
-
-    /// Transfers the range's token into an erased pool for a streaming allocator.
-    #[inline]
-    pub(super) fn into_pool(self) -> (r: PermissionPool)
-        requires self.inv(),
-        ensures r.inv(), r.base() == self.base(),
-            r.capacity() == self.geometry().spec_capacity(),
-            r.dom() == self.permission().dom(),
-    {
-        PermissionPool {
-            base: self.base, capacity: Ghost(self.geometry().spec_capacity()),
-            permission: Tracked(Some(self.permission.get())),
-        }
     }
 }
 
@@ -374,67 +361,22 @@ pub(super) fn release_failed_allocation(
     vstd::raw_ptr::deallocate(ptr, size, align, Tracked(raw), dealloc);
 }
 
-/// A streaming allocator's free bytes. This adds no runtime field or counter.
-pub(super) struct PermissionPool {
-    base: Ghost<*mut u8>,
-    #[allow(dead_code)]
-    capacity: Ghost<usize>,
-    #[allow(dead_code)]
-    permission: Tracked<Option<BytePermission>>,
-}
+} // verus!
 
-impl PermissionPool {
-    pub(super) closed spec fn base(self) -> *mut u8 { self.base@ }
-    pub(super) closed spec fn capacity(self) -> usize { self.capacity@ }
-    pub(super) closed spec fn dom(self) -> Set<int> { self.permission@->0.dom() }
-
-    pub(super) closed spec fn inv(self) -> bool {
-        &&& self.permission@ is Some
-        &&& self.base().addr() != 0
-        &&& self.base().addr() as int + self.capacity() <= usize::MAX
-        &&& self.capacity() <= isize::MAX
-        &&& self.permission@->0.inv()
-        &&& self.permission@->0.provenance() == self.base()@.provenance
-        &&& self.dom().subset_of(Set::range(self.base().addr() as int,
-            self.base().addr() as int + self.capacity()))
-    }
-
-    #[inline]
-    pub(super) fn take(&mut self, base: *mut u8, geometry: ByteRange) -> (r: OwnedRange)
-        requires old(self).inv(), base == old(self).base(), geometry.inv(),
-            geometry.spec_capacity() == old(self).capacity(),
-            geometry.byte_set(old(self).base().addr() as int).subset_of(old(self).dom()),
-        ensures final(self).inv(), final(self).base() == old(self).base(),
-            final(self).capacity() == old(self).capacity(),
-            r.inv(), r.base() == old(self).base(), r.geometry() == geometry,
-            final(self).dom() == old(self).dom().difference(r.permission().dom()),
-    {
-        let tracked permission = self.permission.borrow_mut().tracked_take();
-        let tracked (part, rest) = permission.split(geometry.byte_set(self.base().addr() as int));
-        proof { *self.permission.borrow_mut() = Some(rest); }
+impl OwnedRange {
+    /// A chunk of a streaming ring's region at `geometry`. `RingBuf` places its chunks
+    /// without a proof that they are disjoint, so their byte permissions are assumed here,
+    /// not proved (`docs/verification.md`).
+    pub(super) fn ring_chunk(base: *mut u8, geometry: ByteRange) -> OwnedRange {
         OwnedRange {
-            ptr: base.with_addr(base.addr() + geometry.offset()), len: geometry.len(),
-            geometry: Ghost(geometry), base: self.base, permission: Tracked(part),
+            ptr: base.with_addr(base.addr() + geometry.offset()),
+            len: geometry.len(),
+            geometry: Ghost::assume_new(),
+            base: Ghost::assume_new(),
+            permission: Tracked::assume_new(),
         }
     }
-
-    #[inline]
-    #[allow(unused_variables)] // The return of ownership is entirely erased.
-    pub(super) fn put(&mut self, range: OwnedRange)
-        requires old(self).inv(), range.inv(), range.base() == old(self).base(),
-            range.geometry().spec_capacity() == old(self).capacity(),
-            old(self).dom().disjoint(range.permission().dom()),
-        ensures final(self).inv(), final(self).base() == old(self).base(),
-            final(self).capacity() == old(self).capacity(),
-            final(self).dom() == old(self).dom().union(range.permission().dom()),
-    {
-        let tracked free = self.permission.borrow_mut().tracked_take();
-        let tracked joined = free.join(range.permission.get());
-        proof { *self.permission.borrow_mut() = Some(joined); }
-    }
 }
-
-} // verus!
 
 // SAFETY: this is an owner of untyped bytes, not a typed reference. Its pointer
 // is only observed as metadata here; typed buffers impose their element type's
@@ -444,7 +386,6 @@ unsafe impl Send for OwnedRange {}
 unsafe impl Sync for OwnedRange {}
 
 const _: () = assert!(core::mem::size_of::<OwnedRange>() == 2 * core::mem::size_of::<usize>());
-const _: () = assert!(core::mem::size_of::<PermissionPool>() == 0);
 const _: () = assert!(
     core::mem::size_of::<RawMut<crate::verbs::Verbs>>() == 3 * core::mem::size_of::<usize>()
 );

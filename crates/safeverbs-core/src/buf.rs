@@ -37,8 +37,8 @@ use range::ByteRange;
 mod memory;
 mod permissions;
 mod view;
+use memory::OwnedRange;
 pub(crate) use memory::{Frozen, RawMut};
-use memory::{OwnedRange, PermissionPool};
 pub use view::Buf;
 mod lease;
 pub(crate) use lease::Lease;
@@ -193,12 +193,13 @@ impl<N: Nic> Pd<N> {
 
     /// A ring of `capacity` registered bytes for streaming messages.
     pub fn ring_buf(&self, capacity: usize) -> Result<RingBuf<N>> {
-        let (region, range) = Region::new(self, capacity, 1)?;
+        // Chunks are cut from the region where `RingBuf::place` puts them, not split off
+        // this range.
+        let (region, _whole) = Region::new(self, capacity, 1)?;
         Ok(RingBuf {
             region,
             capacity,
             chunks: VecDeque::new(),
-            free: range.into_pool(),
         })
     }
 }
@@ -732,8 +733,6 @@ pub struct RingBuf<N: Nic = Verbs> {
     capacity: usize,
     /// The chunks handed out and not reclaimed, oldest first.
     chunks: VecDeque<Arc<Frozen<N>>>,
-    /// Actual free-byte permissions, erased in a native build.
-    free: PermissionPool,
 }
 
 impl<N: Nic> RingBuf<N> {
@@ -760,7 +759,7 @@ impl<N: Nic> RingBuf<N> {
             }
             let chunk = self.chunks.pop_front().expect("the front chunk exists");
             match memory::thaw(chunk) {
-                Ok(raw) => self.free.put(raw.range),
+                Ok(_free) => {}
                 Err(chunk) => {
                     self.chunks.push_front(chunk);
                     break;
@@ -802,7 +801,7 @@ impl<N: Nic> RingBuf<N> {
         let at = self.place(len)?;
         let mut buf: BufMut<u8, N> = BufMut::from_raw(RawMut {
             region: self.region.clone(),
-            range: self.free.take(
+            range: OwnedRange::ring_chunk(
                 self.region.ptr.as_ptr(),
                 ByteRange::new(at, len, self.capacity).expect("a chunk fits the ring"),
             ),

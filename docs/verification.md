@@ -121,11 +121,18 @@ nonaliasing proofs while preserving exact token identities; no map is built at r
 `Part`'s invariant ties its actual SGE to that permission's
 byte domain; `Leases` preserves this relation through guard deduplication. Alignment
 checks use the absolute pointer, including when recovering over-aligned elements.
-Failed registration returns the whole permission for checked deallocation. An erased
-pool supports streaming withdrawal and return, but the native `RingBuf` callers still
-need to prove the pool preconditions. Final Arc-driven region cleanup, registration
+Failed registration returns the whole permission for checked deallocation. `RingBuf`'s
+chunks are the exception: its placement is not verified, so their permissions are
+assumed (`OwnedRange::ring_chunk`). Final Arc-driven region cleanup, registration
 lifetime, initialized typed contents and the public wrappers remain unverified. These
 tokens describe allocation ownership, not validity of arbitrary incoming bytes as `T`.
+
+Where unverified code calls a verified function, that function's precondition is assumed,
+not proved: `BufMut::freeze` (the buffer fits `T`), `BufMut::into_part` (at most
+`u32::MAX` bytes, also checked at run time), `BufMut::split_at` (in bounds, also checked),
+`RingBuf::write_with` and `RingBuf::place` (a chunk's permission and base), `Region::new`'s
+failure path (`release_failed_allocation` gets what `allocate` returned) and every caller
+of `Leases::len` (the count fits `usize`).
 
 **Actual frozen views** (`buf/view.rs`). `Buf<T, N>` itself is verified: its native
 Arc and element range retain the same frozen permission through cloning and bounded
@@ -308,7 +315,7 @@ a token over a fresh share. These are trusted, not proved.
   - **Buffers.** Actual mutable/frozen ranges and frozen views now carry the allocator's
     byte permissions through checked geometry, splitting, freeze/thaw and SGE construction.
     The typed wrappers in `buf.rs` remain outside `verus!`. Initialized contents,
-    zerocopy contracts, native streaming-pool callers, exposure/revocation and final
+    zerocopy contracts, `RingBuf`, exposure/revocation and final
     cleanup remain unfinished; registration lifetime is still trusted through
     `registered` and `registered_all`.
   - **Concrete grouped permissions.** The checked loan ledger accounts for shared
