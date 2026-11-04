@@ -358,6 +358,36 @@ impl<N: Device> OpenRequest<N> {
         }
     }
 
+    /// Each input of it is apart from everything `hw` holds, as linear permissions say: nothing
+    /// changes.
+    #[cfg(verus_keep_ghost)]
+    pub(super) fn separate_from_table<C>(&mut self, hw: &Hw<C, N>)
+        requires
+            old(self).inv(),
+            hw.inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_fields(old(self)),
+            final(self).n == old(self).n,
+            final(self).kept.loans() == old(self).kept.loans(),
+            forall|k: int| 0 <= k < final(self).n ==> #[trigger] final(self).wqes@[k] == old(self).wqes@[k],
+            final(self).wqes@ == old(self).wqes@,
+            final(self).gathered@ == old(self).gathered@,
+            final(self).ledger == old(self).ledger,
+            final(self).limit == old(self).limit,
+            forall|i: int| 0 <= i < final(self).kept.loans().len()
+                ==> #[trigger] hw.table_apart(final(self).kept.loans()[i].part.resource()),
+    {
+        let ghost before = *self;
+        self.kept.separate_from_table(hw);
+        proof {
+            self.kept.lemma_same_contents(before.kept);
+            assert forall|k: int| 0 <= k < self.n implies #[trigger] self.wqe_ok(k) by {
+                assert(before.wqe_ok(k));
+            }
+        }
+    }
+
     /// What is said of its WQEs depends on them, their lists, their inputs and limits.
     pub(super) proof fn lemma_same_wqes(&self, pre: &Self)
         requires

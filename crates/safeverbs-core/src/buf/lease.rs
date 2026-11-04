@@ -2,9 +2,9 @@
 //! boundary. Shared deduplication preserves the retained frozen allocation; unique
 //! resources move unchanged into and out of the container.
 //!
-//! The traversals that prove inputs disjoint (`Leases::disjoint_incoming` and the receive
-//! admission's `separate_unique_*`) only borrow linear permissions and change nothing, so
-//! they exist in Verus builds alone (`cfg(verus_keep_ghost)`); plain builds have no such code.
+//! The traversals that prove inputs apart (`Leases::disjoint_incoming` and the engine's
+//! `separate_lease`) only borrow linear permissions and change nothing, so they exist in Verus
+//! builds alone (`cfg(verus_keep_ghost)`); plain builds have no such code.
 //
 // The code keeps the plain forms the proofs reason about (explicit matches, a `Vec`'s view).
 #![allow(clippy::single_match, clippy::ptr_arg)]
@@ -39,14 +39,14 @@ impl<N: Nic> Lease<N> {
 
     pub(crate) closed spec fn observation(self) -> Resource<N> { Resource { resource: self } }
 
-    /// A unique incoming owner is separated from a readonly retained keeper.
+    /// An incoming buffer and a keeper this borrows, as linear permissions say: the first exclusive
+    /// borrow is the incoming one's, if it is unique.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]
-    fn separate_unique_input(&self, incoming: &mut Self)
-        requires *old(incoming) is Unique,
+    pub(crate) fn separate_input(&self, incoming: &mut Self)
         ensures
             *final(incoming) == *old(incoming),
-            self.observation().byte_domain().disjoint(final(incoming).observation().byte_domain()),
+            self.observation().apart(final(incoming).observation()),
         no_unwind
     {
         match incoming {
@@ -63,19 +63,21 @@ impl<N: Nic> Lease<N> {
                     },
                 }
             },
-            Lease::Shared(_) => {},
+            Lease::Shared(frozen) => {
+                frozen_apart(&*frozen, self);
+                proof { Lease::Shared(*frozen).observation().lemma_apart_symmetric(self.observation()); }
+            },
         }
     }
 
-    /// A unique owner is separated from a frozen allocation.
+    /// A buffer and a frozen allocation: the buffer's permission is the exclusive borrow if it is
+    /// unique.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]
     fn separate_frozen(&mut self, other: &Arc<Frozen<N>>)
-        requires
-            *old(self) is Unique,
         ensures
             *final(self) == *old(self),
-            final(self).observation().byte_domain().disjoint(Lease::Shared(*other).observation().byte_domain()),
+            Lease::Shared(*other).observation().apart(final(self).observation()),
         no_unwind
     {
         match self {
@@ -87,7 +89,7 @@ impl<N: Nic> Lease<N> {
                 }
                 raw.disjoint(&other.raw);
             },
-            Lease::Shared(_) => {},
+            Lease::Shared(_) => frozen_apart(other, &*self),
         }
     }
 
@@ -97,32 +99,41 @@ impl<N: Nic> Lease<N> {
     fn disjoint(&mut self, other: &mut Self)
         ensures
             *final(self) == *old(self), *final(other) == *old(other),
-            *final(self) is Unique || *final(other) is Unique ==>
-                final(self).observation().byte_domain().disjoint(final(other).observation().byte_domain()),
+            final(self).observation().apart(final(other).observation()),
         no_unwind
     {
-        match (self, other) {
-            (Lease::Unique(a), Lease::Unique(b)) => {
-                proof { use_type_invariant(&*a); use_type_invariant(&*b); }
-                a.disjoint(b);
-            },
-            (Lease::Unique(a), Lease::Shared(b)) => {
-                proof {
-                    use_type_invariant(&*a); use_type_invariant(&**b);
-                    b.lemma_contents();
+        match self {
+            Lease::Unique(a) => {
+                proof { use_type_invariant(&*a); }
+                match other {
+                    Lease::Unique(b) => {
+                        proof { use_type_invariant(&*b); }
+                        a.disjoint(b);
+                    },
+                    Lease::Shared(b) => {
+                        proof { use_type_invariant(&**b); b.lemma_contents(); }
+                        a.disjoint(&b.raw);
+                    },
                 }
-                a.disjoint(&b.raw);
             },
-            (Lease::Shared(a), Lease::Unique(b)) => {
-                proof {
-                    use_type_invariant(&**a); use_type_invariant(&*b);
-                    a.lemma_contents();
-                }
-                b.disjoint(&a.raw);
+            Lease::Shared(a) => {
+                other.separate_frozen(&*a);
             },
-            (Lease::Shared(_), Lease::Shared(_)) => {},
         }
     }
+}
+
+/// Two real buffers own different bytes, unless they are one frozen allocation: a byte has one
+/// linear permission, and a frozen allocation holds its own. vstd's `is_disjoint` says so with one
+/// side exclusive; a frozen allocation is never exclusive, so here both sides may be shared.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_body]
+#[inline(always)]
+pub(crate) fn frozen_apart<N: Nic>(frozen: &Arc<Frozen<N>>, other: &Lease<N>)
+    ensures
+        Lease::Shared(*frozen).observation().apart(other.observation()),
+    no_unwind
+{
 }
 
 /// The exact retained resource as a proof value. Its allocation internals stay private.
@@ -162,6 +173,41 @@ impl<N: Nic> Resource<N> {
             (Lease::Shared(a), Lease::Shared(b)) => *a == *b,
             _ => false,
         }
+    }
+
+    /// Two keepers own different bytes, unless they are one frozen allocation.
+    pub open spec fn apart(self, other: Self) -> bool {
+        self.same_frozen(other) || self.byte_domain().disjoint(other.byte_domain())
+    }
+
+    /// `apart` goes both ways.
+    pub proof fn lemma_apart_symmetric(self, other: Self)
+        ensures
+            self.apart(other) == other.apart(self),
+    {
+        assert(self.same_frozen(other) == other.same_frozen(self));
+        assert(self.byte_domain().disjoint(other.byte_domain()) == other.byte_domain().disjoint(self.byte_domain()));
+    }
+
+    /// One frozen allocation is shared, with the same bytes.
+    pub proof fn lemma_same_frozen(self, other: Self)
+        requires
+            self.same_frozen(other),
+        ensures
+            !self.unique(),
+            !other.unique(),
+            self.byte_domain() == other.byte_domain(),
+    {
+    }
+
+    /// What is apart from a keeper is apart from what it keeps.
+    pub proof fn lemma_apart_backing(self, keeper: Self, kept: Self)
+        requires
+            self.apart(keeper),
+            keeper.same_backing(kept),
+        ensures
+            self.apart(kept),
+    {
     }
 }
 
@@ -314,19 +360,59 @@ impl<N: Nic> Part<N> {
         }
     }
 
-    /// A unique part and a frozen allocation have disjoint bytes.
+    /// What keeps it alive is apart from everything the engine holds, as linear permissions say.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]
-    pub(crate) fn separate_unique_frozen(&mut self, other: &Arc<Frozen<N>>)
+    pub(crate) fn separate_from_table<C>(self, hw: &crate::hw::Hw<C, N>) -> (same: Self)
         requires
-            old(self).spec_writable(),
+            hw.inv(),
+        ensures
+            same == self,
+            hw.table_apart(self.resource()),
+    {
+        proof { use_type_invariant(&self); }
+        let Part { sge, pd, lease } = self;
+        let mut lease = lease;
+        hw.separate_lease(&mut lease);
+        Part { sge, pd, lease }
+    }
+
+    /// **S1 of a buffer on loan to nobody yet.** While the program holds it, the NIC writes none of
+    /// its bytes, and if it is unique reads none (`Hw::keeper_apart`).
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn apart_from_nic<C>(self, hw: &crate::hw::Hw<C, N>) -> (same: Self)
+        requires
+            hw.inv(),
+        ensures
+            same == self,
+            hw.outside_ok() ==> forall|x: int| #[trigger] self.byte_domain().contains(x) ==> {
+                &&& !hw.nic().nic_may_write(x)
+                &&& self.spec_writable() ==> !hw.nic().nic_may_read(x)
+            },
+    {
+        proof {
+            use_type_invariant(&self);
+            self.lemma_byte_backing();
+            assert forall|x: int| #[trigger] self.byte_domain().contains(x)
+                implies self.lease.observation().byte_domain().contains(x) by {}
+        }
+        let Part { sge, pd, lease } = self;
+        let mut lease = lease;
+        hw.keeper_apart(&mut lease);
+        Part { sge, pd, lease }
+    }
+
+    /// What keeps it alive and a frozen allocation are apart.
+    #[cfg(verus_keep_ghost)]
+    #[inline(always)]
+    pub(crate) fn separate_frozen(&mut self, other: &Arc<Frozen<N>>)
         ensures
             *final(self) == *old(self),
-            final(self).resource().byte_domain().disjoint(Lease::Shared(*other).observation().byte_domain()),
+            Lease::Shared(*other).observation().apart(final(self).resource()),
         no_unwind
     {
         proof { use_type_invariant(&*self); }
-        Lease::separate_frozen(&mut self.lease, other);
+        self.lease.separate_frozen(other);
     }
 
     /// The SGE's bytes are covered by the permission of its retained owner.
@@ -402,6 +488,7 @@ impl<N: Nic> Part<N> {
         requires self.inv(),
         ensures self.byte_domain().subset_of(self.resource().byte_domain()),
             self.resource().unique() == self.spec_writable(),
+            self.spec_writable() ==> self.byte_domain() == self.resource().byte_domain(),
             self.byte_domain().to_iset() == (safeverbs_spec::types::Span {
                 start: self.spec_sge().addr as int, len: self.spec_sge().length as nat,
             }).bytes(),
@@ -426,35 +513,6 @@ impl<N: Nic> Part<N> {
             self.spec_writable() <==> self.lease is Unique,
             self.resource() == self.lease.observation(),
     {}
-
-    /// Borrow one keeper without changing the incoming Part or its token.
-    #[cfg(verus_keep_ghost)]
-    #[inline(always)]
-    pub(crate) fn separate_unique_lease(&mut self, other: &Lease<N>)
-        requires old(self).spec_writable(),
-        ensures
-            *final(self) == *old(self),
-            final(self).byte_domain().disjoint(other.observation().byte_domain()),
-        no_unwind
-    {
-        proof { use_type_invariant(&*self); }
-        other.separate_unique_input(&mut self.lease);
-        proof { self.lemma_byte_backing(); }
-    }
-
-    /// A unique Part is separated from any other Part, including shared views.
-    #[cfg(verus_keep_ghost)]
-    #[inline(always)]
-    pub(crate) fn separate_unique_part(&mut self, other: &Self)
-        requires old(self).spec_writable(),
-        ensures
-            *final(self) == *old(self),
-            final(self).byte_domain().disjoint(other.byte_domain()),
-        no_unwind
-    {
-        proof { use_type_invariant(other); other.lemma_byte_backing(); }
-        self.separate_unique_lease(&other.lease);
-    }
 
     /// Its byte length.
     pub fn len(&self) -> (len: u64)
@@ -499,6 +557,12 @@ spec fn nonalias<N: Nic>(loans: Seq<Loan<N>>) -> bool {
     forall|i: int, j: int| #![trigger loans[i], loans[j]]
         0 <= i < j < loans.len() && (loans[i].part.spec_writable() || loans[j].part.spec_writable())
             ==> loans[i].part.byte_domain().disjoint(loans[j].part.byte_domain())
+}
+
+/// What keeps logical inputs alive is apart, input by input.
+spec fn loans_apart<N: Nic>(loans: Seq<Loan<N>>) -> bool {
+    forall|i: int, j: int| #![trigger loans[i], loans[j]]
+        0 <= i < j < loans.len() ==> loans[i].part.resource().apart(loans[j].part.resource())
 }
 
 /// What [`Leases::push_resource`] does to a list of keepers: it takes over, and it keeps `r`.
@@ -591,6 +655,7 @@ spec fn keeps<N: Nic>(keepers: Seq<Resource<N>>, r: Resource<N>) -> bool {
 /// writes require exclusive resources; shared deduplication changes neither fact.
 spec fn loans_kept<N: Nic>(loans: Seq<Loan<N>>, keepers: Seq<Resource<N>>) -> bool {
     &&& nonalias(loans)
+    &&& loans_apart(loans)
     &&& forall|i: int| 0 <= i < loans.len() ==> {
         let loan = #[trigger] loans[i];
         &&& loan.part.inv()
@@ -646,10 +711,7 @@ proof fn lemma_loan_added<N: Nic>(
         part.inv(),
         access == Some(Dir::In) ==> part.spec_writable(),
         loans_kept(loans, keepers),
-        forall|i: int| 0 <= i < keepers.len() ==> {
-            let kept = #[trigger] keepers[i];
-            kept.unique() || part.spec_writable() ==> kept.byte_domain().disjoint(part.resource().byte_domain())
-        },
+        forall|i: int| 0 <= i < keepers.len() ==> (#[trigger] keepers[i]).apart(part.resource()),
         forall|r: Resource<N>| #[trigger] keeps(keepers, r) ==> keeps(post, r),
         keeps(post, part.resource()),
     ensures
@@ -669,7 +731,27 @@ proof fn lemma_loan_added<N: Nic>(
             assert(keeps(keepers, loan.part.resource()));
             let k = choose|k: int| 0 <= k < keepers.len() && (#[trigger] keepers[k]).same_backing(loan.part.resource());
             lemma_keeper_bytes(loan, keepers[k]);
+            assert(keepers[k].apart(part.resource()));
+            if keepers[k].same_frozen(part.resource()) {
+                keepers[k].lemma_same_frozen(part.resource());
+            }
             assert(keepers[k].byte_domain().disjoint(part.resource().byte_domain()));
+        }
+    }
+    assert forall|i: int, j: int| #![trigger next[i], next[j]]
+        0 <= i < j < next.len() implies next[i].part.resource().apart(next[j].part.resource()) by {
+        assert(next[i] == loans[i]);
+        if j < loans.len() {
+            assert(next[j] == loans[j]);
+        } else {
+            let loan = loans[i];
+            assert(next[j].part == part);
+            assert(keeps(keepers, loan.part.resource()));
+            let k = choose|k: int| 0 <= k < keepers.len() && (#[trigger] keepers[k]).same_backing(loan.part.resource());
+            assert(keepers[k].apart(part.resource()));
+            keepers[k].lemma_apart_symmetric(part.resource());
+            part.resource().lemma_apart_backing(keepers[k], loan.part.resource());
+            part.resource().lemma_apart_symmetric(loan.part.resource());
         }
     }
     assert forall|i: int| 0 <= i < next.len() implies {
@@ -739,57 +821,53 @@ impl<N: Nic> Leases<N> {
         &&& loans_kept(self.loans(), self.view())
     }
 
-    /// The keepers exclude these bytes, and with the invariant so do the loans.
-    pub open spec fn separated_from(self, bytes: Set<int>) -> bool {
-        &&& forall|i: int| 0 <= i < self.view().len()
-            ==> (#[trigger] self.view()[i]).byte_domain().disjoint(bytes)
-        &&& self.inv() ==> forall|i: int| 0 <= i < self.loans().len()
-            ==> (#[trigger] self.loans()[i]).part.byte_domain().disjoint(bytes)
+    /// Every keeper is apart from `incoming`.
+    pub open spec fn apart_from(self, incoming: Resource<N>) -> bool {
+        forall|i: int| 0 <= i < self.view().len() ==> (#[trigger] self.view()[i]).apart(incoming)
+    }
+
+    /// What is apart from a keeper is apart from what it keeps.
+    pub proof fn lemma_apart_backing(self, keeper: Resource<N>, kept: Resource<N>)
+        requires
+            self.apart_from(keeper),
+            keeper.same_backing(kept),
+        ensures
+            self.apart_from(kept),
+    {
+        assert forall|i: int| 0 <= i < self.view().len() implies (#[trigger] self.view()[i]).apart(kept) by {
+            self.view()[i].lemma_apart_backing(keeper, kept);
+        }
     }
 
     /// Traverse only readonly native keepers, mutating just the incoming permission.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]
-    pub(crate) fn separate_unique_input(&self, incoming: &mut Part<N>)
-        requires old(incoming).spec_writable(),
+    pub(crate) fn separate_lease(&self, incoming: &mut Lease<N>)
         ensures
             *final(incoming) == *old(incoming),
-            self.separated_from(final(incoming).byte_domain()),
+            self.apart_from(final(incoming).observation()),
     {
         match &self.held {
             Held::Nothing => {},
-            Held::One(first) => incoming.separate_unique_lease(first),
+            Held::One(first) => first.separate_input(incoming),
             Held::Many(rest) => {
                 let mut i = 0;
                 while i < rest.len()
                     invariant
-                        incoming.spec_writable(),
                         *incoming == *old(incoming),
                         i <= rest@.len(),
-                        forall|j: int| 0 <= j < i ==> (#[trigger] rest@[j]).observation()
-                            .byte_domain().disjoint(incoming.byte_domain()),
+                        forall|j: int| 0 <= j < i ==> (#[trigger] rest@[j]).observation().apart(incoming.observation()),
                     decreases rest@.len() - i,
                 {
-                    incoming.separate_unique_lease(&rest[i]);
+                    rest[i].separate_input(incoming);
                     i += 1;
                 }
             },
         }
         proof {
             assert forall|j: int| 0 <= j < self.view().len()
-                implies (#[trigger] self.view()[j]).byte_domain().disjoint(incoming.byte_domain()) by {
+                implies (#[trigger] self.view()[j]).apart(incoming.observation()) by {
                 assert(self.view()[j] == self.raw_view()[j].observation());
-            }
-            if self.inv() {
-                self.lemma_byte_backing();
-                assert forall|j: int| 0 <= j < self.loans().len()
-                    implies (#[trigger] self.loans()[j]).part.byte_domain().disjoint(incoming.byte_domain()) by {
-                    let part = self.loans()[j].part;
-                    let k = choose|k: int| 0 <= k < self.view().len()
-                        && self.view()[k].same_backing(part.resource())
-                        && part.byte_domain().subset_of(self.view()[k].byte_domain());
-                    assert(self.view()[k].byte_domain().disjoint(incoming.byte_domain()));
-                }
             }
         }
     }
@@ -833,6 +911,24 @@ impl<N: Nic> Leases<N> {
         }
     }
 
+    /// What keeps its inputs alive is apart, input by input, and each is kept here.
+    pub proof fn lemma_apart(self)
+        requires self.inv(),
+        ensures
+            forall|i: int, j: int| #![trigger self.loans()[i], self.loans()[j]]
+                0 <= i < self.loans().len() && 0 <= j < self.loans().len() && i != j
+                    ==> self.loans()[i].part.resource().apart(self.loans()[j].part.resource()),
+    {
+        assert forall|i: int, j: int| #![trigger self.loans()[i], self.loans()[j]]
+            0 <= i < self.loans().len() && 0 <= j < self.loans().len() && i != j
+                implies self.loans()[i].part.resource().apart(self.loans()[j].part.resource()) by {
+            if j < i {
+                assert(self.loans()[j].part.resource().apart(self.loans()[i].part.resource()));
+                self.loans()[j].part.resource().lemma_apart_symmetric(self.loans()[i].part.resource());
+            }
+        }
+    }
+
     /// They hold the same, in the same way.
     pub(crate) closed spec fn same_contents(self, other: Self) -> bool {
         &&& self.raw_view() == other.raw_view()
@@ -850,11 +946,8 @@ impl<N: Nic> Leases<N> {
         ensures
             final(self).same_contents(*old(self)),
             *final(incoming) == *old(incoming),
-            forall|i: int| 0 <= i < final(self).raw_view().len() ==> {
-                let kept = #[trigger] final(self).raw_view()[i];
-                kept is Unique || *final(incoming) is Unique ==>
-                    kept.observation().byte_domain().disjoint(final(incoming).observation().byte_domain())
-            },
+            forall|i: int| 0 <= i < final(self).raw_view().len()
+                ==> (#[trigger] final(self).raw_view()[i]).observation().apart(final(incoming).observation()),
         no_unwind
     {
         let ghost before = *self;
@@ -869,11 +962,7 @@ impl<N: Nic> Leases<N> {
                         rest@ == original,
                         *incoming == *old(incoming),
                         i <= rest@.len(),
-                        forall|j: int| 0 <= j < i ==> {
-                            let kept = #[trigger] rest@[j];
-                            kept is Unique || *incoming is Unique ==>
-                                kept.observation().byte_domain().disjoint(incoming.observation().byte_domain())
-                        },
+                        forall|j: int| 0 <= j < i ==> (#[trigger] rest@[j]).observation().apart(incoming.observation()),
                     decreases rest@.len() - i,
                 {
                     let ghost now = rest@;
@@ -898,21 +987,14 @@ impl<N: Nic> Leases<N> {
             final(self).loans() == old(self).loans(),
             final(self).wqes() == old(self).wqes(),
             *final(incoming) == *old(incoming),
-            forall|i: int| 0 <= i < final(self).view().len() ==> {
-                let kept = #[trigger] final(self).view()[i];
-                kept.unique() || final(incoming).spec_writable() ==>
-                    kept.byte_domain().disjoint(final(incoming).resource().byte_domain())
-            },
+            final(self).apart_from(final(incoming).resource()),
         no_unwind
     {
         proof { use_type_invariant(&*incoming); }
         self.disjoint_incoming(&mut incoming.lease);
         proof {
-            assert forall|i: int| 0 <= i < self.view().len() implies {
-                let kept = #[trigger] self.view()[i];
-                kept.unique() || incoming.spec_writable() ==>
-                    kept.byte_domain().disjoint(incoming.resource().byte_domain())
-            } by {
+            assert forall|i: int| 0 <= i < self.view().len()
+                implies (#[trigger] self.view()[i]).apart(incoming.resource()) by {
                 assert(self.view()[i] == self.raw_view()[i].observation());
             }
         }
@@ -1524,16 +1606,101 @@ impl<N: Nic> Kept<N> {
         }
     }
 
-    /// Every input has a keeper here, no input overlaps a unique one, and neither does the last
-    /// keeper.
+    /// Every input has a keeper here, what keeps inputs alive is apart, and the last keeper is apart
+    /// from the others.
     pub(crate) closed spec fn inv(self) -> bool {
         &&& self.leases.loans().len() == 0
         &&& self.leases.wqes().len() == 0
         &&& loans_kept(self.loans@, self.keepers())
-        &&& self.last matches Some(frozen) ==> forall|j: int| 0 <= j < self.leases.view().len()
-            ==> (#[trigger] self.leases.view()[j]).unique()
-            ==> self.leases.view()[j].byte_domain().disjoint((*frozen).byte_domain())
+        &&& self.last matches Some(frozen) ==> self.leases.apart_from(Lease::Shared(frozen).observation())
         &&& self.last_is_input()
+    }
+
+    /// They hold the same, in the same way.
+    pub(crate) closed spec fn same_contents(self, other: Self) -> bool {
+        &&& self.last == other.last
+        &&& self.leases.same_contents(other.leases)
+        &&& self.loans == other.loans
+    }
+
+    /// What is said of it depends on what it holds.
+    pub(crate) proof fn lemma_same_contents(self, other: Self)
+        requires
+            self.same_contents(other),
+        ensures
+            self.inv() == other.inv(),
+            self.loans() == other.loans(),
+    {
+        assert(self.keepers() == other.keepers());
+    }
+
+    /// Each keeper of it is apart from everything the engine holds, as linear permissions say, and
+    /// so is each of its inputs.
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn separate_from_table<C>(&mut self, hw: &crate::hw::Hw<C, N>)
+        requires
+            hw.inv(),
+            old(self).inv(),
+        ensures
+            final(self).same_contents(*old(self)),
+            forall|i: int| 0 <= i < final(self).loans().len()
+                ==> #[trigger] hw.table_apart(final(self).loans()[i].part.resource()),
+    {
+        let ghost before = *self;
+        let taken = self.last.take();
+        match taken {
+            Some(frozen) => {
+                let mut lease = Lease::Shared(frozen);
+                hw.separate_lease(&mut lease);
+                match lease {
+                    Lease::Shared(same) => self.last = Some(same),
+                    Lease::Unique(_) => {},
+                }
+            },
+            None => {},
+        }
+        let ghost view = self.leases.view();
+        let ghost raw = self.leases.raw_view();
+        match &mut self.leases.held {
+            Held::Nothing => {},
+            Held::One(first) => hw.separate_lease(first),
+            Held::Many(rest) => {
+                let ghost original = rest@;
+                let mut i = 0;
+                while i < rest.len()
+                    invariant
+                        hw.inv(),
+                        rest@ == original,
+                        i <= rest@.len(),
+                        forall|j: int| 0 <= j < i ==> #[trigger] hw.table_apart(rest@[j].observation()),
+                    decreases rest@.len() - i,
+                {
+                    let ghost now = rest@;
+                    hw.separate_lease(&mut rest[i]);
+                    proof {
+                        assert(rest@ =~= now);
+                    }
+                    i += 1;
+                }
+            },
+        }
+        proof {
+            assert(self.same_contents(before));
+            self.lemma_same_contents(before);
+            assert forall|i: int| 0 <= i < self.loans().len()
+                implies #[trigger] hw.table_apart(self.loans()[i].part.resource()) by {
+                let kept = self.loans()[i].part.resource();
+                assert(keeps(self.keepers(), kept));
+                let k = choose|k: int| 0 <= k < self.keepers().len() && (#[trigger] self.keepers()[k]).same_backing(kept);
+                if k < self.leases.view().len() {
+                    assert(self.keepers()[k] == self.leases.view()[k]);
+                    assert(self.leases.view()[k] == self.leases.raw_view()[k].observation());
+                } else {
+                    assert(self.keepers()[k] == Lease::Shared(self.last->0).observation());
+                }
+                hw.lemma_table_apart_backing(self.keepers()[k], kept);
+            }
+        }
     }
 
     /// Its last allocation is that of an input, so a `Peek` of it, which is no more than its bytes,
@@ -1598,6 +1765,10 @@ impl<N: Nic> Kept<N> {
         let part = {
             let mut part = part;
             self.leases.disjoint_part(&mut part);
+            match &self.last {
+                Some(last) => part.separate_frozen(last),
+                None => {},
+            }
             part
         };
         match part.frozen_of() {
@@ -1653,10 +1824,10 @@ impl<N: Nic> Kept<N> {
                     lemma_keeps_element(self.keepers(), Lease::Shared(frozen).observation(), self.leases.view().len() as int);
                     assert(self.keepers()[self.leases.view().len() as int].same_backing(incoming.resource()));
                     assert forall|j: int| 0 <= j < self.leases.view().len()
-                        && (#[trigger] self.leases.view()[j]).unique()
-                        implies self.leases.view()[j].byte_domain().disjoint((*frozen).byte_domain()) by {
+                        implies (#[trigger] self.leases.view()[j]).apart(Lease::Shared(frozen).observation()) by {
                         if j < view.len() {
                             assert(self.leases.view()[j] == view[j]);
+                            assert(view[j].apart(incoming.resource()));
                         }
                     }
                 }
@@ -1699,11 +1870,9 @@ impl<N: Nic> Kept<N> {
         let part = {
             let mut part = part;
             self.leases.disjoint_part(&mut part);
-            if part.is_writable() {
-                match &self.last {
-                    Some(last) => part.separate_unique_frozen(last),
-                    None => {},
-                }
+            match &self.last {
+                Some(last) => part.separate_frozen(last),
+                None => {},
             }
             part
         };
@@ -1734,10 +1903,10 @@ impl<N: Nic> Kept<N> {
                         lemma_keeps_more(self.leases.view(), Lease::Shared(frozen).observation());
                         assert(self.keepers()[self.leases.view().len() as int].same_backing(incoming.resource()));
                         assert forall|j: int| 0 <= j < self.leases.view().len()
-                            && (#[trigger] self.leases.view()[j]).unique()
-                            implies self.leases.view()[j].byte_domain().disjoint((*frozen).byte_domain()) by {
+                            implies (#[trigger] self.leases.view()[j]).apart(Lease::Shared(frozen).observation()) by {
                             if j < view.len() {
                                 assert(self.leases.view()[j] == view[j]);
+                                assert(view[j].apart(incoming.resource()));
                             }
                         }
                     }
@@ -1841,13 +2010,10 @@ impl<N: Nic> Kept<N> {
     {
         let last = self.last->0;
         let keepers = self.keepers();
-        assert(part.resource().byte_domain() == (*last).byte_domain());
-        assert forall|i: int| 0 <= i < keepers.len() implies {
-            let kept = #[trigger] keepers[i];
-            kept.unique() || part.spec_writable() ==> kept.byte_domain().disjoint(part.resource().byte_domain())
-        } by {
+        assert forall|i: int| 0 <= i < keepers.len() implies (#[trigger] keepers[i]).apart(part.resource()) by {
             if i < self.leases.view().len() {
                 assert(keepers[i] == self.leases.view()[i]);
+                keepers[i].lemma_apart_backing(Lease::Shared(last).observation(), part.resource());
             }
         }
         assert forall|r: Resource<N>| #[trigger] keeps(keepers, r) implies keeps(keepers, r) by {}
@@ -1865,15 +2031,10 @@ impl<N: Nic> Kept<N> {
             self.leases.loans().len() == 0,
             self.leases.wqes().len() == 0,
             self.loans@ == before.loans@.push(Loan { part, access }),
-            forall|i: int| 0 <= i < before.keepers().len() ==> {
-                let kept = #[trigger] before.keepers()[i];
-                kept.unique() || part.spec_writable() ==> kept.byte_domain().disjoint(part.resource().byte_domain())
-            },
+            forall|i: int| 0 <= i < before.keepers().len() ==> (#[trigger] before.keepers()[i]).apart(part.resource()),
             forall|r: Resource<N>| #[trigger] keeps(before.keepers(), r) ==> keeps(self.keepers(), r),
             keeps(self.keepers(), part.resource()),
-            self.last matches Some(last) ==> forall|j: int| 0 <= j < self.leases.view().len()
-                ==> (#[trigger] self.leases.view()[j]).unique()
-                ==> self.leases.view()[j].byte_domain().disjoint((*last).byte_domain()),
+            self.last matches Some(last) ==> self.leases.apart_from(Lease::Shared(last).observation()),
             self.last == before.last || self.last is None
                 || (self.last matches Some(frozen) && part.lease == Lease::Shared(frozen)),
         ensures

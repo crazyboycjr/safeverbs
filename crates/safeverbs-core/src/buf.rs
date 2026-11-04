@@ -43,6 +43,8 @@ pub use view::Buf;
 mod lease;
 #[allow(unused_imports)] // Named only by contracts erased from plain cargo builds.
 pub(crate) use lease::Loan;
+#[allow(unused_imports)] // Named only by contracts erased from plain cargo builds.
+pub(crate) use lease::Resource;
 #[allow(unused_imports)] // Erased WQE provenance used by the verified engine.
 pub(crate) use lease::WqeLoans;
 pub(crate) use lease::{Kept, Lease, capacity_of, forget_free, replace_value};

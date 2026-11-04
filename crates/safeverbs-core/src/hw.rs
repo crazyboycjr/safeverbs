@@ -81,7 +81,7 @@ use crate::nic::{
 };
 use crate::pd::{Context, Pd};
 #[cfg(verus_keep_ghost)]
-use crate::refine::{free_lease, kept_free, lemma_kept_free_trans, may_post_holds};
+use crate::refine::{free_lease, may_post_holds, roots_outside};
 use crate::ring::wake::WakeBatch;
 use crate::ring::{Payload, Ring, Seq as RingSeq, Taken};
 use crate::trusted::*;
@@ -368,6 +368,7 @@ pub(crate) open spec fn payload_ok<C, N: Device>(p: Payload<C, N>, detached: boo
     &&& request_resources_ok(p.leases)
     &&& (p.ctx is Some) == !detached
     &&& refines::holds_cover(p.holds@, p.leases.loans())
+    &&& refines::holds_kept(p.holds@, p.leases)
 }
 
 /// Every live WQE stays with its request and that request's buffers; the
@@ -2277,25 +2278,15 @@ impl<C, N: Device> Hw<C, N> {
     pub fn post_recv(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: core::result::Result<core::result::Result<RingSeq, Refusal<C, N>>, UnpostedRecv<C, N>>)
         requires
             old(self).inv(),
-            old(self).lends(part, safeverbs_spec::abs::Dir::In),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
-            r matches Ok(Ok(seq)) ==> old(self).admission_separated_from(part)
-                && final(self).recv_holds_input(index, seq, part),
             r matches Ok(Err(refused)) ==> refused.ctx == ctx,
             r matches Err((back, c)) ==> back == part && c == ctx,
     {
-        let ghost admitted = part;
         #[cfg(verus_keep_ghost)]
-        let part = {
-            let mut part = part;
-            if part_writable_of(&part) {
-                self.separate_unique_input(&mut part);
-            }
-            part
-        };
+        let part = part.separate_from_table(&*self);
         let ghost start = *self;
         let ghost t0 = self.token@;
         let ghost m0 = t0.nic();
@@ -2327,6 +2318,7 @@ impl<C, N: Device> Hw<C, N> {
                         let wqe = e.recv.next_wqe();
                         let id = wr_id(index as u16, true, wqe);
                         let sges = [sge];
+                        let ghost part_of_one = part;
                         // The slot first: from then on it keeps the memory alive.
                         let mut leases = Leases::one(part, Ghost(safeverbs_spec::abs::Dir::In));
                         let ghost entry = crate::buf::WqeLoans {
@@ -2339,10 +2331,7 @@ impl<C, N: Device> Hw<C, N> {
                         leases.record_wqe(Ghost(entry));
                         let detached = ctx.is_none();
                         let implied = Ok(Completed::Received(Received::Message { len: sge.length, imm: None }));
-                        proof {
-                            start.lemma_lends_one(leases.loans(), admitted, safeverbs_spec::abs::Dir::In);
-                        }
-                        let ghost named = start.lemma_name_request(start.qps@, m1, g1, leases);
+                        let ghost named = start.lemma_name_one(m1, g1, leases, part_of_one);
                         let payload = Payload { ctx, leases, holds: Ghost(named.1) };
                         let ghost resource = payload;
                         proof {
@@ -2366,7 +2355,6 @@ impl<C, N: Device> Hw<C, N> {
                                     g.lemma_extends_trans(named.0, start.refined@);
                                     lemma_nic_reaches_trans(m0, m1, self.token@.nic());
                                     self.refined@ = g;
-                                    self.lemma_recv_holds_input(index, seq, admitted);
                                 }
                                 return Ok(Ok(seq));
                             },
@@ -2404,6 +2392,7 @@ impl<C, N: Device> Hw<C, N> {
             may_post_holds(g.abs, resource.holds@),
             forall|l: safeverbs_spec::abs::LeaseId| #[trigger] resource.holds@.contains_key(l)
                 ==> free_lease(refines::table_view(start.qps@, t1.nic()), g.abs, refines::lent_holds(), l),
+            roots_outside(refines::table_view(start.qps@, t1.nic()), g.abs, refines::lent_holds(), resource.holds@),
             ({
                 let e0 = start.qps@[index]->0;
                 let e = self.qps@[index]->0;
@@ -2523,6 +2512,7 @@ impl<C, N: Device> Hw<C, N> {
         self.lemma_one(start, t1, t, mid, n, index);
         // A's `post_request`.
         let g1 = refines::lemma_linked_rely(start.qps@, start.next_name@, t1, m1, mid, start.pending@, pinned(t1), g);
+        refines::lemma_roots_moved(refines::table_view(start.qps@, m1), g.abs, refines::table_view(start.qps@, mid), g1.abs, resource.holds@);
         refines::lemma_recv_queued(mid, n, q, seq![wr]);
         refines::lemma_verb_keeps(start.qps@, start.next_name@, t1, mid, n, start.pending@, q);
         let g2 = refines::lemma_linked_one_posted(start.qps@, self.qps@, mid, n, Nic::Step::post_recv(q, seq![wr]), g1, index, Queue::Recv, staged, 1, crate::ring::ReqView::new(detached, resource), implied);
@@ -2660,7 +2650,6 @@ impl<C, N: Device> Hw<C, N> {
             table_ok(final(qps)@, name, t, m, pending.drop_first()),
             same_qps(final(qps)@, old(qps)@),
             refines::linked(final(qps)@, m, g),
-            kept_free(refines::table_view(old(qps)@, m), g.abs, refines::table_view(final(qps)@, m), g.abs, refines::lent_holds()),
     {
         let ghost start = qps@;
         proof {
@@ -2693,7 +2682,6 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
-            final(self).keeps_free(old(self)),
     {
         let mut wakes = WakeBatch::new();
         let ghost start = *self;
@@ -2706,7 +2694,6 @@ impl<C, N: Device> Hw<C, N> {
                 n <= POLL_MAX,
                 self.refined == start.refined,
                 self.token == start.token,
-                self.keeps_free(&start),
             decreases self.polled_len - self.polled_at,
         {
             proof {
@@ -2720,7 +2707,6 @@ impl<C, N: Device> Hw<C, N> {
             proof {
                 completion::lemma_same_qps_trans(self.qps@, qps, start.qps@);
                 self.lemma_polled_moved(&before);
-                self.lemma_keeps_free_trans(&before, &start);
             }
         }
         self.polled_at = 0;
@@ -2739,7 +2725,6 @@ impl<C, N: Device> Hw<C, N> {
             lemma_table_token(self.qps@, self.next_name@, t0, t, m, cqes);
             assert(cqes.skip(0) =~= cqes);
             self.refined@ = refined;
-            self.lemma_keeps_free_trans(&before_poll, &start);
             self.lemma_moved_trans(&before_poll, &start);
         }
         let mut i = 0;
@@ -2765,7 +2750,6 @@ impl<C, N: Device> Hw<C, N> {
                 caps_model(m.caps, self.caps),
                 refines::linked(self.qps@, m, self.refined@),
                 self.moved_from(&start),
-                self.keeps_free(&start),
             decreases read - i,
         {
             proof {
@@ -2780,7 +2764,6 @@ impl<C, N: Device> Hw<C, N> {
             i += 1;
             proof {
                 completion::lemma_same_qps_trans(self.qps@, qps, start.qps@);
-                self.lemma_keeps_free_trans(&before, &start);
             }
         }
         proof {
@@ -3418,7 +3401,6 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
-            final(self).keeps_free(old(self)),
             r matches Err((_, Some(kept))) ==> kept.leases.inv() && kept.leases.fully_recorded(),
     {
         if index >= self.qps.len() {
@@ -3472,7 +3454,6 @@ impl<C, N: Device> Hw<C, N> {
                                 let g2 = refines::lemma_linked_doorbell(start.qps@, self.qps@, mid, n, g1, index as int, wrs);
                                 g2.lemma_extends_trans(g1, start.refined@);
                                 lemma_nic_reaches_trans(m0, mid, n);
-                                lemma_kept_free_trans(refines::table_view(start.qps@, m0), start.refined@.abs, refines::table_view(start.qps@, mid), g1.abs, refines::table_view(self.qps@, n), g2.abs, refines::lent_holds());
                                 self.refined@ = g2;
                             }
                             return Ok(());
@@ -3514,7 +3495,6 @@ impl<C, N: Device> Hw<C, N> {
                     let g1 = refines::lemma_linked_rely(start.qps@, start.next_name@, t0, m0, n, start.pending@, pinned(t0), start.refined@);
                     let g2 = refines::lemma_linked_refused(start.qps@, self.qps@, n, g1, index as int, Queue::Send, kept_seq);
                     g2.lemma_extends_trans(g1, start.refined@);
-                    lemma_kept_free_trans(refines::table_view(start.qps@, m0), start.refined@.abs, refines::table_view(start.qps@, n), g1.abs, refines::table_view(self.qps@, n), g2.abs, refines::lent_holds());
                     self.refined@ = g2;
                 }
                 wakes.finish();
@@ -3540,7 +3520,6 @@ impl<C, N: Device> Hw<C, N> {
     pub fn post_one(&mut self, index: usize, op: WrOp, part: Part<N>, ctx: Option<C>, signal: bool, ring: bool) -> (r: core::result::Result<core::result::Result<RingSeq, Refusal<C, N>>, Unposted<C, N>>)
         requires
             old(self).inv(),
-            old(self).lends(part, send_access(op)),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
@@ -3548,6 +3527,8 @@ impl<C, N: Device> Hw<C, N> {
             r matches Ok(Err(refused)) ==> refused.ctx == ctx,
             r matches Err(back) ==> back.op == op && back.part == part && back.ctx == ctx,
     {
+        #[cfg(verus_keep_ghost)]
+        let part = part.separate_from_table(&*self);
         let ghost start = *self;
         let ghost t0 = self.token@;
         let ghost m0 = t0.nic();
@@ -3596,10 +3577,7 @@ impl<C, N: Device> Hw<C, N> {
                         }
                         leases.record_wqe(Ghost(entry));
                         let detached = ctx.is_none();
-                        proof {
-                            start.lemma_lends_one(leases.loans(), lent, send_access(op));
-                        }
-                        let ghost named = start.lemma_name_request(start.qps@, m1, g1, leases);
+                        let ghost named = start.lemma_name_one(m1, g1, leases, lent);
                         let payload = Payload { ctx, leases, holds: Ghost(named.1) };
                         let ghost resource = payload;
                         let ghost wr = send_wr(id, signaled, op, sges@);
@@ -3693,6 +3671,7 @@ impl<C, N: Device> Hw<C, N> {
             may_post_holds(g.abs, resource.holds@),
             forall|l: safeverbs_spec::abs::LeaseId| #[trigger] resource.holds@.contains_key(l)
                 ==> free_lease(refines::table_view(start.qps@, t1.nic()), g.abs, refines::lent_holds(), l),
+            roots_outside(refines::table_view(start.qps@, t1.nic()), g.abs, refines::lent_holds(), resource.holds@),
             ({
                 let e0 = start.qps@[index]->0;
                 let q = e0.id();
@@ -3790,6 +3769,7 @@ impl<C, N: Device> Hw<C, N> {
         assert(qp_ok(start.qps@[index], index, t1, mid));
         e0.send.lemma_wqes();
         let g1 = refines::lemma_linked_rely(start.qps@, start.next_name@, t1, m1, mid, start.pending@, pinned(t1), g);
+        refines::lemma_roots_moved(refines::table_view(start.qps@, m1), g.abs, refines::table_view(start.qps@, mid), g1.abs, resource.holds@);
         refines::lemma_send_queued(mid, n, q, seq![wr]);
         refines::lemma_verb_keeps(start.qps@, start.next_name@, t1, mid, n, start.pending@, q);
         let g2 = refines::lemma_linked_one_posted(start.qps@, self.qps@, mid, n, Nic::Step::post_send(q, seq![wr]), g1, index, Queue::Send, staged.send, 1, crate::ring::ReqView::new(detached, resource), implied);
@@ -3806,7 +3786,6 @@ impl<C, N: Device> Hw<C, N> {
     pub fn post_one_slow(&mut self, index: usize, unposted: Unposted<C, N>, signal: bool, ring: bool) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
         requires
             old(self).inv(),
-            old(self).lends(unposted.part, send_access(unposted.op)),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
@@ -3818,11 +3797,6 @@ impl<C, N: Device> Hw<C, N> {
         let ctx = unposted.ctx;
         let mut open = self.open_request(index);
         let ghost s0 = *self;
-        let ghost lent = part;
-        proof {
-            open.lemma_no_inputs();
-            s0.lemma_lends_kept(&start, lent, send_access(op));
-        }
         match self.push_other(index, &mut open, op, part) {
             Ok(()) => {},
             Err(e) => {
@@ -3839,8 +3813,6 @@ impl<C, N: Device> Hw<C, N> {
         proof {
             lemma_same_table_trans(&s1, &s0, &start);
             assert(s1.has_qp(index as int));
-            s1.lemma_lends_kept(&s0, lent, send_access(op));
-            s1.lemma_lends_one(open.kept.loans(), lent, send_access(op));
         }
         match self.make_send_room(index, 1) {
             Ok(()) => {},
@@ -3856,9 +3828,6 @@ impl<C, N: Device> Hw<C, N> {
             },
         }
         let ghost s2 = *self;
-        proof {
-            s2.lemma_lends_all_kept(&s1, open.kept.loans());
-        }
         let closed = self.close(index, &mut open, signal, ctx);
         let seq = match closed {
             Ok(seq) => seq,
@@ -3933,19 +3902,19 @@ impl<C, N: Device> Hw<C, N> {
         requires
             old(self).inv(),
             old(open).inv(),
-            old(self).lends_all(old(open).loans()),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(open).same_fields(old(open)),
-            final(self).lends_all(final(open).loans()),
-            r matches Err(back) ==> back == ctx && *final(open) == *old(open),
+            r matches Err(back) ==> back == ctx,
     {
         let n = open.n;
         if n == 0 || index >= self.qps.len() {
             return Err(ctx);
         }
+        #[cfg(verus_keep_ghost)]
+        open.separate_from_table(&*self);
         let ghost start = *self;
         let ghost t0 = self.token@;
         let ghost m0 = t0.nic();
@@ -3959,7 +3928,6 @@ impl<C, N: Device> Hw<C, N> {
                 if !e.send.can_post() || n as u64 > e.send.wqe_room() as u64 || !e.takes(open) {
                     proof {
                         assert(self.qps@ =~= start.qps@);
-                        self.lemma_lends_all_kept(&start, open.loans());
                     }
                     return Err(ctx);
                 }
@@ -4058,7 +4026,14 @@ impl<C, N: Device> Hw<C, N> {
                 proof {
                     refines::lemma_inputs_directed(leases);
                 }
-                let ghost named = start.lemma_name_request(start.qps@, m1, g1, leases);
+                proof {
+                    start.lemma_table_kept();
+                    assert forall|j: int| 0 <= j < leases.loans().len()
+                        implies #[trigger] refines::table_apart(start.qps@, leases.loans()[j].part.resource()) by {
+                        assert(start.table_apart(taken_from.kept.loans()[j].part.resource()));
+                    }
+                }
+                let ghost named = refines::lemma_name_request(start.qps@, m1, g1, leases);
                 let payload = Payload { ctx, leases, holds: Ghost(named.1) };
                 let ghost resource = payload;
                 let seq = e.send.stage(n as u64, signaled, detached, implied, payload);
@@ -4083,7 +4058,6 @@ impl<C, N: Device> Hw<C, N> {
             None => {
                 proof {
                     assert(self.qps@ =~= start.qps@);
-                    self.lemma_lends_all_kept(&start, open.loans());
                 }
                 Err(ctx)
             },
@@ -4101,7 +4075,6 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
-            final(self).keeps_free(old(self)),
             open.inv(),
             open.has_no_wqe(),
     {
@@ -4244,7 +4217,6 @@ impl<C, N: Device> Hw<C, N> {
         requires
             old(self).inv(),
             old(open).inv(),
-            old(self).lends_all(old(open).loans()),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
@@ -4256,9 +4228,6 @@ impl<C, N: Device> Hw<C, N> {
             let _ = self.make_send_room(index, open.n as u32);
         }
         let ghost mid = *self;
-        proof {
-            mid.lemma_lends_all_kept(&start, open.kept.loans());
-        }
         let r = self.close(index, open, signal, ctx);
         proof {
             lemma_same_table_trans(self, &mid, &start);
@@ -4276,7 +4245,6 @@ impl<C, N: Device> Hw<C, N> {
         requires
             old(self).inv(),
             old(open).inv(),
-            old(self).lends_all(old(open).loans()),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
@@ -4315,7 +4283,6 @@ impl<C, N: Device> Hw<C, N> {
         requires
             old(self).inv(),
             old(open).inv(),
-            old(self).lends_all(old(open).loans()),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
@@ -4344,9 +4311,6 @@ impl<C, N: Device> Hw<C, N> {
             },
         }
         let ghost s1 = *self;
-        proof {
-            s1.lemma_lends_all_kept(&start, open.kept.loans());
-        }
         match self.close(index, open, signal, ctx) {
             Ok(seq) => {
                 let ghost s2 = *self;
@@ -4597,7 +4561,6 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
-            final(self).keeps_free(old(self)),
     {
         let ghost start = *self;
         loop
@@ -4605,7 +4568,6 @@ impl<C, N: Device> Hw<C, N> {
                 self.inv(),
                 self.same_table(&start),
                 self.moved_from(&start),
-                self.keeps_free(&start),
                 start.has_qp(index as int),
                 start == *old(self),
                 index < self.qps@.len(),
@@ -4630,7 +4592,6 @@ impl<C, N: Device> Hw<C, N> {
                 Err((e, _)) => {
                     proof {
                         lemma_same_table_trans(self, &s0, &start);
-                        self.lemma_keeps_free_trans(&s0, &start);
                     }
                     return Err(e);
                 },
@@ -4640,8 +4601,6 @@ impl<C, N: Device> Hw<C, N> {
             proof {
                 lemma_same_table_trans(&s1, &s0, &start);
                 lemma_same_table_trans(self, &s1, &start);
-                s1.lemma_keeps_free_trans(&s0, &start);
-                self.lemma_keeps_free_trans(&s1, &start);
             }
         }
     }
@@ -4790,13 +4749,11 @@ impl<C, N: Device> Hw<C, N> {
             old(self).inv(),
             old(self).has_qp(index as int),
             old(open).inv(),
-            old(self).lends_all(old(open).loans()),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(open).same_fields(old(open)),
-            old(open).has_no_wqe() ==> *final(open) == *old(open) && final(self).keeps_free(old(self)),
             r is Ok ==> final(open).n < final(open).wqes@.len()
                 && final(open).n < usize::MAX
                 && final(open).pd_id == final(self).qps@[index as int]->0.pd_id
@@ -4823,9 +4780,6 @@ impl<C, N: Device> Hw<C, N> {
                 Err(error) => return Err(error),
             }
             let ghost s1 = *self;
-            proof {
-                s1.lemma_lends_all_kept(&s0, open.kept.loans());
-            }
             let _ = self.close(index, open, true, None);
             proof {
                 lemma_same_table_trans(self, &s1, &s0);
@@ -4847,7 +4801,6 @@ impl<C, N: Device> Hw<C, N> {
         requires
             old(self).inv(),
             old(open).inv(),
-            old(self).lends_all(old(open).loans()),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
@@ -4855,10 +4808,6 @@ impl<C, N: Device> Hw<C, N> {
             final(open).inv(),
             r is Ok ==> final(self).has_qp(index as int),
             r matches Err(e) ==> e.buf == part,
-            r is Ok && old(open).has_no_wqe() ==> {
-                &&& final(self).keeps_free(old(self))
-                &&& final(open).loans() == seq![crate::buf::Loan { part, access: Some(send_access(op)) }]
-            },
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -4921,13 +4870,6 @@ impl<C, N: Device> Hw<C, N> {
                     (*open).lemma_one_more(&before, part, access, entry);
                     self.lemma_flags_only(&start, index as int);
                     lemma_same_table_trans(self, &start, &before_room);
-                    if before.n == 0 {
-                        before.lemma_no_inputs();
-                        assert(open.kept.loans() =~= seq![crate::buf::Loan { part, access: Some(send_access(op)) }]);
-                    }
-                    if old(open).n == 0 {
-                        self.lemma_keeps_free_trans(&start, &before_room);
-                    }
                 }
             },
             None => {},
@@ -4968,7 +4910,6 @@ impl<C, N: Device> Hw<C, N> {
         requires
             old(self).inv(),
             old(open).inv(),
-            old(self).lends_all(old(open).loans()),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
@@ -5011,9 +4952,6 @@ impl<C, N: Device> Hw<C, N> {
                 }
                 return Err(error);
             },
-        }
-        proof {
-            self.lemma_lends_all_kept(&start, open.loans());
         }
         match self.open_room(index, open) {
             Ok(()) => {},

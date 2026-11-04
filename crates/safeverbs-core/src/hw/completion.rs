@@ -1425,7 +1425,6 @@ impl<C, N: Device> Hw<C, N> {
             self.inv(),
             self.keeps_requests(pre),
             self.same_table(pre),
-            self.keeps_free(pre),
     {
     }
 
@@ -1452,7 +1451,6 @@ impl<C, N: Device> Hw<C, N> {
             self.inv(),
             self.keeps_requests(pre),
             self.same_table(pre),
-            self.keeps_free(pre),
     {
         let t = pre.token@;
         let m = pre.nic();

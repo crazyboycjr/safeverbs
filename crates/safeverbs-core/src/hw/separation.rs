@@ -1,91 +1,56 @@
-//! Unique receive admission against every buffer the engine retains.
+//! A buffer coming in against every buffer the engine retains.
 //!
-//! The immutable engine borrow preserves its rings and resource snapshots exactly.
-//! Only the incoming unique byte permission is mutably borrowed, with its identity
-//! preserved. The traversal changes nothing, so it exists in Verus builds alone
-//! (`cfg(verus_keep_ghost)`).
+//! The immutable engine borrow preserves its rings and resource snapshots exactly. Only the incoming
+//! unique byte permission is mutably borrowed, with its identity preserved. The traversal changes
+//! nothing, so it exists in Verus builds alone (`cfg(verus_keep_ghost)`).
 
 use super::*;
+#[cfg(verus_keep_ghost)] // Named by the proofs alone.
+use crate::buf::{Lease, Resource};
 
 verus! {
 
 impl<C, N: Device> Hw<C, N> {
-    /// One QP's rings and not-yet-written parts exclude the incoming unique SGE's bytes.
-    /// Completed/refused owners are included.
-    closed spec fn entry_separated_from(&self, index: int, incoming: Part<N>) -> bool {
-        self.qps@[index] is Some ==> {
-            let e = self.qps@[index]->0;
-            &&& e.send.retained_separated_from(incoming)
-            &&& e.recv.retained_separated_from(incoming)
-            &&& forall|j: int| 0 <= j < e.building@.len()
-                ==> (#[trigger] e.building@[j]).byte_domain().disjoint(incoming.byte_domain())
-        }
+    /// What keeps every request of the engine alive is apart from `incoming`. This says nothing about
+    /// other engines.
+    pub open(super) spec fn table_apart(&self, incoming: Resource<N>) -> bool {
+        refines::table_apart(self.qps@, incoming)
     }
 
-    /// Admission-time separation against everything the engine stores.
-    /// This says nothing about other engines or untracked leases the program holds.
-    pub closed spec fn admission_separated_from(&self, incoming: Part<N>) -> bool {
-        forall|i: int| 0 <= i < self.qps@.len()
-            ==> #[trigger] self.entry_separated_from(i, incoming)
+    /// What is apart from a keeper is apart from what it keeps.
+    pub(crate) proof fn lemma_table_apart_backing(&self, keeper: Resource<N>, kept: Resource<N>)
+        requires
+            self.table_apart(keeper),
+            keeper.same_backing(kept),
+        ensures
+            self.table_apart(kept),
+    {
+        refines::lemma_table_apart_backing(self.qps@, keeper, kept);
     }
-
-    /// The successful receive retains this exact logical input in its live request.
-    pub closed spec fn recv_holds_input(&self, index: usize, seq: RingSeq, part: Part<N>) -> bool {
-        self.has_qp(index as int) && {
-            let req = self.qps@[index as int]->0.recv.req(seq as int);
-            req is Some && req->0.phase is InFlight
-                && req->0.leases.leases.loans() == seq![crate::buf::Loan {
-                    part, access: Some(safeverbs_spec::abs::Dir::In),
-                }]
-        }
-    }
-
-    /// Export the private receive observation after the ring update.
-    pub(super) proof fn lemma_recv_holds_input(&self, index: usize, seq: RingSeq, part: Part<N>)
-        requires self.has_qp(index as int),
-            self.qps@[index as int]->0.recv.req(seq as int) is Some,
-            self.qps@[index as int]->0.recv.req(seq as int)->0.phase is InFlight,
-            self.qps@[index as int]->0.recv.req(seq as int)->0.leases.leases.loans() == seq![crate::buf::Loan {
-                part, access: Some(safeverbs_spec::abs::Dir::In),
-            }],
-        ensures self.recv_holds_input(index, seq, part),
-    {}
 
     /// The traversal is read-only on the engine, preserving every snapshot.
     /// There is no native byte comparison; the linear token proofs are erased.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]
-    pub(super) fn separate_unique_input(&self, incoming: &mut Part<N>)
-        requires self.inv(), old(incoming).spec_writable(),
+    pub(crate) fn separate_lease(&self, incoming: &mut Lease<N>)
+        requires self.inv(),
         ensures *final(incoming) == *old(incoming),
-            self.admission_separated_from(*final(incoming)),
+            self.table_apart(final(incoming).observation()),
     {
         let mut i = 0;
         while i < self.qps.len()
             invariant
-                incoming.spec_writable(),
                 self.inv(), *incoming == *old(incoming), i <= self.qps@.len(),
-                forall|k: int| 0 <= k < i
-                    ==> #[trigger] self.entry_separated_from(k, *incoming),
+                forall|k: int| 0 <= k < i && #[trigger] refines::has_entry(self.qps@, k) ==> {
+                    &&& self.qps@[k]->0.send.retained_apart(incoming.observation())
+                    &&& self.qps@[k]->0.recv.retained_apart(incoming.observation())
+                },
             decreases self.qps@.len() - i,
         {
             proof { assert(self.entry_ok(i as int, self.token@, self.nic())); }
             if let Some(e) = &self.qps[i] {
-                e.send.separate_unique_input(incoming);
-                e.recv.separate_unique_input(incoming);
-                let mut j = 0;
-                while j < e.building.len()
-                    invariant
-                        incoming.spec_writable(),
-                        *incoming == *old(incoming), j <= e.building@.len(),
-                        forall|k: int| 0 <= k < j
-                            ==> (#[trigger] e.building@[k]).byte_domain().disjoint(incoming.byte_domain()),
-                    decreases e.building@.len() - j,
-                {
-                    incoming.separate_unique_part(&e.building[j]);
-                    j += 1;
-                }
-                proof { assert(self.entry_separated_from(i as int, *incoming)); }
+                e.send.separate_lease(incoming);
+                e.recv.separate_lease(incoming);
             }
             i += 1;
         }

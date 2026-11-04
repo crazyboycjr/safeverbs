@@ -36,12 +36,17 @@ use crate::ring::{ReqView, Ring};
 
 verus! {
 
-/// A lease a request holds, as the request knows it: how the NIC touches it, and its bytes.
+/// A lease a request holds, as the request knows it: how the NIC touches it, its bytes, and what
+/// keeps them alive.
 pub ghost struct Hold {
     /// How the NIC touches it.
     pub dir: Dir,
     /// Its bytes.
     pub mem: ISet<int>,
+    /// The bytes of what keeps them alive: its own, or those of the frozen allocation it shares.
+    pub kept: ISet<int>,
+    /// It is a share of a frozen allocation, whose lease over `kept` the program holds.
+    pub shared: bool,
 }
 
 /// The leases of A a request holds, by name.
@@ -165,8 +170,25 @@ pub open spec fn names_request<L>(v: View<L>, reqs: Map<int, ReqId>, r: ReqId) -
     exists|s: int| #[trigger] (v.req)(s) is Some && reqs[s] == r
 }
 
-/// The requests of `v` sit in `a` and are all it has, and no two hold the same lease or are the
-/// same request of `a`.
+/// The program holds a shared lease over exactly `bytes`, which no request of `v` keeps: what the
+/// shares of a frozen allocation are made from.
+pub open spec fn has_root<L>(v: View<L>, a: Abs::State, held: Held<L>, bytes: ISet<int>) -> bool {
+    exists|r: LeaseId| #[trigger] free_lease(v, a, held, r) && !a.leases[r].unique && a.leases[r].mem == bytes
+}
+
+/// Every share a request of `v` holds or keeps has its root.
+pub open spec fn rooted<L>(v: View<L>, a: Abs::State, held: Held<L>) -> bool {
+    forall|s: int, l: LeaseId| #[trigger] leases_of(v, held, s).contains_key(l) && leases_of(v, held, s)[l].shared
+        ==> has_root(v, a, held, leases_of(v, held, s)[l].kept)
+}
+
+/// No lease is open to a peer: an engine brings none to A.
+pub open spec fn none_exposed(a: Abs::State) -> bool {
+    forall|l: LeaseId| #[trigger] a.leases.contains_key(l) ==> !(a.leases[l].holder is Exposed)
+}
+
+/// The requests of `v` sit in `a` and are all it has, no two hold the same lease or are the same
+/// request of `a`, and every share has its root.
 pub open spec fn placed<L>(
     v: View<L>,
     a: Abs::State,
@@ -176,6 +198,8 @@ pub open spec fn placed<L>(
 ) -> bool {
     &&& abs_inv(a)
     &&& wf(v)
+    &&& rooted(v, a, held)
+    &&& none_exposed(a)
     &&& forall|s: int| #[trigger] sits(v, a, q, reqs, held, s)
     &&& forall|s: int, t: int| #![trigger leases_of(v, held, s), leases_of(v, held, t)]
         s != t ==> leases_of(v, held, s).dom().disjoint(leases_of(v, held, t).dom())
@@ -395,6 +419,14 @@ pub proof fn lemma_same<L>(
             assert(!leases_of(v, held, s).contains_key(l));
         }
     }
+    assert forall|s: int, l: LeaseId| #[trigger] leases_of(w, held, s).contains_key(l) && leases_of(w, held, s)[l].shared
+        implies has_root(w, a, held, leases_of(w, held, s)[l].kept) by {
+        assert(leases_of(w, held, s) == leases_of(v, held, s));
+        assert(has_root(v, a, held, leases_of(v, held, s)[l].kept));
+        let r = choose|r: LeaseId| #[trigger] free_lease(v, a, held, r) && !a.leases[r].unique
+            && a.leases[r].mem == leases_of(v, held, s)[l].kept;
+        assert(free_lease(w, a, held, r));
+    }
 }
 
 /// `w` is placed in `a2` when it agrees with `v`, placed in `a`, but at request
@@ -432,7 +464,7 @@ pub proof fn lemma_placed_but<L>(
                 ==> a2.leases[l].holder is Program || a2.leases[l].held_by(r)),
         wf_at(w, s),
         sits(w, a2, q, reqs2, held, s),
-        leases_of(w, held, s).dom().subset_of(leases_of(v, held, s).dom()),
+        leases_of(w, held, s).submap_of(leases_of(v, held, s)),
         (w.req)(s) is Some ==> reqs2[s] == r,
     ensures
         placed(w, a2, q, reqs2, held),
@@ -541,9 +573,36 @@ pub proof fn lemma_placed_but<L>(
             }
         }
     }
+    assert forall|t: int, l: LeaseId| #[trigger] leases_of(w, held, t).contains_key(l) && leases_of(w, held, t)[l].shared
+        implies has_root(w, a2, held, leases_of(w, held, t)[l].kept) by {
+        if t != s {
+            assert(leases_of(w, held, t) == leases_of(v, held, t));
+        } else {
+            assert(leases_of(v, held, s).contains_key(l) && leases_of(w, held, s)[l] == leases_of(v, held, s)[l]);
+        }
+        lemma_root_kept(v, a, w, a2, held, leases_of(w, held, t)[l].kept);
+    }
+    assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) implies !(a2.leases[l].holder is Exposed) by {
+        assert(a.leases.contains_key(l));
+        if !leases_of(v, held, s).contains_key(l) {
+            assert(a2.leases[l] == a.leases[l]);
+        }
+    }
 }
 
-/// A lease a request of `v` holds or keeps is one `a` has.
+/// What is free stays free, so a root stays one.
+proof fn lemma_root_kept<L>(v: View<L>, a: Abs::State, w: View<L>, a2: Abs::State, held: Held<L>, bytes: ISet<int>)
+    requires
+        kept_free(v, a, w, a2, held),
+        has_root(v, a, held, bytes),
+    ensures
+        has_root(w, a2, held, bytes),
+{
+    let r = choose|r: LeaseId| #[trigger] free_lease(v, a, held, r) && !a.leases[r].unique && a.leases[r].mem == bytes;
+    assert(free_lease(w, a2, held, r) && a2.leases[r] == a.leases[r]);
+}
+
+/// A lease a request of `v` holds or keeps is one `a` has, with the bytes the request knows.
 pub proof fn lemma_held_exists<L>(
     v: View<L>,
     a: Abs::State,
@@ -558,12 +617,15 @@ pub proof fn lemma_held_exists<L>(
         leases_of(v, held, s).contains_key(l),
     ensures
         a.leases.contains_key(l),
+        a.leases[l].mem == leases_of(v, held, s)[l].mem,
 {
     assert(sits(v, a, q, reqs, held, s));
+    assert(wf_at(v, s));
 }
 
 /// `v` stays placed through a change of A that leaves its requests, and every lease of its own, as
-/// they were: a lease of the program changes, or a queue pair no request is on.
+/// they were, and keeps every root and exposes nothing: a lease of the program changes, or a queue
+/// pair no request is on.
 pub proof fn lemma_placed_apart<L>(
     v: View<L>,
     a: Abs::State,
@@ -581,6 +643,8 @@ pub proof fn lemma_placed_apart<L>(
         forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) && a2.leases[l].holder is Request
             ==> a.leases.contains_key(l) && a2.leases[l] == a.leases[l],
         forall|s: int| #[trigger] (v.staged)(s) is Some ==> a2.qps.contains(q((v.staged)(s)->0.leases)),
+        rooted(v, a2, held),
+        none_exposed(a2),
     ensures
         placed(v, a2, q, reqs, held),
 {
@@ -705,7 +769,7 @@ pub proof fn lemma_forget<L>(
             }
         }
     }
-    assert(leases_of(w, held, s).dom().subset_of(h.dom()));
+    assert(leases_of(w, held, s).submap_of(h));
     assert(!a.requests.contains_key(a.next_id));
     assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) implies a.leases.contains_key(l)
         && (leases_of(v, held, s).contains_key(l) ==> a2.leases[l].holder is Program) by {
@@ -772,7 +836,256 @@ pub proof fn lemma_share<L>(
     assert forall|s: int| #[trigger] (v.staged)(s) is Some implies a2.qps.contains(q((v.staged)(s)->0.leases)) by {
         assert(sits(v, a, q, reqs, held, s));
     }
+    assert forall|k: LeaseId| #[trigger] free_lease(v, a, held, k)
+        implies free_lease(v, a2, held, k) && a2.leases[k] == a.leases[k] by {
+        assert(k < a.next_id);
+    }
+    lemma_rooted_kept(v, a, a2, held);
+    assert forall|k: LeaseId| #[trigger] a2.leases.contains_key(k) implies !(a2.leases[k].holder is Exposed) by {
+        if k != a.next_id {
+            assert(a.leases.contains_key(k));
+        }
+    }
     lemma_placed_apart(v, a, a2, q, reqs, held);
+}
+
+/// What is free stays free, as it was: every share keeps its root.
+pub proof fn lemma_rooted_kept<L>(v: View<L>, a: Abs::State, a2: Abs::State, held: Held<L>)
+    requires
+        rooted(v, a, held),
+        kept_free(v, a, v, a2, held),
+    ensures
+        rooted(v, a2, held),
+{
+    assert forall|s: int, l: LeaseId| #[trigger] leases_of(v, held, s).contains_key(l) && leases_of(v, held, s)[l].shared
+        implies has_root(v, a2, held, leases_of(v, held, s)[l].kept) by {
+        lemma_root_kept(v, a, v, a2, held, leases_of(v, held, s)[l].kept);
+    }
+}
+
+/// `a2` differs from `a` only in leases the program holds, which is all the NIC's reach does not read.
+pub open spec fn same_but_program(a: Abs::State, a2: Abs::State) -> bool {
+    &&& forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) && !(a2.leases[l].holder is Program)
+        ==> a.leases.contains_key(l) && a2.leases[l] == a.leases[l]
+    &&& forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && !(a.leases[l].holder is Program)
+        ==> a2.leases.contains_key(l) && a2.leases[l] == a.leases[l]
+}
+
+/// `same_but_program` is transitive.
+pub proof fn lemma_same_but_program_trans(a: Abs::State, b: Abs::State, c: Abs::State)
+    requires
+        same_but_program(a, b),
+        same_but_program(b, c),
+    ensures
+        same_but_program(a, c),
+{
+    assert forall|l: LeaseId| #[trigger] c.leases.contains_key(l) && !(c.leases[l].holder is Program)
+        implies a.leases.contains_key(l) && c.leases[l] == a.leases[l] by {
+        assert(b.leases.contains_key(l) && c.leases[l] == b.leases[l]);
+    }
+    assert forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && !(a.leases[l].holder is Program)
+        implies c.leases.contains_key(l) && c.leases[l] == a.leases[l] by {
+        assert(b.leases.contains_key(l) && b.leases[l] == a.leases[l]);
+    }
+}
+
+/// What the program may have forgotten overlaps `bytes`: leases it holds that no request of `v` keeps.
+pub open spec fn overlapping<L>(v: View<L>, a: Abs::State, held: Held<L>, bytes: ISet<int>) -> Set<LeaseId> {
+    a.leases.dom().filter(|l: LeaseId| free_lease(v, a, held, l) && !a.leases[l].mem.disjoint(bytes))
+}
+
+/// `bytes` are apart from what keeps every request of `v` alive, and so from its leases.
+pub open spec fn holds_apart<L>(v: View<L>, held: Held<L>, bytes: ISet<int>) -> bool {
+    forall|s: int, l: LeaseId| #[trigger] leases_of(v, held, s).contains_key(l) ==> {
+        &&& leases_of(v, held, s)[l].mem.disjoint(bytes)
+        &&& leases_of(v, held, s)[l].kept.disjoint(bytes)
+    }
+}
+
+/// **A buffer comes to A.** Bytes apart from every request are a unique lease of the program's, by
+/// A's own steps: `drop` of the leases over them that no request keeps, which no live buffer can
+/// stand for, then `alloc`. What the program holds apart from them stays as it was.
+pub proof fn lemma_adopt<L>(
+    v: View<L>,
+    a: Abs::State,
+    q: spec_fn(L) -> QpId,
+    reqs: Map<int, ReqId>,
+    held: Held<L>,
+    bytes: ISet<int>,
+) -> (a2: Abs::State)
+    requires
+        placed(v, a, q, reqs, held),
+        holds_apart(v, held, bytes),
+    ensures
+        abs_reaches(a, a2),
+        placed(v, a2, q, reqs, held),
+        a2.requests == a.requests,
+        a2.outcomes == a.outcomes,
+        a2.qps == a.qps,
+        a2.next_id == a.next_id + 1,
+        free_lease(v, a2, held, a.next_id),
+        a2.leases[a.next_id] == (Lease { mem: bytes, unique: true, any_bytes: true, holder: Holder::Program }),
+        forall|k: LeaseId| #[trigger] free_lease(v, a, held, k) && a.leases[k].mem.disjoint(bytes)
+            ==> free_lease(v, a2, held, k) && a2.leases[k] == a.leases[k],
+        same_but_program(a, a2),
+{
+    let gone = overlapping(v, a, held, bytes);
+    assert forall|l: LeaseId| #[trigger] gone.contains(l) implies a.is_program(l) by {}
+    let a1 = lemma_drop_leases(a, gone);
+    assert(a1.free_except(bytes, None)) by {
+        assert forall|l: LeaseId| #[trigger] a1.leases.contains_key(l) && None::<LeaseId> != Some(l)
+            implies a1.leases[l].mem.disjoint(bytes) by {
+            assert(a.leases.contains_key(l) && !gone.contains(l));
+            if free_lease(v, a, held, l) {
+                assert(a.leases[l].mem.disjoint(bytes));
+            } else {
+                let s = lemma_kept_by(v, a, q, reqs, held, l);
+                lemma_held_exists(v, a, q, reqs, held, s, l);
+            }
+        }
+    }
+    let lease = Lease { mem: bytes, unique: true, any_bytes: true, holder: Holder::Program };
+    let a2 = Abs::State { leases: a1.leases.insert(a1.next_id, lease), next_id: a1.next_id + 1, ..a1 };
+    assert(abs_step(a1, a2, Abs::Step::alloc(bytes, true)));
+    lemma_step_one(a1, a2, Abs::Step::alloc(bytes, true));
+    lemma_abs_reaches_trans(a, a1, a2);
+    assert(!a.leases.contains_key(a.next_id));
+    assert forall|s: int, l: LeaseId| #[trigger] leases_of(v, held, s).contains_key(l)
+        implies a2.leases.contains_key(l) && a2.leases[l] == a.leases[l] by {
+        lemma_held_exists(v, a, q, reqs, held, s, l);
+        assert(!gone.contains(l));
+    }
+    assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) && a2.leases[l].holder is Request
+        implies a.leases.contains_key(l) && a2.leases[l] == a.leases[l] by {
+        assert(l != a.next_id);
+    }
+    assert forall|s: int| #[trigger] (v.staged)(s) is Some implies a2.qps.contains(q((v.staged)(s)->0.leases)) by {
+        assert(sits(v, a, q, reqs, held, s));
+    }
+    assert forall|s: int| !(#[trigger] leases_of(v, held, s).contains_key(a.next_id)) by {
+        if leases_of(v, held, s).contains_key(a.next_id) {
+            lemma_held_exists(v, a, q, reqs, held, s, a.next_id);
+        }
+    }
+    assert forall|s: int, l: LeaseId| #[trigger] leases_of(v, held, s).contains_key(l) && leases_of(v, held, s)[l].shared
+        implies has_root(v, a2, held, leases_of(v, held, s)[l].kept) by {
+        let kept = leases_of(v, held, s)[l].kept;
+        assert(has_root(v, a, held, kept));
+        let r = choose|r: LeaseId| #[trigger] free_lease(v, a, held, r) && !a.leases[r].unique && a.leases[r].mem == kept;
+        assert(!gone.contains(r));
+        assert(free_lease(v, a2, held, r));
+    }
+    assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) implies !(a2.leases[l].holder is Exposed) by {
+        if l != a.next_id {
+            assert(a.leases.contains_key(l));
+        }
+    }
+    lemma_placed_apart(v, a, a2, q, reqs, held);
+    assert forall|k: LeaseId| #[trigger] free_lease(v, a, held, k) && a.leases[k].mem.disjoint(bytes)
+        implies free_lease(v, a2, held, k) && a2.leases[k] == a.leases[k] by {
+        assert(!gone.contains(k));
+    }
+    assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) && !(a2.leases[l].holder is Program)
+        implies a.leases.contains_key(l) && a2.leases[l] == a.leases[l] by {
+        assert(l != a.next_id);
+    }
+    assert forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && !(a.leases[l].holder is Program)
+        implies a2.leases.contains_key(l) && a2.leases[l] == a.leases[l] by {
+        assert(!gone.contains(l));
+        assert(l != a.next_id);
+    }
+    a2
+}
+
+/// A lease of `a` the program does not hold free is one a request of `v` holds or keeps.
+pub proof fn lemma_kept_by<L>(
+    v: View<L>,
+    a: Abs::State,
+    q: spec_fn(L) -> QpId,
+    reqs: Map<int, ReqId>,
+    held: Held<L>,
+    l: LeaseId,
+) -> (s: int)
+    requires
+        placed(v, a, q, reqs, held),
+        a.leases.contains_key(l),
+        !free_lease(v, a, held, l),
+    ensures
+        leases_of(v, held, s).contains_key(l),
+{
+    if a.leases[l].holder is Request {
+        let r = a.leases[l].holder->req;
+        assert(a.requests.contains_key(r));
+        assert(names_request(v, reqs, r));
+        let s = choose|s: int| #[trigger] (v.req)(s) is Some && reqs[s] == r;
+        assert(sits(v, a, q, reqs, held, s));
+        assert(a.leases[l].held_by(r));
+        s
+    } else {
+        assert(a.is_program(l));
+        choose|s: int| #[trigger] leases_of(v, held, s).contains_key(l)
+    }
+}
+
+/// `freeze` of a unique lease of the program's that no request keeps: a shared lease over its
+/// bytes, the root of its shares.
+pub proof fn lemma_adopted_frozen<L>(
+    v: View<L>,
+    a: Abs::State,
+    q: spec_fn(L) -> QpId,
+    reqs: Map<int, ReqId>,
+    held: Held<L>,
+    l: LeaseId,
+) -> (a2: Abs::State)
+    requires
+        placed(v, a, q, reqs, held),
+        free_lease(v, a, held, l),
+        a.leases[l].unique,
+    ensures
+        abs_reaches(a, a2),
+        placed(v, a2, q, reqs, held),
+        a2.requests == a.requests,
+        a2.outcomes == a.outcomes,
+        a2.qps == a.qps,
+        a2.next_id == a.next_id,
+        free_lease(v, a2, held, l),
+        !a2.leases[l].unique,
+        a2.leases[l].mem == a.leases[l].mem,
+        forall|k: LeaseId| #[trigger] free_lease(v, a, held, k) && k != l
+            ==> free_lease(v, a2, held, k) && a2.leases[k] == a.leases[k],
+        same_but_program(a, a2),
+{
+    let a2 = Abs::State { leases: a.leases.insert(l, Lease { unique: false, ..a.leases[l] }), ..a };
+    assert(abs_step(a, a2, Abs::Step::freeze(l)));
+    lemma_step_one(a, a2, Abs::Step::freeze(l));
+    assert forall|s: int, k: LeaseId| #[trigger] leases_of(v, held, s).contains_key(k)
+        implies a2.leases.contains_key(k) && a2.leases[k] == a.leases[k] by {
+        lemma_held_exists(v, a, q, reqs, held, s, k);
+    }
+    assert forall|s: int| #[trigger] (v.staged)(s) is Some implies a2.qps.contains(q((v.staged)(s)->0.leases)) by {
+        assert(sits(v, a, q, reqs, held, s));
+    }
+    assert forall|s: int, k: LeaseId| #[trigger] leases_of(v, held, s).contains_key(k) && leases_of(v, held, s)[k].shared
+        implies has_root(v, a2, held, leases_of(v, held, s)[k].kept) by {
+        let kept = leases_of(v, held, s)[k].kept;
+        assert(has_root(v, a, held, kept));
+        let r = choose|r: LeaseId| #[trigger] free_lease(v, a, held, r) && !a.leases[r].unique && a.leases[r].mem == kept;
+        assert(r != l);
+        assert(free_lease(v, a2, held, r));
+    }
+    assert forall|k: LeaseId| #[trigger] a2.leases.contains_key(k) implies !(a2.leases[k].holder is Exposed) by {
+        assert(a.leases.contains_key(k));
+    }
+    lemma_placed_apart(v, a, a2, q, reqs, held);
+    assert forall|k: LeaseId| #[trigger] a2.leases.contains_key(k) && !(a2.leases[k].holder is Program)
+        implies a.leases.contains_key(k) && a2.leases[k] == a.leases[k] by {
+        assert(k != l);
+    }
+    assert forall|k: LeaseId| #[trigger] a.leases.contains_key(k) && !(a.leases[k].holder is Program)
+        implies a2.leases.contains_key(k) && a2.leases[k] == a.leases[k] by {
+        assert(k != l);
+    }
+    a2
 }
 
 /// What is free stays free through two changes.
@@ -1490,9 +1803,22 @@ pub open spec fn staged_with<L>(v: View<L>, s: int, detached: bool, l: L) -> Vie
     }
 }
 
+/// The program holds a root over `bytes`, as [`has_root`] says, that is not among the leases `h`.
+pub open spec fn root_outside<L>(v: View<L>, a: Abs::State, held: Held<L>, h: Holds, bytes: ISet<int>) -> bool {
+    exists|r: LeaseId| #[trigger] free_lease(v, a, held, r) && !a.leases[r].unique && a.leases[r].mem == bytes
+        && !h.contains_key(r)
+}
+
+/// The leases `h` may go into a request of `v`: every share keeps a root outside them, theirs too.
+pub open spec fn roots_outside<L>(v: View<L>, a: Abs::State, held: Held<L>, h: Holds) -> bool {
+    &&& forall|s: int, l: LeaseId| #[trigger] leases_of(v, held, s).contains_key(l) && leases_of(v, held, s)[l].shared
+        ==> root_outside(v, a, held, h, leases_of(v, held, s)[l].kept)
+    &&& forall|l: LeaseId| #[trigger] h.contains_key(l) && h[l].shared ==> root_outside(v, a, held, h, h[l].kept)
+}
+
 /// Staging a request is no step of A: its leases stay the program's until it
-/// is posted. They may be posted in their directions, and no other request
-/// holds them.
+/// is posted. They may be posted in their directions, no other request
+/// holds them, and the shares among them have their roots.
 pub proof fn lemma_end<L>(
     v: View<L>,
     a: Abs::State,
@@ -1509,6 +1835,7 @@ pub proof fn lemma_end<L>(
         may_post_holds(a, held(s, l)),
         a.qps.contains(q(l)),
         forall|t: int| #[trigger] leases_of(v, held, t).dom().disjoint(held(s, l).dom()),
+        roots_outside(v, a, held, held(s, l)),
     ensures
         placed(staged_with(v, s, detached, l), a, q, reqs, held),
 {
@@ -1529,6 +1856,26 @@ pub proof fn lemma_end<L>(
     }
     assert forall|r: ReqId| #[trigger] a.requests.contains_key(r) implies names_request(w, reqs, r) by {
         assert(names_request(v, reqs, r));
+    }
+    assert forall|t: int, k: LeaseId| #[trigger] leases_of(w, held, t).contains_key(k) && leases_of(w, held, t)[k].shared
+        implies has_root(w, a, held, leases_of(w, held, t)[k].kept) by {
+        let kept = leases_of(w, held, t)[k].kept;
+        let h = held(s, l);
+        if t == s {
+            assert(h.contains_key(k) && h[k].shared);
+            assert(root_outside(v, a, held, h, h[k].kept));
+        } else {
+            assert(leases_of(v, held, t).contains_key(k));
+            assert(root_outside(v, a, held, h, kept));
+        }
+        let r = choose|r: LeaseId| #[trigger] free_lease(v, a, held, r) && !a.leases[r].unique && a.leases[r].mem == kept
+            && !h.contains_key(r);
+        assert forall|u: int| !(#[trigger] leases_of(w, held, u).contains_key(r)) by {
+            if u != s {
+                assert(!leases_of(v, held, u).contains_key(r));
+            }
+        }
+        assert(free_lease(w, a, held, r));
     }
 }
 
@@ -1606,12 +1953,14 @@ proof fn lemma_no_requests_placed<L>(a: Abs::State, q: spec_fn(L) -> QpId, held:
     requires
         abs_inv(a),
         a.requests == Map::<ReqId, Req>::empty(),
+        none_exposed(a),
     ensures
         placed(no_requests::<L>(), a, q, Map::empty(), held),
 {
     let (v, reqs) = (no_requests::<L>(), Map::<int, ReqId>::empty());
     assert forall|s: int| #[trigger] wf_at(v, s) by {}
     assert forall|s: int| #[trigger] sits(v, a, q, reqs, held, s) by {}
+    assert forall|s: int, l: LeaseId| !(#[trigger] leases_of(v, held, s).contains_key(l)) by {}
 }
 
 /// A with the program holding a unique READ destination, a shared source and a
@@ -1633,11 +1982,21 @@ spec fn source_and_destination() -> Abs::State {
     }
 }
 
+/// A unique lease in a request.
+spec fn unique_hold(dir: Dir, mem: ISet<int>) -> Hold {
+    Hold { dir, mem, kept: mem, shared: false }
+}
+
+/// A share of the whole of a frozen allocation in a request.
+spec fn shared_hold(mem: ISet<int>) -> Hold {
+    Hold { dir: Dir::Out, mem, kept: mem, shared: true }
+}
+
 /// What the requests of the examples hold: the destination, to write, and the source, to read.
 spec fn two_leases() -> Holds {
     Map::empty()
-        .insert(0nat, Hold { dir: Dir::In, mem: source_and_destination().leases[0].mem })
-        .insert(1nat, Hold { dir: Dir::Out, mem: source_and_destination().leases[1].mem })
+        .insert(0nat, unique_hold(Dir::In, source_and_destination().leases[0].mem))
+        .insert(1nat, shared_hold(source_and_destination().leases[1].mem))
 }
 
 /// A request with a READ destination and a shared source, of which the program
@@ -1654,8 +2013,11 @@ pub proof fn example_request_of_two_leases() {
     let h = two_leases();
     let reqs0 = Map::<int, ReqId>::empty();
     let v0 = no_requests::<Holds>();
+    assert(none_exposed(a0));
     lemma_no_requests_placed(a0, q, held);
     assert forall|t: int| #[trigger] leases_of(v0, held, t).dom().disjoint(h.dom()) by {}
+    assert(free_lease(v0, a0, held, 2));
+    assert(root_outside(v0, a0, held, h, h[1].kept));
     lemma_end(v0, a0, q, reqs0, held, 0, false, h);
     let staged = staged_with(v0, 0, false, h);
     let a1 = lemma_post_one(staged, a0, q, reqs0, held, 0);
@@ -1697,10 +2059,11 @@ pub proof fn example_refused() {
     assert(abs_inv(a0));
     let held = |_s: int, h: Holds| h;
     let q = |_h: Holds| 7nat;
-    let owned = Map::empty().insert(0nat, Hold { dir: Dir::In, mem: a0.leases[0].mem });
-    let unowned = Map::empty().insert(1nat, Hold { dir: Dir::Out, mem: a0.leases[1].mem });
+    let owned = Map::empty().insert(0nat, unique_hold(Dir::In, a0.leases[0].mem));
+    let unowned = Map::empty().insert(1nat, shared_hold(a0.leases[1].mem));
     let reqs = Map::<int, ReqId>::empty();
     let v0 = no_requests::<Holds>();
+    assert(none_exposed(a0));
     lemma_no_requests_placed(a0, q, held);
     assert forall|t: int| #[trigger] leases_of(v0, held, t).dom().disjoint(owned.dom()) by {}
     lemma_end(v0, a0, q, reqs, held, 0, false, owned);
@@ -1708,6 +2071,12 @@ pub proof fn example_refused() {
     assert forall|t: int| #[trigger] leases_of(v1, held, t).dom().disjoint(unowned.dom()) by {
         assert(t != 0 ==> leases_of(v1, held, t) == Map::<LeaseId, Hold>::empty());
     }
+    assert(free_lease(v1, a0, held, 2)) by {
+        assert forall|t: int| !(#[trigger] leases_of(v1, held, t).contains_key(2)) by {
+            assert(t != 0 ==> leases_of(v1, held, t) == Map::<LeaseId, Hold>::empty());
+        }
+    }
+    assert(root_outside(v1, a0, held, unowned, unowned[1].kept));
     lemma_end(v1, a0, q, reqs, held, 1, true, unowned);
     let v2 = staged_with(v1, 1, true, unowned);
 

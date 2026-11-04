@@ -37,6 +37,8 @@ crates/safeverbs-core/src/trusted.rs ExPd
 crates/safeverbs-core/src/buf/memory.rs ExRegion
 # A standard-library observation, not the deduplication algorithm itself.
 crates/safeverbs-core/src/buf/lease.rs same_frozen_arc
+# Two real buffers, one of them frozen, own different bytes or are one allocation.
+crates/safeverbs-core/src/buf/lease.rs frozen_apart
 # The global zeroed allocator, with vstd-compatible linear permissions on success.
 crates/safeverbs-core/src/buf/memory.rs allocate_zeroed_raw
 # The std Arc ownership extraction not yet covered by this vstd's Rc binding.
