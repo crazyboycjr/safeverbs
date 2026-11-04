@@ -3635,6 +3635,13 @@ impl<C, N: Device> Hw<C, N> {
         lemma_nic_reaches_refl(self.token@.nic());
     }
 
+    /// No step at all is a step of `moved_from`.
+    pub proof fn lemma_moved_refl(&self)
+        ensures
+            self.moved_from(self),
+    {
+    }
+
     /// `moved_from` is transitive.
     pub proof fn lemma_moved_trans(&self, mid: &Self, older: &Self)
         requires
@@ -3929,28 +3936,42 @@ pub proof fn theorem_1_engine<C, N: Device>(run: Seq<EngineState<C, N>>)
     theorem_1(run);
 }
 
-/// Theorem 1 through the engine's own operations: what they ensure is a step of [`EngineState`], so
-/// a run of them from the device just opened stands for runs of A and M, coupled at every point. The
-/// engine is lent any buffer the program holds, and until then the buffer is one A would give the
-/// program: the NIC touches none of its bytes. What the NIC may touch beyond the engine's queues
+/// Theorem 1 through the public operations of [`Engine`](crate::engine::Engine) on typed buffers:
+/// what they ensure is a step of [`EngineState`], so a run of them from the device just opened stands
+/// for runs of A and M, coupled at every point. Until a buffer is lent it is one A would give the
+/// program, so the NIC touches none of its bytes. What the NIC may touch beyond the engine's queues
 /// stays the premise it is (`Hw::outside_ok`).
 #[cfg(verus_keep_ghost)]
 #[allow(dead_code)]
-fn example_run<C, N: Device>(ctx: Context<N>, pd: &Pd<N>, caps: QpCaps, part: Part<N>) {
-    let mut hw = match Hw::<C, N>::new(ctx, 16) {
+fn example_run<C, N: Device, T: crate::transport::Transport>(
+    ctx: Context<N>,
+    td: Option<N::Td>,
+    qp: crate::engine::QpKey<T>,
+    received: crate::buf::BufMut<u8, N>,
+    sent: crate::buf::Buf<u8, N>,
+    context: (C, C),
+) {
+    let hw = match Hw::<C, N>::new(ctx, 16) {
         Ok(hw) => hw,
         Err(_) => return,
     };
     let ghost h1 = hw;
     let ghost m0 = choose|m0: Nic::State| nic_init(m0) && #[trigger] h1.born_from(m0);
-    let part = part.apart_from_nic(&hw);
-    let _ = hw.post_recv(0, part, None);
-    let ghost h3 = hw;
-    let _ = hw.create_qp(pd, None, QpType::Rc, caps, 1);
-    let ghost h4 = hw;
-    let _ = hw.progress();
-    let ghost h5 = hw;
-    let handed_out = hw.next_completion();
+    let mut engine = crate::engine::Engine::of(hw, td);
+    let received = received.apart_from_nic(engine.hw());
+    sent.apart_from_nic(engine.hw());
+    let (first, second) = context;
+    let _ = engine.post_recv(qp, received.part(), first);
+    let ghost h2 = engine.state();
+    if let Ok(part) = sent.try_part() {
+        let _ = engine.stage(qp, WrOp::Send, part, second, true);
+    }
+    let ghost h3 = engine.state();
+    let _ = engine.commit(qp);
+    let ghost h4 = engine.state();
+    let _ = engine.progress();
+    let ghost h5 = engine.state();
+    let handed_out = engine.next_completion();
     proof {
         // What the program gets is what A says of its request.
         if let Some(c) = handed_out {
@@ -3958,10 +3979,11 @@ fn example_run<C, N: Device>(ctx: Context<N>, pd: &Pd<N>, caps: QpCaps, part: Pa
                 h5.lemma_hands_out_in_a(c);
             }
         }
-        if h1.outside_ok() && h3.outside_ok() && h4.outside_ok() && h5.outside_ok() {
+        if h1.outside_ok() && h2.outside_ok() && h3.outside_ok() && h4.outside_ok() && h5.outside_ok() {
             let run = seq![
                 EngineState::<C, N>::Start { nic: m0 },
                 EngineState::Running { hw: h1 },
+                EngineState::Running { hw: h2 },
                 EngineState::Running { hw: h3 },
                 EngineState::Running { hw: h4 },
                 EngineState::Running { hw: h5 },
@@ -3969,13 +3991,14 @@ fn example_run<C, N: Device>(ctx: Context<N>, pd: &Pd<N>, caps: QpCaps, part: Pa
             assert forall|i: int| 0 <= i < run.len() - 1 implies (#[trigger] run[i]).step(&run[i + 1]) by {
                 assert(run[0] == EngineState::<C, N>::Start { nic: m0 });
                 assert(run[1] == EngineState::<C, N>::Running { hw: h1 });
-                assert(run[2] == EngineState::<C, N>::Running { hw: h3 });
-                assert(run[3] == EngineState::<C, N>::Running { hw: h4 });
-                assert(run[4] == EngineState::<C, N>::Running { hw: h5 });
+                assert(run[2] == EngineState::<C, N>::Running { hw: h2 });
+                assert(run[3] == EngineState::<C, N>::Running { hw: h3 });
+                assert(run[4] == EngineState::<C, N>::Running { hw: h4 });
+                assert(run[5] == EngineState::<C, N>::Running { hw: h5 });
             }
             theorem_1_engine(run);
-            assert(run[4] == EngineState::<C, N>::Running { hw: h5 });
-            assert(run[4].abs() == h5.refinement().abs);
+            assert(run[5] == EngineState::<C, N>::Running { hw: h5 });
+            assert(run[5].abs() == h5.refinement().abs);
             assert(coupled(h5.refinement().abs, h5.nic(), h5.refinement().ranges, h5.refinement().wrs));
         }
     }

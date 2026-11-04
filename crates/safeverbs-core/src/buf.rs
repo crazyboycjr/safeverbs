@@ -362,6 +362,7 @@ impl<T, N: Nic> BufMut<T, N> {
     pub(crate) fn part(self) -> (part: Part<N>)
         ensures
             part.spec_writable(),
+            part.byte_domain() == self.byte_domain(),
     {
         if self.raw.len() > u32::MAX as usize {
             // Released first, so that no buffer stays alive across the panic: the `Part` is then
@@ -370,6 +371,24 @@ impl<T, N: Nic> BufMut<T, N> {
             sge_too_long()
         }
         Part::unique(self.raw)
+    }
+
+    /// **S1 of a buffer the program holds.** The NIC reads and writes none of its bytes.
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn apart_from_nic<C>(self, hw: &crate::hw::Hw<C, N>) -> (same: Self)
+        requires
+            hw.inv(),
+        ensures
+            same == self,
+            hw.outside_ok() ==> forall|x: int| #[trigger] self.byte_domain().contains(x) ==> {
+                &&& !hw.nic().nic_may_write(x)
+                &&& !hw.nic().nic_may_read(x)
+            },
+    {
+        proof {
+            use_type_invariant(&self);
+        }
+        BufMut { raw: lease::unique_apart_from_nic(self.raw, hw), _t: PhantomData }
     }
 }
 

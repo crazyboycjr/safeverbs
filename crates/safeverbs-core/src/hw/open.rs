@@ -308,7 +308,10 @@ impl<N: Device> OpenRequest<N> {
 
     /// Whether it has no WQE.
     #[inline(always)]
-    pub fn is_empty(&self) -> (empty: bool) {
+    pub fn is_empty(&self) -> (empty: bool)
+        ensures
+            empty == self.has_no_wqe(),
+    {
         self.n == 0
     }
 
@@ -586,6 +589,15 @@ impl<N: Device> OpenRequest<N> {
         &&& self.reads == pre.reads
         &&& self.max_sges == pre.max_sges
         &&& self.wqes@.len() == pre.wqes@.len()
+    }
+
+    /// `same_fields` keeps the invariant.
+    pub(crate) proof fn lemma_same_fields(&self, pre: &Self)
+        requires
+            self.same_fields(pre),
+        ensures
+            self.inv(),
+    {
     }
 
     /// The WR of WQE `k`, whose number is `first + k`.

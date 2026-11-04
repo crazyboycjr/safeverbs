@@ -142,6 +142,47 @@ pub ghost struct Resource<N: Nic> {
     resource: Lease<N>,
 }
 
+/// **S1 of the buffer `raw` is:** while the program holds it, the NIC touches none of its bytes
+/// (`Hw::keeper_apart`).
+#[cfg(verus_keep_ghost)]
+pub(super) fn unique_apart_from_nic<C, N: Nic>(raw: RawMut<N>, hw: &crate::hw::Hw<C, N>) -> (same: RawMut<N>)
+    requires
+        hw.inv(),
+    ensures
+        same == raw,
+        hw.outside_ok() ==> forall|x: int| #[trigger] raw.byte_domain().contains(x) ==> {
+            &&& !hw.nic().nic_may_write(x)
+            &&& !hw.nic().nic_may_read(x)
+        },
+{
+    let ghost whole = raw.byte_domain();
+    let mut lease = Lease::Unique(raw);
+    hw.keeper_apart(&mut lease);
+    proof {
+        assert(lease.observation().unique() && lease.observation().byte_domain() == whole);
+    }
+    match lease {
+        Lease::Unique(same) => same,
+        Lease::Shared(_) => vstd::pervasive::unreached(),
+    }
+}
+
+/// **S1 of a frozen allocation:** while the program holds it, the NIC writes none of its bytes
+/// (`Hw::keeper_apart`).
+#[cfg(verus_keep_ghost)]
+pub(super) fn frozen_apart_from_nic<C, N: Nic>(frozen: &Arc<Frozen<N>>, hw: &crate::hw::Hw<C, N>)
+    requires
+        hw.inv(),
+    ensures
+        hw.outside_ok() ==> forall|x: int| #[trigger] (**frozen).byte_domain().contains(x) ==> !hw.nic().nic_may_write(x),
+{
+    let mut lease = Lease::Shared(frozen.clone());
+    hw.keeper_apart(&mut lease);
+    proof {
+        assert(lease.observation().byte_domain() == (**frozen).byte_domain());
+    }
+}
+
 impl<N: Nic> Resource<N> {
     /// Whether this physical keeper owns its bytes exclusively.
     pub closed spec fn unique(self) -> bool { self.resource is Unique }
@@ -371,31 +412,6 @@ impl<N: Nic> Part<N> {
         Part { sge, pd, lease }
     }
 
-    /// **S1 of a buffer on loan to nobody yet.** While the program holds it, the NIC writes none of
-    /// its bytes, and if it is unique reads none (`Hw::keeper_apart`).
-    #[cfg(verus_keep_ghost)]
-    pub(crate) fn apart_from_nic<C>(self, hw: &crate::hw::Hw<C, N>) -> (same: Self)
-        requires
-            hw.inv(),
-        ensures
-            same == self,
-            hw.outside_ok() ==> forall|x: int| #[trigger] self.byte_domain().contains(x) ==> {
-                &&& !hw.nic().nic_may_write(x)
-                &&& self.spec_writable() ==> !hw.nic().nic_may_read(x)
-            },
-    {
-        proof {
-            use_type_invariant(&self);
-            self.lemma_byte_backing();
-            assert forall|x: int| #[trigger] self.byte_domain().contains(x)
-                implies self.lease.observation().byte_domain().contains(x) by {}
-        }
-        let Part { sge, pd, lease } = self;
-        let mut lease = lease;
-        hw.keeper_apart(&mut lease);
-        Part { sge, pd, lease }
-    }
-
     /// What keeps it alive and a frozen allocation are apart.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]
@@ -436,6 +452,7 @@ impl<N: Nic> Part<N> {
     pub(super) fn unique(raw: RawMut<N>) -> (r: Self)
         requires raw.byte_len() <= u32::MAX,
         ensures r.inv(), r.resource() == Lease::Unique(raw).observation(),
+            r.byte_domain() == raw.byte_domain(),
             r.spec_sge() == (Sge {
                 addr: raw.pointer().addr() as u64, length: raw.byte_len() as u32, lkey: (*raw.region).lkey,
             }),

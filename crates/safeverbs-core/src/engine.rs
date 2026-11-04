@@ -126,6 +126,7 @@ use core::mem::ManuallyDrop;
 use core::task::Waker;
 use std::time::{Duration, Instant};
 
+use vstd::prelude::*;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::buf::{Buf, BufError, BufMut, Leases, Part};
@@ -136,6 +137,7 @@ use crate::nic::{ConnectAttr, Endpoint, Nic, QpCaps, RemoteBuf, WrOp};
 use crate::pd::{Context, Pd};
 use crate::ring::{Payload, Ring, Seq};
 use crate::transport::{Reliable, Transport};
+use crate::trusted::no_qp;
 use crate::verbs::Verbs;
 #[cfg(doc)]
 use crate::wc::CompletionError;
@@ -150,6 +152,28 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Empty polls of the CQ between two looks at the clock while draining.
 const DRAIN_SPINS: u32 = 1024;
 
+verus! {
+
+/// [`Transport`], without specifications of its own: an engine reads no more of a key than its
+/// index.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_trait_specification]
+pub trait ExTransport: Send + Sync + 'static {
+    /// The trait specified.
+    type ExternalTraitSpecificationFor: Transport;
+}
+
+/// `ManuallyDrop::deref_mut`, which vstd does not specify.
+#[verifier::external_body]
+#[inline(always)]
+fn hw_mut<C, N: Nic>(hw: &mut ManuallyDrop<Hw<C, N>>) -> (r: &mut Hw<C, N>)
+    ensures
+        *r == old(hw)@,
+        final(hw)@ == *final(r),
+{
+    &mut *hw
+}
+
 /// A QP of an engine: its index there, typed by its transport. Cheap to copy.
 ///
 /// A key names a QP of the engine that created it, until the QP is removed;
@@ -159,13 +183,21 @@ const DRAIN_SPINS: u32 = 1024;
 /// on.
 pub struct QpKey<T: Transport> {
     index: u16,
-    _t: PhantomData<fn() -> T>,
+    _t: PhantomData<T>,
 }
 
 impl<T: Transport> QpKey<T> {
+    /// [`QpKey::index`], as a specification.
+    pub closed spec fn spec_index(self) -> usize {
+        self.index as usize
+    }
+
     /// The QP's index in its engine, as [`Completion::qp`] reports it.
     #[inline(always)]
-    pub fn index(self) -> usize {
+    pub fn index(self) -> (index: usize)
+        ensures
+            index == self.spec_index(),
+    {
         self.index as usize
     }
 }
@@ -177,6 +209,831 @@ impl<T: Transport> Clone for QpKey<T> {
 }
 
 impl<T: Transport> Copy for QpKey<T> {}
+
+/// A request that could not be posted: why, and its context and buffers.
+#[verifier::reject_recursive_types(N)]
+pub struct PostError<C = (), N: Nic = Verbs> {
+    /// What went wrong.
+    pub error: Error,
+    /// The value it was given (its context).
+    pub wr_id: C,
+    /// Its buffers.
+    pub leases: Leases<N>,
+}
+
+/// A receive [`Engine::try_post_recv`] hands back: its buffer and its context.
+pub type ReceiveBack<C, N> = (Part<N>, C);
+
+/// A refusal of a request given a context, with that context.
+#[cold]
+#[inline(never)]
+fn owned<C, N: Nic>(refused: Refusal<C, N>) -> (e: PostError<C, N>)
+    requires
+        refused.ctx is Some,
+    ensures
+        e.wr_id == refused.ctx->0,
+{
+    PostError {
+        error: refused.error,
+        wr_id: refused.ctx.expect("the context it was given"),
+        leases: refused.leases,
+    }
+}
+
+/// A parent domain over a protection domain and the engine's thread domain.
+#[verifier::reject_recursive_types(N)]
+struct Domain<N: Nic> {
+    /// Dropped before its protection domain.
+    domain: N::Domain,
+    pd: Pd<N>,
+}
+
+/// A completion queue and the QPs attached to it (the synchronous layer), with
+/// a context of type `C` kept with each request (see the module documentation).
+///
+/// Dropping it drains its QPs (as [`Engine::remove_qp`] does, all at once),
+/// drops the contexts of the requests not delivered, destroys the QPs, releases
+/// the buffers their requests held, then destroys the CQ and the thread domain.
+/// A QP the device never flushes is leaked with its buffers, and so are the CQ
+/// and the domain.
+#[verifier::reject_recursive_types(C)]
+#[verifier::reject_recursive_types(N)]
+pub struct Engine<C = (), N: Nic = Verbs> {
+    /// The verified hardware side; dropped by hand, in `drop`.
+    hw: ManuallyDrop<Hw<C, N>>,
+    /// The parent domains its QPs are created on, one per protection domain; dropped by hand.
+    domains: ManuallyDrop<Vec<Domain<N>>>,
+    /// The thread domain of its QPs, where the device has them; dropped by hand, last.
+    td: ManuallyDrop<Option<N::Td>>,
+}
+
+impl<C, N: Nic> Engine<C, N> {
+    /// What it stands for in Theorem 1: its hardware side, a state of `EngineState`.
+    pub closed spec fn state(&self) -> Hw<C, N> {
+        self.hw@
+    }
+
+    /// Its invariant: only [`Engine::of`] makes one, its fields are private, and every method keeps it.
+    pub open spec fn inv(&self) -> bool {
+        self.state().inv()
+    }
+
+    /// `self` is `older` after calls of the engine: it keeps its invariant, and its hardware side
+    /// moved as [`Hw::moved_from`] says, which is a step of Theorem 1.
+    pub open spec fn moved_from(&self, older: &Self) -> bool {
+        &&& self.inv()
+        &&& self.state().moved_from(&older.state())
+    }
+
+    /// `moved_from` is transitive.
+    proof fn lemma_moved_trans(&self, mid: &Self, older: &Self)
+        requires
+            self.moved_from(mid),
+            mid.moved_from(older),
+        ensures
+            self.moved_from(older),
+    {
+        self.hw@.lemma_moved_trans(&mid.hw@, &older.hw@);
+    }
+
+    /// Its hardware side, as Theorem 1 reads it.
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn hw(&self) -> (hw: &Hw<C, N>)
+        ensures
+            *hw == self.state(),
+    {
+        &*self.hw
+    }
+
+    /// An engine over a hardware side and a thread domain, with no parent domain yet.
+    pub(crate) fn of(hw: Hw<C, N>, td: Option<N::Td>) -> (engine: Self)
+        requires
+            hw.inv(),
+        ensures
+            engine.inv(),
+            engine.state() == hw,
+    {
+        Engine {
+            hw: ManuallyDrop::new(hw),
+            domains: ManuallyDrop::new(Vec::new()),
+            td: ManuallyDrop::new(td),
+        }
+    }
+
+    /// Panics unless `index` names a QP of the engine.
+    fn check(&self, index: usize)
+        requires
+            self.inv(),
+    {
+        if !self.hw.is_qp(index) {
+            no_qp(index);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Polling
+
+    /// Polls the CQ once, recording what completed in the rings of its QPs
+    /// (and waking the wakers registered there); returns the number of
+    /// completions. Owners take their results by sequence number
+    /// ([`Engine::take_send`], [`Engine::take_recv`]).
+    ///
+    /// If a registered waker panics, every CQE already polled is still
+    /// recorded and every registered notification is attempted before the
+    /// panic resumes. Catching that panic does not lose those results.
+    #[inline]
+    pub fn progress(&mut self) -> (n: usize)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        hw_mut(&mut self.hw).progress()
+    }
+
+    /// The first half of [`Engine::poll`], for a caller who cannot lend the engine to a callback:
+    /// reads at most `n` CQEs and updates the CQ's consumer index, unless some read before are not
+    /// routed yet. Returns how many it read.
+    #[inline(always)]
+    pub fn read_completions(&mut self, n: usize) -> (read: usize)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        hw_mut(&mut self.hw).read_completions(n)
+    }
+
+    /// The second half of [`Engine::poll`]: the next request that completed with an owner, `None`
+    /// when nothing is left of what was read.
+    #[inline(always)]
+    pub fn next_completion(&mut self) -> (r: Option<Completion<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Some(c) ==> old(self).state().hands_out(c),
+    {
+        hw_mut(&mut self.hw).next_completion()
+    }
+
+    // -------------------------------------------------------------------------
+    // One QP
+
+    /// Connects the QP to `remote` (RESET to INIT, RTR and RTS). A QP
+    /// connects once: from RESET, as created. Until it is connected (or
+    /// moved to the error state) it takes no work: doorbells are refused
+    /// and receives are not posted. If connecting fails part way, the QP
+    /// takes no work until it is moved to the error state.
+    pub fn connect<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        attr: &ConnectAttr,
+        remote: &Endpoint,
+    ) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        self.check(qp.index());
+        hw_mut(&mut self.hw).connect(qp.index(), attr, remote)
+    }
+
+    /// Moves the QP to the error state: every request in flight completes
+    /// with a flush error and hands its buffers back. Work posted from then
+    /// on is flushed too.
+    pub fn to_error<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        self.check(qp.index());
+        hw_mut(&mut self.hw).set_error(qp.index())
+    }
+
+    /// A request to write on the QP, as a value of its own: no borrow of the engine is held while
+    /// its WQEs go in ([`OpenRequest::try_push`], [`OpenRequest::try_push_lent`]; what those hand
+    /// back goes through [`Engine::push_open`]), and nothing is allocated for it. Nothing reaches
+    /// the hardware or the rings until [`Engine::close_open`] or [`Engine::submit_open`], which look
+    /// at the QP's queue then: they say there is no room, or wait for some.
+    #[inline(always)]
+    pub fn open_request<T: Transport>(&mut self, qp: QpKey<T>) -> (open: OpenRequest<N>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            open.inv(),
+    {
+        hw_mut(&mut self.hw).open_request(qp.index())
+    }
+
+    /// Adds a WQE to `open`, whatever it takes: what [`OpenRequest::try_push`] could not tell is
+    /// checked, and if the request is full it goes out as a request of its own, signaled and
+    /// without an owner, waiting for room (polling the CQ). On error nothing is added and the part
+    /// is handed back.
+    pub fn push_open<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        open: &mut OpenRequest<N>,
+        op: WrOp,
+        part: Part<N>,
+    ) -> (r: Result<(), BufError<Part<N>>>)
+        requires
+            old(self).inv(),
+            old(open).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            final(open).inv(),
+            r matches Err(e) ==> e.buf == part,
+    {
+        hw_mut(&mut self.hw).push_other(qp.index(), open, op, part)
+    }
+
+    /// Whether `open`'s WQEs fit in the QP's queue now.
+    #[inline(always)]
+    pub fn open_fits<T: Transport>(&self, qp: QpKey<T>, open: &OpenRequest<N>) -> bool
+        requires
+            self.inv(),
+    {
+        self.hw.open_fits(qp.index(), open)
+    }
+
+    /// Writes `open`'s WQEs as a request, signaled if `signal` (else only if the ring needs it),
+    /// with `ctx` to come back with its completion, if it has one; it goes out at the next
+    /// [`Engine::commit`]. `open` is empty then and takes more. Returns its sequence number; if it
+    /// has no WQE, the queue no room ([`Engine::open_fits`] says) or the QP does not take what it
+    /// was written for (another protection domain, more WQEs than its requests may have, a READ on
+    /// an unreliable connection), `ctx` back and `open` as it was.
+    pub fn close_open<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        open: &mut OpenRequest<N>,
+        signal: bool,
+        ctx: Option<C>,
+    ) -> (r: core::result::Result<Seq, Option<C>>)
+        requires
+            old(self).inv(),
+            old(open).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            final(open).inv(),
+            r matches Err(back) ==> back == ctx,
+    {
+        let ghost before = *old(open);
+        let r = hw_mut(&mut self.hw).close(qp.index(), open, signal, ctx);
+        proof {
+            open.lemma_same_fields(&before);
+        }
+        r
+    }
+
+    /// `open` as a request with `ctx`, and the doorbell; what it keeps from the QP goes back. If the
+    /// queue has no room this waits for some, polling the CQ. On an error its context and buffers
+    /// come back.
+    #[inline(always)]
+    pub fn submit_open<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        open: &mut OpenRequest<N>,
+        signal: bool,
+        ctx: C,
+    ) -> (r: Result<Seq, PostError<C, N>>)
+        requires
+            old(self).inv(),
+            old(open).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            final(open).inv(),
+            r matches Err(e) ==> e.wr_id == ctx,
+    {
+        match hw_mut(&mut self.hw).submit_open(qp.index(), open, signal, ctx) {
+            Ok(seq) => Ok(seq),
+            Err(refused) => Err(owned(refused)),
+        }
+    }
+
+    /// What `open` holds goes out as a request without an owner, signaled, and the doorbell; what
+    /// it keeps from the QP goes back. If the queue has no room this waits for some, polling the CQ.
+    pub fn submit_open_detached<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        open: &mut OpenRequest<N>,
+    ) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+            old(open).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            final(open).inv(),
+    {
+        let ghost start = *self;
+        proof {
+            start.hw@.lemma_moved_refl();
+        }
+        let index = qp.index();
+        if !open.is_empty() {
+            match hw_mut(&mut self.hw).close_waiting(index, open, true, None) {
+                Ok(_) => {},
+                Err(_) => return Err(Error::QueueFull),
+            }
+        }
+        let ghost closed = *self;
+        hw_mut(&mut self.hw).give_back(index, open);
+        let ghost back = *self;
+        let r = hw_mut(&mut self.hw).commit(index, None);
+        proof {
+            back.lemma_moved_trans(&closed, &start);
+            (*self).lemma_moved_trans(&back, &start);
+        }
+        match r {
+            Ok(()) => Ok(()),
+            Err((e, _)) => Err(e),
+        }
+    }
+
+    /// For an owner about to drop `leases`, those of a completed request of the QP: frozen buffers
+    /// are released here, and a list of several goes back to the QP for the next such request, so
+    /// that it allocates nothing.
+    pub fn hand_back_leases<T: Transport>(&mut self, qp: QpKey<T>, leases: &mut Leases<N>)
+        requires
+            old(self).inv(),
+            old(leases).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            final(leases).inv(),
+    {
+        hw_mut(&mut self.hw).hand_back_leases(qp.index(), leases);
+    }
+
+    /// What `open` keeps from the QP goes back there, for the next request, if it has no WQE: the
+    /// WQEs it has stay in it.
+    pub fn give_back<T: Transport>(&mut self, qp: QpKey<T>, open: &mut OpenRequest<N>)
+        requires
+            old(self).inv(),
+            old(open).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            final(open).inv(),
+    {
+        hw_mut(&mut self.hw).give_back(qp.index(), open);
+    }
+
+    /// One WQE as a request of its own, signaled, and the doorbell; if the queue is full it waits
+    /// for room, polling the CQ.
+    #[inline(always)]
+    fn post_one<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        ctx: C,
+    ) -> (r: Result<Seq, PostError<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Err(e) ==> e.wr_id == ctx,
+    {
+        let ghost start = *self;
+        match hw_mut(&mut self.hw).post_one(qp.index(), op, part, Some(ctx), true, true) {
+            Ok(Ok(seq)) => Ok(seq),
+            Ok(Err(refused)) => Err(owned(refused)),
+            Err(unposted) => {
+                let ghost mid = *self;
+                let r = self.post_slow(qp.index(), unposted, true, true);
+                proof {
+                    (*self).lemma_moved_trans(&mid, &start);
+                }
+                r
+            },
+        }
+    }
+
+    /// [`Engine::post_one`] out of the common.
+    #[cold]
+    #[inline(never)]
+    fn post_slow(
+        &mut self,
+        index: usize,
+        unposted: Unposted<C, N>,
+        signal: bool,
+        ring: bool,
+    ) -> (r: Result<Seq, PostError<C, N>>)
+        requires
+            old(self).inv(),
+            unposted.ctx is Some,
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Err(e) ==> e.wr_id == unposted.ctx->0,
+    {
+        match hw_mut(&mut self.hw).post_one_slow(index, unposted, signal, ring) {
+            Ok(seq) => Ok(seq),
+            Err(refused) => Err(owned(refused)),
+        }
+    }
+
+    /// One WQE doing `op` on `part` as a signaled request of its own, and the doorbell, if nothing
+    /// is out of the common: the QP takes work, nothing is being gathered, there is room and the
+    /// checks pass. Otherwise everything comes back untouched, for
+    /// [`Engine::post_unposted`] or for later.
+    #[inline(always)]
+    pub fn try_post<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        ctx: C,
+    ) -> (r: Result<Result<Seq, PostError<C, N>>, Unposted<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Ok(Err(e)) ==> e.wr_id == ctx,
+            r matches Err(back) ==> back.op == op && back.part == part && back.ctx == Some(ctx),
+    {
+        match hw_mut(&mut self.hw).post_one(qp.index(), op, part, Some(ctx), true, true) {
+            Ok(Ok(seq)) => Ok(Ok(seq)),
+            Ok(Err(refused)) => Ok(Err(owned(refused))),
+            Err(unposted) => Err(unposted),
+        }
+    }
+
+    /// [`Engine::try_post`] without the doorbell, as [`Engine::stage`] writes it: signaled if
+    /// `signal`, else only if the ring needs it.
+    #[inline(always)]
+    pub fn try_stage<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        ctx: C,
+        signal: bool,
+    ) -> (r: Result<Result<Seq, PostError<C, N>>, Unposted<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Ok(Err(e)) ==> e.wr_id == ctx,
+            r matches Err(back) ==> back.op == op && back.part == part && back.ctx == Some(ctx),
+    {
+        match hw_mut(&mut self.hw).post_one(qp.index(), op, part, Some(ctx), signal, false) {
+            Ok(Ok(seq)) => Ok(Ok(seq)),
+            Ok(Err(refused)) => Ok(Err(owned(refused))),
+            Err(unposted) => Err(unposted),
+        }
+    }
+
+    /// What [`Engine::try_post`] or [`Engine::try_stage`] handed back, as a request of the general
+    /// kind, signaled if `signal`, and the doorbell if `ring`: it waits for room if it must,
+    /// polling the CQ.
+    pub fn post_unposted<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        unposted: Unposted<C, N>,
+        signal: bool,
+        ring: bool,
+    ) -> (r: Result<Seq, PostError<C, N>>)
+        requires
+            old(self).inv(),
+            unposted.ctx is Some,
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Err(e) ==> e.wr_id == unposted.ctx->0,
+    {
+        self.post_slow(qp.index(), unposted, signal, ring)
+    }
+
+    /// Writes one WQE doing `op` on `part` as a request of its own, with `ctx` to come back with
+    /// its completion, signaled if `signal` (else only if the ring needs it). Its WQE goes out at
+    /// the next [`Engine::commit`], with those written before it.
+    #[inline]
+    pub fn stage<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        ctx: C,
+        signal: bool,
+    ) -> (r: Result<Seq, PostError<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Err(e) ==> e.wr_id == ctx,
+    {
+        let ghost start = *self;
+        match hw_mut(&mut self.hw).post_one(qp.index(), op, part, Some(ctx), signal, false) {
+            Ok(Ok(seq)) => Ok(seq),
+            Ok(Err(refused)) => Err(owned(refused)),
+            Err(unposted) => {
+                let ghost mid = *self;
+                let r = self.post_slow(qp.index(), unposted, signal, false);
+                proof {
+                    (*self).lemma_moved_trans(&mid, &start);
+                }
+                r
+            },
+        }
+    }
+
+    /// [`Engine::stage`] of a request without an owner: nobody will take it back, its buffers are
+    /// released when it completes, and its first error is reported by
+    /// [`Engine::take_send_error`].
+    #[inline]
+    pub fn stage_detached<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        signal: bool,
+    ) -> (r: Result<Seq, BufError<Leases<N>>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        let ghost start = *self;
+        let done = match hw_mut(&mut self.hw).post_one(qp.index(), op, part, None, signal, false) {
+            Ok(done) => done,
+            Err(unposted) => {
+                let ghost mid = *self;
+                let done = hw_mut(&mut self.hw).post_one_slow(qp.index(), unposted, signal, false);
+                proof {
+                    (*self).lemma_moved_trans(&mid, &start);
+                }
+                done
+            },
+        };
+        match done {
+            Ok(seq) => Ok(seq),
+            Err(refused) => Err(BufError { error: refused.error, buf: refused.leases }),
+        }
+    }
+
+    /// Rings the QP's doorbell for every request written since the last
+    /// one. If the device refuses, none of them is posted: each one with an
+    /// owner completes at once as [`CompletionError::Refused`], which its owner
+    /// takes with its context and buffers ([`Engine::take_send`], or
+    /// [`Engine::poll`]); each one without an owner releases its buffers and is
+    /// reported by [`Engine::take_send_error`]. Sequence numbers are never
+    /// reused. [`Request::submit`] hands the context and buffers of its own
+    /// request back with the error instead.
+    /// A waker panic during refusal propagates only after all staged
+    /// requests have their refusal result and notifications are attempted.
+    #[inline]
+    pub fn commit<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        match hw_mut(&mut self.hw).commit(qp.index(), None) {
+            Ok(()) => Ok(()),
+            Err((e, _)) => Err(e),
+        }
+    }
+
+    /// Takes the context, result and buffers of completed (or refused) request `seq` of `queue`.
+    #[inline(always)]
+    pub fn take<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        queue: Queue,
+        seq: Seq,
+    ) -> (r: Option<Completion<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            old(self).state().takeable(qp.spec_index(), queue, seq) ==> r is Some,
+            queue is Recv ==> (r matches Some(c) ==> old(self).state().recv_taken_matches(qp.spec_index(), seq, c)),
+            queue is Send ==> (r matches Some(c) ==> old(self).state().send_taken_matches(qp.spec_index(), seq, c)),
+    {
+        hw_mut(&mut self.hw).take(qp.index(), queue, seq)
+    }
+
+    /// Takes the context, result and buffers of completed (or refused) send
+    /// request `seq`.
+    #[inline]
+    pub fn take_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> (r: Option<Completion<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            old(self).state().takeable(qp.spec_index(), Queue::Send, seq) ==> r is Some,
+            r matches Some(c) ==> old(self).state().send_taken_matches(qp.spec_index(), seq, c),
+    {
+        hw_mut(&mut self.hw).take(qp.index(), Queue::Send, seq)
+    }
+
+    /// Takes the context, result and buffer of completed receive `seq`.
+    #[inline]
+    pub fn take_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> (r: Option<Completion<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            old(self).state().takeable(qp.spec_index(), Queue::Recv, seq) ==> r is Some,
+            r matches Some(c) ==> old(self).state().recv_taken_matches(qp.spec_index(), seq, c),
+    {
+        hw_mut(&mut self.hw).take(qp.index(), Queue::Recv, seq)
+    }
+
+    /// Gives up send request `seq`: its buffers are released when it completes
+    /// (now, if it has), and its context comes back, if it has one still.
+    pub fn detach_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> (ctx: Option<C>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        let (ctx, _waker) = hw_mut(&mut self.hw).detach(qp.index(), Queue::Send, seq);
+        ctx
+    }
+
+    /// Gives up receive `seq`: its buffer is released when it completes (now, if
+    /// it has), and its context comes back, if it has one still.
+    pub fn detach_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> (ctx: Option<C>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        let (ctx, _waker) = hw_mut(&mut self.hw).detach(qp.index(), Queue::Recv, seq);
+        ctx
+    }
+
+    /// Gives up request `seq` of `queue`, as [`Engine::detach_send`] and [`Engine::detach_recv`] do,
+    /// for a caller that holds the engine behind a borrow or a lock: its context and its waker come
+    /// back, to drop once it has let go of the engine.
+    pub fn give_up<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        queue: Queue,
+        seq: Seq,
+    ) -> (given_up: (Option<C>, Option<Waker>))
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        hw_mut(&mut self.hw).detach(qp.index(), queue, seq)
+    }
+
+    /// The first error of a send request without an owner (a dropped future's,
+    /// a sink's, a split batch's part), once.
+    pub fn take_send_error<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Option<DetachedError>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Some(error) ==> old(self).state().detached_taken_matches(qp.spec_index(), error),
+    {
+        hw_mut(&mut self.hw).take_send_error(qp.index())
+    }
+
+    /// Wakes `waker` when send request `seq` completes; the waker it replaces comes back.
+    pub fn set_send_waker<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        seq: Seq,
+        waker: &Waker,
+    ) -> (replaced: Option<Waker>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        hw_mut(&mut self.hw).set_waker(qp.index(), Queue::Send, seq, waker)
+    }
+
+    /// Wakes `waker` when receive `seq` completes; the waker it replaces comes back.
+    pub fn set_recv_waker<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        seq: Seq,
+        waker: &Waker,
+    ) -> (replaced: Option<Waker>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        hw_mut(&mut self.hw).set_waker(qp.index(), Queue::Recv, seq, waker)
+    }
+
+    /// Waits until a new send request of at least one WQE fits on the QP:
+    /// rings its doorbell for what is written and polls the CQ until a slot
+    /// and a WQE are free. Fails if every slot holds a result nobody took.
+    pub fn make_send_room<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        hw_mut(&mut self.hw).make_room(qp.index())
+    }
+
+    /// Posts a receive into `part`, a unique buffer, on the QP, with `ctx` for
+    /// its owner. Refused, with `part` and `ctx`, when the receive queue is
+    /// full or the QP takes no work.
+    #[inline(always)]
+    pub fn post_recv<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        part: Part<N>,
+        ctx: C,
+    ) -> (r: Result<Seq, PostError<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Err(e) ==> e.wr_id == ctx,
+    {
+        let ghost start = *self;
+        match self.try_post_recv(qp, part, ctx) {
+            Ok(posted) => posted,
+            Err((part, ctx)) => {
+                let ghost mid = *self;
+                let e = self.recv_error(qp, part, ctx);
+                proof {
+                    (*self).lemma_moved_trans(&mid, &start);
+                }
+                Err(e)
+            },
+        }
+    }
+
+    /// [`Engine::post_recv`] if nothing is out of the common: the QP takes work, the checks pass
+    /// and there is room. Otherwise the buffer and `ctx` come back untouched, for
+    /// [`Engine::recv_error`] to say why.
+    #[inline(always)]
+    pub fn try_post_recv<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        part: Part<N>,
+        ctx: C,
+    ) -> (r: Result<Result<Seq, PostError<C, N>>, ReceiveBack<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Ok(Err(e)) ==> e.wr_id == ctx,
+            r matches Err((back, c)) ==> back == part && c == ctx,
+    {
+        match hw_mut(&mut self.hw).post_recv(qp.index(), part, Some(ctx)) {
+            Ok(Ok(seq)) => Ok(Ok(seq)),
+            Ok(Err(refused)) => Ok(Err(owned(refused))),
+            Err((part, ctx)) => Err((part, ctx.expect("the context it was given"))),
+        }
+    }
+
+    /// Why [`Engine::try_post_recv`] handed a receive back.
+    #[cold]
+    #[inline(never)]
+    pub fn recv_error<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        part: Part<N>,
+        ctx: C,
+    ) -> (e: PostError<C, N>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+            e.wr_id == ctx,
+    {
+        let refused = hw_mut(&mut self.hw).recv_refused(qp.index(), part, Some(ctx));
+        proof {
+            self.hw@.lemma_moved_refl();
+        }
+        owned(refused)
+    }
+
+    /// [`Engine::post_recv`] of a receive without an owner: its buffer is released when it
+    /// completes, and its first error goes with the detached send errors' own.
+    pub fn post_recv_detached<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        part: Part<N>,
+    ) -> (r: Result<Seq, BufError<Leases<N>>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        let refused = match hw_mut(&mut self.hw).post_recv(qp.index(), part, None) {
+            Ok(Ok(seq)) => return Ok(seq),
+            Ok(Err(refused)) => refused,
+            Err((part, ctx)) => hw_mut(&mut self.hw).recv_refused(qp.index(), part, ctx),
+        };
+        Err(BufError { error: refused.error, buf: refused.leases })
+    }
+}
+
+} // verus!
 
 impl<T: Transport> PartialEq for QpKey<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -190,16 +1047,6 @@ impl<T: Transport> core::fmt::Debug for QpKey<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "QpKey({})", self.index)
     }
-}
-
-/// A request that could not be posted: why, and its context and buffers.
-pub struct PostError<C = (), N: Nic = Verbs> {
-    /// What went wrong.
-    pub error: Error,
-    /// The value it was given (its context).
-    pub wr_id: C,
-    /// Its buffers.
-    pub leases: Leases<N>,
 }
 
 impl<C, N: Nic> PostError<C, N> {
@@ -261,44 +1108,6 @@ impl<C, N: Nic> From<PostError<C, N>> for std::io::Error {
     }
 }
 
-/// A receive [`Engine::try_post_recv`] hands back: its buffer and its context.
-pub type ReceiveBack<C, N> = (Part<N>, C);
-
-/// A refusal of a request given a context, with that context.
-#[cold]
-#[inline(never)]
-fn owned<C, N: Nic>(refused: Refusal<C, N>) -> PostError<C, N> {
-    PostError {
-        error: refused.error,
-        wr_id: refused.ctx.expect("the context it was given"),
-        leases: refused.leases,
-    }
-}
-
-/// A parent domain over a protection domain and the engine's thread domain.
-struct Domain<N: Nic> {
-    /// Dropped before its protection domain.
-    domain: N::Domain,
-    pd: Pd<N>,
-}
-
-/// A completion queue and the QPs attached to it (the synchronous layer), with
-/// a context of type `C` kept with each request (see the module documentation).
-///
-/// Dropping it drains its QPs (as [`Engine::remove_qp`] does, all at once),
-/// drops the contexts of the requests not delivered, destroys the QPs, releases
-/// the buffers their requests held, then destroys the CQ and the thread domain.
-/// A QP the device never flushes is leaked with its buffers, and so are the CQ
-/// and the domain.
-pub struct Engine<C = (), N: Nic = Verbs> {
-    /// The verified hardware side; dropped by hand, in `drop`.
-    hw: ManuallyDrop<Hw<C, N>>,
-    /// The parent domains its QPs are created on, one per protection domain; dropped by hand.
-    domains: ManuallyDrop<Vec<Domain<N>>>,
-    /// The thread domain of its QPs, where the device has them; dropped by hand, last.
-    td: ManuallyDrop<Option<N::Td>>,
-}
-
 impl<C, N: Nic> Engine<C, N> {
     /// The bytes of a QP in the table, for the measurements.
     #[doc(hidden)]
@@ -308,11 +1117,7 @@ impl<C, N: Nic> Engine<C, N> {
     /// its own where the device has them.
     pub fn new(ctx: &Context<N>, cq_size: u32) -> Result<Engine<C, N>> {
         let hw = Hw::new(ctx.clone(), cq_size)?;
-        Ok(Engine {
-            hw: ManuallyDrop::new(hw),
-            domains: ManuallyDrop::new(Vec::new()),
-            td: ManuallyDrop::new(ctx.nic().alloc_td()),
-        })
+        Ok(Engine::of(hw, ctx.nic().alloc_td()))
     }
 
     /// The device of its QPs.
@@ -334,11 +1139,6 @@ impl<C, N: Nic> Engine<C, N> {
     /// The CQ entries its QPs reserve (the sum of their queue depths).
     pub fn reserved(&self) -> u32 {
         self.hw.reserved()
-    }
-
-    /// Panics unless `index` names a QP of the engine.
-    fn check(&self, index: usize) {
-        assert!(self.hw.is_qp(index), "no QP {index} in this engine");
     }
 
     /// The parent domain to create a QP of `pd` on: the engine's for that protection domain,
@@ -473,19 +1273,6 @@ impl<C, N: Nic> Engine<C, N> {
     // -------------------------------------------------------------------------
     // Polling
 
-    /// Polls the CQ once, recording what completed in the rings of its QPs
-    /// (and waking the wakers registered there); returns the number of
-    /// completions. Owners take their results by sequence number
-    /// ([`Engine::take_send`], [`Engine::take_recv`]).
-    ///
-    /// If a registered waker panics, every CQE already polled is still
-    /// recorded and every registered notification is attempted before the
-    /// panic resumes. Catching that panic does not lose those results.
-    #[inline]
-    pub fn progress(&mut self) -> usize {
-        self.hw.progress()
-    }
-
     /// The event loop's poll: reads at most `n` CQEs ([`POLL_MAX`] at most), updates the CQ's
     /// consumer index, and then hands every request they complete with an owner (and that was not
     /// taken otherwise) to `f`, with the engine, in each queue's order, and every request refused
@@ -510,21 +1297,6 @@ impl<C, N: Nic> Engine<C, N> {
             handed += 1;
         }
         handed
-    }
-
-    /// The first half of [`Engine::poll`], for a caller who cannot lend the engine to a callback:
-    /// reads at most `n` CQEs and updates the CQ's consumer index, unless some read before are not
-    /// routed yet. Returns how many it read.
-    #[inline(always)]
-    pub fn read_completions(&mut self, n: usize) -> usize {
-        self.hw.read_completions(n)
-    }
-
-    /// The second half of [`Engine::poll`]: the next request that completed with an owner, `None`
-    /// when nothing is left of what was read.
-    #[inline(always)]
-    pub fn next_completion(&mut self) -> Option<Completion<C, N>> {
-        self.hw.next_completion()
     }
 
     // -------------------------------------------------------------------------
@@ -601,29 +1373,6 @@ impl<C, N: Nic> Engine<C, N> {
         })
     }
 
-    /// Connects the QP to `remote` (RESET to INIT, RTR and RTS). A QP
-    /// connects once: from RESET, as created. Until it is connected (or
-    /// moved to the error state) it takes no work: doorbells are refused
-    /// and receives are not posted. If connecting fails part way, the QP
-    /// takes no work until it is moved to the error state.
-    pub fn connect<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        attr: &ConnectAttr,
-        remote: &Endpoint,
-    ) -> Result<()> {
-        self.check(qp.index());
-        self.hw.connect(qp.index(), attr, remote)
-    }
-
-    /// Moves the QP to the error state: every request in flight completes
-    /// with a flush error and hands its buffers back. Work posted from then
-    /// on is flushed too.
-    pub fn to_error<T: Transport>(&mut self, qp: QpKey<T>) -> Result<()> {
-        self.check(qp.index());
-        self.hw.set_error(qp.index())
-    }
-
     /// Starts a request on the QP's send queue: add its WQEs, then give it its
     /// context when it is finished ([`Request::submit`], [`Request::finish`]).
     /// Nothing reaches the hardware until then; its WQEs go out at the next
@@ -637,188 +1386,6 @@ impl<C, N: Nic> Engine<C, N> {
             open,
             _t: PhantomData,
         }
-    }
-
-    /// A request to write on the QP, as a value of its own: no borrow of the engine is held while
-    /// its WQEs go in ([`OpenRequest::try_push`], [`OpenRequest::try_push_lent`]; what those hand
-    /// back goes through [`Engine::push_open`]), and nothing is allocated for it. Nothing reaches
-    /// the hardware or the rings until [`Engine::close_open`] or [`Engine::submit_open`], which look
-    /// at the QP's queue then: they say there is no room, or wait for some.
-    #[inline(always)]
-    pub fn open_request<T: Transport>(&mut self, qp: QpKey<T>) -> OpenRequest<N> {
-        self.hw.open_request(qp.index())
-    }
-
-    /// Adds a WQE to `open`, whatever it takes: what [`OpenRequest::try_push`] could not tell is
-    /// checked, and if the request is full it goes out as a request of its own, signaled and
-    /// without an owner, waiting for room (polling the CQ). On error nothing is added and the part
-    /// is handed back.
-    pub fn push_open<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        open: &mut OpenRequest<N>,
-        op: WrOp,
-        part: Part<N>,
-    ) -> Result<(), BufError<Part<N>>> {
-        self.hw.push_other(qp.index(), open, op, part)
-    }
-
-    /// Whether `open`'s WQEs fit in the QP's queue now.
-    #[inline(always)]
-    pub fn open_fits<T: Transport>(&self, qp: QpKey<T>, open: &OpenRequest<N>) -> bool {
-        self.hw.open_fits(qp.index(), open)
-    }
-
-    /// Writes `open`'s WQEs as a request, signaled if `signal` (else only if the ring needs it),
-    /// with `ctx` to come back with its completion, if it has one; it goes out at the next
-    /// [`Engine::commit`]. `open` is empty then and takes more. Returns its sequence number; if it
-    /// has no WQE, the queue no room ([`Engine::open_fits`] says) or the QP does not take what it
-    /// was written for (another protection domain, more WQEs than its requests may have, a READ on
-    /// an unreliable connection), `ctx` back and `open` as it was.
-    pub fn close_open<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        open: &mut OpenRequest<N>,
-        signal: bool,
-        ctx: Option<C>,
-    ) -> core::result::Result<Seq, Option<C>> {
-        self.hw.close(qp.index(), open, signal, ctx)
-    }
-
-    /// `open` as a request with `ctx`, and the doorbell; what it keeps from the QP goes back. If the
-    /// queue has no room this waits for some, polling the CQ. On an error its context and buffers
-    /// come back.
-    #[inline(always)]
-    pub fn submit_open<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        open: &mut OpenRequest<N>,
-        signal: bool,
-        ctx: C,
-    ) -> Result<Seq, PostError<C, N>> {
-        match self.hw.submit_open(qp.index(), open, signal, ctx) {
-            Ok(seq) => Ok(seq),
-            Err(refused) => Err(owned(refused)),
-        }
-    }
-
-    /// What `open` holds goes out as a request without an owner, signaled, and the doorbell; what
-    /// it keeps from the QP goes back. If the queue has no room this waits for some, polling the CQ.
-    pub fn submit_open_detached<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        open: &mut OpenRequest<N>,
-    ) -> Result<()> {
-        let index = qp.index();
-        if !open.is_empty() && self.hw.close_waiting(index, open, true, None).is_err() {
-            return Err(Error::QueueFull);
-        }
-        self.hw.give_back(index, open);
-        self.hw.commit(index, None).map_err(|(e, _)| e)
-    }
-
-    /// For an owner about to drop `leases`, those of a completed request of the QP: frozen buffers
-    /// are released here, and a list of several goes back to the QP for the next such request, so
-    /// that it allocates nothing.
-    pub fn hand_back_leases<T: Transport>(&mut self, qp: QpKey<T>, leases: &mut Leases<N>) {
-        self.hw.hand_back_leases(qp.index(), leases);
-    }
-
-    /// What `open` keeps from the QP goes back there, for the next request, if it has no WQE: the
-    /// WQEs it has stay in it.
-    pub fn give_back<T: Transport>(&mut self, qp: QpKey<T>, open: &mut OpenRequest<N>) {
-        self.hw.give_back(qp.index(), open);
-    }
-
-    /// One WQE as a request of its own, signaled, and the doorbell; if the queue is full it waits
-    /// for room, polling the CQ.
-    #[inline(always)]
-    fn post_one<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        op: WrOp,
-        part: Part<N>,
-        ctx: C,
-    ) -> Result<Seq, PostError<C, N>> {
-        match self
-            .hw
-            .post_one(qp.index(), op, part, Some(ctx), true, true)
-        {
-            Ok(Ok(seq)) => Ok(seq),
-            Ok(Err(refused)) => Err(owned(refused)),
-            Err(unposted) => self.post_slow(qp.index(), unposted, true, true),
-        }
-    }
-
-    /// [`Engine::post_one`] out of the common.
-    #[cold]
-    #[inline(never)]
-    fn post_slow(
-        &mut self,
-        index: usize,
-        unposted: Unposted<C, N>,
-        signal: bool,
-        ring: bool,
-    ) -> Result<Seq, PostError<C, N>> {
-        self.hw
-            .post_one_slow(index, unposted, signal, ring)
-            .map_err(owned)
-    }
-
-    /// One WQE doing `op` on `part` as a signaled request of its own, and the doorbell, if nothing
-    /// is out of the common: the QP takes work, nothing is being gathered, there is room and the
-    /// checks pass. Otherwise everything comes back untouched, for
-    /// [`Engine::post_unposted`] or for later.
-    #[inline(always)]
-    pub fn try_post<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        op: WrOp,
-        part: Part<N>,
-        ctx: C,
-    ) -> Result<Result<Seq, PostError<C, N>>, Unposted<C, N>> {
-        match self
-            .hw
-            .post_one(qp.index(), op, part, Some(ctx), true, true)
-        {
-            Ok(Ok(seq)) => Ok(Ok(seq)),
-            Ok(Err(refused)) => Ok(Err(owned(refused))),
-            Err(unposted) => Err(unposted),
-        }
-    }
-
-    /// [`Engine::try_post`] without the doorbell, as [`Engine::stage`] writes it: signaled if
-    /// `signal`, else only if the ring needs it.
-    #[inline(always)]
-    pub fn try_stage<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        op: WrOp,
-        part: Part<N>,
-        ctx: C,
-        signal: bool,
-    ) -> Result<Result<Seq, PostError<C, N>>, Unposted<C, N>> {
-        match self
-            .hw
-            .post_one(qp.index(), op, part, Some(ctx), signal, false)
-        {
-            Ok(Ok(seq)) => Ok(Ok(seq)),
-            Ok(Err(refused)) => Ok(Err(owned(refused))),
-            Err(unposted) => Err(unposted),
-        }
-    }
-
-    /// What [`Engine::try_post`] or [`Engine::try_stage`] handed back, as a request of the general
-    /// kind, signaled if `signal`, and the doorbell if `ring`: it waits for room if it must,
-    /// polling the CQ.
-    pub fn post_unposted<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        unposted: Unposted<C, N>,
-        signal: bool,
-        ring: bool,
-    ) -> Result<Seq, PostError<C, N>> {
-        self.post_slow(qp.index(), unposted, signal, ring)
     }
 
     /// SENDs `buf` into the peer's next receive, as a signaled request of its
@@ -896,208 +1463,6 @@ impl<C, N: Nic> Engine<C, N> {
         ctx: C,
     ) -> Result<Seq, PostError<C, N>> {
         self.post_recv(qp, buf.into_part(), ctx)
-    }
-
-    /// Writes one WQE doing `op` on `part` as a request of its own, with `ctx` to come back with
-    /// its completion, signaled if `signal` (else only if the ring needs it). Its WQE goes out at
-    /// the next [`Engine::commit`], with those written before it.
-    #[inline]
-    pub fn stage<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        op: WrOp,
-        part: Part<N>,
-        ctx: C,
-        signal: bool,
-    ) -> Result<Seq, PostError<C, N>> {
-        match self
-            .hw
-            .post_one(qp.index(), op, part, Some(ctx), signal, false)
-        {
-            Ok(Ok(seq)) => Ok(seq),
-            Ok(Err(refused)) => Err(owned(refused)),
-            Err(unposted) => self.post_slow(qp.index(), unposted, signal, false),
-        }
-    }
-
-    /// [`Engine::stage`] of a request without an owner: nobody will take it back, its buffers are
-    /// released when it completes, and its first error is reported by
-    /// [`Engine::take_send_error`].
-    #[inline]
-    pub fn stage_detached<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        op: WrOp,
-        part: Part<N>,
-        signal: bool,
-    ) -> Result<Seq, BufError<Leases<N>>> {
-        let done = match self.hw.post_one(qp.index(), op, part, None, signal, false) {
-            Ok(done) => done,
-            Err(unposted) => self.hw.post_one_slow(qp.index(), unposted, signal, false),
-        };
-        done.map_err(|refused| BufError {
-            error: refused.error,
-            buf: refused.leases,
-        })
-    }
-
-    /// Rings the QP's doorbell for every request written since the last
-    /// one. If the device refuses, none of them is posted: each one with an
-    /// owner completes at once as [`CompletionError::Refused`], which its owner
-    /// takes with its context and buffers ([`Engine::take_send`], or
-    /// [`Engine::poll`]); each one without an owner releases its buffers and is
-    /// reported by [`Engine::take_send_error`]. Sequence numbers are never
-    /// reused. [`Request::submit`] hands the context and buffers of its own
-    /// request back with the error instead.
-    /// A waker panic during refusal propagates only after all staged
-    /// requests have their refusal result and notifications are attempted.
-    #[inline]
-    pub fn commit<T: Transport>(&mut self, qp: QpKey<T>) -> Result<()> {
-        self.hw.commit(qp.index(), None).map_err(|(e, _)| e)
-    }
-
-    /// Takes the context, result and buffers of completed (or refused) request `seq` of `queue`.
-    #[inline(always)]
-    pub fn take<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        queue: Queue,
-        seq: Seq,
-    ) -> Option<Completion<C, N>> {
-        self.hw.take(qp.index(), queue, seq)
-    }
-
-    /// Takes the context, result and buffers of completed (or refused) send
-    /// request `seq`.
-    #[inline]
-    pub fn take_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<Completion<C, N>> {
-        self.hw.take(qp.index(), Queue::Send, seq)
-    }
-
-    /// Takes the context, result and buffer of completed receive `seq`.
-    #[inline]
-    pub fn take_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<Completion<C, N>> {
-        self.hw.take(qp.index(), Queue::Recv, seq)
-    }
-
-    /// Gives up send request `seq`: its buffers are released when it completes
-    /// (now, if it has), and its context comes back, if it has one still.
-    pub fn detach_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<C> {
-        self.hw.detach(qp.index(), Queue::Send, seq).0
-    }
-
-    /// Gives up receive `seq`: its buffer is released when it completes (now, if
-    /// it has), and its context comes back, if it has one still.
-    pub fn detach_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<C> {
-        self.hw.detach(qp.index(), Queue::Recv, seq).0
-    }
-
-    /// Gives up request `seq` of `queue`, as [`Engine::detach_send`] and [`Engine::detach_recv`] do,
-    /// for a caller that holds the engine behind a borrow or a lock: its context and its waker come
-    /// back, to drop once it has let go of the engine.
-    pub fn give_up<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        queue: Queue,
-        seq: Seq,
-    ) -> (Option<C>, Option<Waker>) {
-        self.hw.detach(qp.index(), queue, seq)
-    }
-
-    /// The first error of a send request without an owner (a dropped future's,
-    /// a sink's, a split batch's part), once.
-    pub fn take_send_error<T: Transport>(&mut self, qp: QpKey<T>) -> Option<DetachedError> {
-        self.hw.take_send_error(qp.index())
-    }
-
-    /// Wakes `waker` when send request `seq` completes; the waker it replaces comes back.
-    pub fn set_send_waker<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        seq: Seq,
-        waker: &Waker,
-    ) -> Option<Waker> {
-        self.hw.set_waker(qp.index(), Queue::Send, seq, waker)
-    }
-
-    /// Wakes `waker` when receive `seq` completes; the waker it replaces comes back.
-    pub fn set_recv_waker<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        seq: Seq,
-        waker: &Waker,
-    ) -> Option<Waker> {
-        self.hw.set_waker(qp.index(), Queue::Recv, seq, waker)
-    }
-
-    /// Waits until a new send request of at least one WQE fits on the QP:
-    /// rings its doorbell for what is written and polls the CQ until a slot
-    /// and a WQE are free. Fails if every slot holds a result nobody took.
-    pub fn make_send_room<T: Transport>(&mut self, qp: QpKey<T>) -> Result<()> {
-        self.hw.make_room(qp.index())
-    }
-
-    /// Posts a receive into `part`, a unique buffer, on the QP, with `ctx` for
-    /// its owner. Refused, with `part` and `ctx`, when the receive queue is
-    /// full or the QP takes no work.
-    #[inline(always)]
-    pub fn post_recv<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        part: Part<N>,
-        ctx: C,
-    ) -> Result<Seq, PostError<C, N>> {
-        match self.try_post_recv(qp, part, ctx) {
-            Ok(posted) => posted,
-            Err((part, ctx)) => Err(self.recv_error(qp, part, ctx)),
-        }
-    }
-
-    /// [`Engine::post_recv`] if nothing is out of the common: the QP takes work, the checks pass
-    /// and there is room. Otherwise the buffer and `ctx` come back untouched, for
-    /// [`Engine::recv_error`] to say why.
-    #[inline(always)]
-    pub fn try_post_recv<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        part: Part<N>,
-        ctx: C,
-    ) -> Result<Result<Seq, PostError<C, N>>, ReceiveBack<C, N>> {
-        match self.hw.post_recv(qp.index(), part, Some(ctx)) {
-            Ok(Ok(seq)) => Ok(Ok(seq)),
-            Ok(Err(refused)) => Ok(Err(owned(refused))),
-            Err((part, ctx)) => Err((part, ctx.expect("the context it was given"))),
-        }
-    }
-
-    /// Why [`Engine::try_post_recv`] handed a receive back.
-    #[cold]
-    #[inline(never)]
-    pub fn recv_error<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        part: Part<N>,
-        ctx: C,
-    ) -> PostError<C, N> {
-        owned(self.hw.recv_refused(qp.index(), part, Some(ctx)))
-    }
-
-    /// [`Engine::post_recv`] of a receive without an owner: its buffer is released when it
-    /// completes, and its first error goes with the detached send errors' own.
-    pub fn post_recv_detached<T: Transport>(
-        &mut self,
-        qp: QpKey<T>,
-        part: Part<N>,
-    ) -> Result<Seq, BufError<Leases<N>>> {
-        let refused = match self.hw.post_recv(qp.index(), part, None) {
-            Ok(Ok(seq)) => return Ok(seq),
-            Ok(Err(refused)) => refused,
-            Err((part, ctx)) => self.hw.recv_refused(qp.index(), part, ctx),
-        };
-        Err(BufError {
-            error: refused.error,
-            buf: refused.leases,
-        })
     }
 }
 
@@ -1441,6 +1806,18 @@ mod tests {
         drop(w);
         drop(pd);
         assert_eq!(model.registered(), 0);
+    }
+
+    /// A ring whose counters have reached their end takes no more requests and no completion would
+    /// give it room: waiting for room says so, and does not spin for ever.
+    #[test]
+    fn counters_at_their_end_fail_who_waits_for_room() {
+        let model = Model::new(11);
+        let pd = Context::new(model.clone()).alloc_pd().unwrap();
+        let mut w = Engine::<(), _>::new(pd.context(), 64).unwrap();
+        let (a, _) = connected_pair(&mut w, &pd, 8, 1);
+        w.hw.send_ring_mut(a.index()).at_counters_end();
+        assert!(matches!(w.make_send_room(a), Err(Error::Clogged)));
     }
 
     /// Dropping an engine drains every QP before destroying it.

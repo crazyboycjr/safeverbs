@@ -949,6 +949,18 @@ impl<C, N: Device> Hw<C, N> {
         &&& same_qps(self.qps@, other.qps@)
     }
 
+    /// The context of request `seq` of QP `index`'s send queue, if it is staged there.
+    pub closed spec fn staged_ctx(&self, index: int, seq: int) -> Option<Option<C>> {
+        if self.has_qp(index) {
+            match self.qps@[index]->0.send.staged(seq) {
+                Some(r) => Some(r.leases.ctx),
+                None => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// QP `index` is in the table.
     pub closed spec fn has_qp(&self, index: int) -> bool {
         0 <= index < self.qps@.len() && self.qps@[index] is Some
@@ -3402,6 +3414,8 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             r matches Err((_, Some(kept))) ==> kept.leases.inv() && kept.leases.fully_recorded(),
+            r matches Err((_, kept)) ==> (keep matches Some(seq) ==> (old(self).staged_ctx(index as int, seq as int) matches Some(ctx)
+                ==> (kept matches Some(payload) && payload.ctx == ctx))),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -3790,6 +3804,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            r matches Err(refused) ==> refused.ctx == unposted.ctx,
     {
         let ghost start = *self;
         let op = unposted.op;
@@ -3813,6 +3828,10 @@ impl<C, N: Device> Hw<C, N> {
         proof {
             lemma_same_table_trans(&s1, &s0, &start);
             assert(s1.has_qp(index as int));
+        }
+        proof {
+            assert(qp_ok(s1.qps@[index as int], index as int, s1.token@, s1.nic()));
+            s1.qps@[index as int]->0.send.lemma_wqes();
         }
         match self.make_send_room(index, 1) {
             Ok(()) => {},
@@ -3872,6 +3891,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            r matches Err(refused) ==> (old(self).staged_ctx(index as int, seq as int) matches Some(ctx) ==> refused.ctx == ctx),
     {
         match self.commit(index, Some(seq)) {
             Ok(()) => Ok(seq),
@@ -3908,6 +3928,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             final(open).same_fields(old(open)),
             r matches Err(back) ==> back == ctx,
+            r matches Ok(seq) ==> final(self).staged_ctx(index as int, seq as int) == Some(ctx),
     {
         let n = open.n;
         if n == 0 || index >= self.qps.len() {
@@ -4182,6 +4203,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(open).inv(),
+            forall|seq: int| #[trigger] final(self).staged_ctx(index as int, seq) == old(self).staged_ctx(index as int, seq),
     {
         if open.n == 0 && index < self.qps.len() {
             let ghost start = *self;
@@ -4222,9 +4244,14 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(open).inv(),
+            r matches Err(back) ==> back == ctx,
     {
         let ghost start = *self;
         if open.n > 0 && !self.open_fits(index, open) && self.open_belongs(index, open) {
+            proof {
+                assert(qp_ok(self.qps@[index as int], index as int, self.token@, self.token@.nic()));
+                self.qps@[index as int]->0.send.lemma_wqes();
+            }
             let _ = self.make_send_room(index, open.n as u32);
         }
         let ghost mid = *self;
@@ -4250,6 +4277,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(open).inv(),
+            r matches Err(refused) ==> refused.ctx == Some(ctx),
     {
         let ghost start = *self;
         match self.close(index, open, signal, Some(ctx)) {
@@ -4288,6 +4316,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(open).inv(),
+            r matches Err(refused) ==> refused.ctx == ctx,
     {
         let ghost start = *self;
         if open.is_empty() {
@@ -4297,6 +4326,10 @@ impl<C, N: Device> Hw<C, N> {
         if !self.open_belongs(index, open) {
             let leases = open.take_leases();
             return Err(Refusal { error: Error::Invalid("a request written for another QP"), ctx, leases });
+        }
+        proof {
+            assert(qp_ok(self.qps@[index as int], index as int, self.token@, self.token@.nic()));
+            self.qps@[index as int]->0.send.lemma_wqes();
         }
         match self.make_send_room(index, open.n as u32) {
             Ok(()) => {},
@@ -4549,14 +4582,20 @@ proof fn lemma_same_table_trans<C, N: Device>(a: &Hw<C, N>, b: &Hw<C, N>, c: &Hw
 
 impl<C, N: Device> Hw<C, N> {
     /// Waits until a new send request of `wqes` WQEs fits on QP `index`: rings its doorbell for
-    /// what is written and polls the CQ until a slot and the WQEs are free. Fails if every slot
-    /// holds a result nobody took, or if the doorbell is refused.
+    /// what is written and polls the CQ until the WQEs are free. Fails if it has no free slot, which
+    /// no completion gives it (its slots are twice its depth, so they are held by results nobody
+    /// took, or its counters have reached their end), or if the doorbell is refused.
+    ///
+    /// It waits only for a signaled WQE out (`Ring::lemma_room_or_signal`), whose completion makes
+    /// room: that the device completes it is the premise of liveness, and all that this loop's end
+    /// rests on.
     #[verifier::exec_allows_no_decreases_clause]
     #[verifier::spinoff_prover]
     fn make_send_room(&mut self, index: usize, wqes: u32) -> (r: Result<()>)
         requires
             old(self).inv(),
             old(self).has_qp(index as int),
+            1 <= wqes <= old(self).qps@[index as int]->0.send.spec_max_wqes(),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
@@ -4572,19 +4611,25 @@ impl<C, N: Device> Hw<C, N> {
                 start == *old(self),
                 index < self.qps@.len(),
                 self.qps@[index as int] is Some,
+                1 <= wqes <= self.qps@[index as int]->0.send.spec_max_wqes(),
         {
             proof {
                 assert(qp_ok(self.qps@[index as int], index as int, self.token@, self.token@.nic()));
             }
-            let (can, clogged) = match &self.qps[index] {
-                Some(e) => (e.send.can_post() && wqes <= e.send.wqe_room(), e.send.is_clogged()),
+            let (room, free) = match &self.qps[index] {
+                Some(e) => (e.send.can_post() && wqes <= e.send.wqe_room(), e.send.has_free_slot()),
                 None => (false, false),
             };
-            if can {
+            if room {
                 return Ok(());
             }
-            if clogged {
+            if !free {
                 return Err(Error::Clogged);
+            }
+            proof {
+                let ring = self.qps@[index as int]->0.send;
+                ring.lemma_room_or_signal();
+                assert(ring.spec_signal_out());
             }
             let ghost s0 = *self;
             match self.commit(index, None) {
@@ -6021,6 +6066,10 @@ impl<C, N: Device> Hw<C, N> {
             no_qp(index);
             return Err(Error::Invalid("no such QP"));
         }
+        proof {
+            assert(qp_ok(self.qps@[index as int], index as int, self.token@, self.token@.nic()));
+            self.qps@[index as int]->0.send.lemma_wqes();
+        }
         self.make_send_room(index, 1)
     }
 }
@@ -6076,4 +6125,10 @@ pub open spec fn send_access(op: WrOp) -> safeverbs_spec::abs::Dir {
 impl<C, N: Device> Hw<C, N> {
     /// The bytes of a QP in the table.
     pub(crate) const QP_BYTES: usize = core::mem::size_of::<HwQp<C, N>>();
+
+    /// The send ring of QP `index`, as tests shape it.
+    #[cfg(test)]
+    pub(crate) fn send_ring_mut(&mut self, index: usize) -> &mut Ring<Payload<C, N>> {
+        &mut self.qps[index].as_mut().expect("a QP").send
+    }
 }

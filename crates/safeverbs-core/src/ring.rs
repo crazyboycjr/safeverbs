@@ -1389,6 +1389,22 @@ impl<L> Ring<L> {
         self.has_free_slot() && self.wqe_posted - self.wqe_retired < self.depth
     }
 
+    /// A signaled WQE is out: written, and not retired.
+    pub closed spec fn spec_signal_out(&self) -> bool {
+        self.sig_end > self.wqe_retired
+    }
+
+    /// The queue has room for the longest request, or a signaled WQE is out. So who waits for room
+    /// waits for that WQE's completion, and that completion is enough: after the last signaled WQE
+    /// are at most `depth - max_wqes` WQEs.
+    pub proof fn lemma_room_or_signal(&self)
+        requires
+            self.inv(),
+        ensures
+            self.spec_signal_out() || self.spec_max_wqes() <= self.spec_depth() - (self.spec_wqe_posted() - self.spec_wqe_retired()),
+    {
+    }
+
     /// Whether every slot is taken by a retired request whose owner has not
     /// taken it: waiting for completions would not free one.
     pub fn is_clogged(&self) -> bool
@@ -5174,6 +5190,23 @@ impl<L> Ring<L> {
     /// Whether slot `i` holds a waker.
     fn has_waker(&self, i: usize) -> bool {
         !self.wakers.is_empty() && self.wakers[i].is_some()
+    }
+}
+
+#[cfg(test)]
+impl<L> Ring<L> {
+    /// An empty ring as it is after [`COUNTERS_END`] requests and WQEs, which takes no more.
+    pub(crate) fn at_counters_end(&mut self) {
+        assert_eq!(self.posted, self.head, "the ring must be empty");
+        self.head = COUNTERS_END;
+        self.retired = COUNTERS_END;
+        self.committed = COUNTERS_END;
+        self.posted = COUNTERS_END;
+        self.wqe_retired = COUNTERS_END;
+        self.wqe_committed = COUNTERS_END;
+        self.wqe_posted = COUNTERS_END;
+        self.sig_end = COUNTERS_END;
+        self.committed_sig_end = COUNTERS_END;
     }
 }
 

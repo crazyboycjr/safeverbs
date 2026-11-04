@@ -199,6 +199,21 @@ impl<T, N: Nic> Buf<T, N> {
         peek_of(&self.frozen, &self.view, core::mem::size_of::<T>())
     }
 
+    /// **S1 of a frozen buffer the program holds.** The NIC writes none of its bytes.
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn apart_from_nic<C>(&self, hw: &crate::hw::Hw<C, N>)
+        requires
+            hw.inv(),
+        ensures
+            hw.outside_ok() ==> forall|x: int| #[trigger] self.byte_domain().contains(x) ==> !hw.nic().nic_may_write(x),
+    {
+        proof {
+            use_type_invariant(self);
+            self.lemma_byte_backing();
+        }
+        super::lease::frozen_apart_from_nic(&self.frozen, hw);
+    }
+
     /// The elements `[start, end)` by reference, if they are within it.
     #[inline]
     pub(super) fn view_elements(&self, start: usize, end: usize) -> (r: Option<BufView<'_, T, N>>)
@@ -222,13 +237,11 @@ impl<T, N: Nic> Buf<T, N> {
 
     /// Builds the SGE only from the checked view and its frozen keeper.
     #[inline]
-    pub(super) fn try_part(self) -> (r: Result<Part<N>, Self>)
+    pub(crate) fn try_part(self) -> (r: Result<Part<N>, Self>)
         ensures
-            r is Ok <==> self.view.spec_bytes().spec_len() <= u32::MAX,
             r matches Ok(part) ==> part.inv() && part.byte_domain() == self.byte_domain()
                 && !part.spec_writable(),
-            r matches Err(same) ==> same.inv() && *same.frozen == *self.frozen
-                && same.view == self.view && same.byte_domain() == self.byte_domain(),
+            r matches Err(same) ==> same.byte_domain() == self.byte_domain(),
     {
         proof {
             use_type_invariant(&self);

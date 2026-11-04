@@ -239,6 +239,7 @@ impl<C, N: Device> HwQp<C, N> {
         &&& self.pd_id == pre.pd_id
         &&& self.max_len == pre.max_len
         &&& self.reliable == pre.reliable
+        &&& self.send.spec_max_wqes() == pre.send.spec_max_wqes()
     }
 
     /// The same QP as `pre`, as far as the coupling reads it, but for its rings and what was
