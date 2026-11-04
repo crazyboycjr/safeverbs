@@ -14,7 +14,7 @@ obligations of the `Refines` trait. **The library does not discharge them yet.**
 proved of it are components: the completion ring refines A, and the worker's hardware
 side keeps the NIC within M, its rings coupled to M's queues and its requests' results equal
 to what M retired. The step that would tie them together, mapping the worker's requests
-onto A's groups, is the main open item (see "Remaining").
+and buffers onto A's requests and leases, is the main open item (see "Remaining").
 
 `scripts/verify.sh` checks everything below that is called proved. The specification
 crate uses no `assume`, `admit`, `external_body` or assumed specification; the code of
@@ -45,8 +45,8 @@ conflicting ways.
   permission of the buffer its request retains (`buf/lease.rs`), the inputs of one request
   are disjoint where one is unique, and a buffer posted as a receive is disjoint from
   every buffer the worker holds.
-- *Not proved:* that the worker's requests are groups of A, so the coupling of A and M for
-  the whole library. S1 of the library still rests on Rust's ownership of `BufMut`, `Buf`
+- *Not proved:* that the worker's requests and buffers are requests and leases of A, so the
+  coupling of A and M for the whole library. S1 of the library still rests on Rust's ownership of `BufMut`, `Buf`
   and `Part` together with these component proofs.
 - *The one exception:* `Exposed::copy_to_slice` reads memory a peer may be writing. No
   reference to exposed memory is ever formed; it is read only through this copy, with volatile
@@ -70,18 +70,26 @@ conflicting ways.
   deregisters regions (`buf.rs`, `pd.rs`). The worker's rely assumes it deregisters no
   region a written WR names, which leases ensure.
 
-**F1, outcome correspondence.** Each request gets at most one outcome, the one M produced
-for its own WQEs, with its own buffers.
-- *Spec.* An outcome never changes once produced, taking it returns it with exactly the
-  members the request was posted with, and a request taken never comes back
-  (`lemma_f1_outcome_fixed`, `lemma_f1_take`, `lemma_f1_taken_once`). Against M, a request
-  owns a nonempty interval of WQEs on one queue, and no other request owns any of them;
-  its outcome exists only once all of them retired, and is the first error in posting
-  order or the last WQE's success (`corollary_f1`, `lemma_aggregate`); a request whose
-  prefix retired is still in flight (`corollary_inflight`). A successful SEND or WRITE has
-  one outcome, reported or implied (`lemma_ack_outcome_unique`).
+**F1, what a request's outcome means.** Each request gets at most one outcome, with its own
+buffers. Success means every WQE succeeded; an error names the first that failed, those before
+it having succeeded and it and those after it not, their remote effects unknown; a refusal
+means the NIC never saw the request.
+- *Spec.* An outcome never changes once produced, and a request taken never comes back
+  (`lemma_f1_one_outcome`); taking it returns it, and each lease under its own name
+  (`lemma_f1_take`). Against M (`corollary_f1`), a request owns a nonempty interval of WQEs on
+  one queue, no other request owns any of them, and its outcome exists only once all of them
+  retired. Success: all of them succeeded, READs with the full length they asked for, and the
+  outcome is the last WQE's. An error: it is the first in posting order (`lemma_aggregate`),
+  those before it succeeded, and it and those after it did not. M gives this last part: a queue
+  pair stays in `Err` while its queue holds a WQE, and in `Err` every WQE fails
+  (`lemma_request_step`, `WqeRange::no_success_after_error`). A refusal: M's queues hold no new
+  WQE and the program kept the leases, of which the NIC writes none and reads no unique one
+  (`corollary_f1_refused`). A successful SEND or WRITE has one outcome, reported or implied
+  (`lemma_ack_outcome_unique`).
 - *Ring.* `take` returns exactly the outcome and the payload of a complete request, or of
-  one whose doorbell was refused, and says which. Sequence numbers are never reused. A worker's
+  one whose doorbell was refused, and says which; a refused request never becomes a request of
+  A, and its leases stay the program's throughout (`lemma_ring_abort`,
+  `lemma_ring_take_refused`). Sequence numbers are never reused. A worker's
   payload is the request's buffers and its context (`ring/payload.rs`), so each context comes
   back exactly once with its own buffers by the same proof, with no new trust.
 - *Worker.* Each completion reaches the queue pair, queue and request of its own WQE
@@ -110,20 +118,22 @@ for its own WQEs, with its own buffers.
   which M never saw. Which of those requests fails first across the queue is not claimed
   beyond what the ring keeps: the first one to retire with an error since the last take.
 
-**R1, no leak by the library.** Every buffer handed to the library is returned or released
-once, never before the NIC is done with it.
-- *Spec.* A request in flight keeps its members unchanged until its outcome exists
-  (`lemma_r1_kept_while_in_flight`); every request lives on an existing queue pair
-  (`lemma_r1_requests_on_live_qps`); a released group handle or lease never comes back
-  (`lemma_r1_released_once`, `lemma_r1_member_released_once`), and each lease belongs to
-  one group (`lemma_member_owned_once`).
+**R1, the library never loses track of a buffer.** Every lease is in exactly one place at every
+moment, moves only along the allowed transitions, and is released once, after the NIC is done.
+- *Spec.* `Abs::State::place` says where a lease is: with the program, with the peer, in flight
+  in a request, in a complete request not taken yet, or released (`inv_places` makes that
+  meaningful, and every request lives on an existing queue pair). Every step keeps it there or
+  moves it along `allowed_move`, and a lease leaves a request in flight only once the request
+  has its outcome (`lemma_r1`). Against M, a lease in flight has its request's last WQE still
+  posted, even if a prefix retired with an error, and a lease in a complete request has all its
+  WQEs retired (`corollary_r1`).
 - *Ring.* Leases stay in their slot until the request completes, is taken, refused,
   detached or released with its queue pair, and leave it once.
 - *Worker.* A queue pair is destroyed only when neither ring has a WQE in flight, which M
   turns into empty queues: its buffers are released after the NIC retired their WQEs.
-- *Conditional.* Release is eventual only if the device flushes. When it does not, the
-  worker keeps the queue pair and its buffers and reports `Error::NotFlushed`; this
-  retention is tested, not proved.
+- *A device that does not flush.* The worker keeps the queue pair and its buffers and reports
+  `Error::NotFlushed`: their leases stay in flight, and nothing the NIC may still use is freed.
+  This retention is tested, not proved.
 
 **L1, no lost wakeup.** Once a request is complete, any waker its future registered has
 been invoked.
@@ -133,8 +143,10 @@ been invoked.
 - *Worker.* A waker that panics is caught; the worker finishes the poll's bookkeeping, then
   resumes the panic. Verus checks the normal path; the panicking one is tested.
 
-Liveness (that a request eventually completes) is outside the claim: it needs the NIC to
-make progress, someone to poll the CQ and the executor to poll woken tasks.
+**Liveness is stated, not proved.** F1-live (every request gets exactly one outcome) and R1-live
+(nothing stays in flight after its queue pair is dropped, and every buffer is returned or
+released) share one premise, that the device retires every posted WQE: `design.md`, section 3.4.
+Waking a future also needs the executor to poll woken tasks.
 
 ## Tested, not proved
 
@@ -252,12 +264,17 @@ data, so M sees a queue pair's inline limit as zero.
 
 ## Remaining
 
-- **The worker's `impl Refines`.** Map each ring request onto a group of A, with fresh
-  names, each member's direction and the check that groups stay compatible, and couple
-  them to M (`coupled`). Requests' results already agree with M (F1); what `coupled` still
-  needs from the worker is that complete requests' WQE intervals stay disjoint too (the
-  ring keeps this for requests not retired) and, for a request in flight, that M's `retired`
-  map holds nothing of the rest of its interval (`WqeRange::pending`).
+- **The worker's `impl Refines`.** Give each buffer a lease of A and each ring request a
+  request of A, with each lease's direction (`refine::Held`) and the check that leases stay
+  compatible, and couple them to M (`coupled`). Requests' results already agree with M (F1);
+  what `coupled` still needs from the worker is that complete requests' WQE intervals stay
+  disjoint too (the ring keeps this for requests not retired); for a request in flight, that
+  M's `retired` map holds nothing of the rest of its interval (`WqeRange::pending`); the WR of
+  every send WQE (`records_wrs`: it keeps each request's last today); and that no WQE of a
+  request succeeded after one that failed (`WqeRange::errors_stick`, which `lemma_request_step`
+  keeps through every step of M).
+- **F1-live and R1-live**, stated in `design.md` (section 3.4), with the device's retiring every
+  posted WQE as their premise.
 - **Buffers.** The typed wrappers of `buf.rs` are outside `verus!`; initialized contents
   and the zerocopy contracts, `RingBuf`, exposure and revocation and the final cleanup of a
   region are not verified, and the registration lifetime is trusted (`registered`,
@@ -295,8 +312,8 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 154 verified, 0 errors
-safeverbs-core: verification results:: 412 verified, 0 errors
+safeverbs-spec: verification results:: 149 verified, 0 errors
+safeverbs-core: verification results:: 415 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

@@ -20,8 +20,8 @@ For a smaller asynchronous application, read the
 Keep three units distinct:
 
 - A **WQE** is one hardware work item.
-- A **request** may own several WQEs, but has one sequence number, context, result and group
-  of leases. A batch completes only after its entire WQE interval retires.
+- A **request** may own several WQEs, but has one sequence number, context and result, and
+  holds several leases. A batch completes only after its entire WQE interval retires.
 - A **worker** owns one shared CQ and several QPs. Each QP still has its own send and
   receive rings; sharing the CQ does not merge their completion accounting.
 
@@ -111,7 +111,7 @@ Start with [verification.md](verification.md), then:
 1. [`guarantees.rs`](../crates/safeverbs-spec/src/guarantees.rs): the precise S1, F1,
    R1 and L1 statements; S2 belongs to the implementation's legal calls into M.
 2. [`abs.rs`](../crates/safeverbs-spec/src/abs.rs): A, the abstract ownership and
-   request machine, including groups that mix unique and shared leases, and
+   request machine, including requests that mix unique and shared leases, and
    cancellation.
 3. [`nic.rs`](../crates/safeverbs-spec/src/nic.rs): M, the hardware behavior and verb
    preconditions being assumed.
