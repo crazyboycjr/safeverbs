@@ -288,17 +288,16 @@ pub proof fn lemma_pending_last(range: WqeRange, m: Nic::State)
 ///   every WQE retired and preserves the first error, or the final success.
 /// - **S1 against M:** every byte M lets the NIC (or the peer) read or write is one A gives
 ///   to the NIC for that kind of access.
-pub open spec fn coupled(a: Abs::State, m: Nic::State, ranges: Map<Id, WqeRange>) -> bool {
-    &&& forall|r: Id| #[trigger] a.groups.contains_key(r) && a.groups[r].is_request()
-        ==> ranges.contains_key(r) && ranges[r].qp == a.req(r).qp
-    &&& forall|r: Id| #[trigger] a.outcomes.contains_key(r) ==> ranges.contains_key(r)
-    &&& forall|r: Id| #[trigger] ranges.contains_key(r) ==> ranges[r].wf()
-    &&& forall|r1: Id, r2: Id| #![trigger ranges[r1], ranges[r2]]
+pub open spec fn coupled(a: Abs::State, m: Nic::State, ranges: Map<ReqId, WqeRange>) -> bool {
+    &&& forall|r: ReqId| #[trigger] a.requests.contains_key(r)
+        ==> ranges.contains_key(r) && ranges[r].qp == a.requests[r].qp
+    &&& forall|r: ReqId| #[trigger] a.outcomes.contains_key(r) ==> ranges.contains_key(r)
+    &&& forall|r: ReqId| #[trigger] ranges.contains_key(r) ==> ranges[r].wf()
+    &&& forall|r1: ReqId, r2: ReqId| #![trigger ranges[r1], ranges[r2]]
         ranges.contains_key(r1) && ranges.contains_key(r2) && r1 != r2
             ==> ranges[r1].disjoint(ranges[r2])
-    &&& forall|r: Id| #[trigger] a.groups.contains_key(r) && a.groups[r].in_flight()
-        ==> ranges[r].pending(m)
-    &&& forall|r: Id| #[trigger] a.outcomes.contains_key(r)
+    &&& forall|r: ReqId| #[trigger] a.in_flight(r) ==> ranges[r].pending(m)
+    &&& forall|r: ReqId| #[trigger] a.outcomes.contains_key(r)
         ==> ranges[r].all_retired(m.retired) && ranges[r].aggregate(m.retired) == a.outcomes[r]
     &&& forall|x: int| #[trigger] m.nic_may_read(x) ==> a.nic_reads(x)
     &&& forall|x: int| #[trigger] m.nic_may_write(x) ==> a.nic_writes(x)
@@ -320,7 +319,7 @@ pub trait Refines: Sized {
     spec fn nic(&self) -> Nic::State;
 
     /// The nonempty WQE interval owned by each request (ghost, retained with its outcome).
-    spec fn ranges(&self) -> Map<Id, WqeRange>;
+    spec fn ranges(&self) -> Map<ReqId, WqeRange>;
 
     /// A start state: the device just opened, nothing created yet.
     spec fn init(&self) -> bool;
@@ -373,7 +372,7 @@ pub trait Refines: Sized {
 ///   overflow, every CQE names its WQE);
 /// - A and M are coupled ([`coupled`]): each request owns a disjoint WQE interval, its
 ///   outcome aggregates M's outcomes only after all its WQEs retire, and the NIC touches
-///   only memory A gives it ([`corollary_s1`], [`corollary_f1`]).
+///   only memory A gives it ([`corollary_s1`], [`corollary_f1`], [`corollary_r1`]).
 pub proof fn theorem_1<C: Refines>(run: Seq<C>)
     requires
         run.len() > 0,
@@ -435,7 +434,7 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
 
 /// **S1 against M.** In a coupled state, nothing the program may write is touched by the NIC
 /// or the peer as M defines their reach, and nothing the program may read is written by them.
-pub proof fn corollary_s1(a: Abs::State, m: Nic::State, ranges: Map<Id, WqeRange>, x: int)
+pub proof fn corollary_s1(a: Abs::State, m: Nic::State, ranges: Map<ReqId, WqeRange>, x: int)
     requires
         abs_inv(a),
         coupled(a, m, ranges),
@@ -453,8 +452,8 @@ pub proof fn corollary_f1(
     a: Abs::State,
     a2: Abs::State,
     m: Nic::State,
-    ranges: Map<Id, WqeRange>,
-    r: Id,
+    ranges: Map<ReqId, WqeRange>,
+    r: ReqId,
     o: Outcome,
 )
     requires
@@ -466,7 +465,7 @@ pub proof fn corollary_f1(
         ranges[r].wf(),
         ranges[r].all_retired(m.retired),
         o == ranges[r].aggregate(m.retired),
-        forall|r2: Id| #[trigger] ranges.contains_key(r2) && r2 != r
+        forall|r2: ReqId| #[trigger] ranges.contains_key(r2) && r2 != r
             ==> ranges[r2].disjoint(ranges[r]),
         o.status.is_err() ==> exists|s: nat|
             ranges[r].first_error(m.retired, s) && o == m.retired[ranges[r].at(s)],
@@ -481,27 +480,29 @@ pub proof fn corollary_f1(
     lemma_aggregate(ranges[r], m.retired);
 }
 
-/// **R1 against M.** Retiring a prefix of an in-flight request's WQEs returns or releases
-/// none of its leases: its last WQE is still posted and A records no outcome.
-pub proof fn corollary_inflight(
-    a: Abs::State,
-    m: Nic::State,
-    ranges: Map<Id, WqeRange>,
-    r: Id,
-)
+/// **R1 against M.** A lease in a request in flight has its NIC still at work: the request's
+/// last WQE is posted, even if a prefix of its WQEs retired, with an error or not. A lease in
+/// a complete request has the NIC done with it: all the request's WQEs retired. With
+/// [`crate::guarantees::lemma_r1`], a lease leaves a request, to the program or released, only
+/// after that.
+pub proof fn corollary_r1(a: Abs::State, m: Nic::State, ranges: Map<ReqId, WqeRange>, l: LeaseId)
     requires
         abs_inv(a),
         coupled(a, m, ranges),
-        a.in_flight(r),
     ensures
-        ranges.contains_key(r),
-        posted(m, ranges[r].last()),
-        !m.retired.contains_key(ranges[r].last()),
-        !ranges[r].all_retired(m.retired),
-        !a.outcomes.contains_key(r),
-        a.groups[r].members == a.posted[r],
+        a.place(l) matches Place::InFlight(r) ==> {
+            &&& posted(m, ranges[r].last())
+            &&& !m.retired.contains_key(ranges[r].last())
+            &&& !ranges[r].all_retired(m.retired)
+            &&& !a.outcomes.contains_key(r)
+        },
+        a.place(l) matches Place::Completed(r) ==> ranges[r].all_retired(m.retired),
 {
-    lemma_pending_last(ranges[r], m);
+    match a.place(l) {
+        Place::InFlight(r) => lemma_pending_last(ranges[r], m),
+        Place::Completed(r) => assert(a.outcomes.contains_key(r)),
+        _ => {},
+    }
 }
 
 // =========================================================================================

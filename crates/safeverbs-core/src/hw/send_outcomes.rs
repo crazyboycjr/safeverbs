@@ -591,6 +591,7 @@ pub(super) proof fn lemma_results_committed<L>(pre: Ring<L>, post: Ring<L>, m: N
     assert forall|s: int| #[trigger] post.req(s) is Some implies send_result(post, m, q, s) by {
         pre.lemma_meta(s);
         if pre.staged(s) is Some {
+            assert(crate::refine::wf_at(pre.view(), s));
             assert((pre.view().staged)(s) == pre.staged(s));
         }
     }

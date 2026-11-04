@@ -5,12 +5,12 @@
 //! guarantees as lemmas about A, and the refinement theorem the library's core proves.
 //! Read it in this order:
 //!
-//! 1. [`abs`]: **A**, the abstract machine. Buffers are *leases*, in groups held by the
-//!    program, by a posted request or by the peer; every library call moves groups.
+//! 1. [`abs`]: **A**, the abstract machine. Buffers are *leases*, each held by the program,
+//!    by a posted request or by the peer; every library call moves leases.
 //! 2. [`guarantees`]: **S1** (no conflicting access between the program and the NIC),
-//!    **F1** (each request gets its own outcome, once, with its own buffers), **R1** (no
-//!    buffer released early or twice, none outliving its queue pair) and **L1** (no lost
-//!    wakeup), proved about every state A can reach.
+//!    **F1** (each request gets its own outcome, once, with its own buffers), **R1** (the
+//!    library never loses track of a buffer: one place at a time, released once, after the
+//!    NIC is done) and **L1** (no lost wakeup), proved about every state A can reach.
 //! 3. [`nic`]: **M**, the trusted model of the NIC as one endpoint sees it. Each verb's
 //!    precondition is what **S2** (no local misuse) promises the library meets.
 //! 4. [`refinement`]: **Theorem 1**, as the interface the core must prove, and how A and M

@@ -176,8 +176,8 @@ pub open spec fn waker_name(waker: Option<Waker>) -> Option<WakerId> {
 // What the abstract machine sees
 
 /// A request of the ring as the abstract machine A sees it
-/// (`safeverbs_spec::abs::Req`, less its queue pair and direction, which the
-/// queue pair knows), with what it holds.
+/// (`safeverbs_spec::abs::Req`, less its queue pair, which the queue pair
+/// knows), with what it holds.
 pub ghost struct ReqView<L> {
     /// In flight, or complete with its outcome.
     pub phase: Phase,
@@ -853,19 +853,17 @@ impl<L> Ring<L> {
                     && self.req(s) is None,
     {
         reveal(Ring::inv_slots);
-        assert forall|s: int| #[trigger] (self.view().req)(s) is Some implies crate::refine::req_wf(
-            (self.view().req)(s)->0,
-        ) by {
-            if s < self.retired {
-                assert(self.done_ok(s));
-            } else {
+        assert forall|s: int| #[trigger] crate::refine::wf_at(self.view(), s) by {
+            if self.req(s) is Some {
+                if s < self.retired {
+                    assert(self.done_ok(s));
+                } else {
+                    assert(self.live_ok(s));
+                }
+            }
+            if self.staged(s) is Some {
                 assert(self.live_ok(s));
             }
-        }
-        assert forall|s: int| #[trigger] (self.view().staged)(s) is Some implies crate::refine::staged_wf(
-            (self.view().staged)(s)->0,
-        ) by {
-            assert(self.live_ok(s));
         }
         assert forall|s: int| #[trigger] self.req(s) is Some implies self.spec_head() <= s
             < self.spec_committed() && (self.req(s)->0.phase is InFlight) == (self.spec_retired()

@@ -143,7 +143,7 @@ impl<N: Nic> Resource<N> {
 pub ghost struct Loan<N: Nic> {
     /// The input's metadata and resource, captured before deduplication.
     pub part: Part<N>,
-    /// None for a standalone, unposted resource group.
+    /// None for standalone, unposted leases.
     pub access: Option<Dir>,
 }
 
@@ -631,7 +631,7 @@ impl<N: Nic> Leases<N> {
         }
     }
 
-    /// An empty resource group, with no allocation.
+    /// No leases, with no allocation.
     pub fn new() -> (r: Self)
         ensures r.inv(), r.view() == Seq::<Resource<N>>::empty(), r.loans().len() == 0,
             r.wqes().len() == 0, r.fully_recorded(),
@@ -740,7 +740,7 @@ impl<N: Nic> Leases<N> {
         }
     }
 
-    /// An unposted input group has no selected operation yet.
+    /// Unposted leases have no selected operation yet.
     #[inline]
     pub(crate) fn push(&mut self, part: Part<N>)
         ensures old(self).inv() ==> final(self).inv(),
@@ -843,7 +843,7 @@ impl<N: Nic> Leases<N> {
         self.first.is_some() as usize + self.rest.len()
     }
 
-    /// Whether the group is empty.
+    /// Whether it holds no lease.
     pub fn is_empty(&self) -> (empty: bool)
         ensures self.inv() ==> (empty <==> self.view().len() == 0),
     { self.first.is_none() }

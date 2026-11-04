@@ -28,187 +28,116 @@ pub proof fn lemma_s1_no_conflict(s: Abs::State, a: int)
         !(s.program_reads(a) && s.nic_writes(a)),
 {
     if s.program_writes(a) && (s.nic_reads(a) || s.nic_writes(a)) {
-        let i = choose|i: Id| s.groups.contains_key(i) && s.groups[i].writes_program(a);
-        let k = choose|k: int| 0 <= k < s.groups[i].members.len()
-            && s.groups[i].members[k].unique && s.groups[i].members[k].mem.contains(a);
-        let j = choose|j: Id| s.groups.contains_key(j)
-            && (s.groups[j].nic_may_read(a) || s.groups[j].nic_may_write(a));
-        assert(s.groups[j].contains(a));
-        let l = choose|l: int| 0 <= l < s.groups[j].members.len()
-            && s.groups[j].members[l].mem.contains(a);
-        assert(i != j);
-        assert(s.groups[i].compatible(s.groups[j]));
-        assert(s.groups[i].members[k].mem.disjoint(s.groups[j].members[l].mem));
+        let k = choose|k: LeaseId| s.leases.contains_key(k) && s.is_program(k)
+            && s.leases[k].unique && s.leases[k].mem.contains(a);
+        let l = choose|l: LeaseId| s.leases.contains_key(l)
+            && (s.nic_reads_lease(l) || s.nic_writes_lease(l)) && s.leases[l].mem.contains(a);
+        assert(k != l);
+        assert(s.leases[k].mem.disjoint(s.leases[l].mem));
     }
     if s.program_reads(a) && s.nic_writes(a) {
-        let i = choose|i: Id| s.groups.contains_key(i) && s.groups[i].is_program()
-            && s.groups[i].contains(a);
-        let k = choose|k: int| 0 <= k < s.groups[i].members.len()
-            && s.groups[i].members[k].mem.contains(a);
-        let j = choose|j: Id| s.groups.contains_key(j) && s.groups[j].nic_may_write(a);
-        let l = choose|l: int| 0 <= l < s.groups[j].members.len()
-            && s.groups[j].members[l].mem.contains(a) && s.groups[j].write_member(l);
-        lemma_s1_nic_writes_any_bytes(s, j, l);
-        assert(i != j);
-        assert(s.groups[j].compatible(s.groups[i]));
-        assert(s.groups[j].members[l].mem.disjoint(s.groups[i].members[k].mem));
+        let k = choose|k: LeaseId| s.leases.contains_key(k) && s.is_program(k)
+            && s.leases[k].mem.contains(a);
+        let l = choose|l: LeaseId| s.leases.contains_key(l) && s.nic_writes_lease(l)
+            && s.leases[l].mem.contains(a);
+        lemma_s1_nic_writes_any_bytes(s, l);
+        assert(k != l);
+        assert(s.leases[k].mem.disjoint(s.leases[l].mem));
     }
 }
 
-/// **S1, types.** Every member written by the NIC or peer is individually unique and
-/// accepts arbitrary bytes. Other members of the same request may be shared sources.
-pub proof fn lemma_s1_nic_writes_any_bytes(s: Abs::State, i: Id, k: int)
+/// **S1, types.** Every lease the NIC or the peer may write is unique and accepts arbitrary
+/// bytes. Other leases of the same request may be shared sources.
+pub proof fn lemma_s1_nic_writes_any_bytes(s: Abs::State, l: LeaseId)
     requires
         s.invariant(),
-        s.groups.contains_key(i),
-        0 <= k < s.groups[i].members.len(),
-        s.groups[i].write_member(k),
+        s.leases.contains_key(l),
+        s.nic_writes_lease(l),
     ensures
-        s.groups[i].members[k].any_bytes,
-        s.groups[i].members[k].unique,
+        s.leases[l].any_bytes,
+        s.leases[l].unique,
 {
 }
 
 // =========================================================================================
-// F1: completion correspondence.
+// F1: at most one outcome per request, handed back with its own leases.
 
 /// **F1, one outcome.** Once the NIC produced an outcome for a request, no step changes or
-/// removes it: each request gets at most one outcome. (That it gets one at all is liveness:
-/// it needs the NIC to finish and someone to poll the CQ.)
-pub proof fn lemma_f1_outcome_fixed(pre: Abs::State, post: Abs::State, r: Id)
+/// removes it. A request no longer held (taken, or released after a detached completion) never
+/// comes back: names are never reused.
+pub proof fn lemma_f1_one_outcome(pre: Abs::State, post: Abs::State, r: ReqId)
     requires
         pre.invariant(),
         Abs::State::next(pre, post),
-        pre.outcomes.contains_key(r),
     ensures
-        post.outcomes.contains_key(r),
-        post.outcomes[r] == pre.outcomes[r],
+        pre.outcomes.contains_key(r) ==> post.outcomes.contains_key(r)
+            && post.outcomes[r] == pre.outcomes[r],
+        r < pre.next_id && !pre.requests.contains_key(r) ==> !post.requests.contains_key(r),
 {
     reveal(Abs::State::next);
     reveal(Abs::State::next_by);
 }
 
-/// **F1, its own outcome and buffers.** When the client takes request `r`'s outcome, it is
-/// the outcome the NIC produced for `r`, and the ordered members that come back retain
-/// exactly the identities, byte ranges and permissions `r` was posted with.
-pub proof fn lemma_f1_take(pre: Abs::State, post: Abs::State, r: Id, o: Outcome)
+/// **F1, its own outcome and leases.** When the client takes request `r`'s outcome, it is the
+/// outcome the NIC produced for `r`. Each lease of `r`, which are those it was posted with
+/// ([`lemma_r1`]), comes back to the program under its own name, with its bytes and permissions,
+/// and no other lease moves.
+pub proof fn lemma_f1_take(pre: Abs::State, post: Abs::State, r: ReqId, o: Outcome)
     requires
         pre.invariant(),
         Abs::State::take(pre, post, r, o),
     ensures
         o == pre.outcomes[r],
-        post.is_program(pre.next_id),
-        post.groups[pre.next_id].members == pre.posted[r],
+        !post.requests.contains_key(r),
+        forall|l: LeaseId| #[trigger] post.leases.contains_key(l) <==> pre.leases.contains_key(l),
+        forall|l: LeaseId| #[trigger] pre.leases.contains_key(l) && pre.leases[l].held_by(r)
+            ==> post.is_program(l) && post.leases[l].same_as(pre.leases[l]),
+        forall|l: LeaseId| #[trigger] pre.leases.contains_key(l) && !pre.leases[l].held_by(r)
+            ==> post.leases[l] == pre.leases[l],
 {
-}
-
-/// **F1, taken once.** A request that is no longer held (taken, or released after a detached
-/// completion) never becomes a request again: ids are never reused.
-pub proof fn lemma_f1_taken_once(pre: Abs::State, post: Abs::State, r: Id)
-    requires
-        pre.invariant(),
-        Abs::State::next(pre, post),
-        r < pre.next_id,
-        !pre.is_request(r),
-    ensures
-        !post.is_request(r),
-{
-    reveal(Abs::State::next);
-    reveal(Abs::State::next_by);
 }
 
 // =========================================================================================
-// R1: no leak, no early release.
+// R1: the library never loses track of a buffer.
 
-/// Some group holds lease `member`, whatever its handle.
-pub open spec fn member_live(s: Abs::State, member: Id) -> bool {
-    exists|i: Id, k: int| #![trigger s.groups[i].members[k]]
-        s.groups.contains_key(i) && 0 <= k < s.groups[i].members.len()
-            && s.groups[i].members[k].id == member
-}
-
-/// **R1, leases.** A lease that no group holds any more never reappears. Taking or
-/// separating a group does not release its leases; dropping the group that holds a lease
-/// does. New leases always get fresh identities.
-pub proof fn lemma_r1_member_released_once(pre: Abs::State, post: Abs::State, member: Id)
-    requires
-        pre.invariant(),
-        Abs::State::next(pre, post),
-        member < pre.next_id,
-        !member_live(pre, member),
-    ensures
-        !member_live(post, member),
-{
-    reveal(Abs::State::next);
-    reveal(Abs::State::next_by);
-    if member_live(post, member) {
-        let (i, k) = choose|i: Id, k: int| post.groups.contains_key(i)
-            && 0 <= k < post.groups[i].members.len()
-            && post.groups[i].members[k].id == member;
-        assert forall|j: Id, l: int| #![trigger pre.groups[j].members[l]]
-            pre.groups.contains_key(j) && 0 <= l < pre.groups[j].members.len()
-                implies pre.groups[j].members[l].id != member by {}
+/// The moves a lease may make. The program may put it in a request, lend it to the peer or
+/// release it. The peer only gives it back. A request in flight keeps it until it completes,
+/// which releases it if the request has no owner left. A complete request gives it back to the
+/// program, or releases it if its future is dropped. Released is for good.
+pub open spec fn allowed_move(from: Place, to: Place) -> bool {
+    match (from, to) {
+        (Place::Program, Place::InFlight(_)) => true,
+        (Place::Program, Place::Exposed) => true,
+        (Place::Program, Place::Released) => true,
+        (Place::Exposed, Place::Program) => true,
+        (Place::InFlight(r), Place::Completed(s)) => r == s,
+        (Place::InFlight(_), Place::Released) => true,
+        (Place::Completed(_), Place::Program) => true,
+        (Place::Completed(_), Place::Released) => true,
+        _ => from == to,
     }
 }
 
-/// Each lease held is a member of one group, at one position. Shared clones may overlap
-/// bytes, but cloning never duplicates a lease identity.
-pub proof fn lemma_member_owned_once(s: Abs::State, i: Id, j: Id, k: int, l: int)
-    requires
-        s.invariant(),
-        s.groups.contains_key(i), s.groups.contains_key(j),
-        0 <= k < s.groups[i].members.len(),
-        0 <= l < s.groups[j].members.len(),
-        s.groups[i].members[k].id == s.groups[j].members[l].id,
-    ensures
-        i == j && k == l,
-{
-    if i != j {
-        assert(s.groups[i].compatible(s.groups[j]));
-    } else if k != l {
-        assert(s.groups[i].wf());
-    }
-}
-
-/// **R1, never before the NIC is done.** A request in flight keeps its members unchanged,
-/// until the NIC produces its outcome: no client action (dropping the future included)
-/// releases it earlier. With S1 this means its memory is never reused while the NIC may
-/// still access it.
-pub proof fn lemma_r1_kept_while_in_flight(pre: Abs::State, post: Abs::State, r: Id)
+/// **R1.** At every moment a lease is in exactly one place ([`Abs::State::place`], made
+/// meaningful by the invariant `inv_places`). Every step leaves it there or moves it along
+/// [`allowed_move`]; a new lease starts with the program. It enters a request only as that
+/// request is posted, and leaves a request in flight only once the NIC produced that request's
+/// outcome: dropping a future does not release it, and neither does a device that never
+/// flushes, which leaves it in flight for good. While the program does not hold a lease, its
+/// bytes and permissions stay as they are.
+pub proof fn lemma_r1(pre: Abs::State, post: Abs::State, l: LeaseId)
     requires
         pre.invariant(),
         Abs::State::next(pre, post),
-        pre.in_flight(r),
     ensures
-        post.in_flight(r) ==> post.groups[r].members == pre.groups[r].members,
-        !post.in_flight(r) ==> post.outcomes.contains_key(r),
-{
-    reveal(Abs::State::next);
-    reveal(Abs::State::next_by);
-}
-
-/// **R1, at the latest when its queue pair is dropped.** Every request lives on a queue
-/// pair that still exists; dropping a queue pair needs all of its requests gone.
-pub proof fn lemma_r1_requests_on_live_qps(s: Abs::State, r: Id)
-    requires
-        s.invariant(),
-        s.is_request(r),
-    ensures
-        s.qps.contains(s.req(r).qp),
-{
-}
-
-/// **R1, group handles.** A retired group handle never reappears. Member identities can
-/// survive a take or separation under fresh program handles; this lemma does not claim
-/// those members disappear. `lemma_member_owned_once` prevents duplicate live ownership.
-pub proof fn lemma_r1_released_once(pre: Abs::State, post: Abs::State, i: Id)
-    requires
-        pre.invariant(),
-        Abs::State::next(pre, post),
-        i < pre.next_id,
-        !pre.groups.contains_key(i),
-    ensures
-        !post.groups.contains_key(i),
+        l < pre.next_id ==> allowed_move(pre.place(l), post.place(l)),
+        l >= pre.next_id && post.leases.contains_key(l) ==> post.place(l) is Program,
+        post.place(l) matches Place::InFlight(r) ==> post.place(l) == pre.place(l)
+            || r == pre.next_id,
+        pre.place(l) matches Place::InFlight(r) ==> post.place(l) == pre.place(l)
+            || post.outcomes.contains_key(r),
+        pre.leases.contains_key(l) && !(pre.place(l) is Program) && post.leases.contains_key(l)
+            ==> post.leases[l].same_as(pre.leases[l]),
 {
     reveal(Abs::State::next);
     reveal(Abs::State::next_by);
@@ -219,24 +148,24 @@ pub proof fn lemma_r1_released_once(pre: Abs::State, post: Abs::State, i: Id)
 
 /// **L1.** A complete request holds no waker: whatever waker its future registered was
 /// invoked when it completed (next lemma), or was dropped because the future was.
-pub proof fn lemma_l1_no_waker_left(s: Abs::State, r: Id)
+pub proof fn lemma_l1_no_waker_left(s: Abs::State, r: ReqId)
     requires
         s.invariant(),
-        s.is_request(r),
-        s.req(r).phase is Complete,
+        s.requests.contains_key(r),
+        s.requests[r].phase is Complete,
     ensures
-        s.req(r).waker is None,
+        s.requests[r].waker is None,
 {
 }
 
 /// **L1, the wakeup.** Completing a request whose future registered waker `w` invokes `w`.
-pub proof fn lemma_l1_completion_wakes(pre: Abs::State, post: Abs::State, r: Id, o: Outcome)
+pub proof fn lemma_l1_completion_wakes(pre: Abs::State, post: Abs::State, r: ReqId, o: Outcome)
     requires
         pre.invariant(),
         Abs::State::complete(pre, post, r, o),
-        pre.req(r).waker is Some,
+        pre.requests[r].waker is Some,
     ensures
-        post.wakes == pre.wakes.push(pre.req(r).waker->0),
+        post.wakes == pre.wakes.push(pre.requests[r].waker->0),
 {
 }
 

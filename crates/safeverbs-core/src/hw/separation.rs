@@ -26,7 +26,7 @@ impl<C, N: Device> Hw<C, N> {
     }
 
     /// Admission-time separation against everything the worker stores.
-    /// This says nothing about other workers or untracked program-held groups.
+    /// This says nothing about other workers or untracked leases the program holds.
     pub closed spec fn admission_separated_from(&self, incoming: Part<N>) -> bool {
         forall|i: int| 0 <= i < self.qps@.len()
             ==> #[trigger] self.entry_separated_from(i, incoming)

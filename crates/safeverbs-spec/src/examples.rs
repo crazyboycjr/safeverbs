@@ -1,15 +1,17 @@
 //! Worked examples: concrete executions of A and M, checked step by step.
 //!
-//! They show that the transitions can actually happen (no precondition is accidentally
-//! unsatisfiable, which would make the lemmas about them vacuous) and illustrate the rules:
-//! a buffer's lease moves into a request and back, a waker is invoked on completion, an
-//! unsignaled write is retired, as a success, by the CQE of a later signaled one, and a
-//! batch completes with its first error once all its WQEs retired.
+//! They show that the transitions can happen (no precondition is accidentally unsatisfiable,
+//! which would make the lemmas about them vacuous) and illustrate the rules: a buffer's lease
+//! moves into a request and back, a waker is invoked on completion, a dropped future keeps its
+//! lease in flight, an unsignaled write is retired, as a success, by the CQE of a later signaled
+//! one, and a batch completes with its first error once all its WQEs retired.
 #![allow(unused_imports)]
 
 use crate::abs::*;
+use crate::guarantees::*;
 use crate::nic::*;
-use crate::refinement::WqeRange;
+use crate::nic_proofs::*;
+use crate::refinement::*;
 use crate::types::*;
 use vstd::multiset::*;
 use vstd::prelude::*;
@@ -39,6 +41,11 @@ pub proof fn example_operation_metadata() {
     assert(empty.allows_outcome(failed));
 }
 
+/// A request that has just been posted.
+spec fn fresh_req() -> Req {
+    Req { qp: 7, phase: Phase::InFlight, waker: None, detached: false }
+}
+
 /// A: allocate a buffer, freeze it, send it, poll once (`Pending`, registering a waker), let
 /// the NIC complete it (the waker runs), take the outcome and the buffer back.
 #[verifier::spinoff_prover]
@@ -48,10 +55,10 @@ pub proof fn example_send_in_a() {
 
     let s0 = Abs::State {
         qps: Set::empty(),
-        groups: Map::empty(),
+        leases: Map::empty(),
+        requests: Map::empty(),
         next_id: 0,
         outcomes: Map::empty(),
-        posted: Map::empty(),
         wakes: Seq::empty(),
     };
     assert(Abs::State::start(s0));
@@ -59,45 +66,42 @@ pub proof fn example_send_in_a() {
     let s1 = Abs::State { qps: s0.qps.insert(7), ..s0 };
     assert(Abs::State::create_qp(s0, s1, 7));
 
-    let buf = Group::singleton(0, mem, true, true);
-    let s2 = Abs::State { groups: s1.groups.insert(0, buf), next_id: 1, ..s1 };
+    let buf = Lease { mem, unique: true, any_bytes: true, holder: Holder::Program };
+    let s2 = Abs::State { leases: s1.leases.insert(0, buf), next_id: 1, ..s1 };
     assert(Abs::State::alloc(s1, s2, mem, true));
 
-    let frozen = Group::singleton(0, mem, false, true);
-    let s3 = Abs::State { groups: s2.groups.insert(0, frozen), ..s2 };
+    let frozen = Lease { unique: false, ..buf };
+    let s3 = Abs::State { leases: s2.leases.insert(0, frozen), ..s2 };
     assert(Abs::State::freeze(s2, s3, 0));
 
-    let req = Req { qp: 7, dirs: seq![Dir::Out], phase: Phase::InFlight, waker: None, detached: false };
+    let dirs = Map::empty().insert(0nat, Dir::Out);
     let s4 = Abs::State {
-        groups: s3.groups.remove(0).insert(1, frozen.with_req(req)),
-        posted: s3.posted.insert(1, frozen.members),
+        requests: s3.requests.insert(1, fresh_req()),
+        leases: s3.leases_in_request(dirs, 1),
         next_id: 2,
         ..s3
     };
-    assert(Abs::State::post_request(s3, s4, 0, 7, seq![Dir::Out]));
+    assert(Abs::State::post_request(s3, s4, dirs, 7));
+    assert(s4.place(0) == Place::InFlight(1));
 
-    let s5 = Abs::State { groups: s4.groups.insert(1, frozen.with_req(req.with_waker(9))), ..s4 };
+    let s5 = Abs::State { requests: s4.requests.insert(1, fresh_req().with_waker(9)), ..s4 };
     assert(Abs::State::register(s4, s5, 1, 9));
 
-    let done = req.with_waker(9).completed(ok);
     let s6 = Abs::State {
         outcomes: s5.outcomes.insert(1, ok),
         wakes: s5.wakes.push(9),
-        groups: s5.groups.insert(1, frozen.with_req(done)),
+        requests: s5.requests.insert(1, fresh_req().with_waker(9).completed(ok)),
         ..s5
     };
     assert(Abs::State::complete(s5, s6, 1, ok));
+    assert(s6.place(0) == Place::Completed(1));
 
-    let s7 = Abs::State {
-        groups: s6.groups.remove(1).insert(2, frozen.with_req(done).with_holder(Holder::Program)),
-        next_id: 3,
-        ..s6
-    };
+    let s7 = Abs::State { requests: s6.requests.remove(1), leases: s6.leases_returned(1), ..s6 };
     assert(Abs::State::take(s6, s7, 1, ok));
 
-    // The waker ran, and the program holds the buffer again.
+    // The waker ran, and the program holds the buffer again, under its own name.
     assert(s7.wakes == seq![9nat]);
-    assert(s7.is_program(2) && s7.groups[2].members[0].mem == mem);
+    assert(s7.is_program(0) && s7.leases[0].mem == mem);
 }
 
 /// A: post a receive, drop its future before it completes. Nothing is cancelled: the
@@ -105,35 +109,40 @@ pub proof fn example_send_in_a() {
 pub proof fn example_dropped_receive_in_a() {
     let mem = Span { start: 4096, len: 4096 }.bytes();
     let got = Outcome { status: Status::Success, kind: CompletionKind::Receive, byte_len: 100, imm: Some(5) };
-    let buf = Group::singleton(0, mem, true, true);
+    let buf = Lease { mem, unique: true, any_bytes: true, holder: Holder::Program };
     let s0 = Abs::State {
         qps: Set::empty().insert(7),
-        groups: Map::empty().insert(0, buf),
+        leases: Map::empty().insert(0, buf),
+        requests: Map::empty(),
         next_id: 1,
         outcomes: Map::empty(),
-        posted: Map::empty(),
         wakes: Seq::empty(),
     };
 
-    let req = Req { qp: 7, dirs: seq![Dir::In], phase: Phase::InFlight, waker: None, detached: false };
+    let dirs = Map::empty().insert(0nat, Dir::In);
     let s1 = Abs::State {
-        groups: s0.groups.remove(0).insert(1, buf.with_req(req)),
-        posted: s0.posted.insert(1, buf.members),
+        requests: s0.requests.insert(1, fresh_req()),
+        leases: s0.leases_in_request(dirs, 1),
         next_id: 2,
         ..s0
     };
-    assert(Abs::State::post_request(s0, s1, 0, 7, seq![Dir::In]));
+    assert(Abs::State::post_request(s0, s1, dirs, 7));
+    assert(s0.invariant());
+    Abs::State::post_request_inductive(s0, s1, dirs, 7);
 
     // The future is dropped: the request is still in flight and still holds the buffer.
-    let s2 = Abs::State { groups: s1.groups.insert(1, buf.with_req(req.detach())), ..s1 };
+    let s2 = Abs::State { requests: s1.requests.insert(1, fresh_req().detach()), ..s1 };
     assert(Abs::State::detach(s1, s2, 1));
-    assert(s2.in_flight(1) && s2.groups[1].members[0].mem == mem);
-    assert(s2.nic_writes(4096));
+    Abs::State::detach_inductive(s1, s2, 1);
+    assert(s2.place(0) == Place::InFlight(1));
+    assert(s2.leases.contains_key(0) && s2.leases[0].mem.contains(4096) && s2.nic_writes(4096));
 
-    // The NIC completes it: the outcome is recorded and the lease released, together.
-    let s3 = Abs::State { outcomes: s2.outcomes.insert(1, got), groups: s2.groups.remove(1), ..s2 };
-    assert(Abs::State::complete(s2, s3, 1, got));
-    assert(!s3.groups.contains_key(1) && s3.outcomes[1] == got);
+    // The NIC completes it: the outcome is recorded and the lease released, together (R1).
+    let s3 = Abs::State { outcomes: s2.outcomes.insert(1, got), requests: s2.requests.remove(1), leases: s2.leases_but(1), ..s2 };
+    assert(abs_step(s2, s3, Abs::Step::complete(1, got)));
+    lemma_abs_step_is_next(s2, s3, Abs::Step::complete(1, got));
+    lemma_r1(s2, s3, 0);
+    assert(s3.place(0) is Released && s3.outcomes[1] == got);
 }
 
 /// QP 7 of the M examples, connected: RC, in protection domain 1, room for four sends and
@@ -181,33 +190,33 @@ proof fn lemma_connected()
     reveal(Nic::State::init);
     reveal(Nic::State::init_by);
     assert(Nic::State::init_by(m0, Nic::Config::open(s.caps)));
-    crate::refinement::lemma_nic_init_invariant(m0);
+    lemma_nic_init_invariant(m0);
     let m1 = Nic::State { pds: s.pds, ..m0 };
     assert(Nic::State::alloc_pd(m0, m1, 1));
-    crate::nic_proofs::lemma_alloc_pd(m0, m1, 1);
+    lemma_alloc_pd(m0, m1, 1);
     let m2 = Nic::State { mrs: s.mrs, ..m1 };
     assert(Nic::State::reg_mr(m1, m2, 5, s.mrs[5]));
-    crate::nic_proofs::lemma_reg_mr(m1, m2, 5, s.mrs[5]);
+    lemma_reg_mr(m1, m2, 5, s.mrs[5]);
     let cq = Cq { cap: 16, entries: Seq::empty(), reserved: Multiset::empty(), used: Multiset::empty() };
     let m3 = Nic::State { cqs: Map::empty().insert(3, cq), ..m2 };
     assert(Nic::State::create_cq(m2, m3, 3, 16));
-    crate::nic_proofs::lemma_create_cq(m2, m3, 3, 16);
+    lemma_create_cq(m2, m3, 3, 16);
     let qp = qp7().with_state(QpState::Reset);
     let cqs1 = m3.cqs.insert(3, m3.cqs[3].reserve(7, 4));
     assert(cqs1.insert(3, cqs1[3].reserve(7, 4)) =~= s.cqs);
-    crate::nic_proofs::lemma_copies(7, 4);
+    lemma_copies(7, 4);
     let m4 = Nic::State { cqs: s.cqs, qps: Map::empty().insert(7, qp), ..m3 };
     assert(Nic::State::create_qp(m3, m4, 7, qp.attr));
-    crate::nic_proofs::lemma_create_qp(m3, m4, 7, qp.attr);
+    lemma_create_qp(m3, m4, 7, qp.attr);
     let m5 = Nic::State { qps: m4.qps.insert(7, qp.with_state(QpState::Init)), ..m4 };
     assert(Nic::State::modify_qp(m4, m5, 7, QpState::Init));
-    crate::nic_proofs::lemma_modify_qp(m4, m5, 7, QpState::Init);
+    lemma_modify_qp(m4, m5, 7, QpState::Init);
     let m6 = Nic::State { qps: m5.qps.insert(7, qp.with_state(QpState::Rtr)), ..m5 };
     assert(Nic::State::modify_qp(m5, m6, 7, QpState::Rtr));
-    crate::nic_proofs::lemma_modify_qp(m5, m6, 7, QpState::Rtr);
+    lemma_modify_qp(m5, m6, 7, QpState::Rtr);
     let m7 = Nic::State { qps: m6.qps.insert(7, qp7()), ..m6 };
     assert(Nic::State::modify_qp(m6, m7, 7, QpState::Rts));
-    crate::nic_proofs::lemma_modify_qp(m6, m7, 7, QpState::Rts);
+    lemma_modify_qp(m6, m7, 7, QpState::Rts);
     assert(m7.qps =~= s.qps);
     assert(m7 == s);
 }
@@ -323,96 +332,57 @@ pub proof fn example_batch_first_error() {
     assert(range.aggregate(m5.retired) == remote);
 }
 
-/// A: one request's group has a READ destination and a frozen SEND source, of which the
-/// program keeps a clone. The NIC writes the one and reads the other while the program may
-/// read the clone. Dropping the future keeps the whole group until completion; taking the
-/// outcome returns the members as they were posted, which separate into the two buffers.
+/// A: one request holds a READ destination and a frozen SEND source, of which the program
+/// keeps a clone. The NIC writes the one and reads the other while the program may read the
+/// clone. Taking the outcome returns each lease under its own name: the destination is the
+/// program's to write again, the source stays shared.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(20)]
-pub proof fn example_mixed_group() {
-    let dst = Span { start: 128, len: 64 }.bytes();
-    let src = Span { start: 0, len: 64 }.bytes();
+pub proof fn example_mixed_request() {
+    let source = Lease { mem: Span { start: 0, len: 64 }.bytes(), unique: false, any_bytes: true, holder: Holder::Program };
+    let destination = Lease { mem: Span { start: 128, len: 64 }.bytes(), unique: true, any_bytes: true, holder: Holder::Program };
     let remote = Outcome { status: Status::RemoteErr, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
     let a0 = Abs::State {
-        qps: Set::empty(), groups: Map::empty(), next_id: 0,
-        outcomes: Map::empty(), posted: Map::empty(), wakes: Seq::empty(),
+        qps: Set::empty().insert(7),
+        leases: Map::empty().insert(0, source).insert(1, destination).insert(2, source),
+        requests: Map::empty(),
+        next_id: 3,
+        outcomes: Map::empty(),
+        wakes: Seq::empty(),
     };
-    assert(Abs::State::start(a0));
-    Abs::State::start_inductive(a0);
-    let a1 = Abs::State { qps: a0.qps.insert(7), ..a0 };
-    assert(Abs::State::create_qp(a0, a1, 7));
-    Abs::State::create_qp_inductive(a0, a1, 7);
-    let read = Group::singleton(0, dst, true, true);
-    let a2 = Abs::State { groups: a1.groups.insert(0, read), next_id: 1, ..a1 };
-    assert(Abs::State::alloc(a1, a2, dst, true));
-    Abs::State::alloc_inductive(a1, a2, dst, true);
-    let write = Group::singleton(1, src, true, true);
-    let a3 = Abs::State { groups: a2.groups.insert(1, write), next_id: 2, ..a2 };
-    assert(Abs::State::alloc(a2, a3, src, true));
-    Abs::State::alloc_inductive(a2, a3, src, true);
-    let frozen = Group::singleton(1, src, false, true);
-    let a4 = Abs::State { groups: a3.groups.insert(1, frozen), ..a3 };
-    assert(Abs::State::freeze(a3, a4, 1));
-    Abs::State::freeze_inductive(a3, a4, 1);
-    let clone = Group::singleton(2, src, false, true);
-    let a5 = Abs::State { groups: a4.groups.insert(2, clone), next_id: 3, ..a4 };
-    assert(Abs::State::share(a4, a5, 1, src));
-    Abs::State::share_inductive(a4, a5, 1, src);
-    let mixed = Group { members: read.members + frozen.members, holder: Holder::Program };
-    let a6 = Abs::State { groups: a5.groups.remove(0).remove(1).insert(3, mixed), next_id: 4, ..a5 };
-    assert(Abs::State::join(a5, a6, 0, 1));
-    Abs::State::join_inductive(a5, a6, 0, 1);
-    let dirs = seq![Dir::In, Dir::Out];
-    assert(mixed.allows(dirs) && !mixed.allows(seq![Dir::In, Dir::In]));
-    let req = Req { qp: 7, dirs, phase: Phase::InFlight, waker: None, detached: false };
-    let a7 = Abs::State {
-        groups: a6.groups.remove(3).insert(4, mixed.with_req(req)),
-        posted: a6.posted.insert(4, mixed.members), next_id: 5, ..a6
+    assert(abs_inv(a0));
+    let dirs = Map::empty().insert(0nat, Dir::Out).insert(1nat, Dir::In);
+    assert(a0.may_post(dirs));
+    assert(dirs.insert(0, Dir::In).contains_key(0) && !a0.may_post(dirs.insert(0, Dir::In)));
+    let a1 = Abs::State {
+        requests: a0.requests.insert(3, fresh_req()),
+        leases: a0.leases_in_request(dirs, 3),
+        next_id: 4,
+        ..a0
     };
-    assert(Abs::State::post_request(a6, a7, 3, 7, dirs));
-    Abs::State::post_request_inductive(a6, a7, 3, 7, dirs);
+    assert(Abs::State::post_request(a0, a1, dirs, 7));
+    Abs::State::post_request_inductive(a0, a1, dirs, 7);
 
-    // S1: the NIC writes byte 128 and reads byte 0, which the program reads too (the clone).
-    assert(a7.groups[4].members[0].mem.contains(128) && a7.groups[4].write_member(0));
-    assert(a7.groups[4].members[1].mem.contains(0) && a7.groups[4].read_member(1));
-    assert(a7.groups[2].members[0].mem.contains(0) && a7.groups[2].contains(0));
-    assert(a7.nic_writes(128) && a7.nic_reads(0) && a7.program_reads(0));
-    crate::guarantees::lemma_s1_no_conflict(a7, 0);
-    crate::guarantees::lemma_s1_no_conflict(a7, 128);
-    assert(!a7.program_reads(128) && !a7.nic_writes(0));
-    let a8 = Abs::State { groups: a7.groups.insert(4, mixed.with_req(req.with_waker(9))), ..a7 };
-    assert(Abs::State::register(a7, a8, 4, 9));
-    Abs::State::register_inductive(a7, a8, 4, 9);
+    // S1: the NIC writes byte 128 and reads byte 0, which the program reads too, through the clone.
+    assert(a1.leases.contains_key(0) && a1.leases.contains_key(1) && a1.leases.contains_key(2));
+    assert(a1.leases[1].mem.contains(128) && a1.nic_writes_lease(1) && a1.nic_writes(128));
+    assert(a1.leases[0].mem.contains(0) && a1.nic_reads_lease(0) && a1.nic_reads(0));
+    assert(a1.leases[2].mem.contains(0) && a1.program_reads(0));
+    lemma_s1_no_conflict(a1, 128);
+    assert(!a1.program_reads(128));
 
-    // Dropped: the request keeps the group, unwoken, until it completes; then it goes.
-    let detached = Abs::State { groups: a8.groups.insert(4, mixed.with_req(req.detach())), ..a8 };
-    assert(Abs::State::detach(a8, detached, 4));
-    assert(detached.in_flight(4) && detached.groups[4].members == mixed.members);
-    let dropped = Abs::State { groups: detached.groups.remove(4), outcomes: detached.outcomes.insert(4, remote), ..detached };
-    assert(Abs::State::complete(detached, dropped, 4, remote));
-    assert(dropped.groups.dom() =~= set![2nat] && dropped.wakes.len() == 0);
-
-    // Or kept: completing wakes it, taking returns its members, and they separate.
-    let done = Abs::State {
-        groups: a8.groups.insert(4, mixed.with_req(req.completed(remote))),
-        outcomes: a8.outcomes.insert(4, remote), wakes: a8.wakes.push(9), ..a8
+    let a2 = Abs::State {
+        outcomes: a1.outcomes.insert(3, remote),
+        requests: a1.requests.insert(3, fresh_req().completed(remote)),
+        ..a1
     };
-    assert(Abs::State::complete(a8, done, 4, remote));
-    Abs::State::complete_inductive(a8, done, 4, remote);
-    let taken = Abs::State { groups: done.groups.remove(4).insert(5, mixed), next_id: 6, ..done };
-    assert(Abs::State::take(done, taken, 4, remote));
-    crate::guarantees::lemma_f1_take(done, taken, 4, remote);
-    let separated = Abs::State {
-        groups: taken.groups.remove(5).insert(6, read).insert(7, frozen), next_id: 8, ..taken
-    };
-    assert(mixed.members.take(1) =~= read.members && mixed.members.skip(1) =~= frozen.members);
-    assert(Abs::State::separate(taken, separated, 5, 1));
-    // The destination is the program's to write again; the source stays shared.
-    assert(separated.groups[6].members[0].mem.contains(128) && separated.groups.contains_key(6));
-    assert(separated.groups[6].writes_program(128) && separated.program_writes(128));
-    assert(!separated.groups[2].writes_program(0) && !separated.groups[7].writes_program(0));
-    assert(separated.groups.dom() =~= set![2nat, 6nat, 7nat]);
-    assert(!separated.program_writes(0));
+    assert(Abs::State::complete(a1, a2, 3, remote));
+    Abs::State::complete_inductive(a1, a2, 3, remote);
+    let a3 = Abs::State { requests: a2.requests.remove(3), leases: a2.leases_returned(3), ..a2 };
+    assert(Abs::State::take(a2, a3, 3, remote));
+    lemma_f1_take(a2, a3, 3, remote);
+    assert(a3.leases.contains_key(1) && a3.leases[1].mem.contains(128) && a3.program_writes(128));
+    assert(!a3.leases[0].unique && !a3.leases[2].unique);
 }
 
 } // verus!
