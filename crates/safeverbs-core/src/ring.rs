@@ -849,6 +849,15 @@ impl<L> Ring<L> {
         forall|s: int, w: int| #[trigger] self.dma(s, w) == pre.dma(s, w)
     }
 
+    /// Everything but the wakers and those woken is as it was.
+    pub open spec fn same_but_results(&self, other: &Self) -> bool {
+        &&& forall|s: int| #[trigger] self.req(s) == other.req(s)
+        &&& forall|s: int| #[trigger] self.staged(s) == other.staged(s)
+        &&& forall|s: int| #[trigger] self.refused(s) == other.refused(s)
+        &&& self.same_dma(other)
+        &&& self.same_meta(other)
+    }
+
     /// A DMA observer names an in-flight or staged request, with its
     /// exact resources, and never a result retained after refusal.
     pub proof fn lemma_dma(&self, s: int, w: int)
@@ -1094,6 +1103,7 @@ impl<L> Ring<L> {
             ring.spec_wqe_retired() == 0,
             ring.spec_wqe_committed() == 0,
             ring.spec_wqe_posted() == 0,
+            ring.spec_routed() == 0,
             ring.spec_depth() == depth,
             ring.spec_max_wqes() == max_wqes,
             forall|s: int| #[trigger] ring.req(s) is None,
@@ -1565,43 +1575,63 @@ impl<L> Ring<L> {
             implied is Ok,
         ensures
             seq == old(self).spec_posted(),
-            final(self).inv(),
-            final(self).spec_head() == old(self).spec_head(),
-            final(self).spec_retired() == old(self).spec_retired(),
-            final(self).spec_committed() == old(self).spec_committed(),
-            final(self).spec_posted() == seq + 1,
-            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
-            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
-            final(self).spec_wqe_posted() == old(self).spec_wqe_posted() + wqes,
-            final(self).spec_depth() == old(self).spec_depth(),
-            final(self).spec_max_wqes() == old(self).spec_max_wqes(),
-            final(self).woken() == old(self).woken(),
-            final(self).spec_detached_error() == old(self).spec_detached_error(),
-            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
-            forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
-            forall|s: int| #[trigger] final(self).staged(s) == if s == seq {
-                Some(ReqView::new(detached, leases))
-            } else {
-                old(self).staged(s)
-            },
-            forall|s: int, w: int| #[trigger] final(self).dma(s, w) == if s == seq
-                && old(self).spec_wqe_posted() <= w < old(self).spec_wqe_posted() + wqes {
-                Some(leases)
-            } else {
-                old(self).dma(s, w)
-            },
-            forall|s: int| #[trigger] final(self).meta(s) == if s == seq {
-                Some(RequestMeta {
-                    first: old(self).spec_wqe_posted(),
-                    end: (old(self).spec_wqe_posted() + wqes) as u64,
-                    outcome: implied,
-                })
-            } else {
-                old(self).meta(s)
-            },
+            final(self).just_staged(old(self), wqes, ReqView::new(detached, leases), implied),
     {
+        let ghost pre = *self;
         self.fill(wqes, detached, implied, leases);
-        self.stage_filled(wqes, signaled)
+        let ghost filled = *self;
+        let seq = self.stage_filled(wqes, signaled);
+        proof {
+            self.lemma_filled_staged(&filled, &pre, wqes, ReqView::new(detached, leases), implied);
+        }
+        seq
+    }
+
+    /// A request of `wqes` WQEs is staged after what `pre` had, in the next slot: `view` with
+    /// `outcome`.
+    pub open spec fn just_staged(&self, pre: &Self, wqes: u64, view: ReqView<L>, outcome: CompletionResult) -> bool {
+        let seq = pre.spec_posted() as int;
+        let first = pre.spec_wqe_posted();
+        &&& self.inv()
+        &&& self.spec_head() == pre.spec_head()
+        &&& self.spec_retired() == pre.spec_retired()
+        &&& self.spec_committed() == pre.spec_committed()
+        &&& self.spec_posted() == seq + 1
+        &&& self.spec_wqe_retired() == pre.spec_wqe_retired()
+        &&& self.spec_wqe_committed() == pre.spec_wqe_committed()
+        &&& self.spec_wqe_posted() == first + wqes
+        &&& self.spec_depth() == pre.spec_depth()
+        &&& self.spec_max_wqes() == pre.spec_max_wqes()
+        &&& self.spec_routed() == pre.spec_routed()
+        &&& self.woken() == pre.woken()
+        &&& self.spec_detached_error() == pre.spec_detached_error()
+        &&& forall|s: int| #[trigger] self.req(s) == pre.req(s)
+        &&& forall|s: int| #[trigger] self.refused(s) == pre.refused(s)
+        &&& forall|s: int| #[trigger] self.staged(s) == if s == seq {
+            Some(view)
+        } else {
+            pre.staged(s)
+        }
+        &&& forall|s: int, w: int| #[trigger] self.dma(s, w) == if s == seq && first <= w < first + wqes {
+            Some(view.leases)
+        } else {
+            pre.dma(s, w)
+        }
+        &&& forall|s: int| #[trigger] self.meta(s) == if s == seq {
+            Some(RequestMeta { first, end: (first + wqes) as u64, outcome })
+        } else {
+            pre.meta(s)
+        }
+    }
+
+    /// What is staged over a filled slot is staged over what was there before it was filled.
+    pub proof fn lemma_filled_staged(&self, filled: &Self, pre: &Self, wqes: u64, view: ReqView<L>, outcome: CompletionResult)
+        requires
+            self.just_staged(filled, wqes, view, outcome),
+            filled.same_but_free(pre),
+        ensures
+            self.just_staged(pre, wqes, view, outcome),
+    {
     }
 
     /// Everything of the invariant but that the next request's slot holds what [`Ring::fill`] put
@@ -1784,36 +1814,7 @@ impl<L> Ring<L> {
             signaled || !old(self).spec_must_signal(wqes),
         ensures
             seq == old(self).spec_posted(),
-            final(self).inv(),
-            final(self).spec_head() == old(self).spec_head(),
-            final(self).spec_retired() == old(self).spec_retired(),
-            final(self).spec_committed() == old(self).spec_committed(),
-            final(self).spec_posted() == seq + 1,
-            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
-            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
-            final(self).spec_wqe_posted() == old(self).spec_wqe_posted() + wqes,
-            final(self).spec_depth() == old(self).spec_depth(),
-            final(self).spec_max_wqes() == old(self).spec_max_wqes(),
-            final(self).woken() == old(self).woken(),
-            final(self).spec_detached_error() == old(self).spec_detached_error(),
-            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
-            forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
-            forall|s: int| #[trigger] final(self).staged(s) == if s == seq {
-                Some(old(self).filled_view())
-            } else {
-                old(self).staged(s)
-            },
-            forall|s: int, w: int| #[trigger] final(self).dma(s, w) == if s == seq
-                && old(self).spec_wqe_posted() <= w < old(self).filled_end() {
-                Some(old(self).filled_view().leases)
-            } else {
-                old(self).dma(s, w)
-            },
-            forall|s: int| #[trigger] final(self).meta(s) == if s == seq {
-                Some(old(self).filled_meta())
-            } else {
-                old(self).meta(s)
-            },
+            final(self).just_staged(old(self), wqes, old(self).filled_view(), old(self).filled_meta().outcome),
     {
         let seq = self.posted;
         let end_wqe = self.wqe_posted + wqes;
@@ -2018,6 +2019,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
             final(self).spec_depth() == old(self).spec_depth(),
             final(self).spec_max_wqes() == old(self).spec_max_wqes(),
+            final(self).spec_routed() == old(self).spec_routed(),
             final(self).same_dma(old(self)),
             final(self).same_meta(old(self)),
             final(self).spec_detached_error() == old(self).spec_detached_error(),
@@ -2141,6 +2143,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
             final(self).spec_depth() == old(self).spec_depth(),
             final(self).spec_max_wqes() == old(self).spec_max_wqes(),
+            final(self).spec_routed() == old(self).spec_routed(),
             final(self).keeps_dma(old(self)),
             forall|s: int| #[trigger] final(self).meta(s) ==
                 if old(self).staged(s) is Some { None } else { old(self).meta(s) },
@@ -2178,6 +2181,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
             final(self).spec_depth() == old(self).spec_depth(),
             final(self).spec_max_wqes() == old(self).spec_max_wqes(),
+            final(self).spec_routed() == old(self).spec_routed(),
             final(self).keeps_dma(old(self)),
             forall|s: int| #[trigger] final(self).meta(s) ==
                 if old(self).staged(s) is Some { None } else { old(self).meta(s) },
@@ -2225,6 +2229,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
             final(self).spec_depth() == old(self).spec_depth(),
             final(self).spec_max_wqes() == old(self).spec_max_wqes(),
+            final(self).spec_routed() == old(self).spec_routed(),
             final(self).spec_detached_error() is None ==> forall|s: int|
                 #[trigger] old(self).staged(s) is Some && s != keep ==> !old(self).staged(
                     s,
@@ -2269,6 +2274,7 @@ impl<L> Ring<L> {
             final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
             final(self).spec_depth() == old(self).spec_depth(),
             final(self).spec_max_wqes() == old(self).spec_max_wqes(),
+            final(self).spec_routed() == old(self).spec_routed(),
             final(self).spec_detached_error() is None ==> forall|s: int|
                 #[trigger] old(self).staged(s) is Some && s != keep ==> !old(self).staged(
                     s,
@@ -2286,6 +2292,7 @@ impl<L> Ring<L> {
             invariant
                 pre.inv(),
                 self.same_counters_but_woken(&pre),
+                self.routed == pre.routed,
                 wqe == pre.wqe_committed,
                 self.woken() == pre.woken() + pre.wakers(pre.committed as int, seq as int),
                 self.detached_error is None ==> forall|s: int|
@@ -2834,6 +2841,8 @@ impl<L> Ring<L> {
                     == self.retire_outcome(s, recv, wqe, wc),
             self.spec_retired() <= s < to && self.req(s) is Some && self.req(s)->0.detached
                 ==> self.completion_meta(s, recv, wqe, wc, to, spent) is None,
+            self.req(s) is None && to <= self.spec_committed()
+                ==> self.completion_meta(s, recv, wqe, wc, to, spent) == self.meta(s),
     {
         self.lemma_meta(s);
         self.lemma_view();
@@ -3256,6 +3265,8 @@ impl<L> Ring<L> {
     /// slot and whether it ends exactly there, so that the completion is spent. Otherwise WQE `wqe`
     /// lies inside it: an error is recorded on it, if it is its first, and this returns `None`.
     #[inline(always)]
+    #[verifier::spinoff_prover]
+    #[verifier::rlimit(30)]
     pub(crate) fn retire_next(&mut self, recv: bool, wqe: u64, wc: &Wc, wakes: &mut WakeBatch) -> (r: Option<bool>)
         requires
             old(self).inv(),
@@ -3421,6 +3432,7 @@ impl<L> Ring<L> {
         &&& self.spec_depth() == pre.spec_depth()
         &&& self.spec_max_wqes() == pre.spec_max_wqes()
         &&& pre.spec_wqe_retired() <= self.spec_wqe_retired() <= wqe + 1
+        &&& !spent ==> self.spec_wqe_retired() <= wqe
         &&& self.spec_routed() == if spent { wqe + 1 } else { pre.spec_routed() as int }
         &&& forall|s: int| #[trigger] self.req(s) is Some ==> self.req(s)
             == if pre.spec_retired() <= s < self.spec_retired() {
@@ -3449,6 +3461,7 @@ impl<L> Ring<L> {
         requires
             self.completed_with(pre, recv, wqe, wc, spent),
             pre.spec_wqe_retired() <= wqe < pre.spec_wqe_committed(),
+            !spent ==> self.spec_wqe_retired() <= wqe,
         ensures
             self.walked(pre, recv, wqe, wc, spent),
     {

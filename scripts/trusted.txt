@@ -12,8 +12,13 @@ crates/safeverbs-core/src/ring/wake.rs resume
 crates/safeverbs-core/src/ring.rs will_wake
 crates/safeverbs-core/src/ring.rs clone_waker
 
-# Writing a free slot with no drop glue, and so no landing pad, on the data path.
-crates/safeverbs-core/src/ring.rs forget_free
+# Standard-library functions vstd does not specify, for a free slot written with no drop glue,
+# and so no landing pad, on the data path, and for lists kept for reuse.
+crates/safeverbs-core/src/buf/lease.rs replace_value
+crates/safeverbs-core/src/buf/lease.rs forget_free
+crates/safeverbs-core/src/buf/lease.rs capacity_of
+crates/safeverbs-core/src/buf/lease.rs swap_in
+crates/safeverbs-core/src/hw/open.rs one_of
 
 # The exec types the verbs' contracts read: their definitions, as written.
 crates/safeverbs-core/src/trusted.rs ExSge
@@ -27,6 +32,7 @@ crates/safeverbs-core/src/trusted.rs ExBufError
 # Device and allocation payload types: opaque.
 crates/safeverbs-core/src/trusted.rs ExConnectAttr
 crates/safeverbs-core/src/trusted.rs ExEndpoint
+crates/safeverbs-core/src/trusted.rs ExContext
 crates/safeverbs-core/src/trusted.rs ExPd
 crates/safeverbs-core/src/buf/memory.rs ExRegion
 # A standard-library observation, not the deduplication algorithm itself.
@@ -57,6 +63,9 @@ crates/safeverbs-core/src/trusted.rs qp_lock_free
 crates/safeverbs-core/src/trusted.rs no_qp
 # PD identity and allocation/registration lifetime (the resource container is verified).
 crates/safeverbs-core/src/trusted.rs pd_id_of
+crates/safeverbs-core/src/trusted.rs same_device
+crates/safeverbs-core/src/trusted.rs clone_pd
+crates/safeverbs-core/src/trusted.rs pd_alive
 crates/safeverbs-core/src/trusted.rs registered
 crates/safeverbs-core/src/trusted.rs registered_all
 # The verbs of the data path, each with its contract from M; their bodies call the NIC.

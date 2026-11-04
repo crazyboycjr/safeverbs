@@ -253,7 +253,10 @@ pub(crate) fn forget_free<T>(free: T, Ghost(nothing): Ghost<bool>)
 /// `Vec::capacity`, which vstd does not specify.
 #[verifier::external_body]
 #[inline(always)]
-fn capacity_of<T>(v: &Vec<T>) -> usize {
+pub(crate) fn capacity_of<T>(v: &Vec<T>) -> (capacity: usize)
+    ensures
+        v@.len() <= capacity,
+{
     v.capacity()
 }
 
@@ -1760,6 +1763,20 @@ impl<N: Nic> Kept<N> {
         }
     }
 
+    /// The inputs the NIC writes are unique.
+    pub(crate) proof fn lemma_loans(self)
+        requires
+            self.inv(),
+        ensures
+            forall|i: int| 0 <= i < self.loans().len() && (#[trigger] self.loans()[i]).access == Some(Dir::In)
+                ==> self.loans()[i].part.spec_writable(),
+    {
+        assert forall|i: int| 0 <= i < self.loans().len() && (#[trigger] self.loans()[i]).access == Some(Dir::In)
+            implies self.loans()[i].part.spec_writable() by {
+            assert(loans_kept(self.loans(), self.keepers()));
+        }
+    }
+
     /// `frozen` is the frozen allocation of its last WQE.
     pub(crate) closed spec fn keeps_frozen(self, frozen: Frozen<N>) -> bool {
         self.last matches Some(last) && *last == frozen
@@ -1773,7 +1790,7 @@ impl<N: Nic> Kept<N> {
             old(self).inv(),
             old(self).keeps_frozen(**peek.frozen),
             peek.inv(),
-            peek.spec_bytes() <= u32::MAX,
+            peek.bytes <= u32::MAX,
         ensures
             final(self).inv(),
             final(self).loans() == old(self).loans().push(Loan { part: peek.part(pd), access: Some(Dir::Out) }),

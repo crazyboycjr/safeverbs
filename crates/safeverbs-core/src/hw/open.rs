@@ -63,7 +63,7 @@ pub struct OpenRequest<N: Device> {
 /// Whether a WQE doing `op` on `len` bytes needs nothing more of its QP than the length and the
 /// protection domain.
 #[inline(always)]
-fn plain_op(op: &WrOp, len: u64) -> (plain: bool)
+pub(super) fn plain_op(op: &WrOp, len: u64) -> (plain: bool)
     ensures
         plain ==> !opcode_model(*op).writes_local(),
 {
@@ -74,14 +74,43 @@ fn plain_op(op: &WrOp, len: u64) -> (plain: bool)
     }
 }
 
-/// A list of one scatter/gather element.
+/// `core::slice::from_ref`, which vstd does not specify.
 #[verifier::external_body]
 #[inline(always)]
-pub(super) fn one_sge(sge: &Sge) -> (sges: &[Sge])
+pub(super) fn one_of<T>(value: &T) -> (list: &[T])
     ensures
-        sges@ == seq![*sge],
+        list@ == seq![*value],
 {
-    core::slice::from_ref(sge)
+    core::slice::from_ref(value)
+}
+
+/// The WR of one element: what it names and its bytes.
+pub(super) proof fn lemma_one_wr(id: u64, signaled: bool, op: WrOp, sges: Seq<Sge>, sge: Sge)
+    requires
+        sges == seq![sge],
+    ensures
+        send_wr(id, signaled, op, sges).sges == seq![sge_model(sge)],
+        total_len(send_wr(id, signaled, op, sges).sges) == sge.length,
+{
+    let wr = send_wr(id, signaled, op, sges);
+    assert(wr.sges =~= seq![sge_model(sge)]);
+    assert(wr.sges.drop_last() =~= Seq::<safeverbs_spec::nic::Sge>::empty());
+    reveal_with_fuel(total_len, 2);
+}
+
+/// The scatter/gather list of `parts`, in their order.
+pub(super) open spec fn parts_sges<N: Device>(parts: Seq<Part<N>>) -> Seq<Sge> {
+    parts.map_values(|part: Part<N>| part_sge(part))
+}
+
+/// The list of one part.
+pub(super) proof fn lemma_parts_one<N: Device>(part: Part<N>)
+    ensures
+        parts_sges(seq![part]) == seq![part_sge(part)],
+        sges_len(parts_sges(seq![part])) == part_sge(part).length,
+{
+    assert(parts_sges(seq![part]) =~= seq![part_sge(part)]);
+    lemma_sges_len_one(part_sge(part));
 }
 
 /// The bytes of a list of one element.
@@ -89,9 +118,11 @@ pub(super) proof fn lemma_sges_len_one(sge: Sge)
     ensures
         sges_len(seq![sge]) == sge.length,
 {
-    let m = seq![sge].map_values(|s: Sge| sge_model(s));
+    let f = |sge: Sge| sge_model(sge);
+    let m = seq![sge].map_values(f);
     assert(m.drop_last() =~= Seq::<safeverbs_spec::nic::Sge>::empty());
     assert(m.last() == sge_model(sge));
+    reveal_with_fuel(total_len, 2);
 }
 
 /// What matched the inputs still does with more of them.
@@ -249,10 +280,7 @@ impl<N: Device> OpenRequest<N> {
 
     /// Whether it has no WQE.
     #[inline(always)]
-    pub fn is_empty(&self) -> (empty: bool)
-        ensures
-            empty == (self.n == 0),
-    {
+    pub fn is_empty(&self) -> (empty: bool) {
         self.n == 0
     }
 
@@ -286,14 +314,6 @@ impl<N: Device> OpenRequest<N> {
     #[inline(always)]
     pub fn has_room(&self) -> (room: bool) {
         self.n < self.limit
-    }
-
-    /// A WQE doing `op` went in: whether its QP has to be reliable.
-    #[inline(always)]
-    pub(super) fn note_op(&mut self, op: &WrOp) {
-        if !plain_op(op, 0) {
-            self.reads = true;
-        }
     }
 
     /// From now on every WQE goes to its QP.
@@ -360,7 +380,7 @@ impl<N: Device> OpenRequest<N> {
         // SAFETY: `i < n`, and `n` is at most the length of `wqes`.
         let wqe = unsafe { self.wqes.as_slice().get_unchecked(i) };
         if wqe.sges == 1 {
-            one_sge(&wqe.sge)
+            one_of(&wqe.sge)
         } else {
             let from = wqe.first_sge as usize;
             vstd::slice::slice_subrange(self.gathered.as_slice(), from, from + wqe.sges as usize)
@@ -431,6 +451,8 @@ impl<N: Device> OpenRequest<N> {
             final(self).limit == old(self).limit,
             final(self).pd_id == old(self).pd_id,
             final(self).max_len == old(self).max_len,
+            final(self).reads == old(self).reads,
+            final(self).max_sges == old(self).max_sges,
             final(self).gathered@ == old(self).gathered@,
             final(spare)@.len() == 0,
             leases.inv(),
@@ -448,7 +470,6 @@ impl<N: Device> OpenRequest<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
-            final(self).n == 0,
     {
         self.take_leases_with(&mut Vec::new(), Ghost(Seq::empty()))
     }
@@ -498,6 +519,240 @@ impl<N: Device> OpenRequest<N> {
         }
     }
 
+    /// The same, whatever fields of it the program can tell: what closing it keeps.
+    pub open(super) spec fn same_fields(&self, pre: &Self) -> bool {
+        &&& self.inv()
+        &&& self.pd_id == pre.pd_id
+        &&& self.max_len == pre.max_len
+        &&& self.reads == pre.reads
+        &&& self.max_sges == pre.max_sges
+        &&& self.wqes@.len() == pre.wqes@.len()
+    }
+
+    /// The WR of WQE `k`, whose number is `first + k`.
+    pub(super) open spec fn wr_of(&self, k: int, index: u16, first: u64, signaled: bool) -> SendWr {
+        send_wr(spec_wr_id(index, false, (first + k) as u64), signaled, self.wqes@[k].op, self.sges_at(k))
+    }
+
+    /// The WRs of its WQEs, numbered from `first`, the last signaled if `signaled`.
+    pub(super) open spec fn posted_wrs(&self, index: u16, first: u64, signaled: bool) -> Seq<SendWr> {
+        Seq::new(self.n as nat, |k: int| self.wr_of(k, index, first, signaled && k == self.n - 1))
+    }
+
+    /// Its ledger, its WQEs numbered from `first`.
+    pub(super) open spec fn posted_ledger(&self, index: u16, first: u64) -> Seq<WqeLoans> {
+        Seq::new(self.n as nat, |k: int| WqeLoans {
+            wr_id: spec_wr_id(index, false, (first + k) as u64),
+            ..self.ledger@[k]
+        })
+    }
+
+    /// What M asks of its WRs, once the regions of its inputs are registered and its QP takes it;
+    /// and its ledger, with their numbers, is one for the ring.
+    pub(super) proof fn lemma_posted(&self, index: u16, first: u64, signaled: bool, m: Nic::State, attr: QpAttr)
+        requires
+            self.inv(),
+            1 <= self.n,
+            forall|j: int| 0 <= j < self.kept.loans().len() ==> m.registered(
+                attr.pd,
+                sge_model(part_sge((#[trigger] self.kept.loans()[j]).part)),
+                part_writable(self.kept.loans()[j].part),
+            ),
+            self.max_len <= m.caps.max_msg,
+            self.max_sges <= attr.max_sge,
+            self.reads ==> attr.transport == Transport::Rc,
+            attr.transport == Transport::Rc || attr.transport == Transport::Uc,
+        ensures ({
+            let more = self.posted_wrs(index, first, signaled);
+            let wqes = self.posted_ledger(index, first);
+            let loans = self.kept.loans();
+            &&& more.len() == self.n
+            &&& wqes.len() == self.n
+            &&& forall|j: int| 0 <= j < more.len() ==> {
+                let wr = #[trigger] more[j];
+                &&& wr.wr_id == spec_wr_id(index, false, (first + j) as u64)
+                &&& m.send_wr_ok(attr, wr)
+                &&& !wr.inline
+            }
+            &&& more.last().opcode == opcode_model(self.wqes@[self.n - 1].op)
+            &&& total_len(more.last().sges) == sges_len(self.sges_at(self.n - 1))
+            &&& forall|i: int| 0 <= i < wqes.len() ==> (#[trigger] wqes[i]).matches(loans)
+            &&& forall|i: int, j: int| 0 <= i < j < wqes.len() ==> (#[trigger] wqes[i]).end() <= (#[trigger] wqes[j]).first
+            &&& covers_inputs(wqes, loans.len() as int)
+        }),
+    {
+        let more = self.posted_wrs(index, first, signaled);
+        let wqes = self.posted_ledger(index, first);
+        let loans = self.kept.loans();
+        self.kept.lemma_loans();
+        assert forall|j: int| 0 <= j < more.len() implies {
+            let wr = #[trigger] more[j];
+            &&& wr.wr_id == spec_wr_id(index, false, (first + j) as u64)
+            &&& m.send_wr_ok(attr, wr)
+            &&& !wr.inline
+        } by {
+            assert(self.wqe_ok(j));
+            let entry = self.ledger@[j];
+            let wr = more[j];
+            let list = self.sges_at(j);
+            let f = |sge: Sge| sge_model(sge);
+            assert(wr.sges =~= list.map_values(f));
+            assert(sges_len(list) == total_len(wr.sges));
+            assert(entry.sges == list);
+            assert(wr.opcode == opcode_model(self.wqes@[j].op));
+            assert forall|i: int| 0 <= i < wr.sges.len()
+                implies m.registered(attr.pd, #[trigger] wr.sges[i], wr.opcode.writes_local()) by {
+                let loan = loans[entry.end() - 1 - i];
+                assert(loan.part.spec_sge() == entry.sges[i]);
+                assert(wr.sges[i] == sge_model(list[i]));
+                assert(m.registered(attr.pd, sge_model(part_sge(loan.part)), part_writable(loan.part)));
+            }
+            assert(list.len() == self.wqes@[j].sges) by {
+                if self.wqes@[j].sges == 1 {
+                    assert(list =~= seq![self.wqes@[j].sge]);
+                }
+            }
+            assert(wr.sges.len() == list.len());
+        }
+        let last = self.n - 1;
+        assert(more.last() == more[last as int]);
+        let f = |sge: Sge| sge_model(sge);
+        assert(more[last as int].sges =~= self.sges_at(last as int).map_values(f));
+        assert forall|i: int| 0 <= i < wqes.len() implies (#[trigger] wqes[i]).matches(loans) by {
+            assert(self.wqe_ok(i));
+            assert(wqes[i].sges == self.ledger@[i].sges && wqes[i].first == self.ledger@[i].first
+                && wqes[i].opcode == self.ledger@[i].opcode);
+        }
+        assert forall|i: int, j: int| 0 <= i < j < wqes.len()
+            implies (#[trigger] wqes[i]).end() <= (#[trigger] wqes[j]).first by {
+            assert(self.ledger@[i].end() <= self.ledger@[j].first);
+        }
+        assert forall|i: int| 0 <= i < loans.len() implies #[trigger] crate::buf::input_is_covered(wqes, i) by {
+            assert(crate::buf::input_is_covered(self.ledger@, i));
+            let w = choose|w: int| 0 <= w < self.ledger@.len()
+                && (#[trigger] self.ledger@[w]).first <= i < self.ledger@[w].end();
+            assert(wqes[w].first == self.ledger@[w].first && wqes[w].sges == self.ledger@[w].sges);
+        }
+    }
+
+    /// Each of its WRs is in the ledger of `leases`, which recorded it.
+    pub(super) proof fn lemma_ledger_of_posted(&self, leases: Leases<N>, index: u16, first: u64, signaled: bool)
+        requires
+            self.inv(),
+            leases.wqes() == self.posted_ledger(index, first),
+        ensures ({
+            let more = self.posted_wrs(index, first, signaled);
+            forall|j: int| 0 <= j < more.len() ==> ledger_has(
+                leases,
+                (#[trigger] more[j]).wr_id,
+                Some(more[j].opcode),
+                more[j].sges,
+            )
+        }),
+    {
+        let more = self.posted_wrs(index, first, signaled);
+        assert forall|j: int| 0 <= j < more.len() implies ledger_has(
+            leases,
+            (#[trigger] more[j]).wr_id,
+            Some(more[j].opcode),
+            more[j].sges,
+        ) by {
+            assert(self.wqe_ok(j));
+            lemma_ledger_wr(leases, j, more[j].wr_id, signaled && j == self.n - 1, self.wqes@[j].op, self.sges_at(j));
+        }
+    }
+
+    /// Its list of elements may be another as long as none of its WQEs has it.
+    pub(super) proof fn lemma_gathered_swapped(&self, pre: &Self)
+        requires
+            pre.inv(),
+            self.gathered@ == pre.gathered@ || pre.gathered@.len() == 0,
+            *self == (OpenRequest { gathered: self.gathered, ..*pre }),
+        ensures
+            self.inv(),
+    {
+        assert forall|k: int| 0 <= k < self.n implies #[trigger] self.wqe_ok(k) by {
+            assert(pre.wqe_ok(k));
+            if self.wqes@[k].sges != 1 {
+                assert(self.gathered@ == pre.gathered@);
+            }
+            assert(self.sges_at(k) == pre.sges_at(k));
+        }
+    }
+
+    /// A WQE of several elements in: its list at the end of `gathered`, its inputs at the end of
+    /// its loans, the last element first.
+    pub(super) proof fn lemma_gathered_more(&self, pre: &Self, built: Seq<Part<N>>, access: safeverbs_spec::abs::Dir, entry: WqeLoans, base: Seq<Sge>)
+        requires
+            pre.inv(),
+            self.n == pre.n + 1,
+            self.n <= self.wqes@.len(),
+            self.limit == pre.limit,
+            self.wqes@ == pre.wqes@.update(pre.n as int, self.wqes@[pre.n as int]),
+            1 <= built.len() <= MAX_SGES,
+            base == pre.gathered@,
+            self.wqes@[pre.n as int].sges == built.len(),
+            self.wqes@[pre.n as int].first_sge == base.len(),
+            self.wqes@[pre.n as int].sge == part_sge(built[0]),
+            self.gathered@.len() == base.len() + built.len(),
+            forall|k: int| 0 <= k < base.len() ==> #[trigger] self.gathered@[k] == base[k],
+            forall|k: int| 0 <= k < built.len() ==> #[trigger] self.gathered@[base.len() + k] == part_sge(built[k]),
+            base.len() + built.len() <= u32::MAX,
+            entry.opcode == Some(opcode_model(self.wqes@[pre.n as int].op)),
+            entry.sges == parts_sges(built),
+            entry.first == pre.kept.loans().len(),
+            self.kept.inv(),
+            self.kept.loans().len() == pre.kept.loans().len() + built.len(),
+            forall|j: int| 0 <= j < pre.kept.loans().len() ==> #[trigger] self.kept.loans()[j] == pre.kept.loans()[j],
+            forall|j: int| 0 <= j < built.len() ==> #[trigger] self.kept.loans()[pre.kept.loans().len() + (built.len() - 1 - j)]
+                == (Loan { part: built[j], access: Some(access) }),
+            access == entry.access(),
+            self.ledger@ == pre.ledger@.push(entry),
+            sges_len(parts_sges(built)) <= pre.max_len,
+            forall|j: int| 0 <= j < built.len() ==> part_pd(#[trigger] built[j]) == pre.pd_id,
+            self.max_len == pre.max_len,
+            self.pd_id == pre.pd_id,
+            pre.reads ==> self.reads,
+            opcode_model(self.wqes@[pre.n as int].op).writes_local() ==> self.reads,
+            pre.max_sges <= self.max_sges,
+            built.len() <= self.max_sges,
+        ensures
+            self.inv(),
+    {
+        let k = pre.n as int;
+        let w = self.wqes@[k];
+        let list = parts_sges(built);
+        if w.sges == 1 {
+            assert(list =~= seq![w.sge]);
+        } else {
+            let sub = self.gathered@.subrange(w.first_sge as int, w.first_sge as int + w.sges as int);
+            assert forall|j: int| 0 <= j < list.len() implies sub[j] == list[j] by {
+                assert(self.gathered@[base.len() + j] == part_sge(built[j]));
+            }
+            assert(sub =~= list);
+        }
+        assert(self.sges_at(k) == entry.sges);
+        assert(self.ledger@[k] == entry);
+        assert(entry.end() == self.kept.loans().len());
+        assert forall|j: int| 0 <= j < entry.sges.len() implies {
+            let loan = #[trigger] self.kept.loans()[entry.end() - 1 - j];
+            &&& loan.part.spec_sge() == entry.sges[j]
+            &&& loan.access == Some(entry.access())
+        } by {
+            assert(self.kept.loans()[pre.kept.loans().len() + (built.len() - 1 - j)]
+                == (Loan { part: built[j], access: Some(access) }));
+        }
+        assert(self.wqe_ok(k));
+        assert forall|j: int| 0 <= j < pre.n implies #[trigger] self.wqes@[j] == pre.wqes@[j] by {}
+        assert forall|i: int| pre.kept.loans().len() <= i < self.kept.loans().len()
+            implies (#[trigger] self.kept.loans()[i]).part.spec_pd() == self.pd_id by {
+            let j = built.len() - 1 - (i - pre.kept.loans().len());
+            assert(self.kept.loans()[pre.kept.loans().len() + (built.len() - 1 - j)]
+                == (Loan { part: built[j], access: Some(access) }));
+        }
+        self.lemma_added(pre);
+    }
+
     /// Keeping nothing new leaves what is said of its WQEs as it was.
     proof fn lemma_kept_same(&self, pre: &Self)
         requires
@@ -522,7 +777,7 @@ impl<N: Device> OpenRequest<N> {
     }
 
     /// A WQE of one element, whose part is the input it just got, keeps the invariant.
-    proof fn lemma_one_more(&self, pre: &Self, part: Part<N>, access: safeverbs_spec::abs::Dir, entry: WqeLoans)
+    pub(super) proof fn lemma_one_more(&self, pre: &Self, part: Part<N>, access: safeverbs_spec::abs::Dir, entry: WqeLoans)
         requires
             pre.inv(),
             self.n == pre.n + 1,
@@ -543,7 +798,7 @@ impl<N: Device> OpenRequest<N> {
             part_pd(part) == pre.pd_id,
             self.max_len == pre.max_len,
             self.pd_id == pre.pd_id,
-            self.reads == pre.reads,
+            pre.reads ==> self.reads,
             self.max_sges == pre.max_sges,
             opcode_model(self.wqes@[pre.n as int].op).writes_local() ==> self.reads,
         ensures
@@ -580,7 +835,7 @@ impl<N: Device> OpenRequest<N> {
     #[inline(always)]
     fn takes_peek(&self, peek: &Peek<'_, N>) -> (takes: bool)
         ensures
-            takes ==> self.n < self.limit && peek.spec_bytes() <= self.max_len
+            takes ==> self.n < self.limit && peek.bytes <= self.max_len
                 && self.kept.keeps_frozen(**peek.frozen),
     {
         self.n < self.limit && peek.bytes <= self.max_len as usize && self.kept.keeps_peek(peek)

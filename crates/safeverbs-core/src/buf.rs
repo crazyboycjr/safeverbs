@@ -45,7 +45,7 @@ mod lease;
 pub(crate) use lease::Loan;
 #[allow(unused_imports)] // Erased WQE provenance used by the verified engine.
 pub(crate) use lease::WqeLoans;
-pub(crate) use lease::{Kept, Lease, forget_free, replace_value};
+pub(crate) use lease::{Kept, Lease, capacity_of, forget_free, replace_value};
 pub use lease::{Leases, Part, Peek};
 #[cfg(verus_keep_ghost)]
 pub(crate) use lease::{covers_inputs, input_is_covered};

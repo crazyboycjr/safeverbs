@@ -134,6 +134,7 @@ pub(super) proof fn lemma_recv_routed<L>(
             assert(recv_result(pre, m, q, s));
             assert(pre.meta(s)->0.first == wqe);
             let o = crate::wc::result_model(pre.retire_outcome(s, true, wqe, wc));
+            wc.lemma_outcome_ok();
             if wc.spec_ok() {
                 wc.lemma_received();
             } else {
@@ -247,6 +248,17 @@ impl<C, N: Device> Hw<C, N> {
         e.recv.lemma_meta(seq as int);
         self.lemma_recv_result(index, seq);
         lemma_recv_reports(c.result, self.nic().retired[self.recv_wqe(index, seq)->0], e.recv.meta(seq as int)->0.outcome);
+    }
+
+    /// What [`Hw::take`] hands out of a receive, the event loop may hand out.
+    pub(super) proof fn lemma_recv_hands_out(&self, c: Completion<C, N>)
+        requires
+            c.queue is Recv,
+            c.leases.inv() && c.leases.fully_recorded(),
+            self.recv_taken_matches(c.qp, c.seq, c),
+        ensures
+            self.hands_out(c),
+    {
     }
 
     /// What the ring handed back of a receive holds a context: a receive with an owner does.

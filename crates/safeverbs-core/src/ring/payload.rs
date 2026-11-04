@@ -128,6 +128,45 @@ impl<L> Ring<L> {
 }
 
 impl<C, N: Nic> Ring<Payload<C, N>> {
+    /// What giving up request `seq` leaves of `pre`.
+    pub open spec fn gave_up(&self, pre: &Self, seq: int) -> bool {
+        &&& forall|s: int| #[trigger] self.req(s) == if s == seq && pre.req(s) is Some {
+            if pre.req(s)->0.phase is Complete {
+                None
+            } else {
+                Some(ReqView { leases: pre.req(s)->0.leases.without_ctx(), ..pre.req(s)->0.detach() })
+            }
+        } else {
+            pre.req(s)
+        }
+        &&& forall|s: int| #[trigger] self.staged(s) == if s == seq && pre.staged(s) is Some {
+            Some(ReqView { leases: pre.staged(s)->0.leases.without_ctx(), ..pre.staged(s)->0.detach() })
+        } else {
+            pre.staged(s)
+        }
+        &&& forall|s: int| #[trigger] self.refused(s) == if s == seq {
+            None
+        } else {
+            pre.refused(s)
+        }
+        &&& self.woken() == pre.woken()
+        &&& self.same_wqes(pre)
+        &&& self.spec_retired() == pre.spec_retired()
+        &&& self.spec_committed() == pre.spec_committed()
+        &&& self.spec_posted() == pre.spec_posted()
+        &&& forall|s: int, w: int| #[trigger] self.dma(s, w) == if s == seq && pre.dma(s, w) is Some {
+            Some(pre.dma(s, w)->0.without_ctx())
+        } else {
+            pre.dma(s, w)
+        }
+        &&& forall|s: int| #[trigger] self.meta(s) == if s == seq && pre.req(s) is Some && pre.req(s)->0.phase is Complete {
+            None
+        } else {
+            pre.meta(s)
+        }
+        &&& self.spec_detached_error() == pre.spec_detached_error()
+    }
+
     /// Gives up ownership of request `seq`, as [`Ring::detach`] does, and hands
     /// back its context, if it has one.
     pub fn give_up(&mut self, seq: Seq) -> (given_up: (Option<C>, Option<Waker>))
@@ -138,41 +177,7 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
             old(self).req(seq as int) matches Some(r) ==> given_up.0 == r.leases.ctx,
             old(self).staged(seq as int) matches Some(r) ==> given_up.0 == r.leases.ctx,
             old(self).refused(seq as int) matches Some(p) ==> given_up.0 == p.ctx,
-            forall|s: int| #[trigger] final(self).req(s) == if s == seq && old(self).req(s) is Some {
-                if old(self).req(s)->0.phase is Complete {
-                    None
-                } else {
-                    Some(ReqView { leases: old(self).req(s)->0.leases.without_ctx(), ..old(self).req(s)->0.detach() })
-                }
-            } else {
-                old(self).req(s)
-            },
-            forall|s: int| #[trigger] final(self).staged(s) == if s == seq && old(self).staged(s) is Some {
-                Some(ReqView { leases: old(self).staged(s)->0.leases.without_ctx(), ..old(self).staged(s)->0.detach() })
-            } else {
-                old(self).staged(s)
-            },
-            forall|s: int| #[trigger] final(self).refused(s) == if s == seq {
-                None
-            } else {
-                old(self).refused(s)
-            },
-            final(self).woken() == old(self).woken(),
-            final(self).same_wqes(old(self)),
-            final(self).spec_retired() == old(self).spec_retired(),
-            final(self).spec_committed() == old(self).spec_committed(),
-            final(self).spec_posted() == old(self).spec_posted(),
-            forall|s: int, w: int| #[trigger] final(self).dma(s, w) == if s == seq && old(self).dma(s, w) is Some {
-                Some(old(self).dma(s, w)->0.without_ctx())
-            } else {
-                old(self).dma(s, w)
-            },
-            forall|s: int| #[trigger] final(self).meta(s) == if s == seq && old(self).req(s) is Some && old(self).req(s)->0.phase is Complete {
-                None
-            } else {
-                old(self).meta(s)
-            },
-            final(self).spec_detached_error() == old(self).spec_detached_error(),
+            final(self).gave_up(old(self), seq as int),
     {
         proof {
             self.lemma_state_views(seq as int);

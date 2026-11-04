@@ -687,10 +687,34 @@ pub fn part_writable_of<N: Device>(part: &Part<N>) -> (writable: bool)
     part.is_writable()
 }
 
-/// A protection domain exists in M as long as a handle to it does. Learning it moves the token's
-/// view to the present, since the domain may be newer than what the engine last saw.
+/// Whether a protection domain is of the device of `ctx`, the one M of an engine's token models.
+pub uninterp spec fn pd_of_device<N: Device>(ctx: Context<N>, pd: Pd<N>) -> bool;
+
+/// [`pd_of_device`].
 #[verifier::external_body]
-pub fn pd_alive<N: Device>(_pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
+pub fn same_device<N: Device>(ctx: &Context<N>, pd: &Pd<N>) -> (same: bool)
+    ensures
+        same == pd_of_device(*ctx, *pd),
+{
+    ctx.same_device(pd.context())
+}
+
+/// A handle to the same protection domain.
+#[verifier::external_body]
+pub fn clone_pd<N: Device>(pd: &Pd<N>) -> (clone: Pd<N>)
+    ensures
+        pd_of(clone) == pd_of(*pd),
+        pd_id(clone) == pd_id(*pd),
+{
+    pd.clone()
+}
+
+/// A protection domain of the device exists in M as long as a handle to it does. Learning it moves
+/// the token's view to the present, since the domain may be newer than what the engine last saw.
+#[verifier::external_body]
+pub fn pd_alive<N: Device>(_ctx: &Context<N>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
+    requires
+        pd_of_device(*_ctx, *_pd),
     ensures
         final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),

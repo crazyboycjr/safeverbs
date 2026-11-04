@@ -89,6 +89,19 @@ pub(super) proof fn lemma_implied_added<L>(
 {
 }
 
+/// WQE `n` of the send queue of QP `q` succeeded, as M retired it.
+pub(super) open spec fn send_succeeded(retired: IMap<WqeRef, Outcome>, q: QpId, n: nat) -> bool {
+    let w = WqeRef { qp: q, queue: Queue::Send, seq: n };
+    retired.contains_key(w) && retired[w].status is Success
+}
+
+/// WQE `n` of the send queue of QP `q`, which `qp` held, M retired with an outcome its WR allows.
+pub(super) open spec fn popped_ok(qp: Qp, retired: IMap<WqeRef, Outcome>, q: QpId, n: nat) -> bool {
+    let w = WqeRef { qp: q, queue: Queue::Send, seq: n };
+    let wr = qp.sq[n - qp.sq_head].wr;
+    retired.contains_key(w) && wr.opcode.allows_outcome(total_len(wr.sges), retired[w])
+}
+
 /// Advancing M's head or removing native results preserves every surviving tail.
 pub(super) proof fn lemma_bound_kept<L>(
     pre: Ring<L>, post: Ring<L>, tails: Map<int, SendWr>,
@@ -97,6 +110,7 @@ pub(super) proof fn lemma_bound_kept<L>(
 )
     requires tail_bound(pre, tails, qp, written, retired, q),
         post.spec_wqe_committed() == pre.spec_wqe_committed(),
+        qp.sq_head + qp.sq.len() == pre.spec_wqe_committed(),
         next.sq_head >= qp.sq_head,
         forall|j: int| 0 <= j < next.sq.len() ==> next.sq_head + j < qp.sq_head + qp.sq.len()
             && (#[trigger] next.sq[j]).wr == qp.sq[next.sq_head + j - qp.sq_head].wr,
@@ -107,11 +121,7 @@ pub(super) proof fn lemma_bound_kept<L>(
         forall|w: WqeRef| w.qp == q && w.queue is Send && w.seq < qp.sq_head
             && #[trigger] retired.contains_key(w)
             ==> after.contains_key(w) && after[w] == retired[w],
-        forall|n: nat| qp.sq_head <= n < next.sq_head ==> {
-            let w = WqeRef { qp: q, queue: Queue::Send, seq: n };
-            &&& #[trigger] after.contains_key(w)
-            &&& qp.sq[n - qp.sq_head].wr.opcode.allows_outcome(total_len(qp.sq[n - qp.sq_head].wr.sges), after[w])
-        },
+        forall|n: nat| qp.sq_head <= n < next.sq_head ==> #[trigger] popped_ok(qp, after, q, n),
     ensures tail_bound(post, tails, next, written, after, q),
 {
     assert forall|s: int| #[trigger] post.meta(s) is Some implies {
@@ -145,6 +155,7 @@ pub(super) proof fn lemma_bound_kept<L>(
             if last < qp.sq_head {
                 assert(retired.contains_key(w));
             } else {
+                assert(popped_ok(qp, after, q, last as nat));
                 assert(qp.sq_head <= last as nat);
                 assert(qp.sq_head <= last < pre.spec_wqe_committed()) by {
                     assert(qp.sq_head + qp.sq.len() >= next.sq_head);
@@ -287,8 +298,8 @@ pub(super) open spec fn is_first_error(
 ) -> bool {
     error matches CompletionError::Failed { position, .. }
         && range.first + position < cut
-        && range.first_error(retired, range.first + position)
-        && retired[range.at(range.first + position)] == crate::wc::result_model(Err(error))
+        && range.first_error(retired, (range.first + position) as nat)
+        && retired[range.at((range.first + position) as nat)] == crate::wc::result_model(Err(error))
 }
 
 /// `outcome` is what a request whose WQEs before `cut` M retired says of them: the first error
@@ -367,7 +378,7 @@ proof fn lemma_prefix_same(
 {
     if let Err(error) = outcome {
         if let CompletionError::Failed { position, .. } = error {
-            let s = range.first + position;
+            let s = (range.first + position) as nat;
             assert(after[range.at(s)] == before[range.at(s)]);
             assert forall|j: nat| range.first <= j < s implies (#[trigger] after[range.at(j)]).status is Success by {
                 assert(after[range.at(j)] == before[range.at(j)]);
@@ -441,7 +452,7 @@ pub(super) proof fn lemma_prefix_aggregate(range: WqeRange, retired: IMap<WqeRef
     match outcome {
         Err(error) => {
             if let CompletionError::Failed { position, .. } = error {
-                lemma_aggregate_first_error(range, retired, range.first + position);
+                lemma_aggregate_first_error(range, retired, (range.first + position) as nat);
             }
         },
         Ok(_) => {
@@ -633,11 +644,7 @@ pub(super) proof fn lemma_request_retired<L>(
         send_implied(pre, tails),
         tail_bound(pre, tails, m.qps[q], written, m.retired, q),
         pre.spec_routed() <= wqe < m.qps[q].sq_head,
-        forall|n: nat| pre.spec_routed() <= n < wqe ==> {
-            let w = WqeRef { qp: q, queue: Queue::Send, seq: n };
-            &&& #[trigger] m.retired.contains_key(w)
-            &&& m.retired[w].status is Success
-        },
+        forall|n: nat| pre.spec_routed() <= n < wqe ==> #[trigger] send_succeeded(m.retired, q, n),
         m.retired.contains_key(WqeRef { qp: q, queue: Queue::Send, seq: wqe as nat }),
         m.retired[WqeRef { qp: q, queue: Queue::Send, seq: wqe as nat }] == wc.outcome(),
     ensures
@@ -666,7 +673,7 @@ pub(super) proof fn lemma_request_retired<L>(
         assert(routed <= n < wqe);
         let w = WqeRef { qp: q, queue: Queue::Send, seq: n };
         assert(range.at(n) == w);
-        assert(m.retired.contains_key(w));
+        assert(send_succeeded(m.retired, q, n));
     }
     let last_at = (end - 1) as nat;
     assert(range.at(last_at) == range.last());
@@ -674,6 +681,7 @@ pub(super) proof fn lemma_request_retired<L>(
         assert(range.last() == (WqeRef { qp: q, queue: Queue::Send, seq: wqe as nat }));
     } else {
         assert(routed <= last_at < wqe);
+        assert(send_succeeded(m.retired, q, last_at));
         assert(m.retired.contains_key(range.last()));
         assert(m.retired[range.last()].status is Success);
     }
@@ -724,11 +732,7 @@ pub(super) proof fn lemma_results_routed<L>(
         tail_bound(pre, tails, m.qps[q], written, m.retired, q),
         pre.spec_wqe_retired() <= wqe,
         pre.spec_routed() <= wqe < m.qps[q].sq_head,
-        forall|n: nat| pre.spec_routed() <= n < wqe ==> {
-            let w = WqeRef { qp: q, queue: Queue::Send, seq: n };
-            &&& #[trigger] m.retired.contains_key(w)
-            &&& m.retired[w].status is Success
-        },
+        forall|n: nat| pre.spec_routed() <= n < wqe ==> #[trigger] send_succeeded(m.retired, q, n),
         m.retired.contains_key(WqeRef { qp: q, queue: Queue::Send, seq: wqe as nat }),
         m.retired[WqeRef { qp: q, queue: Queue::Send, seq: wqe as nat }] == wc.outcome(),
         post.walked(&pre, false, wqe, wc, spent),
@@ -773,7 +777,7 @@ pub(super) proof fn lemma_results_routed<L>(
                         let w = WqeRef { qp: q, queue: Queue::Send, seq: n };
                         assert(range.at(n) == w);
                         assert(routed <= n < wqe);
-                        assert(m.retired.contains_key(w));
+                        assert(send_succeeded(m.retired, q, n));
                     }
                     assert(range.at(wqe as nat) == (WqeRef { qp: q, queue: Queue::Send, seq: wqe as nat }));
                     match meta.outcome {
@@ -789,6 +793,7 @@ pub(super) proof fn lemma_results_routed<L>(
                             }
                         },
                     }
+                    post.lemma_pending_cache_observation(pre, wqe, wc, s);
                     assert(post.meta(s)->0.outcome == if meta.outcome is Ok && !wc.spec_ok() {
                         Err(wc.spec_failure((wqe - meta.first) as u32))
                     } else {
@@ -831,8 +836,8 @@ pub open spec fn send_reports_outcome(
             Err(CompletionError::Failed { status, position, .. }) => {
                 &&& o.status.is_err()
                 &&& o.status == status.model()
-                &&& range.first_error(retired, range.first + position)
-                &&& retired[range.at(range.first + position)] == o
+                &&& range.first_error(retired, (range.first + position) as nat)
+                &&& retired[range.at((range.first + position) as nat)] == o
             },
             Err(CompletionError::Refused) => false,
         }
@@ -840,7 +845,7 @@ pub open spec fn send_reports_outcome(
 }
 
 /// What a complete request says, by the invariant, is what [`send_reports_outcome`] says.
-proof fn lemma_reports(
+pub(super) proof fn lemma_reports(
     range: WqeRange, retired: IMap<WqeRef, Outcome>, last: SendWr, outcome: CompletionResult,
 )
     requires
@@ -917,6 +922,17 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
+    /// What [`Hw::take`] hands out of a send request, the event loop may hand out.
+    pub(super) proof fn lemma_send_hands_out(&self, c: Completion<C, N>)
+        requires
+            c.queue is Send,
+            c.leases.inv() && c.leases.fully_recorded(),
+            self.send_taken_matches(c.qp, c.seq, c),
+        ensures
+            self.hands_out(c),
+    {
+    }
+
     /// What the ring handed back of a send request holds a context, if it is not a refused one.
     pub(super) proof fn lemma_send_taken(&self, index: usize, seq: RingSeq, t: Taken<Payload<C, N>>)
         requires
@@ -953,8 +969,8 @@ impl<C, N: Device> Hw<C, N> {
                 CompletionError::Failed { status, position, .. } => {
                     &&& range.wf() && range.all_retired(retired)
                     &&& o.status.is_err() && o.status == status.model()
-                    &&& range.first_error(retired, range.first + position)
-                    &&& retired[range.at(range.first + position)] == o
+                    &&& range.first_error(retired, (range.first + position) as nat)
+                    &&& retired[range.at((range.first + position) as nat)] == o
                 },
             }
         }
