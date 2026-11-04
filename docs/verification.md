@@ -161,9 +161,11 @@ means the NIC never saw the request.
   beyond what the ring keeps: the first one to retire with an error since the last take.
 - *Against A.* A request completes in A when M pops its last WQE, with M's aggregate of its WQEs,
   which is what its ring then reports. The ring hears of it later, when the CQE is routed, which
-  is no step of A (`seen`). Under Theorem 1, `corollary_f1` and `corollary_f1_refused` apply to the
-  engine's states: distinct requests own disjoint WQE intervals for good, those complete or taken
-  too (`ranges_ok`), and no WQE of a request succeeds after one that failed.
+  is no step of A (`seen`). What the event loop hands out of a request the NIC saw is what A says
+  of it: A has it complete, and the result reports that outcome (`lemma_hands_out_in_a`). Under
+  Theorem 1, `corollary_f1` and `corollary_f1_refused` apply to the engine's states: distinct
+  requests own disjoint WQE intervals for good, those complete or taken too (`ranges_ok`), and no
+  WQE of a request succeeds after one that failed.
 
 **R1, the library never loses track of a buffer.** Every lease is in exactly one place at every
 moment, moves only along the allowed transitions, and is released once, after the NIC is done.
@@ -377,7 +379,7 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 163 verified, 0 errors
-safeverbs-core: verification results:: 657 verified, 0 errors
+safeverbs-core: verification results:: 658 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

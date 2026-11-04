@@ -2975,6 +2975,59 @@ impl<C, N: Device> Hw<C, N> {
         lemma_linked_taken(pre.qps@, self.qps@, m, pre.refined@, index, queue, seq, taken)
     }
 
+    /// What the event loop hands out of a request the NIC saw is what A says of that request: A has
+    /// it complete, and its result reports that outcome.
+    pub(super) proof fn lemma_hands_out_in_a(&self, c: Completion<C, N>)
+        requires
+            self.inv(),
+            self.hands_out(c),
+            !(c.result matches Err(CompletionError::Refused)),
+        ensures ({
+            let g = self.refinement();
+            let r = g.reqs[key(c.qp as int, completion::queue_of(c.queue), c.seq as int)];
+            let o = g.ranges[r].aggregate(self.nic().retired);
+            &&& g.abs.requests.contains_key(r)
+            &&& g.abs.requests[r].phase == safeverbs_spec::abs::Phase::Complete(o)
+            &&& g.abs.outcomes.contains_key(r)
+            &&& g.abs.outcomes[r] == o
+            &&& match c.result {
+                Ok(done) => done.model() == o,
+                Err(CompletionError::Failed { status, .. }) => o.status == status.model(),
+                Err(CompletionError::Refused) => false,
+            }
+        }),
+    {
+        let g = self.refined@;
+        let m = self.nic();
+        let i = c.qp as int;
+        let s = c.seq as int;
+        let queue = completion::queue_of(c.queue);
+        let qps = self.qps@;
+        let e = qps[i]->0;
+        let r = ring_of(e, queue);
+        let k = key(i, queue, s);
+        let v = table_view(qps, m);
+        let range = range_of(e.id(), queue, r.meta(s)->0);
+        lemma_key_fields(i, queue, s);
+        lemma_table_at(qps, m, i, queue, s);
+        assert(qp_ok(qps[i], i, self.token@, m));
+        assert(queue == Queue::Send || queue == Queue::Recv);
+        assert(r.req(s) is Some);
+        assert(ring_resources_ok(r));
+        assert(payload_ok(r.req(s)->0.leases, r.req(s)->0.detached));
+        assert(table_req(qps, m, k) is Some);
+        assert(g.ranges.contains_key(g.reqs[k]) && g.ranges[g.reqs[k]] == key_range(qps, k));
+        assert(key_range(qps, k) == range);
+        assert(range.wf() && (range.queue is Recv ==> range.end == range.first + 1));
+        // Its last WQE retired: M popped it.
+        let last = range.at((range.end - 1) as nat);
+        assert(m.retired.contains_key(last));
+        assert(m.qps.contains_key(e.id()));
+        assert(last.seq < head_of(m.qps[last.qp], last.queue));
+        assert(popped(m, range));
+        assert(sits(v, g.abs, lent_qp(), g.reqs, lent_holds(), k));
+    }
+
     /// The leases of a request about to be written on table `qps`, M at `m`, A at `g`: what `self`
     /// promised is still the program's.
     pub(super) proof fn lemma_name_request(&self, qps: Seq<Option<HwQp<C, N>>>, m: Nic::State, g: Refinement, leases: Leases<N>) -> (r: (Refinement, Holds))
@@ -3525,7 +3578,14 @@ fn example_run<C, N: Device>(ctx: Context<N>, pd: &Pd<N>, caps: QpCaps, part: Pa
     let ghost h4 = hw;
     let _ = hw.progress();
     let ghost h5 = hw;
+    let handed_out = hw.next_completion();
     proof {
+        // What the program gets is what A says of its request.
+        if let Some(c) = handed_out {
+            if !(c.result matches Err(CompletionError::Refused)) {
+                h5.lemma_hands_out_in_a(c);
+            }
+        }
         if h1.outside_ok() && h2.outside_ok() && h3.outside_ok() && h4.outside_ok() && h5.outside_ok() {
             let run = seq![
                 EngineState::<C, N>::Start { nic: m0 },
