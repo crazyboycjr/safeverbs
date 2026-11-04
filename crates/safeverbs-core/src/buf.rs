@@ -38,12 +38,10 @@ use crate::pd::Pd;
 use crate::trusted::{clone_pd, pd_id_of, register_region};
 use crate::verbs::Verbs;
 
-mod range;
-use range::ByteRange;
 mod memory;
 mod permissions;
+mod range;
 mod view;
-use memory::OwnedRange;
 pub(crate) use memory::{Frozen, RawMut};
 pub use view::{Buf, BufView};
 mod lease;
@@ -97,11 +95,9 @@ impl<N: Nic> Region<N> {
 
     /// Allocates `size` zeroed bytes aligned to `align` and registers them in `pd` for local writes,
     /// or frees them.
-    fn allocated(pd: &Pd<N>, size: usize, align: usize) -> (r: Result<(Arc<Region<N>>, OwnedRange)>)
+    fn allocated(pd: &Pd<N>, size: usize, align: usize) -> (r: Result<RawMut<N>>)
         ensures
-            r matches Ok((region, range)) ==> region.inv() && range.inv()
-                && range.base() == region.ptr
-                && range.geometry().spec_len() == size,
+            r matches Ok(whole) ==> (*whole.region).inv(),
     {
         let (address, range, deallocation) = match memory::allocate(size, align) {
             Some(allocation) => allocation,
@@ -121,7 +117,7 @@ impl<N: Nic> Region<N> {
                     pd: ManuallyDrop::new(clone_pd(pd)),
                     deallocation: Tracked(Some(deallocation)),
                 };
-                Ok((Arc::new(region), range))
+                Ok(RawMut::new(Arc::new(region), range))
             },
             Err(e) => {
                 memory::release_failed_allocation(address, size, align, range, deallocation);
@@ -142,8 +138,9 @@ impl<N: Nic> Region<N> {
 }
 
 /// **The permissions split from a region are its own again when it goes.** Each one lives in a
-/// [`RawMut`], which holds an `Arc` of the region: `Region::drop` runs when the last `Arc` goes, so
-/// when none of them is left. Each is gone with its holder, so its bytes are nobody's.
+/// [`RawMut`], which holds an `Arc` of the region its range belongs to: `Region::drop` runs when the
+/// last `Arc` goes, so when none of them is left. Each is gone with its holder, so its bytes are
+/// nobody's.
 #[verifier::external_body]
 fn bytes_back<N: Nic>(_region: &Region<N>) -> (raw: Tracked<PointsToRaw>)
     ensures
@@ -165,7 +162,7 @@ unsafe impl<N: Nic> Sync for Region<N> {}
 impl<N: Nic> Region<N> {
     /// Allocates `bytes` zeroed bytes aligned to `align` (at least a cache
     /// line) and registers them in `pd` for local writes.
-    fn new(pd: &Pd<N>, bytes: usize, align: usize) -> Result<(Arc<Region<N>>, OwnedRange)> {
+    fn whole(pd: &Pd<N>, bytes: usize, align: usize) -> Result<RawMut<N>> {
         if bytes == 0 {
             return Err(Error::Invalid("an empty buffer"));
         }
@@ -473,16 +470,16 @@ impl<N: Nic> Pd<N> {
         let bytes = n
             .checked_mul(size_of::<T>())
             .ok_or(Error::Invalid("buffer size"))?;
-        let (region, range) = Region::new(self, bytes, align_of::<T>())?;
+        let whole = Region::whole(self, bytes, align_of::<T>())?;
         // Whole elements, in memory aligned for them: this always holds.
-        BufMut::from_checked(RawMut::new(region, range)).ok_or(Error::Invalid("buffer size"))
+        BufMut::from_checked(whole).ok_or(Error::Invalid("buffer size"))
     }
 
     /// A ring of `capacity` registered bytes for streaming messages.
     pub fn ring_buf(&self, capacity: usize) -> Result<RingBuf<N>> {
         // Chunks are cut from the region where `RingBuf::place` puts them, not split off
         // this range.
-        let (region, _whole) = Region::new(self, capacity, 1)?;
+        let RawMut { region, .. } = Region::whole(self, capacity, 1)?;
         Ok(RingBuf {
             region,
             capacity,
@@ -1072,8 +1069,8 @@ impl<N: Nic> RingBuf<N> {
             return (len <= self.capacity).then_some(0);
         };
         // The ring owns its whole region: offsets are positions in the ring.
-        let tail = front.raw.range.offset(self.region.ptr);
-        let head = back.raw.range.end(self.region.ptr);
+        let tail = front.raw.offset();
+        let head = back.raw.end();
         // Chunks lie from `tail` to `head`, or wrapped from `tail` to the end
         // and from the start to `head`. A wrapped head never reaches the
         // tail (strict comparisons), so `head >= tail` means not wrapped.
@@ -1096,13 +1093,8 @@ impl<N: Nic> RingBuf<N> {
     /// returns it frozen; `None` while the ring has no room for it.
     pub fn write_with(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Buf<u8, N>> {
         let at = self.place(len)?;
-        let mut buf: BufMut<u8, N> = BufMut::of_bytes(RawMut::new(
-            self.region.clone(),
-            OwnedRange::ring_chunk(
-                self.region.ptr,
-                ByteRange::new(at, len, self.capacity).expect("a chunk fits the ring"),
-            ),
-        ));
+        let chunk = RawMut::ring_chunk(self.region.clone(), at, len);
+        let mut buf: BufMut<u8, N> = BufMut::of_bytes(chunk.expect("a chunk fits the ring"));
         fill(&mut buf);
         let buf = buf.freeze();
         self.chunks.push_back(buf.frozen.clone());

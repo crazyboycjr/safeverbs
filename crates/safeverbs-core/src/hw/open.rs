@@ -267,19 +267,6 @@ impl<N: Device> OpenRequest<N> {
         self.kept.loans()
     }
 
-    /// Without a WQE it has no input.
-    pub(super) proof fn lemma_no_inputs(&self)
-        requires
-            self.inv(),
-            self.n == 0,
-        ensures
-            self.kept.loans().len() == 0,
-    {
-        if self.kept.loans().len() > 0 {
-            assert(crate::buf::input_is_covered(self.ledger@, 0));
-        }
-    }
-
     /// One that holds nothing and takes nothing.
     pub fn closed() -> (r: Self)
         ensures

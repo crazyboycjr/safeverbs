@@ -156,6 +156,8 @@ impl OwnedRange {
         ensures
             r.0.inv(), r.1.inv(),
             r.0.base() == self.base(), r.1.base() == self.base(),
+            r.0.geometry().spec_capacity() == self.geometry().spec_capacity(),
+            r.1.geometry().spec_capacity() == self.geometry().spec_capacity(),
             r.0.geometry().spec_offset() == self.geometry().spec_offset(),
             r.0.geometry().spec_len() == at,
             r.1.geometry().spec_offset() == self.geometry().spec_offset() + at,
@@ -207,6 +209,9 @@ impl<N: Nic> RawMut<N> {
     /// A range of a region, kept alive by it.
     #[inline(always)]
     pub(super) fn new(region: Arc<Region<N>>, range: OwnedRange) -> (r: Self)
+        requires
+            range.base() == (*region).ptr,
+            range.geometry().spec_capacity() == (*region).size,
         ensures
             r.region == region,
             r.range == range,
@@ -215,8 +220,36 @@ impl<N: Nic> RawMut<N> {
         RawMut { region, range }
     }
 
+    /// The `len` bytes `at` bytes into `region`, for a streaming ring, if they are in it.
+    pub(super) fn ring_chunk(region: Arc<Region<N>>, at: usize, len: usize) -> (r: Option<Self>) {
+        match ByteRange::new(at, len, region.size) {
+            Some(geometry) => {
+                let range = OwnedRange::ring_chunk(region.ptr, geometry);
+                Some(RawMut::new(region, range))
+            },
+            None => None,
+        }
+    }
+
+    /// Where it starts in its region.
+    pub(super) fn offset(&self) -> usize {
+        proof { use_type_invariant(self); }
+        self.range.offset(self.region.ptr)
+    }
+
+    /// Where it ends in its region.
+    pub(super) fn end(&self) -> usize {
+        proof { use_type_invariant(self); }
+        self.range.end(self.region.ptr)
+    }
+
+    /// Its range is a range of its region.
     #[verifier::type_invariant]
-    pub(crate) closed spec fn inv(self) -> bool { self.range.inv() }
+    pub(crate) closed spec fn inv(self) -> bool {
+        &&& self.range.inv()
+        &&& self.range.base() == (*self.region).ptr
+        &&& self.range.geometry().spec_capacity() == (*self.region).size
+    }
     pub(crate) closed spec fn pointer(self) -> *mut u8 { self.range.pointer() }
     pub(crate) closed spec fn byte_len(self) -> usize { self.range.spec_len() }
     pub(crate) closed spec fn byte_domain(self) -> Set<int> { self.range.permission().dom() }

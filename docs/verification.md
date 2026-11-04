@@ -48,7 +48,7 @@ crate uses no `assume`, `admit`, `external_body` or assumed specification; the c
 only the items of `scripts/trusted.txt` (see "Trusted computing base"). The rest is ordinary Rust,
 not trusted by the proofs and not verified either: `pd.rs`, `verbs.rs`, `model.rs`, the `safeverbs`
 crate, and the shells of `buf.rs` and `engine.rs`. A shell is what Verus cannot read: the methods
-with zerocopy's bounds, `Region::new`'s layout, `Exposed` and `RingBuf`; an engine's callbacks
+with zerocopy's bounds, `Region::whole`'s layout, `Exposed` and `RingBuf`; an engine's callbacks
 (`poll`), clocks (`drain`), parent domains (`create_qp`), and `Request`, whose `Drop` writes. They
 have no proof obligations to get wrong: they reach verified code only by calling it, and every
 method they call needs no more than the invariants below ("What is assumed").
@@ -277,8 +277,8 @@ are left, and each is an invariant only verified code can change:
 - `OpenRequest::inv` and `Leases::inv`, of what `Engine`'s methods take: the fields are private, each
   maker ensures it and each method keeps it. They are no type invariants because a request's fields
   change one at a time on the data path;
-- `RingBuf`'s chunks: their byte permissions are trusted (`ring_chunk`), and placing one relies on
-  its base.
+- `Region::inv`, which a region's `Drop` relies on to free it: only `Region::allocated` makes one,
+  which ensures it, and the fields are private.
 
 A `BufMut`, a `Buf`, a `Part` and a `Peek` need no such word: what they say is a type invariant, and
 a post takes them as they are.
@@ -306,7 +306,7 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `hw/open.rs` `one_of` | `core::slice::from_ref` is a list of that one element |
 | `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
 | `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExContext`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
-| `buf.rs` `bytes_back` | when a region goes, the permissions split from it are its own again: each lives in a `RawMut`, which holds an `Arc` of the region, so none is left when the last `Arc` goes. The rest of freeing it is verified (`Region::free_memory`, vstd's `deallocate` with the allocation's `Dealloc`) |
+| `buf.rs` `bytes_back` | when a region goes, the permissions split from it are its own again: each lives in a `RawMut`, which holds an `Arc` of the region its range belongs to (a type invariant), so none is left when the last `Arc` goes. The rest of freeing it is verified (`Region::free_memory`, vstd's `deallocate` with the allocation's `Dealloc`) |
 | `buf.rs` `sge_too_long` | a panic never returns |
 | `engine.rs` `ExTransport` | the transport trait may bound a key's generics (declared without specifications) |
 | `engine.rs` `hw_mut` | `ManuallyDrop::deref_mut` is a reference to its contents |
@@ -332,24 +332,14 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `trusted.rs` `doorbell` | `ibv_wr_complete` is M's `post_send` of the WRs written since the start, after rely steps, or nothing on error |
 | `trusted.rs` `post_recv` | `ibv_post_recv` of one WR is M's `post_recv`, or nothing on error |
 | `trusted.rs` `poll` | each CQE `ibv_poll_cq` returns is the one M's `poll_cq` pops, with its `wr_id` and outcome |
+| Not an item: initialized contents | memory comes zeroed from the allocator, which nothing here states (`allocate_zeroed_raw` claims no contents), and `T: FromBytes` makes zeroes and any other bytes a valid `T`. A says of a lease that it accepts any bytes (`any_bytes`), true of every lease an engine adopts for that reason: a `BufMut<T>` exists only for such a `T`, a bound of `Pd::alloc` and of `BufMut`'s other makers in the shell, which the proofs take as given |
+| Not an item: `IntoBytes` | a `T` has no padding, so sending one reads only initialized bytes: a bound of `into_part` and the `Lend` impls |
+| Not an item: `Immutable` | a `T` has no interior mutability, so a frozen buffer's bytes do not change while the NIC reads them: a bound of `freeze` |
+| Not an item: references to buffers | `Deref` and `DerefMut` make a `&[T]` or `&mut [T]` with `from_raw_parts`, which the proofs do not see: they stand on the permission's being unique or frozen, on the fit of `T` (`fits_type`, a type invariant) and on the rows above |
 
-**Why `FromBytes`, `IntoBytes` and `Immutable`, and what a reference to a buffer is, stay out of the
-proofs.** The proofs read bytes and permissions, never a value of `T`: M and A say which bytes the NIC
-may touch, and no more. So what those traits give is trusted, as rustc and zerocopy's own contracts:
+The proofs read bytes and permissions, never a value of `T`: M and A say which bytes the NIC may
+touch, and no more. So the last rows are what rustc and zerocopy's contracts are trusted for.
 
-- *Initialized contents.* Memory comes zeroed from the allocator, which nothing here states
-  (`allocate_zeroed_raw` claims no contents), and `T: FromBytes` makes zeroes and any bytes a valid
-  `T`, which is what `Pd::alloc` and `BufMut`'s other makers ask of `T`. A says of a lease that it
-  accepts any bytes (`any_bytes`), true of every lease the engine adopts for that reason: a `BufMut<T>`
-  exists only for such a `T`, a bound on the shell's methods that the proofs take as given.
-- *Sending.* `T: IntoBytes` says that a `T` has no padding, so that sending one reads only
-  initialized bytes: a bound on `into_part` and the `Lend` impls.
-- *Sharing.* `T: Immutable` says that no `T` has interior mutability, so that a frozen buffer's bytes
-  do not change while the NIC reads them: a bound on `freeze`.
-- *References.* `Deref` and `DerefMut` of a `BufMut` and `Deref` of a `Buf` make a `&[T]` or a `&mut
-  [T]` with `from_raw_parts`, which their linear permissions say nothing to Verus about: they stand
-  on the permission's being unique or frozen, on the type invariant's fit of `T` (`fits_type`), and on
-  the two facts above.
 
 Each wrapper requires M's precondition on the engine's token and ensures that M moved by
 rely steps (the NIC's own, and other engines' on their own queues) and then by the verb.
@@ -381,8 +371,8 @@ data, so M sees a queue pair's inline limit as zero.
   (`send_tails`), for what a result reports. One record could serve both.
 - **The public API.** Connect the futures, sinks and streams of `safeverbs` to the
   verified engine, and state exactly which public operations the theorem covers, including
-  reuse after a caught panic. `Engine`'s shell, `Request` above all, could come inside `verus!` when
-  Verus reads its callbacks. Keep conditional release distinct from leak freedom.
+  reuse after a caught panic. Of `Engine`'s shell, `Request` could come inside `verus!` first, as far
+  as what it does in `Drop` allows. Keep conditional release distinct from leak freedom.
 - **Theorem 2**, for two endpoints that both run SafeVerbs, is stated in `refinement.rs`
   and `design.md` only.
 - **M.** Gather evidence that real NICs conform (differential tests on hardware and
@@ -408,7 +398,7 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 163 verified, 0 errors
-safeverbs-core: verification results:: 751 verified, 0 errors
+safeverbs-core: verification results:: 753 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only
