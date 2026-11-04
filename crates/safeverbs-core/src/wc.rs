@@ -471,6 +471,15 @@ impl Wc {
 
 } // verus!
 
+impl Wc {
+    /// The `wr_id` the NIC reported, for programs that post on the NIC's trait themselves
+    /// (the hand-written baselines of `scripts/measure.sh`). The library's own is internal.
+    #[doc(hidden)]
+    pub fn probe_wr_id(&self) -> u64 {
+        self.wr_id
+    }
+}
+
 impl fmt::Display for CompletionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
