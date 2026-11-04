@@ -49,7 +49,8 @@ impl Span {
 /// The status of a work completion, as `ibv_wc_status` reports it (the cases that matter here).
 pub enum Status {
     Success,
-    /// The QP was in the error state: the request was not executed.
+    /// The QP was in the error state: the WQE did not complete successfully, and its remote
+    /// effects are unknown.
     FlushErr,
     /// Local errors: length, protection (bad lkey or range), QP operation.
     LocalErr,

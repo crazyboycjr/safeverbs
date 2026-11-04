@@ -2,15 +2,16 @@
 //!
 //! To get it, the library's trusted core (`safeverbs-core`) implements [`Refines`] for its
 //! whole state, rings, buffers and ghost state included: an invariant, an abstraction
-//! function to A, its view of the NIC in M and each request's WQE interval, with the
-//! trait's three obligations proved. [`theorem_1`] then gives the guarantees along every
-//! execution.
+//! function to A, its view of the NIC in M, each request's WQE interval and each send WQE's WR,
+//! with the trait's three obligations proved. [`theorem_1`] then gives the guarantees along
+//! every execution.
 //!
 //! A request owns a nonempty interval of WQEs on one QP and queue (a batch owns several).
 //! Retiring a proper prefix leaves it in flight with its leases; it completes when its last
 //! WQE retires, with the first error in posting order, or the last WQE's success if none
 //! failed (so a batch of READs reports the last READ's length). This is an obligation on
-//! the implementation, not a restriction added to M.
+//! the implementation, not a restriction added to M. What an outcome then means for the
+//! request's WQEs is [`corollary_f1`].
 //!
 //! **Why `nic()` is honest.** The core's view of the NIC is a ghost token that only the
 //! trusted verbs wrappers change. Each wrapper's contract is M: it *requires* the verb's
@@ -32,6 +33,7 @@
 
 use crate::abs::*;
 use crate::nic::*;
+use crate::share::*;
 use crate::types::*;
 use vstd::prelude::*;
 
@@ -158,6 +160,41 @@ impl WqeRange {
     pub open spec fn pending(self, m: Nic::State) -> bool {
         exists|cut: nat| self.pending_at(m, cut)
     }
+
+    /// The outcome of send WQE `s`, if it executed: as M retired it, or as its queue holds it.
+    pub open spec fn outcome(self, m: Nic::State, s: nat) -> Option<Outcome> {
+        let w = self.at(s);
+        if m.retired.contains_key(w) {
+            Some(m.retired[w])
+        } else if posted(m, w) {
+            m.qps[self.qp].sq[s - m.qps[self.qp].sq_head].outcome
+        } else {
+            None
+        }
+    }
+
+    /// WQE `s` executed with an error.
+    pub open spec fn failed(self, m: Nic::State, s: nat) -> bool {
+        self.outcome(m, s) matches Some(o) && o.status.is_err()
+    }
+
+    /// What M's rules give a send request whose WQEs it holds: once one of them failed, its
+    /// queue pair is in `Err` (it stays there while its queue holds a WQE), and each WQE after
+    /// that one that executed failed too ([`crate::nic_proofs::lemma_request_step`]).
+    pub open spec fn errors_stick(self, m: Nic::State) -> bool {
+        forall|j: nat| self.first <= j < self.end && #[trigger] self.failed(m, j) ==> {
+            &&& m.qps[self.qp].state is Err
+            &&& forall|k: nat| j < k < self.end && (#[trigger] self.outcome(m, k)) is Some
+                ==> self.failed(m, k)
+        }
+    }
+
+    /// No WQE of the range succeeded after one that failed.
+    pub open spec fn no_success_after_error(self, retired: IMap<WqeRef, Outcome>) -> bool {
+        forall|j: nat, k: nat| #![trigger retired[self.at(j)], retired[self.at(k)]]
+            self.first <= j < k < self.end && retired[self.at(j)].status.is_err()
+                ==> retired[self.at(k)].status.is_err()
+    }
 }
 
 /// The aggregate selects the earliest failure in posting order, or the final success.
@@ -280,15 +317,34 @@ pub proof fn lemma_pending_last(range: WqeRange, m: Nic::State)
     assert(cut <= ((range.end - 1) as nat) < range.end);
 }
 
+/// `wrs` remembers the WR of each send WQE, which M forgets when the WQE retires: it is the WR
+/// M's queue holds, and each retired WQE's outcome is one that WR allows.
+pub open spec fn records_wrs(m: Nic::State, wrs: IMap<WqeRef, SendWr>) -> bool {
+    &&& forall|w: WqeRef| #[trigger] posted(m, w) && w.queue is Send ==> {
+        &&& wrs.contains_key(w)
+        &&& wrs[w] == m.qps[w.qp].sq[w.seq - m.qps[w.qp].sq_head].wr
+    }
+    &&& forall|w: WqeRef| #[trigger] m.retired.contains_key(w) && w.queue is Send ==> {
+        &&& wrs.contains_key(w)
+        &&& wrs[w].opcode.allows_outcome(total_len(wrs[w].sges), m.retired[w])
+    }
+}
+
 /// The coupling between A and M that the core's invariant must imply.
 ///
 /// - **F1 against M:** every request owns a nonempty WQE interval. Distinct requests own
 ///   disjoint intervals, including after their outcomes are taken. While in flight, a
 ///   retired prefix is allowed but the final WQE is outstanding. Completion requires
-///   every WQE retired and preserves the first error, or the final success.
+///   every WQE retired and preserves the first error, or the final success; no WQE succeeded
+///   after one that failed; and `wrs` says what each send WQE asked for.
 /// - **S1 against M:** every byte M lets the NIC (or the peer) read or write is one A gives
 ///   to the NIC for that kind of access.
-pub open spec fn coupled(a: Abs::State, m: Nic::State, ranges: Map<ReqId, WqeRange>) -> bool {
+pub open spec fn coupled(
+    a: Abs::State,
+    m: Nic::State,
+    ranges: Map<ReqId, WqeRange>,
+    wrs: IMap<WqeRef, SendWr>,
+) -> bool {
     &&& forall|r: ReqId| #[trigger] a.requests.contains_key(r)
         ==> ranges.contains_key(r) && ranges[r].qp == a.requests[r].qp
     &&& forall|r: ReqId| #[trigger] a.outcomes.contains_key(r) ==> ranges.contains_key(r)
@@ -297,8 +353,12 @@ pub open spec fn coupled(a: Abs::State, m: Nic::State, ranges: Map<ReqId, WqeRan
         ranges.contains_key(r1) && ranges.contains_key(r2) && r1 != r2
             ==> ranges[r1].disjoint(ranges[r2])
     &&& forall|r: ReqId| #[trigger] a.in_flight(r) ==> ranges[r].pending(m)
-    &&& forall|r: ReqId| #[trigger] a.outcomes.contains_key(r)
-        ==> ranges[r].all_retired(m.retired) && ranges[r].aggregate(m.retired) == a.outcomes[r]
+    &&& forall|r: ReqId| #[trigger] a.outcomes.contains_key(r) ==> {
+        &&& ranges[r].all_retired(m.retired)
+        &&& ranges[r].aggregate(m.retired) == a.outcomes[r]
+        &&& ranges[r].no_success_after_error(m.retired)
+    }
+    &&& records_wrs(m, wrs)
     &&& forall|x: int| #[trigger] m.nic_may_read(x) ==> a.nic_reads(x)
     &&& forall|x: int| #[trigger] m.nic_may_write(x) ==> a.nic_writes(x)
 }
@@ -321,6 +381,9 @@ pub trait Refines: Sized {
     /// The nonempty WQE interval owned by each request (ghost, retained with its outcome).
     spec fn ranges(&self) -> Map<ReqId, WqeRange>;
 
+    /// The WR of each send WQE (ghost, retained after M forgets it).
+    spec fn wrs(&self) -> IMap<WqeRef, SendWr>;
+
     /// A start state: the device just opened, nothing created yet.
     spec fn init(&self) -> bool;
 
@@ -339,7 +402,8 @@ pub trait Refines: Sized {
     ;
 
     /// Every call keeps the invariant, is zero or more steps of A, and moves the NIC by
-    /// steps of M only (every verb it called met its precondition).
+    /// steps of M only (every verb it called met its precondition). A request keeps its WQEs,
+    /// and a WQE its WR.
     proof fn lemma_step(c: Self, d: Self)
         requires
             c.inv(),
@@ -348,6 +412,8 @@ pub trait Refines: Sized {
             d.inv(),
             abs_reaches(c.abs(), d.abs()),
             nic_reaches(c.nic(), d.nic()),
+            c.ranges().submap_of(d.ranges()),
+            c.wrs().submap_of(d.wrs()),
     ;
 
     /// The invariant couples A and M.
@@ -355,7 +421,7 @@ pub trait Refines: Sized {
         requires
             c.inv(),
         ensures
-            coupled(c.abs(), c.nic(), c.ranges()),
+            coupled(c.abs(), c.nic(), c.ranges(), c.wrs()),
     ;
 }
 
@@ -370,8 +436,8 @@ pub trait Refines: Sized {
 /// - the NIC is in a state M reaches from its start by legal steps only: every verb the
 ///   library called met its precondition (**S2**), and M's own invariants hold (no CQ
 ///   overflow, every CQE names its WQE);
-/// - A and M are coupled ([`coupled`]): each request owns a disjoint WQE interval, its
-///   outcome aggregates M's outcomes only after all its WQEs retire, and the NIC touches
+/// - A and M are coupled ([`coupled`]): each request owns a disjoint WQE interval for good,
+///   its outcome aggregates M's outcomes only after all its WQEs retire, and the NIC touches
 ///   only memory A gives it ([`corollary_s1`], [`corollary_f1`], [`corollary_r1`]).
 pub proof fn theorem_1<C: Refines>(run: Seq<C>)
     requires
@@ -386,7 +452,11 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
             &&& c.inv()
             &&& abs_reaches(run[0].abs(), c.abs()) && abs_inv(c.abs())
             &&& nic_reaches(run[0].nic(), c.nic()) && nic_inv(c.nic())
-            &&& coupled(c.abs(), c.nic(), c.ranges())
+            &&& coupled(c.abs(), c.nic(), c.ranges(), c.wrs())
+        },
+        forall|i: int| 0 <= i < run.len() - 1 ==> {
+            &&& (#[trigger] run[i]).ranges().submap_of(run[i + 1].ranges())
+            &&& run[i].wrs().submap_of(run[i + 1].wrs())
         },
     decreases run.len(),
 {
@@ -423,10 +493,18 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
             &&& c.inv()
             &&& abs_reaches(a0, c.abs()) && abs_inv(c.abs())
             &&& nic_reaches(m0, c.nic()) && nic_inv(c.nic())
-            &&& coupled(c.abs(), c.nic(), c.ranges())
+            &&& coupled(c.abs(), c.nic(), c.ranges(), c.wrs())
         } by {
             if i < n {
                 assert(run[i] == prefix[i]);
+            }
+        }
+        assert forall|i: int| 0 <= i < run.len() - 1 implies {
+            &&& (#[trigger] run[i]).ranges().submap_of(run[i + 1].ranges())
+            &&& run[i].wrs().submap_of(run[i + 1].wrs())
+        } by {
+            if i < n - 1 {
+                assert(run[i] == prefix[i] && run[i + 1] == prefix[i + 1]);
             }
         }
     }
@@ -434,10 +512,16 @@ pub proof fn theorem_1<C: Refines>(run: Seq<C>)
 
 /// **S1 against M.** In a coupled state, nothing the program may write is touched by the NIC
 /// or the peer as M defines their reach, and nothing the program may read is written by them.
-pub proof fn corollary_s1(a: Abs::State, m: Nic::State, ranges: Map<ReqId, WqeRange>, x: int)
+pub proof fn corollary_s1(
+    a: Abs::State,
+    m: Nic::State,
+    ranges: Map<ReqId, WqeRange>,
+    wrs: IMap<WqeRef, SendWr>,
+    x: int,
+)
     requires
         abs_inv(a),
-        coupled(a, m, ranges),
+        coupled(a, m, ranges, wrs),
     ensures
         !(a.program_writes(x) && (m.nic_may_read(x) || m.nic_may_write(x))),
         !(a.program_reads(x) && m.nic_may_write(x)),
@@ -445,20 +529,26 @@ pub proof fn corollary_s1(a: Abs::State, m: Nic::State, ranges: Map<ReqId, WqeRa
     crate::guarantees::lemma_s1_no_conflict(a, x);
 }
 
-/// **F1 against M.** The client takes the aggregate of its own fully retired interval.
-/// No other request owns any WQE of that interval. An error is the first one in posting
-/// order; success carries the final WQE's defined metadata.
+/// **F1 against M.** What the outcome a client takes says of its request's WQEs, all of them
+/// retired and none owned by another request.
+///
+/// - **Success:** every WQE succeeded, a READ with the full length it asked for. The outcome
+///   is the last WQE's.
+/// - **An error:** it is the error of WQE `s`, at position `s - first` in the request. The
+///   WQEs before it succeeded. It and those after it did not succeed, and M says nothing of
+///   their remote effects.
 pub proof fn corollary_f1(
     a: Abs::State,
     a2: Abs::State,
     m: Nic::State,
     ranges: Map<ReqId, WqeRange>,
+    wrs: IMap<WqeRef, SendWr>,
     r: ReqId,
     o: Outcome,
 )
     requires
         abs_inv(a),
-        coupled(a, m, ranges),
+        coupled(a, m, ranges, wrs),
         Abs::State::take(a, a2, r, o),
     ensures
         ranges.contains_key(r),
@@ -467,17 +557,84 @@ pub proof fn corollary_f1(
         o == ranges[r].aggregate(m.retired),
         forall|r2: ReqId| #[trigger] ranges.contains_key(r2) && r2 != r
             ==> ranges[r2].disjoint(ranges[r]),
-        o.status.is_err() ==> exists|s: nat|
-            ranges[r].first_error(m.retired, s) && o == m.retired[ranges[r].at(s)],
         !o.status.is_err() ==> {
             &&& forall|s: nat| ranges[r].first <= s < ranges[r].end
                 ==> (#[trigger] m.retired[ranges[r].at(s)]).status is Success
             &&& o == m.retired[ranges[r].last()]
+            &&& ranges[r].queue is Send ==> forall|s: nat| ranges[r].first <= s < ranges[r].end
+                && (#[trigger] wrs[ranges[r].at(s)]).opcode is Read
+                ==> m.retired[ranges[r].at(s)].byte_len == total_len(wrs[ranges[r].at(s)].sges)
+        },
+        o.status.is_err() ==> exists|s: nat| {
+            &&& #[trigger] ranges[r].first_error(m.retired, s)
+            &&& o == m.retired[ranges[r].at(s)]
+            &&& forall|k: nat| s < k < ranges[r].end
+                ==> (#[trigger] m.retired[ranges[r].at(k)]).status.is_err()
         },
 {
     crate::guarantees::lemma_f1_take(a, a2, r, o);
     assert(a.outcomes.contains_key(r));
-    lemma_aggregate(ranges[r], m.retired);
+    let range = ranges[r];
+    let retired = m.retired;
+    lemma_aggregate(range, retired);
+    if o.status.is_err() {
+        let s = choose|s: nat| range.first_error(retired, s) && range.aggregate(retired) == retired[range.at(s)];
+        assert forall|k: nat| s < k < range.end implies (#[trigger] retired[range.at(k)]).status.is_err() by {
+            assert(retired[range.at(s)].status.is_err());
+        }
+        assert(range.first_error(retired, s));
+    } else if range.queue is Send {
+        assert forall|s: nat| range.first <= s < range.end && (#[trigger] wrs[range.at(s)]).opcode is Read
+            implies retired[range.at(s)].byte_len == total_len(wrs[range.at(s)].sges) by {
+            assert(retired.contains_key(range.at(s)));
+            assert(retired[range.at(s)].status is Success);
+        }
+    }
+}
+
+/// **F1, a refusal.** A request whose doorbell the device refused never reached M or A. M moved
+/// by rely steps only (what `trusted.rs` says of a refused doorbell), so the queue pair holds
+/// no new WQE. A took no step, so the program kept the request's leases: the NIC writes none
+/// of their bytes, and reads none of a unique one's.
+pub proof fn corollary_f1_refused(
+    a: Abs::State,
+    m: Nic::State,
+    n: Nic::State,
+    ranges: Map<ReqId, WqeRange>,
+    wrs: IMap<WqeRef, SendWr>,
+    sh: Share,
+    pins: ISet<Key>,
+    q: QpId,
+    dirs: Map<LeaseId, Dir>,
+)
+    requires
+        abs_inv(a),
+        coupled(a, n, ranges, wrs),
+        a.may_post(dirs),
+        nic_inv(m),
+        share_wf(m, sh),
+        rely_reaches(sh, pins, m, n),
+        sh.owns.contains(q),
+        m.qps.contains_key(q),
+    ensures
+        qp_kept(m.qps[q], n.qps[q]),
+        forall|l: LeaseId, x: int| dirs.contains_key(l) && #[trigger] a.leases[l].mem.contains(x) ==> {
+            &&& !n.nic_may_write(x)
+            &&& a.leases[l].unique ==> !n.nic_may_read(x)
+        },
+{
+    lemma_rely_frame(sh, pins, m, n);
+    assert forall|l: LeaseId, x: int| dirs.contains_key(l) && #[trigger] a.leases[l].mem.contains(x) implies {
+        &&& !n.nic_may_write(x)
+        &&& a.leases[l].unique ==> !n.nic_may_read(x)
+    } by {
+        assert(a.is_program(l) && a.leases.contains_key(l));
+        assert(a.program_reads(x));
+        if a.leases[l].unique {
+            assert(a.program_writes(x));
+        }
+        corollary_s1(a, n, ranges, wrs, x);
+    }
 }
 
 /// **R1 against M.** A lease in a request in flight has its NIC still at work: the request's
@@ -485,10 +642,16 @@ pub proof fn corollary_f1(
 /// a complete request has the NIC done with it: all the request's WQEs retired. With
 /// [`crate::guarantees::lemma_r1`], a lease leaves a request, to the program or released, only
 /// after that.
-pub proof fn corollary_r1(a: Abs::State, m: Nic::State, ranges: Map<ReqId, WqeRange>, l: LeaseId)
+pub proof fn corollary_r1(
+    a: Abs::State,
+    m: Nic::State,
+    ranges: Map<ReqId, WqeRange>,
+    wrs: IMap<WqeRef, SendWr>,
+    l: LeaseId,
+)
     requires
         abs_inv(a),
-        coupled(a, m, ranges),
+        coupled(a, m, ranges, wrs),
     ensures
         a.place(l) matches Place::InFlight(r) ==> {
             &&& posted(m, ranges[r].last())

@@ -5,6 +5,7 @@
 #![allow(unused_imports)]
 
 use crate::nic::*;
+use crate::refinement::*;
 use crate::types::*;
 use vstd::multiset::*;
 use vstd::prelude::*;
@@ -1220,6 +1221,263 @@ pub proof fn lemma_keeps_enabled(pre: Nic::State, post: Nic::State, step: Nic::S
             }
         },
         _ => {},
+    }
+}
+
+// =========================================================================================
+// A request's WQEs under M's rules
+
+/// `pending_at` depends on the retired map and on where the send queue ends.
+proof fn lemma_pending_kept(range: WqeRange, m: Nic::State, n: Nic::State, cut: nat)
+    requires
+        range.queue is Send,
+        range.pending_at(m, cut),
+        n.qps.contains_key(range.qp),
+        n.qps[range.qp].sq_head == m.qps[range.qp].sq_head,
+        m.qps[range.qp].sq.len() <= n.qps[range.qp].sq.len(),
+        forall|s: nat| range.first <= s < range.end
+            ==> (n.retired.contains_key(#[trigger] range.at(s)) <==> m.retired.contains_key(range.at(s))),
+    ensures
+        range.pending_at(n, cut),
+{
+    assert(posted(m, range.at((range.end - 1) as nat)));
+    assert forall|s: nat| range.first <= s < cut implies {
+        let w = #[trigger] range.at(s);
+        n.retired.contains_key(w) && !posted(n, w)
+    } by {
+        assert(!posted(m, range.at(s)));
+    }
+    assert forall|s: nat| cut <= s < range.end implies {
+        let w = #[trigger] range.at(s);
+        posted(n, w) && !n.retired.contains_key(w)
+    } by {
+        assert(posted(m, range.at(s)));
+    }
+}
+
+/// `errors_stick` depends on the outcomes of the request's WQEs and on `Err`.
+proof fn lemma_errors_stick_kept(range: WqeRange, m: Nic::State, n: Nic::State)
+    requires
+        range.errors_stick(m),
+        forall|s: nat| range.first <= s < range.end ==> #[trigger] range.outcome(n, s) == range.outcome(m, s),
+        m.qps[range.qp].state is Err ==> n.qps[range.qp].state is Err,
+    ensures
+        range.errors_stick(n),
+{
+    assert forall|j: nat| range.first <= j < range.end && #[trigger] range.failed(n, j) implies {
+        &&& n.qps[range.qp].state is Err
+        &&& forall|k: nat| j < k < range.end && (#[trigger] range.outcome(n, k)) is Some
+            ==> range.failed(n, k)
+    } by {
+        assert(range.outcome(n, j) == range.outcome(m, j));
+        assert(range.failed(m, j));
+        assert forall|k: nat| j < k < range.end && (#[trigger] range.outcome(n, k)) is Some
+            implies range.failed(n, k) by {
+            assert(range.outcome(n, k) == range.outcome(m, k));
+            assert(range.failed(m, k));
+        }
+    }
+}
+
+/// A step that leaves alone the request's WQEs in `retired` and in the send queue of its queue
+/// pair, whatever it adds after them, and keeps `Err`.
+proof fn lemma_request_framed(range: WqeRange, m: Nic::State, n: Nic::State, cut: nat)
+    requires
+        range.queue is Send,
+        range.pending_at(m, cut),
+        range.errors_stick(m),
+        n.qps.contains_key(range.qp),
+        n.qps[range.qp].sq_head == m.qps[range.qp].sq_head,
+        m.qps[range.qp].sq.len() <= n.qps[range.qp].sq.len(),
+        forall|k: int| 0 <= k < m.qps[range.qp].sq.len()
+            ==> #[trigger] n.qps[range.qp].sq[k] == m.qps[range.qp].sq[k],
+        m.qps[range.qp].state is Err ==> n.qps[range.qp].state is Err,
+        forall|s: nat| range.first <= s < range.end
+            ==> (n.retired.contains_key(#[trigger] range.at(s)) <==> m.retired.contains_key(range.at(s))),
+        forall|s: nat| range.first <= s < range.end && m.retired.contains_key(#[trigger] range.at(s))
+            ==> n.retired[range.at(s)] == m.retired[range.at(s)],
+    ensures
+        range.pending_at(n, cut),
+        range.errors_stick(n),
+{
+    lemma_pending_kept(range, m, n, cut);
+    assert forall|s: nat| range.first <= s < range.end
+        implies #[trigger] range.outcome(n, s) == range.outcome(m, s) by {
+        assert(s < cut ==> m.retired.contains_key(range.at(s)));
+        assert(s >= cut ==> posted(m, range.at(s)));
+    }
+    lemma_errors_stick_kept(range, m, n);
+}
+
+/// The NIC executes a WQE of the request's queue pair. In `Err` it fails, whichever it is, and
+/// a failure moves the queue pair to `Err`.
+proof fn lemma_request_executed(range: WqeRange, m: Nic::State, n: Nic::State, o: Outcome, cut: nat)
+    requires
+        range.queue is Send,
+        nic_inv(m),
+        Nic::State::execute_send(m, n, range.qp, o),
+        range.pending_at(m, cut),
+        range.errors_stick(m),
+    ensures
+        range.pending_at(n, cut),
+        range.errors_stick(n),
+{
+    let q = range.qp;
+    let qp = m.qps[q];
+    lemma_room_for_send_cqe(m, q);
+    assert(m.qp_wf(qp));
+    lemma_pending_kept(range, m, n, cut);
+    let done = qp.sq_head + qp.sq_done;
+    assert forall|s: nat| range.first <= s < range.end && s != done
+        implies #[trigger] range.outcome(n, s) == range.outcome(m, s) by {
+        assert(s < cut ==> m.retired.contains_key(range.at(s)));
+        assert(s >= cut ==> posted(m, range.at(s)) && n.qps[q].sq[s - qp.sq_head] == qp.sq[s - qp.sq_head]);
+    }
+    assert forall|j: nat| range.first <= j < range.end && #[trigger] range.failed(n, j) implies {
+        &&& n.qps[q].state is Err
+        &&& forall|k: nat| j < k < range.end && (#[trigger] range.outcome(n, k)) is Some
+            ==> range.failed(n, k)
+    } by {
+        assert forall|k: nat| j < k < range.end && (#[trigger] range.outcome(n, k)) is Some
+            implies range.failed(n, k) by {
+            if j == done {
+                // The WQE just executed: those after it have not.
+                assert(posted(m, range.at(k)));
+                assert(range.outcome(n, k) == range.outcome(m, k));
+                assert(qp.sq[k - qp.sq_head].outcome is None);
+            } else {
+                // An earlier failure: the queue pair is in `Err`, so what executes now fails.
+                assert(range.outcome(n, j) == range.outcome(m, j));
+                assert(range.failed(m, j));
+                if k == done {
+                    assert(posted(m, range.at(k)));
+                } else {
+                    assert(range.outcome(n, k) == range.outcome(m, k));
+                    assert(range.failed(m, k));
+                }
+            }
+        }
+        if j != done {
+            assert(range.outcome(n, j) == range.outcome(m, j));
+            assert(range.failed(m, j));
+        }
+    }
+}
+
+/// A CQE of the request's send queue is polled: the WQEs it retires keep their outcomes.
+proof fn lemma_request_polled(range: WqeRange, m: Nic::State, n: Nic::State, c: CqId, cut: nat)
+    requires
+        range.queue is Send,
+        nic_inv(m),
+        Nic::State::poll_cq(m, n, c),
+        m.cqs[c].entries[0].qp == range.qp,
+        m.cqs[c].entries[0].queue is Send,
+        range.pending_at(m, cut),
+        range.errors_stick(m),
+    ensures
+        range.pending(n) && range.errors_stick(n)
+            || range.all_retired(n.retired) && range.no_success_after_error(n.retired),
+{
+    let qp = m.qps[range.qp];
+    let e = m.cqs[c].entries[0];
+    lemma_head_is_first(m, c);
+    assert(m.qp_wf(qp));
+    reveal(retires);
+    let fresh = retires(qp, e);
+    assert(n.retired == m.retired.union_prefer_right(fresh));
+    assert(posted(m, range.at((range.end - 1) as nat)));
+    assert forall|s: nat| range.first <= s < range.end implies {
+        let w = #[trigger] range.at(s);
+        &&& n.retired.contains_key(w) <==> s <= e.seq || s < cut
+        &&& range.outcome(n, s) == range.outcome(m, s)
+    } by {
+        let w = range.at(s);
+        if s < cut {
+            assert(!posted(m, w) && m.retired.contains_key(w));
+            assert(!fresh.contains_key(w));
+        } else {
+            assert(posted(m, w) && !m.retired.contains_key(w));
+            if s <= e.seq {
+                assert(fresh.contains_key(w));
+                assert(qp.sq[s - qp.sq_head].outcome is Some);
+            } else {
+                assert(!fresh.contains_key(w));
+                assert(n.qps[range.qp].sq[s - n.qps[range.qp].sq_head] == qp.sq[s - qp.sq_head]);
+            }
+        }
+    }
+    if e.seq + 1 >= range.end {
+        assert forall|s: nat| range.first <= s < range.end
+            implies n.retired.contains_key(#[trigger] range.at(s)) by {}
+        assert forall|j: nat, k: nat| #![trigger n.retired[range.at(j)], n.retired[range.at(k)]]
+            range.first <= j < k < range.end && n.retired[range.at(j)].status.is_err()
+            implies n.retired[range.at(k)].status.is_err() by {
+            assert(range.outcome(n, j) == range.outcome(m, j));
+            assert(range.outcome(n, k) == range.outcome(m, k));
+            assert(range.failed(m, j));
+        }
+    } else {
+        let next = if cut < e.seq + 1 { (e.seq + 1) as nat } else { cut };
+        assert(range.pending_at(n, next)) by {
+            assert forall|s: nat| range.first <= s < next implies {
+                let w = #[trigger] range.at(s);
+                n.retired.contains_key(w) && !posted(n, w)
+            } by {}
+            assert forall|s: nat| next <= s < range.end implies {
+                let w = #[trigger] range.at(s);
+                posted(n, w) && !n.retired.contains_key(w)
+            } by {}
+        }
+        lemma_errors_stick_kept(range, m, n);
+    }
+}
+
+/// **What M gives a request.** Any step of M leaves a request whose WQEs it holds with its WQEs
+/// held, the ones after a failure failing too, or with all of them retired, none successful
+/// after one that failed. A queue pair stays in `Err` while its queue holds a WQE, and in `Err`
+/// every WQE fails. So a request's WQEs fail from its first error on, whichever they are.
+pub proof fn lemma_request_step(range: WqeRange, m: Nic::State, n: Nic::State, step: Nic::Step)
+    requires
+        range.queue is Send,
+        nic_inv(m),
+        nic_step(m, n, step),
+        range.pending(m),
+        range.errors_stick(m),
+    ensures
+        range.pending(n) || range.all_retired(n.retired),
+        range.pending(n) ==> range.errors_stick(n),
+        range.all_retired(n.retired) ==> range.no_success_after_error(n.retired),
+{
+    let q = range.qp;
+    let cut = choose|cut: nat| range.pending_at(m, cut);
+    assert(posted(m, range.at((range.end - 1) as nat)));
+    match step {
+        Nic::Step::execute_send(p, o) => {
+            lemma_room_for_send_cqe(m, p);
+            if p == q {
+                lemma_request_executed(range, m, n, o, cut);
+            } else {
+                lemma_request_framed(range, m, n, cut);
+            }
+        },
+        Nic::Step::poll_cq(c) => {
+            let e = m.cqs[c].entries[0];
+            if e.qp == q && e.queue is Send {
+                lemma_request_polled(range, m, n, c, cut);
+            } else {
+                lemma_head_is_first(m, c);
+                reveal(retires);
+                lemma_request_framed(range, m, n, cut);
+            }
+        },
+        Nic::Step::execute_recv(p, o) => {
+            lemma_room_for_recv_cqe(m, p);
+            lemma_request_framed(range, m, n, cut);
+        },
+        _ => lemma_request_framed(range, m, n, cut),
+    }
+    if range.pending(n) {
+        lemma_pending_last(range, n);
     }
 }
 

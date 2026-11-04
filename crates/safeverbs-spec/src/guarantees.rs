@@ -4,8 +4,11 @@
 //! invariants are inductive: `abs.rs` proves each transition preserves them). Two-state
 //! lemmas talk about any single step `Abs::State::next(pre, post)`, whichever action it is.
 //!
-//! S2 (no local misuse) is not a property of A: it relates the library to the NIC model M
-//! and is part of the refinement theorem ([`crate::refinement`]).
+//! What a guarantee says of WQEs is stated against M in [`crate::refinement`]: what an outcome
+//! means for a request's WQEs ([`crate::refinement::corollary_f1`]) and a refusal
+//! ([`crate::refinement::corollary_f1_refused`]), and that the NIC is done with a lease that
+//! left its request ([`crate::refinement::corollary_r1`]). S2 (no local misuse) is not a
+//! property of A either: it relates the library to M and is part of the refinement theorem.
 #![allow(unused_imports)]
 
 use crate::abs::*;

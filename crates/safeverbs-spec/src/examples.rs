@@ -1,10 +1,10 @@
 //! Worked examples: concrete executions of A and M, checked step by step.
 //!
-//! They show that the transitions can happen (no precondition is accidentally unsatisfiable,
-//! which would make the lemmas about them vacuous) and illustrate the rules: a buffer's lease
-//! moves into a request and back, a waker is invoked on completion, a dropped future keeps its
-//! lease in flight, an unsignaled write is retired, as a success, by the CQE of a later signaled
-//! one, and a batch completes with its first error once all its WQEs retired.
+//! They show that the transitions can happen and that the guarantees apply (no
+//! precondition is accidentally unsatisfiable, which would make the lemmas about them
+//! vacuous): a buffer's lease moves into a request and back, a waker is invoked on completion,
+//! a dropped future keeps its lease in flight, a batch of READs succeeds whole through one
+//! completion, a batch fails at position 1, and a refused post changes nothing.
 #![allow(unused_imports)]
 
 use crate::abs::*;
@@ -12,6 +12,7 @@ use crate::guarantees::*;
 use crate::nic::*;
 use crate::nic_proofs::*;
 use crate::refinement::*;
+use crate::share::*;
 use crate::types::*;
 use vstd::multiset::*;
 use vstd::prelude::*;
@@ -221,44 +222,71 @@ proof fn lemma_connected()
     assert(m7 == s);
 }
 
-/// Two RDMA writes, from `[0, 64)` and `[64, 128)`, posted with one doorbell; only the
-/// second asks for a completion.
-spec fn two_writes() -> Seq<SendWr> {
+/// With every queue empty and no region open to the peer, the NIC has no reach at all.
+proof fn lemma_no_reach(m: Nic::State, x: int)
+    requires
+        forall|q: QpId| #[trigger] m.qps.contains_key(q) ==> m.qps[q].sq.len() == 0 && m.qps[q].rq.len() == 0,
+        forall|k: Key| #[trigger] m.mrs.contains_key(k) ==> !m.mrs[k].remote_read && !m.mrs[k].remote_write,
+    ensures
+        !m.nic_may_read(x),
+        !m.nic_may_write(x),
+{
+}
+
+/// A with the program holding a shared source `[0, 128)`, of which it keeps a clone, and a
+/// unique destination `[128, 192)`.
+spec fn source_and_destination() -> Abs::State {
+    let source = Lease { mem: Span { start: 0, len: 128 }.bytes(), unique: false, any_bytes: true, holder: Holder::Program };
+    let destination = Lease { mem: Span { start: 128, len: 64 }.bytes(), unique: true, any_bytes: true, holder: Holder::Program };
+    Abs::State {
+        qps: Set::empty().insert(7),
+        leases: Map::empty().insert(0, source).insert(1, destination).insert(2, source),
+        requests: Map::empty(),
+        next_id: 3,
+        outcomes: Map::empty(),
+        wakes: Seq::empty(),
+    }
+}
+
+/// Two RDMA reads into `[0, 64)` and `[64, 128)` with one doorbell; only the second asks for a
+/// completion.
+spec fn two_reads() -> Seq<SendWr> {
     seq![
-        SendWr { wr_id: 1, opcode: Opcode::Write, sges: seq![Sge { addr: 0, len: 64, lkey: 5 }], signaled: false, inline: false },
-        SendWr { wr_id: 2, opcode: Opcode::Write, sges: seq![Sge { addr: 64, len: 64, lkey: 5 }], signaled: true, inline: false },
+        SendWr { wr_id: 1, opcode: Opcode::Read, sges: seq![Sge { addr: 0, len: 64, lkey: 5 }], signaled: false, inline: false },
+        SendWr { wr_id: 2, opcode: Opcode::Read, sges: seq![Sge { addr: 64, len: 64, lkey: 5 }], signaled: true, inline: false },
     ]
 }
 
-/// M: the NIC executes the two writes, only the second produces a CQE, and polling it
-/// retires both, the first as a success.
+/// **F1, success.** On M, the NIC executes the two reads, only the second produces a CQE, and
+/// polling it retires both, the first as a success. On A, the request holds both destinations.
+/// Taking its outcome says both succeeded, each with the length it asked for.
 #[verifier::spinoff_prover]
-#[verifier::rlimit(30)]
-pub proof fn example_unsignaled_in_m() {
+#[verifier::rlimit(40)]
+pub proof fn example_batch_success() {
     reveal_with_fuel(total_len, 2);
-    let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
-    let (m0, wrs) = (connected(), two_writes());
+    reveal(retires);
+    let ok = Outcome { status: Status::Success, kind: CompletionKind::Read, byte_len: 64, imm: None };
+    let (m0, wrs) = (connected(), two_reads());
     lemma_connected();
     let qp1 = Qp { sq: wrs.map_values(|wr: SendWr| SendSlot { wr, outcome: None }), ..qp7() };
     let m1 = Nic::State { qps: m0.qps.insert(7, qp1), ..m0 };
     assert(Nic::State::post_send(m0, m1, 7, wrs));
-    crate::nic_proofs::lemma_post_send(m0, m1, 7, wrs);
+    lemma_post_send(m0, m1, 7, wrs);
 
     // The first: unsignaled and successful, so no CQE.
     let qp2 = Qp { sq: qp1.sq.update(0, SendSlot { wr: wrs[0], outcome: Some(ok) }), sq_done: 1, ..qp1 };
     let m2 = Nic::State { qps: m1.qps.insert(7, qp2), ..m1 };
     assert(Nic::State::execute_send(m1, m2, 7, ok));
-    crate::nic_proofs::lemma_execute_send(m1, m2, 7, ok);
+    lemma_execute_send(m1, m2, 7, ok);
 
     // The second: signaled, so a CQE for sequence number 1.
     let e = Cqe { qp: 7, queue: Queue::Send, wr_id: 2, outcome: ok, seq: 1 };
     let qp3 = Qp { sq: qp2.sq.update(1, SendSlot { wr: wrs[1], outcome: Some(ok) }), sq_done: 2, ..qp2 };
     let m3 = Nic::State { qps: m2.qps.insert(7, qp3), cqs: m2.cqs.insert(3, m2.cqs[3].push(e)), ..m2 };
     assert(Nic::State::execute_send(m2, m3, 7, ok));
-    crate::nic_proofs::lemma_execute_send(m2, m3, 7, ok);
+    lemma_execute_send(m2, m3, 7, ok);
 
-    // Polling that one CQE retires both writes: by M's lemma, the unsignaled one (sequence
-    // number 0) succeeded, and the send queue is empty again.
+    // Polling that one CQE retires both, and the send queue is empty again.
     let m4 = Nic::State {
         qps: m3.qps.insert(7, Qp { sq: qp3.sq.skip(2), sq_head: 2, sq_done: 0, ..qp3 }),
         cqs: m3.cqs.insert(3, m3.cqs[3].pop()),
@@ -266,90 +294,184 @@ pub proof fn example_unsignaled_in_m() {
         ..m3
     };
     assert(Nic::State::poll_cq(m3, m4, 3));
-    crate::nic::lemma_poll(m3, m4, 3);
+    lemma_poll(m3, m4, 3);
     assert(!m3.qps[7].sq[0].wr.signaled);
-    assert(m4.retired[WqeRef { qp: 7, queue: Queue::Send, seq: 0 }].status is Success);
-    assert(m4.retired[WqeRef { qp: 7, queue: Queue::Send, seq: 1 }] == ok);
     assert(m4.qps[7].sq.len() == 0);
-}
 
-/// M: the two writes are one request (a batch) and the first fails. Its CQE retires only a
-/// prefix of the batch, which stays in flight. The second write flushes, and once it
-/// retires too, the batch's outcome is its first error, not the last write's flush.
-#[verifier::spinoff_prover]
-#[verifier::rlimit(30)]
-pub proof fn example_batch_first_error() {
-    reveal_with_fuel(total_len, 2);
-    reveal(retires);
-    let remote = Outcome { status: Status::RemoteErr, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
-    let flush = Outcome { status: Status::FlushErr, ..remote };
-    let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 2 };
-    let (m0, wrs) = (connected(), two_writes());
-    lemma_connected();
-    let qp1 = Qp { sq: wrs.map_values(|wr: SendWr| SendSlot { wr, outcome: None }), ..qp7() };
-    let m1 = Nic::State { qps: m0.qps.insert(7, qp1), ..m0 };
-    assert(Nic::State::post_send(m0, m1, 7, wrs));
-    crate::nic_proofs::lemma_post_send(m0, m1, 7, wrs);
-    assert(range.pending_at(m1, 0));
-
-    // A failed WQE produces a CQE even unsignaled, and moves the QP to `Err`.
-    let e1 = Cqe { qp: 7, queue: Queue::Send, wr_id: 1, outcome: remote, seq: 0 };
-    let qp2 = Qp { sq: qp1.sq.update(0, SendSlot { wr: wrs[0], outcome: Some(remote) }), sq_done: 1, state: QpState::Err, ..qp1 };
-    let m2 = Nic::State { qps: m1.qps.insert(7, qp2), cqs: m1.cqs.insert(3, m1.cqs[3].push(e1)), ..m1 };
-    assert(Nic::State::execute_send(m1, m2, 7, remote));
-    crate::nic_proofs::lemma_execute_send(m1, m2, 7, remote);
-
-    // Polling it retires the first write only: the batch is still in flight.
-    let qp3 = Qp { sq: qp2.sq.skip(1), sq_head: 1, sq_done: 0, ..qp2 };
-    let m3 = Nic::State {
-        qps: m2.qps.insert(7, qp3), cqs: m2.cqs.insert(3, m2.cqs[3].pop()),
-        retired: m2.retired.union_prefer_right(retires(qp2, e1)), ..m2
-    };
-    assert(Nic::State::poll_cq(m2, m3, 3));
-    crate::nic_proofs::lemma_poll_cq(m2, m3, 3);
-    assert(m3.retired.contains_key(range.at(0)) && !m3.retired.contains_key(range.at(1)));
-    assert(range.pending_at(m3, 1));
-
-    // The second write flushes. Once it retires, the batch's outcome is `RemoteErr`.
-    let e2 = Cqe { qp: 7, queue: Queue::Send, wr_id: 2, outcome: flush, seq: 1 };
-    let qp4 = Qp { sq: qp3.sq.update(0, SendSlot { wr: wrs[1], outcome: Some(flush) }), sq_done: 1, ..qp3 };
-    let m4 = Nic::State { qps: m3.qps.insert(7, qp4), cqs: m3.cqs.insert(3, m3.cqs[3].push(e2)), ..m3 };
-    assert(Nic::State::execute_send(m3, m4, 7, flush));
-    crate::nic_proofs::lemma_execute_send(m3, m4, 7, flush);
-    let m5 = Nic::State {
-        qps: m4.qps.insert(7, Qp { sq: qp4.sq.skip(1), sq_head: 2, sq_done: 0, ..qp4 }),
-        cqs: m4.cqs.insert(3, m4.cqs[3].pop()),
-        retired: m4.retired.union_prefer_right(retires(qp4, e2)), ..m4
-    };
-    assert(Nic::State::poll_cq(m4, m5, 3));
-    assert(m5.retired[range.at(0)] == remote && m5.retired[range.last()] == flush);
-    assert(range.all_retired(m5.retired)) by {
-        assert forall|s: nat| range.first <= s < range.end
-            implies m5.retired.contains_key(#[trigger] range.at(s)) by { assert(s == 0 || s == 1); }
-    }
-    assert(range.first_error(m5.retired, 0));
-    crate::refinement::lemma_aggregate_first_error(range, m5.retired, 0);
-    assert(range.aggregate(m5.retired) == remote);
-}
-
-/// A: one request holds a READ destination and a frozen SEND source, of which the program
-/// keeps a clone. The NIC writes the one and reads the other while the program may read the
-/// clone. Taking the outcome returns each lease under its own name: the destination is the
-/// program's to write again, the source stays shared.
-#[verifier::spinoff_prover]
-#[verifier::rlimit(20)]
-pub proof fn example_mixed_request() {
-    let source = Lease { mem: Span { start: 0, len: 64 }.bytes(), unique: false, any_bytes: true, holder: Holder::Program };
-    let destination = Lease { mem: Span { start: 128, len: 64 }.bytes(), unique: true, any_bytes: true, holder: Holder::Program };
-    let remote = Outcome { status: Status::RemoteErr, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    // A: the request holds both destinations.
+    let destination = |start: int| Lease { mem: Span { start, len: 64 }.bytes(), unique: true, any_bytes: true, holder: Holder::Program };
     let a0 = Abs::State {
         qps: Set::empty().insert(7),
-        leases: Map::empty().insert(0, source).insert(1, destination).insert(2, source),
+        leases: Map::empty().insert(0, destination(0)).insert(1, destination(64)),
         requests: Map::empty(),
-        next_id: 3,
+        next_id: 2,
         outcomes: Map::empty(),
         wakes: Seq::empty(),
     };
+    assert(abs_inv(a0));
+    let dirs = Map::empty().insert(0nat, Dir::In).insert(1nat, Dir::In);
+    let a1 = Abs::State {
+        requests: a0.requests.insert(2, fresh_req()),
+        leases: a0.leases_in_request(dirs, 2),
+        next_id: 3,
+        ..a0
+    };
+    assert(Abs::State::post_request(a0, a1, dirs, 7));
+    Abs::State::post_request_inductive(a0, a1, dirs, 7);
+    let a2 = Abs::State {
+        outcomes: a1.outcomes.insert(2, ok),
+        requests: a1.requests.insert(2, fresh_req().completed(ok)),
+        ..a1
+    };
+    assert(Abs::State::complete(a1, a2, 2, ok));
+    Abs::State::complete_inductive(a1, a2, 2, ok);
+    let a3 = Abs::State { requests: a2.requests.remove(2), leases: a2.leases_returned(2), ..a2 };
+    assert(Abs::State::take(a2, a3, 2, ok));
+
+    // They are coupled, and F1 says what the outcome means.
+    let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 2 };
+    let log = IMap::new(|w: WqeRef| w.qp == 7 && w.queue is Send && w.seq < 2, |w: WqeRef| wrs[w.seq as int]);
+    let ranges = Map::empty().insert(2nat, range);
+    assert forall|s: nat| range.first <= s < range.end implies m4.retired.contains_key(#[trigger] range.at(s)) by {}
+    assert forall|s: nat| range.first <= s < range.end implies (#[trigger] m4.retired[range.at(s)]).status is Success by {}
+    lemma_aggregate_success(range, m4.retired);
+    assert forall|x: int| !m4.nic_may_read(x) && !m4.nic_may_write(x) by { lemma_no_reach(m4, x); }
+    assert(records_wrs(m4, log));
+    assert(coupled(a2, m4, ranges, log));
+    corollary_f1(a2, a3, m4, ranges, log, 2, ok);
+    assert(log[range.at(0)].opcode is Read && log[range.at(1)].opcode is Read);
+    assert(m4.retired[range.at(0)].byte_len == 64);
+    assert(m4.retired[range.at(1)].byte_len == 64);
+}
+
+/// A WRITE from `[0, 64)`, a READ into `[128, 192)` and a WRITE from `[64, 128)` with one
+/// doorbell; only the last asks for a completion.
+spec fn write_read_write() -> Seq<SendWr> {
+    seq![
+        SendWr { wr_id: 1, opcode: Opcode::Write, sges: seq![Sge { addr: 0, len: 64, lkey: 5 }], signaled: false, inline: false },
+        SendWr { wr_id: 2, opcode: Opcode::Read, sges: seq![Sge { addr: 128, len: 64, lkey: 5 }], signaled: false, inline: false },
+        SendWr { wr_id: 3, opcode: Opcode::Write, sges: seq![Sge { addr: 64, len: 64, lkey: 5 }], signaled: true, inline: false },
+    ]
+}
+
+/// The run of M behind [`example_batch_error_at_position_1`]: the first WRITE succeeds, the READ
+/// fails, and the CQE of that failure retires both while the last WRITE waits (`middle`); then
+/// the last WRITE flushes and its CQE retires it (`end`).
+#[verifier::spinoff_prover]
+#[verifier::rlimit(40)]
+proof fn lemma_batch_error_run() -> (r: (Nic::State, Nic::State))
+    ensures
+        ({
+            let (middle, end) = r;
+            let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 3 };
+            let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+            let remote = Outcome { status: Status::RemoteErr, ..ok };
+            let flush = Outcome { status: Status::FlushErr, ..ok };
+            &&& middle.invariant()
+            &&& range.pending_at(middle, 2)
+            &&& middle.retired[range.at(0)] == ok && middle.retired[range.at(1)] == remote
+            &&& middle.qps[7].sq.len() == 1 && middle.qps[7].sq[0].wr == write_read_write()[2]
+            &&& middle.qps[7].sq_head == 2
+            &&& middle.qps[7].rq.len() == 0
+            &&& middle.qps[7].state is Err
+            &&& middle.mrs == connected().mrs
+            &&& middle.qps.dom() == connected().qps.dom()
+            &&& forall|w: WqeRef| #[trigger] middle.retired.contains_key(w)
+                <==> w.qp == 7 && w.queue is Send && w.seq < 2
+            &&& end.qps[7].sq.len() == 0 && end.qps[7].rq.len() == 0
+            &&& end.mrs == connected().mrs
+            &&& end.qps.dom() == connected().qps.dom()
+            &&& end.retired[range.at(0)] == ok && end.retired[range.at(1)] == remote
+            &&& end.retired[range.at(2)] == flush
+            &&& forall|w: WqeRef| #[trigger] end.retired.contains_key(w)
+                <==> w.qp == 7 && w.queue is Send && w.seq < 3
+            &&& range.no_success_after_error(end.retired)
+        }),
+{
+    reveal_with_fuel(total_len, 2);
+    reveal(retires);
+    let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    let remote = Outcome { status: Status::RemoteErr, ..ok };
+    let flush = Outcome { status: Status::FlushErr, ..ok };
+    let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 3 };
+    let (m0, wrs) = (connected(), write_read_write());
+    lemma_connected();
+
+    let qp1 = Qp { sq: wrs.map_values(|wr: SendWr| SendSlot { wr, outcome: None }), ..qp7() };
+    let m1 = Nic::State { qps: m0.qps.insert(7, qp1), ..m0 };
+    assert(Nic::State::post_send(m0, m1, 7, wrs));
+    lemma_post_send(m0, m1, 7, wrs);
+    assert(range.pending_at(m1, 0));
+    assert(range.errors_stick(m1));
+
+    // The first WRITE succeeds, without a CQE.
+    let qp2 = Qp { sq: qp1.sq.update(0, SendSlot { wr: wrs[0], outcome: Some(ok) }), sq_done: 1, ..qp1 };
+    let m2 = Nic::State { qps: m1.qps.insert(7, qp2), ..m1 };
+    assert(Nic::State::execute_send(m1, m2, 7, ok));
+    lemma_execute_send(m1, m2, 7, ok);
+    lemma_request_step(range, m1, m2, Nic::Step::execute_send(7, ok));
+    assert(range.pending_at(m2, 0));
+
+    // The READ fails: a CQE even unsignaled, and the QP moves to `Err`.
+    let e1 = Cqe { qp: 7, queue: Queue::Send, wr_id: 2, outcome: remote, seq: 1 };
+    let qp3 = Qp { sq: qp2.sq.update(1, SendSlot { wr: wrs[1], outcome: Some(remote) }), sq_done: 2, state: QpState::Err, ..qp2 };
+    let m3 = Nic::State { qps: m2.qps.insert(7, qp3), cqs: m2.cqs.insert(3, m2.cqs[3].push(e1)), ..m2 };
+    assert(Nic::State::execute_send(m2, m3, 7, remote));
+    lemma_execute_send(m2, m3, 7, remote);
+    lemma_request_step(range, m2, m3, Nic::Step::execute_send(7, remote));
+    assert(range.pending_at(m3, 0));
+
+    // Polling its CQE retires a prefix of the batch, which stays in flight.
+    let qp4 = Qp { sq: qp3.sq.skip(2), sq_head: 2, sq_done: 0, ..qp3 };
+    let m4 = Nic::State {
+        qps: m3.qps.insert(7, qp4), cqs: m3.cqs.insert(3, m3.cqs[3].pop()),
+        retired: m3.retired.union_prefer_right(retires(qp3, e1)), ..m3
+    };
+    assert(Nic::State::poll_cq(m3, m4, 3));
+    lemma_poll_cq(m3, m4, 3);
+    lemma_request_step(range, m3, m4, Nic::Step::poll_cq(3));
+    assert(range.pending_at(m4, 2));
+
+    // The last WRITE flushes, and its CQE retires it.
+    let e2 = Cqe { qp: 7, queue: Queue::Send, wr_id: 3, outcome: flush, seq: 2 };
+    let qp5 = Qp { sq: qp4.sq.update(0, SendSlot { wr: wrs[2], outcome: Some(flush) }), sq_done: 1, ..qp4 };
+    let m5 = Nic::State { qps: m4.qps.insert(7, qp5), cqs: m4.cqs.insert(3, m4.cqs[3].push(e2)), ..m4 };
+    assert(Nic::State::execute_send(m4, m5, 7, flush));
+    lemma_execute_send(m4, m5, 7, flush);
+    lemma_request_step(range, m4, m5, Nic::Step::execute_send(7, flush));
+    assert(range.pending_at(m5, 2));
+
+    let m6 = Nic::State {
+        qps: m5.qps.insert(7, Qp { sq: qp5.sq.skip(1), sq_head: 3, sq_done: 0, ..qp5 }),
+        cqs: m5.cqs.insert(3, m5.cqs[3].pop()),
+        retired: m5.retired.union_prefer_right(retires(qp5, e2)), ..m5
+    };
+    assert(Nic::State::poll_cq(m5, m6, 3));
+    lemma_request_step(range, m5, m6, Nic::Step::poll_cq(3));
+    assert forall|s: nat| range.first <= s < range.end implies m6.retired.contains_key(#[trigger] range.at(s)) by {}
+    (m4, m6)
+}
+
+/// **F1, an error at position 1, and R1.** One request holds a shared source and a unique READ
+/// destination. On M, the first WRITE succeeds, the READ fails and the last WRITE flushes.
+/// While the last WRITE waits, the request is in flight with its leases, though a prefix of it
+/// retired with an error. Once taken, its outcome is the READ's error, at position 1: the WQE
+/// before it succeeded, and the one after it did not.
+#[verifier::spinoff_prover]
+#[verifier::rlimit(40)]
+pub proof fn example_batch_error_at_position_1() {
+    reveal_with_fuel(total_len, 2);
+    let (middle, end) = lemma_batch_error_run();
+    let wrs = write_read_write();
+    let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    let remote = Outcome { status: Status::RemoteErr, ..ok };
+    let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 3 };
+    let log = IMap::new(|w: WqeRef| w.qp == 7 && w.queue is Send && w.seq < 3, |w: WqeRef| wrs[w.seq as int]);
+    let ranges = Map::empty().insert(3nat, range);
+
+    // A: the request holds the source, to read, and the destination, to write. The program
+    // keeps a clone of the source. A shared lease cannot be a destination.
+    let a0 = source_and_destination();
     assert(abs_inv(a0));
     let dirs = Map::empty().insert(0nat, Dir::Out).insert(1nat, Dir::In);
     assert(a0.may_post(dirs));
@@ -371,6 +493,17 @@ pub proof fn example_mixed_request() {
     lemma_s1_no_conflict(a1, 128);
     assert(!a1.program_reads(128));
 
+    // In flight, with a prefix retired, an error among it: coupled, and R1 says so.
+    assert forall|x: int| #[trigger] middle.nic_may_read(x) implies a1.nic_reads(x) by {
+        assert(Span { start: 64, len: 64 }.contains(x) ==> a1.leases[0].mem.contains(x));
+    }
+    assert forall|x: int| !(#[trigger] middle.nic_may_write(x)) by {}
+    assert(records_wrs(middle, log));
+    assert(range.pending(middle));
+    assert(coupled(a1, middle, ranges, log));
+    corollary_r1(a1, middle, ranges, log, 1);
+
+    // The NIC completes it, and the client takes it back.
     let a2 = Abs::State {
         outcomes: a1.outcomes.insert(3, remote),
         requests: a1.requests.insert(3, fresh_req().completed(remote)),
@@ -380,9 +513,42 @@ pub proof fn example_mixed_request() {
     Abs::State::complete_inductive(a1, a2, 3, remote);
     let a3 = Abs::State { requests: a2.requests.remove(3), leases: a2.leases_returned(3), ..a2 };
     assert(Abs::State::take(a2, a3, 3, remote));
-    lemma_f1_take(a2, a3, 3, remote);
+
+    // Complete: coupled, and F1 says what the outcome means.
+    assert forall|s: nat| range.first <= s < range.end implies end.retired.contains_key(#[trigger] range.at(s)) by {}
+    assert(range.first_error(end.retired, 1)) by {
+        assert forall|j: nat| range.first <= j < 1 implies (#[trigger] end.retired[range.at(j)]).status is Success by {}
+    }
+    lemma_aggregate_first_error(range, end.retired, 1);
+    assert forall|x: int| !end.nic_may_read(x) && !end.nic_may_write(x) by { lemma_no_reach(end, x); }
+    assert(records_wrs(end, log));
+    assert(coupled(a2, end, ranges, log));
+    corollary_f1(a2, a3, end, ranges, log, 3, remote);
+    corollary_r1(a2, end, ranges, log, 1);
+    assert(end.retired[range.at(0)].status is Success && end.retired[range.at(2)].status.is_err());
+
+    // The destination is the program's to write again; the source stays shared.
     assert(a3.leases.contains_key(1) && a3.leases[1].mem.contains(128) && a3.program_writes(128));
-    assert(!a3.leases[0].unique && !a3.leases[2].unique);
+}
+
+/// **F1, a refusal.** The device refused the doorbell of a request of a source and a
+/// destination: M moved by rely steps only, here none, and A took no step. The queue pair holds
+/// no new WQE, and the NIC touches neither the destination nor, to write, the source.
+pub proof fn example_refused_post() {
+    let m = connected();
+    lemma_connected();
+    let sh = Share { cq: 3, owns: ISet::new(|q: QpId| q == 7) };
+    let pins = ISet::empty();
+    lemma_rely_refl(sh, pins, m);
+    let a = source_and_destination();
+    assert(abs_inv(a));
+    let dirs = Map::empty().insert(0nat, Dir::Out).insert(1nat, Dir::In);
+    assert(a.may_post(dirs));
+    let (ranges, log) = (Map::<ReqId, WqeRange>::empty(), IMap::<WqeRef, SendWr>::empty());
+    assert forall|x: int| !m.nic_may_read(x) && !m.nic_may_write(x) by { lemma_no_reach(m, x); }
+    assert(coupled(a, m, ranges, log));
+    corollary_f1_refused(a, m, m, ranges, log, sh, pins, 7, dirs);
+    assert(a.leases[1].mem.contains(128) && !m.nic_may_read(128) && !m.nic_may_write(128));
 }
 
 } // verus!
