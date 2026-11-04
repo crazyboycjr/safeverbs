@@ -5,6 +5,9 @@
 //! The traversals that prove inputs disjoint (`Leases::disjoint_incoming` and the receive
 //! admission's `separate_unique_*`) only borrow linear permissions and change nothing, so
 //! they exist in Verus builds alone (`cfg(verus_keep_ghost)`); plain builds have no such code.
+//
+// The code keeps the plain forms the proofs reason about (explicit matches, a `Vec`'s view).
+#![allow(clippy::single_match, clippy::ptr_arg)]
 
 use safeverbs_spec::abs::Dir;
 use std::sync::Arc;
@@ -1185,11 +1188,10 @@ impl<N: Nic> Leases<N> {
     pub(crate) fn hand_back_many(&mut self, spare: &mut Vec<Lease<N>>)
         requires
             old(self).inv(),
-            old(self).fully_recorded(),
             old(spare)@.len() == 0,
         ensures
             final(self).inv(),
-            final(self).fully_recorded(),
+            old(self).fully_recorded() ==> final(self).fully_recorded(),
             final(self).uniques() == old(self).uniques(),
             !old(self).spec_many() ==> *final(self) == *old(self),
             final(spare)@.len() == 0,
@@ -1456,11 +1458,6 @@ impl<N: Nic> Peek<'_, N> {
         }
     }
 
-    /// The number of bytes.
-    pub(crate) closed spec fn spec_bytes(&self) -> usize {
-        self.bytes
-    }
-
     /// The part the program would get for its bytes in a protection domain.
     pub(crate) closed spec fn part(&self, pd: u64) -> Part<N> {
         Part { sge: self.spec_sge(), pd, lease: Lease::Shared(*self.frozen) }
@@ -1536,6 +1533,30 @@ impl<N: Nic> Kept<N> {
         &&& self.last matches Some(frozen) ==> forall|j: int| 0 <= j < self.leases.view().len()
             ==> (#[trigger] self.leases.view()[j]).unique()
             ==> self.leases.view()[j].byte_domain().disjoint((*frozen).byte_domain())
+        &&& self.last_is_input()
+    }
+
+    /// Its last allocation is that of an input, so a `Peek` of it, which is no more than its bytes,
+    /// is of that input's protection domain.
+    closed spec fn last_is_input(self) -> bool {
+        self.last matches Some(frozen) ==> exists|i: int|
+            0 <= i < self.loans@.len() && (#[trigger] self.loans@[i]).part.lease == Lease::Shared(frozen)
+    }
+
+    /// The input it holds the last allocation for stays one when another joins.
+    proof fn lemma_last_stays(self, before: &Self, part: Part<N>, access: Option<Dir>)
+        requires
+            before.last_is_input(),
+            self.last == before.last,
+            self.loans@ == before.loans@.push(Loan { part, access }),
+        ensures
+            self.last_is_input(),
+    {
+        if let Some(frozen) = self.last {
+            let i = choose|i: int|
+                0 <= i < before.loans@.len() && (#[trigger] before.loans@[i]).part.lease == Lease::Shared(frozen);
+            assert(self.loans@[i] == before.loans@[i]);
+        }
     }
 
     /// The inputs of its WQEs so far.
@@ -1586,6 +1607,7 @@ impl<N: Nic> Kept<N> {
                         self.loans = Ghost(before.loans@.push(Loan { part: incoming, access: Some(access) }));
                         proof {
                             before.lemma_last_keeps(incoming, Some(access));
+                            self.lemma_last_stays(&before, incoming, Some(access));
                         }
                         return Ok(());
                     }
@@ -1791,6 +1813,7 @@ impl<N: Nic> Kept<N> {
             old(self).keeps_frozen(**peek.frozen),
             peek.inv(),
             peek.bytes <= u32::MAX,
+            forall|i: int| 0 <= i < old(self).loans().len() ==> (#[trigger] old(self).loans()[i]).part.spec_pd() == pd,
         ensures
             final(self).inv(),
             final(self).loans() == old(self).loans().push(Loan { part: peek.part(pd), access: Some(Dir::Out) }),
@@ -1801,6 +1824,7 @@ impl<N: Nic> Kept<N> {
             peek.lemma_part(pd);
             before.lemma_last_keeps(peek.part(pd), Some(Dir::Out));
             assert(self.keepers() == before.keepers());
+            self.lemma_last_stays(&before, peek.part(pd), Some(Dir::Out));
         }
     }
 
@@ -1850,10 +1874,17 @@ impl<N: Nic> Kept<N> {
             self.last matches Some(last) ==> forall|j: int| 0 <= j < self.leases.view().len()
                 ==> (#[trigger] self.leases.view()[j]).unique()
                 ==> self.leases.view()[j].byte_domain().disjoint((*last).byte_domain()),
+            self.last == before.last || self.last is None
+                || (self.last matches Some(frozen) && part.lease == Lease::Shared(frozen)),
         ensures
             self.inv(),
     {
         lemma_loan_added(before.loans@, before.keepers(), part, access, self.keepers());
+        if self.last == before.last {
+            self.lemma_last_stays(before, part, access);
+        } else if let Some(frozen) = self.last {
+            assert(self.loans@[before.loans@.len() as int].part.lease == Lease::Shared(frozen));
+        }
     }
 
     /// Its buffers, leaving it none, for the WQEs `wqes`. Starting a list of several takes the room

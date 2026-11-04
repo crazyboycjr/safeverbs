@@ -10,12 +10,13 @@
 //!
 //! | Ring operation | Steps of A |
 //! | --- | --- |
-//! | `begin`, `push_wqe`, `take_detached_error` | none (`lemma_ring_stutter`) |
-//! | `end` | none: a staged request's leases are still the program's (`lemma_ring_end`) |
+//! | `fill`, `unfill`, `take_general_path`, `take_detached_error` | none (`lemma_ring_stutter`) |
+//! | `stage`, `stage_filled` | none: a staged request's leases are still the program's (`lemma_ring_end`) |
 //! | `commit` | `post_request` for each staged request, then its `register` or `detach` (`lemma_ring_commit`) |
 //! | `abort`, `abort_keeping` | `drop` of each lease of each staged request without an owner; none for the others, whose leases the ring keeps for their owners (refused) or hands back (`lemma_ring_abort`) |
-//! | `complete` | `complete` for each request retired, in order, waking the same wakers (`lemma_ring_complete`) |
-//! | `take` | `take` (`lemma_ring_take`); none for a refused request (`lemma_ring_take_refused`) |
+//! | `complete`, `retire_next` | `complete` for each request retired, in order, waking the same wakers (`lemma_ring_complete`) |
+//! | `retire_oldest`, its slot emptied | `complete`, then `take`, of the oldest request in flight (`lemma_ring_oldest`) |
+//! | `take`, `take_retired` | `take` (`lemma_ring_take`); none for a refused request (`lemma_ring_take_refused`) |
 //! | `detach` | `detach`, none for a staged request, `drop` of each lease for a refused one (`lemma_ring_detach`) |
 //! | `set_waker` | `register`, none for a staged request (`lemma_ring_register`) |
 //! | `release_all` | `complete` for each request in flight, then `detach`, and `drop` of each lease of each staged or refused one (`lemma_ring_release_all`) |
@@ -32,10 +33,10 @@
 //! of each lease for a refused one).
 //!
 //! Leases are tracked as values: the `L` that A sees a request hold is the
-//! one `end` moved into the ring, and `take` and `abort_keeping` hand back
+//! one `stage` moved into the ring, and `take` and `abort_keeping` hand back
 //! that value. With the linearity of `L` (Rust moves it; the ring never
 //! duplicates it), this proves retention of the ring's resource values: its leases stay
-//! in its slot, unreachable, from `end` until A says the NIC is done with
+//! in its slot, unreachable, from `stage` until A says the NIC is done with
 //! them (complete, or never posted), and leave it exactly once.
 //!
 //! Which request of A a request of the ring is (`reqs`) and which leases of A
@@ -1333,7 +1334,8 @@ pub proof fn lemma_release<L>(
 // ring's requests sit before; it gives the state of A after the steps the
 // table at the top names, in which they sit after.
 
-/// `begin`, `push_wqe` and `take_detached_error`: no step.
+/// Filling a slot or emptying it again, marking the request's path and `take_detached_error`: no
+/// step.
 pub proof fn lemma_ring_stutter<L>(
     pre: Ring<L>,
     post: Ring<L>,
@@ -1352,7 +1354,7 @@ pub proof fn lemma_ring_stutter<L>(
     lemma_same(pre.view(), post.view(), a, q, reqs, held);
 }
 
-/// `end`: no step; the staged request holds leases of the program's, which
+/// `stage`: no step; the staged request holds leases of the program's, which
 /// may be posted in their directions.
 pub proof fn lemma_ring_end<L>(
     pre: Ring<L>,
@@ -1514,6 +1516,47 @@ pub proof fn lemma_ring_complete<L>(
     }
     lemma_same(retired_range(pre.view(), r0, r1, o), post.view(), a2, q, reqs, held);
     pre.lemma_wakers(r0, r1);
+    a2
+}
+
+/// `retire_oldest`, its caller emptying the slot it returns: A's `complete` of the oldest request in
+/// flight, which holds no waker, then A's `take`.
+pub proof fn lemma_ring_oldest<L>(
+    pre: Ring<L>,
+    post: Ring<L>,
+    recv: bool,
+    wqe: u64,
+    wc: Wc,
+    a: Abs::State,
+    q: QpId,
+    reqs: Map<int, ReqId>,
+    held: Held<L>,
+) -> (a2: Abs::State)
+    requires
+        pre.inv(),
+        placed(pre.view(), a, q, reqs, held),
+        post.retired_and_taken(&pre),
+        pre.req(pre.spec_retired() as int) is Some,
+        !pre.req(pre.spec_retired() as int)->0.detached,
+        pre.req(pre.spec_retired() as int)->0.waker is None,
+    ensures
+        abs_reaches(a, a2),
+        placed(post.view(), a2, q, reqs, held),
+        post.woken() == pre.woken(),
+        a2.wakes == a.wakes,
+{
+    let r = pre.spec_retired() as int;
+    post.lemma_retired_and_taken(&pre);
+    pre.lemma_view();
+    let o = |s: int| crate::wc::result_model(pre.retire_outcome(s, recv, wqe, wc));
+    let a1 = lemma_complete(pre.view(), a, q, reqs, held, r, r + 1, o);
+    let v1 = retired_range(pre.view(), r, r + 1, o);
+    let req = pre.req(r)->0;
+    let a2 = lemma_take(v1, a1, q, reqs, held, r, o(r), req.leases);
+    lemma_abs_reaches_trans(a, a1, a2);
+    lemma_same(without(v1, r), post.view(), a2, q, reqs, held);
+    assert(wakers(pre.view(), r, r) =~= Seq::<WakerId>::empty());
+    assert(a.wakes + wakers(pre.view(), r, r + 1) =~= a.wakes);
     a2
 }
 

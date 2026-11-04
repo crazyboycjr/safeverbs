@@ -672,7 +672,9 @@ impl<C, N: Nic> Engine<C, N> {
     /// Writes `open`'s WQEs as a request, signaled if `signal` (else only if the ring needs it),
     /// with `ctx` to come back with its completion, if it has one; it goes out at the next
     /// [`Engine::commit`]. `open` is empty then and takes more. Returns its sequence number; if it
-    /// has no WQE or the queue no room, `ctx` back ([`Engine::open_fits`] says).
+    /// has no WQE, the queue no room ([`Engine::open_fits`] says) or the QP does not take what it
+    /// was written for (another protection domain, more WQEs than its requests may have, a READ on
+    /// an unreliable connection), `ctx` back and `open` as it was.
     pub fn close_open<T: Transport>(
         &mut self,
         qp: QpKey<T>,
@@ -1548,6 +1550,12 @@ mod tests {
         ] {
             assert!(refused);
         }
+        assert_eq!(
+            w.submit_open_detached(short, &mut open),
+            Err(Error::QueueFull),
+            "a request without an owner that cannot go out says so"
+        );
+        assert_eq!(open.len(), 2);
         // Waiting for room on one of them never ends well: it says so, with the buffers.
         let error = w.submit_open(short, &mut open, true, ()).unwrap_err();
         assert_eq!(

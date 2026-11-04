@@ -33,7 +33,8 @@
 //!   posting order, at its position in the interval, else the last WQE's
 //!   success (`send_outcomes`). [`Hw::take`] hands back exactly that, with
 //!   the request's own context and buffers, or says that its doorbell was
-//!   refused, which M never saw. A detached request's first error is held to
+//!   refused, which M never saw, and so does [`Hw::next_completion`] as it routes
+//!   the CQEs read (`Hw::hands_out`). A detached request's first error is held to
 //!   the same ([`Hw::take_send_error`]).
 //! - **Capacity.** The CQ's entries reserved in M are exactly what the
 //!   engine counts ([`Hw::reserved`]); a QP is created only if its depths fit
@@ -41,12 +42,13 @@
 //!   flight, so the CQ never overruns (M's `lemma_cq_never_overflows`).
 //! - **Teardown.** A QP is destroyed only when neither ring has a WQE in
 //!   flight, which the coupling turns into M's empty queues, `destroy_qp`'s
-//!   precondition ([`Hw::destroy`]).
+//!   precondition, and no CQE read names it ([`Hw::destroy`]).
 //! - **State.** The engine posts work only on a QP it connected or moved to
 //!   the error state, which M sees in `Rts` or `Err`.
 //!
 //! The unverified engine (`crate::engine`) drives a `Hw` through its public
-//! methods only; each requires and keeps the invariant.
+//! methods only; each requires and keeps the invariant, and that of the
+//! request being written it is given (`open`).
 //
 // The imports are used by ghost code too; `global` erases to a block. The
 // code keeps the plain forms the proofs reason about (explicit matches,
@@ -949,17 +951,10 @@ spec fn same_qps<C, N: Device>(a: Seq<Option<HwQp<C, N>>>, b: Seq<Option<HwQp<C,
     &&& forall|i: int| 0 <= i < a.len() && #[trigger] a[i] is Some ==> a[i]->0.same_config(b[i]->0)
 }
 
-/// The table `qps` is coupled to M's state `m`, with the CQEs `pending` read and not routed: every
-/// entry is; one entry per QP name, and every QP of the share M has is one.
-spec fn table_ok<C, N: Device>(
-    qps: Seq<Option<HwQp<C, N>>>, next_name: nat, t: NicToken, m: Nic::State,
-    pending: Seq<Cqe>,
-) -> bool {
+/// The names of the table `qps`: one entry per QP name, every QP of the share M has is one, only
+/// the table's QPs write, and names from `next_name` on are unused.
+spec fn names_ok<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, next_name: nat, t: NicToken, m: Nic::State) -> bool {
     let sh = t.share();
-    &&& nic_inv(m)
-    &&& share_wf(m, sh)
-    &&& qps.len() <= MAX_QPS
-    &&& forall|i: int| 0 <= i < qps.len() ==> #[trigger] qp_ok(qps[i], i, t, m)
     &&& forall|i: int, j: int|
         #![trigger qps[i], qps[j]]
         0 <= i < qps.len() && 0 <= j < qps.len() && i != j && qps[i] is Some
@@ -967,7 +962,6 @@ spec fn table_ok<C, N: Device>(
     &&& forall|q: QpId|
         #[trigger] m.qps.contains_key(q) && sh.owns.contains(q) ==> exists|i: int|
             0 <= i < qps.len() && #[trigger] qps[i] is Some && qps[i]->0.id() == q
-    // Only the table's QPs write; names from `next_name` on are unused.
     &&& forall|q: QpId|
         #[trigger] writes(t, q) ==> exists|i: int|
             0 <= i < qps.len() && #[trigger] qps[i] is Some && qps[i]->0.id() == q
@@ -976,6 +970,18 @@ spec fn table_ok<C, N: Device>(
     &&& forall|n: nat| n >= next_name ==> !(#[trigger] m.qps.contains_key(t.name(n)))
     &&& forall|n: nat, w: WqeRef|
         n >= next_name && #[trigger] m.retired.contains_key(w) ==> w.qp != #[trigger] t.name(n)
+}
+
+/// The table `qps` is coupled to M's state `m`, with the CQEs `pending` read and not routed.
+spec fn table_ok<C, N: Device>(
+    qps: Seq<Option<HwQp<C, N>>>, next_name: nat, t: NicToken, m: Nic::State,
+    pending: Seq<Cqe>,
+) -> bool {
+    &&& nic_inv(m)
+    &&& share_wf(m, t.share())
+    &&& qps.len() <= MAX_QPS
+    &&& forall|i: int| 0 <= i < qps.len() ==> #[trigger] qp_ok(qps[i], i, t, m)
+    &&& names_ok(qps, next_name, t, m)
     &&& pending_ok(qps, m, pending)
 }
 
@@ -1038,10 +1044,21 @@ impl<C, N: Device> Hw<C, N> {
 // =============================================================================
 // What the others' steps keep
 
+/// What `framed` says of QP `q` of the share, which is all its coupling reads.
+spec fn framed_qp(pins: ISet<Key>, m: Nic::State, n: Nic::State, q: QpId) -> bool {
+    &&& n.caps == m.caps
+    &&& forall|k: Key| #[trigger] pins.contains(k) && m.mrs.contains_key(k)
+        ==> n.mrs.contains_key(k) && n.mrs[k] == m.mrs[k]
+    &&& n.qps.contains_key(q)
+    &&& qp_kept(m.qps[q], n.qps[q])
+    &&& forall|w: WqeRef| w.qp == q && #[trigger] m.retired.contains_key(w)
+        ==> n.retired.contains_key(w) && n.retired[w] == m.retired[w]
+}
+
 /// A send WR M accepted still is after steps that keep the regions it names.
-proof fn lemma_send_wr_framed(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State, attr: QpAttr, wr: SendWr)
+proof fn lemma_send_wr_framed(pins: ISet<Key>, m: Nic::State, n: Nic::State, q: QpId, attr: QpAttr, wr: SendWr)
     requires
-        framed(sh, pins, m, n),
+        framed_qp(pins, m, n, q),
         m.send_wr_ok(attr, wr),
         !wr.inline ==> forall|i: int| 0 <= i < wr.sges.len() ==> pins.contains(#[trigger] wr.sges[i].lkey),
     ensures
@@ -1083,14 +1100,13 @@ impl<C, N: Device> HwQp<C, N> {
     )
         requires
             self.ok(index, m, t.share(), t.started(self.id()), t.written(self.id())),
-            framed(t.share(), pinned(t), m, n),
+            framed_qp(pinned(t), m, n, self.id()),
             queued_outcomes_ok(n, self.id()),
         ensures
             self.ok(index, n, t.share(), t.started(self.id()), t.written(self.id())),
     {
         let q = self.id@;
         let (a, b) = (m.qps[q], n.qps[q]);
-        assert(qp_kept(a, b));
         outcomes::lemma_recv_framed(self.recv, m, n, q);
         send_outcomes::lemma_results_framed(self.send, m, n, q);
         assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
@@ -1110,7 +1126,7 @@ impl<C, N: Device> HwQp<C, N> {
         let written = t.written(q);
         assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(b.attr, #[trigger] written[j]) by {
             lemma_written_pinned(t, q, j);
-            lemma_send_wr_framed(t.share(), pinned(t), m, n, a.attr, written[j]);
+            lemma_send_wr_framed(pinned(t), m, n, q, a.attr, written[j]);
         }
         assert forall|j: int| 0 <= j < b.sq.len() implies b.sq_head + j < a.sq_head + a.sq.len()
             && (#[trigger] b.sq[j]).wr == a.sq[b.sq_head + j - a.sq_head].wr by {
@@ -1219,6 +1235,58 @@ proof fn lemma_pending_but_one<C, N: Device>(pre: Seq<Option<HwQp<C, N>>>, post:
     }
 }
 
+/// What the table says of names stays true of a table with the same QPs, if M has no QP of the share
+/// it did not have, the writers are the table's, and nothing is retired of a name M had no use of.
+proof fn lemma_names_kept<C, N: Device>(pre: Seq<Option<HwQp<C, N>>>, post: Seq<Option<HwQp<C, N>>>, name: nat, t0: NicToken, t: NicToken, m: Nic::State, n: Nic::State)
+    requires
+        names_ok(pre, name, t0, m),
+        same_qps(post, pre),
+        t.same_engine(&t0),
+        forall|p: QpId| #[trigger] n.qps.contains_key(p) && t.share().owns.contains(p) ==> m.qps.contains_key(p),
+        forall|p: QpId| #[trigger] writes(t, p) ==> exists|k: int|
+            0 <= k < pre.len() && #[trigger] pre[k] is Some && pre[k]->0.id() == p,
+        forall|w: WqeRef| #[trigger] n.retired.contains_key(w) && t.share().owns.contains(w.qp)
+            ==> m.retired.contains_key(w) || m.qps.contains_key(w.qp),
+    ensures
+        names_ok(post, name, t, n),
+{
+    let sh = t.share();
+    assert forall|i: int, j: int|
+        #![trigger post[i], post[j]]
+        0 <= i < post.len() && 0 <= j < post.len() && i != j && post[i] is Some
+            && post[j] is Some implies post[i]->0.id() != post[j]->0.id() by {
+        assert(pre[i] is Some && pre[j] is Some);
+    }
+    assert forall|p: QpId| #[trigger] n.qps.contains_key(p) && sh.owns.contains(p) implies exists|k: int|
+        0 <= k < post.len() && #[trigger] post[k] is Some && post[k]->0.id() == p by {
+        assert(m.qps.contains_key(p));
+        let k = choose|k: int| 0 <= k < pre.len() && #[trigger] pre[k] is Some && pre[k]->0.id() == p;
+        assert(post[k] is Some);
+    }
+    assert forall|p: QpId| #[trigger] writes(t, p) implies exists|k: int|
+        0 <= k < post.len() && #[trigger] post[k] is Some && post[k]->0.id() == p by {
+        let k = choose|k: int| 0 <= k < pre.len() && #[trigger] pre[k] is Some && pre[k]->0.id() == p;
+        assert(post[k] is Some);
+    }
+    assert forall|a: nat| #[trigger] sh.owns.contains(t.name(a)) by {
+        assert(t.name(a) == t0.name(a));
+    }
+    assert forall|a: nat, b: nat| #[trigger] t.name(a) == #[trigger] t.name(b) implies a == b by {
+        assert(t.name(a) == t0.name(a) && t.name(b) == t0.name(b));
+    }
+    assert forall|k: nat| k >= name implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
+        assert(t.name(k) == t0.name(k));
+        assert(sh.owns.contains(t.name(k)));
+    }
+    assert forall|k: nat, w: WqeRef| k >= name && #[trigger] n.retired.contains_key(w)
+        implies w.qp != #[trigger] t.name(k) by {
+        assert(t.name(k) == t0.name(k));
+        if w.qp == t.name(k) {
+            assert(sh.owns.contains(w.qp));
+        }
+    }
+}
+
 /// The table survives steps that do not touch the engine's share (nor the regions its written WRs
 /// name).
 proof fn lemma_table_rely<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, name: nat, t: NicToken, m: Nic::State, n: Nic::State, pending: Seq<Cqe>)
@@ -1234,22 +1302,15 @@ proof fn lemma_table_rely<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, name: nat,
         assert(qp_ok(qps[i], i, t, m));
         if let Some(e) = qps[i] {
             lemma_queued_outcomes_rely(sh, pinned(t), m, n, e.id());
+            assert(sh.owns.contains(e.id()));
+            assert forall|w: WqeRef| w.qp == e.id() && #[trigger] m.retired.contains_key(w)
+                implies n.retired.contains_key(w) && n.retired[w] == m.retired[w] by {
+                assert(sh.owns.contains(w.qp));
+            }
             e.lemma_framed(i as u16, t, m, n);
         }
     }
-    assert forall|q: QpId| #[trigger] n.qps.contains_key(q) && sh.owns.contains(q) implies exists|i: int|
-        0 <= i < qps.len() && #[trigger] qps[i] is Some && qps[i]->0.id() == q by {
-        assert(m.qps.contains_key(q));
-    }
-    assert forall|k: nat| k >= name implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
-        assert(sh.owns.contains(t.name(k)));
-    }
-    assert forall|k: nat, w: WqeRef| k >= name && #[trigger] n.retired.contains_key(w)
-        implies w.qp != #[trigger] t.name(k) by {
-        if w.qp == t.name(k) {
-            assert(sh.owns.contains(w.qp));
-        }
-    }
+    lemma_names_kept(qps, qps, name, t, t, m, n);
     assert forall|i: int| 0 <= i < qps.len() implies #[trigger] same_for_cqes(qps[i], qps[i], m, n) by {
         assert(qp_ok(qps[i], i, t, m));
         if let Some(e) = qps[i] {
@@ -1440,19 +1501,7 @@ proof fn lemma_table_token<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, name: nat
         assert(t2.started(q) == t1.started(q) && t2.written(q) == t1.written(q));
         assert(writes(t1, q));
     }
-    assert forall|a: nat| #[trigger] t2.share().owns.contains(t2.name(a)) by {
-        assert(t2.name(a) == t1.name(a));
-    }
-    assert forall|a: nat, b: nat| #[trigger] t2.name(a) == #[trigger] t2.name(b) implies a == b by {
-        assert(t2.name(a) == t1.name(a) && t2.name(b) == t1.name(b));
-    }
-    assert forall|k: nat| k >= name implies !(#[trigger] m.qps.contains_key(t2.name(k))) by {
-        assert(t2.name(k) == t1.name(k));
-    }
-    assert forall|k: nat, w: WqeRef| k >= name && #[trigger] m.retired.contains_key(w)
-        implies w.qp != #[trigger] t2.name(k) by {
-        assert(t2.name(k) == t1.name(k));
-    }
+    lemma_names_kept(qps, qps, name, t1, t2, m, m);
 }
 
 impl<C, N: Device> Hw<C, N> {
@@ -1963,54 +2012,18 @@ impl<C, N: Device> Hw<C, N> {
                 }
             }
         }
-        assert forall|i: int, j: int|
-            #![trigger self.qps@[i], self.qps@[j]]
-            0 <= i < self.qps@.len() && 0 <= j < self.qps@.len() && i != j && self.qps@[i] is Some
-                && self.qps@[j] is Some implies self.qps@[i]->0.id() != self.qps@[j]->0.id() by {
-            if i != index && j != index {
-                assert(self.qps@[i] == start.qps@[i] && self.qps@[j] == start.qps@[j]);
-            } else if i == index {
-                assert(self.qps@[j] == start.qps@[j]);
-            } else {
-                assert(self.qps@[i] == start.qps@[i]);
-            }
-        }
-        assert forall|p: QpId| #[trigger] n.qps.contains_key(p) && t.share().owns.contains(p) implies exists|i: int|
-            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
-            assert(mid.qps.contains_key(p));
-            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
-            if i != index {
-                assert(self.qps@[i] == start.qps@[i]);
-            }
-        }
-        assert forall|p: QpId| #[trigger] writes(t, p) implies exists|i: int|
-            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
+        completion::lemma_same_qps_but_one(start.qps@, self.qps@, index);
+        assert forall|p: QpId| #[trigger] writes(t, p) implies exists|k: int|
+            0 <= k < start.qps@.len() && #[trigger] start.qps@[k] is Some && start.qps@[k]->0.id() == p by {
             if p == q {
-                assert(self.qps@[index] is Some);
+                assert(start.qps@[index] is Some);
             } else {
                 assert(t.started(p) == t0.started(p));
                 assert(t.written(p) == t0.written(p));
                 assert(writes(t0, p));
-                let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
-                if i != index {
-                    assert(self.qps@[i] == start.qps@[i]);
-                }
             }
         }
-        assert forall|a: nat| #[trigger] t.share().owns.contains(t.name(a)) by {
-            assert(t.name(a) == t0.name(a));
-        }
-        assert forall|a: nat, b: nat| #[trigger] t.name(a) == #[trigger] t.name(b) implies a == b by {
-            assert(t.name(a) == t0.name(a) && t.name(b) == t0.name(b));
-        }
-        assert forall|k: nat| k >= self.next_name@ implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
-            assert(t.name(k) == t0.name(k));
-            assert(!mid.qps.contains_key(t0.name(k)));
-        }
-        assert forall|k: nat, w: WqeRef| k >= self.next_name@ && #[trigger] n.retired.contains_key(w)
-            implies w.qp != #[trigger] t.name(k) by {
-            assert(t.name(k) == t0.name(k));
-        }
+        lemma_names_kept(start.qps@, self.qps@, self.next_name@, t0, t, mid, n);
         assert forall|i: int| 0 <= i < self.qps@.len() implies #[trigger] same_for_cqes(start.qps@[i], self.qps@[i], mid, n) by {
             if i != index {
                 assert(qp_ok(start.qps@[i], i, t0, mid));
@@ -2133,82 +2146,22 @@ impl<C, N: Device> Hw<C, N> {
                 if let Some(e) = self.qps@[i] {
                     let p = e.id();
                     assert(p != q);
-                    let (a, b) = (m.qps[p], n.qps[p]);
-                    assert(qp_kept(a, b));
-                    outcomes::lemma_recv_framed(e.recv, m, n, p);
-                    send_outcomes::lemma_results_framed(e.send, m, n, p);
-                    assert forall|j: int| 0 <= j < b.sq.len() implies b.sq_head + j < a.sq_head + a.sq.len()
-                        && (#[trigger] b.sq[j]).wr == a.sq[b.sq_head + j - a.sq_head].wr by {
-                        assert(b.sq[j].wr == a.sq[j].wr);
+                    assert(sh.owns.contains(p));
+                    assert forall|w: WqeRef| w.qp == p && #[trigger] m.retired.contains_key(w)
+                        implies n.retired.contains_key(w) && n.retired[w] == m.retired[w] by {
+                        assert(sh.owns.contains(w.qp));
                     }
-                    send_outcomes::lemma_bound_kept(e.send, e.send, e.send_tails@, a, b, t.written(p), m.retired, n.retired, p);
-                    assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
-                        i as u16,
-                        false,
-                        (b.sq_head + k) as u64,
-                    ) by {
-                        assert(b.sq[k].wr == a.sq[k].wr);
-                    }
-                    assert forall|k: int| 0 <= k < b.rq.len() implies (#[trigger] b.rq[k]).wr.wr_id == spec_wr_id(
-                        i as u16,
-                        true,
-                        (b.rq_head + k) as u64,
-                    ) by {
-                        assert(b.rq[k].wr == a.rq[k].wr);
-                    }
-                    let written = t.written(p);
-                    assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(b.attr, #[trigger] written[j]) by {
-                        lemma_written_pinned(t, p, j);
-                        let wr = written[j];
-                        assert(m.send_wr_ok(a.attr, wr));
-                        if !wr.inline {
-                            assert forall|x: int| 0 <= x < wr.sges.len() implies n.registered(a.attr.pd, #[trigger] wr.sges[x], wr.opcode.writes_local()) by {
-                                assert(m.registered(a.attr.pd, wr.sges[x], wr.opcode.writes_local()));
-                                assert(pinned(t).contains(wr.sges[x].lkey));
-                            }
-                        }
-                    }
+                    assert(queued_outcomes_ok(n, p));
+                    e.lemma_framed(i as u16, t, m, n);
                 }
             }
         }
-        assert forall|i: int, j: int|
-            #![trigger self.qps@[i], self.qps@[j]]
-            0 <= i < self.qps@.len() && 0 <= j < self.qps@.len() && i != j && self.qps@[i] is Some
-                && self.qps@[j] is Some implies self.qps@[i]->0.id() != self.qps@[j]->0.id() by {
-            if i != index && j != index {
-                assert(self.qps@[i] == start.qps@[i] && self.qps@[j] == start.qps@[j]);
-            } else if i == index {
-                assert(self.qps@[j] == start.qps@[j]);
-            } else {
-                assert(self.qps@[i] == start.qps@[i]);
-            }
+        completion::lemma_same_qps_but_one(start.qps@, self.qps@, index);
+        assert forall|w: WqeRef| #[trigger] n.retired.contains_key(w) && sh.owns.contains(w.qp)
+            implies m.retired.contains_key(w) || m.qps.contains_key(w.qp) by {
+            assert(sh.owns.contains(w.qp));
         }
-        assert forall|p: QpId| #[trigger] n.qps.contains_key(p) && sh.owns.contains(p) implies exists|i: int|
-            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
-            assert(m.qps.contains_key(p));
-            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
-            if i != index {
-                assert(self.qps@[i] == start.qps@[i]);
-            }
-        }
-        assert forall|p: QpId| #[trigger] writes(t, p) implies exists|i: int|
-            0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
-            let i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == p;
-            if i != index {
-                assert(self.qps@[i] == start.qps@[i]);
-            }
-        }
-        assert forall|k: nat| k >= self.next_name@ implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
-            assert(sh.owns.contains(t.name(k)));
-            assert(!m.qps.contains_key(t.name(k)));
-        }
-        assert forall|k: nat, w: WqeRef| k >= self.next_name@ && #[trigger] n.retired.contains_key(w)
-            implies w.qp != #[trigger] t.name(k) by {
-            if w.qp == t.name(k) {
-                assert(sh.owns.contains(w.qp));
-                assert(m.retired.contains_key(w));
-            }
-        }
+        lemma_names_kept(start.qps@, self.qps@, self.next_name@, t, t, m, n);
         assert forall|i: int| 0 <= i < self.qps@.len() implies #[trigger] same_for_cqes(start.qps@[i], self.qps@[i], m, n) by {
             assert(qp_ok(start.qps@[i], i, t, m));
             if i != index {
@@ -2466,22 +2419,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& e.send_tails == e0.send_tails
                 &&& seq == e0.recv.spec_posted()
                 &&& staged.just_staged(&e0.recv, 1, crate::ring::ReqView::new(detached, resource), implied)
-                &&& e.recv.inv()
-                &&& e.recv.spec_head() == staged.spec_head()
-                &&& e.recv.spec_retired() == staged.spec_retired()
-                &&& e.recv.spec_committed() == staged.spec_posted()
-                &&& e.recv.spec_posted() == staged.spec_posted()
-                &&& forall|s: int| #[trigger] e.recv.req(s) == if staged.staged(s) is Some { staged.staged(s) } else { staged.req(s) }
-                &&& forall|s: int| #[trigger] e.recv.staged(s) is None
-                &&& forall|s: int| #[trigger] e.recv.refused(s) == staged.refused(s)
-                &&& e.recv.spec_wqe_retired() == staged.spec_wqe_retired()
-                &&& e.recv.spec_wqe_committed() == staged.spec_wqe_posted()
-                &&& e.recv.spec_wqe_posted() == staged.spec_wqe_posted()
-                &&& e.recv.spec_depth() == staged.spec_depth()
-                &&& e.recv.spec_max_wqes() == staged.spec_max_wqes()
-                &&& e.recv.spec_routed() == staged.spec_routed()
-                &&& e.recv.same_dma(&staged)
-                &&& e.recv.same_meta(&staged)
+                &&& e.recv.just_committed(&staged)
                 &&& payload_ok(resource, detached)
                 &&& implied matches Ok(Completed::Received(Received::Message { .. }))
                 &&& id == spec_wr_id(index as u16, true, e0.recv.spec_wqe_posted())
@@ -2860,7 +2798,6 @@ impl<C, N: Device> Hw<C, N> {
     /// the CQEs read: each is routed, its ring walked up to it, and what that retires handed out.
     /// `None` when nothing is left. A panic of a waker registered on the requests resumes then.
     #[inline(always)]
-    #[verifier::exec_allows_no_decreases_clause]
     #[verifier::spinoff_prover]
     pub fn next_completion(&mut self) -> (r: Option<Completion<C, N>>)
         requires
@@ -2879,6 +2816,7 @@ impl<C, N: Device> Hw<C, N> {
                 self.inv(),
                 self.keeps_requests(&start),
                 start == *old(self),
+            decreases self.pending@.len(), self.walk_to_go(),
         {
             let at = self.polled_at;
             let wc = &self.polled[at];
@@ -2984,6 +2922,17 @@ impl<C, N: Device> Hw<C, N> {
         None
     }
 
+    /// How many requests the walk of the next CQE may yet retire: those of its ring in flight.
+    closed spec fn walk_to_go(&self) -> nat {
+        if self.pending@.len() == 0 {
+            0
+        } else {
+            let e = self.pending@[0];
+            let r = ring_of(self.qps@[cqe_index(e)]->0, e.queue);
+            (r.spec_committed() - r.spec_retired()) as nat
+        }
+    }
+
     /// What [`Hw::next_completion`] does with a CQE out of the common: one step of its walk, on the
     /// oldest request of its queue, which retires it if it ends at or before the CQE's WQE, and
     /// hands it out if it has an owner. A CQE that ends inside it is spent.
@@ -3000,6 +2949,8 @@ impl<C, N: Device> Hw<C, N> {
         ensures
             final(self).inv(),
             final(self).keeps_requests(old(self)),
+            final(self).pending@.len() < old(self).pending@.len()
+                || (final(self).pending@ == old(self).pending@ && final(self).walk_to_go() < old(self).walk_to_go()),
             r matches Some(c) ==> old(self).hands_out(c),
     {
         let ghost pre = *self;
@@ -3308,27 +3259,7 @@ impl<C, N: Device> HwQp<C, N> {
             !self.started,
             self.recv == pre.recv,
             self.send_tails == pre.send_tails,
-            self.send.inv(),
-            self.send.spec_head() == pre.send.spec_head(),
-            self.send.spec_retired() == pre.send.spec_retired(),
-            self.send.spec_committed() == pre.send.spec_posted(),
-            self.send.spec_posted() == pre.send.spec_posted(),
-            forall|s: int| #[trigger] self.send.req(s) == if pre.send.staged(s) is Some {
-                pre.send.staged(s)
-            } else {
-                pre.send.req(s)
-            },
-            forall|s: int| #[trigger] self.send.staged(s) is None,
-            forall|s: int| #[trigger] self.send.refused(s) == pre.send.refused(s),
-            self.send.spec_wqe_retired() == pre.send.spec_wqe_retired(),
-            self.send.spec_wqe_committed() == pre.send.spec_wqe_posted(),
-            self.send.spec_wqe_posted() == pre.send.spec_wqe_posted(),
-            self.send.spec_depth() == pre.send.spec_depth(),
-            self.send.spec_max_wqes() == pre.send.spec_max_wqes(),
-            self.send.spec_routed() == pre.send.spec_routed(),
-            self.send.same_dma(&pre.send),
-            self.send.same_meta(&pre.send),
-            self.send.spec_detached_error() == pre.send.spec_detached_error(),
+            self.send.just_committed(&pre.send),
         ensures
             self.ok(index, n, sh, false, Seq::empty()),
     {
@@ -3384,27 +3315,14 @@ impl<C, N: Device> HwQp<C, N> {
 
     /// The written WRs were discarded: what the ring staged is refused, and M never saw it.
     #[verifier::spinoff_prover]
-    proof fn lemma_refused(&self, pre: &Self, index: u16, n: Nic::State, sh: Share, written: Seq<SendWr>)
+    proof fn lemma_refused(&self, pre: &Self, index: u16, n: Nic::State, sh: Share, written: Seq<SendWr>, keep: int)
         requires
             pre.ok(index, n, sh, pre.started, written),
             self.same_qp(*pre),
             !self.started,
             self.recv == pre.recv,
             self.send_tails == pre.send_tails,
-            self.send.inv(),
-            forall|s: int| #[trigger] self.send.req(s) == pre.send.req(s),
-            forall|s: int| #[trigger] self.send.staged(s) is None,
-            forall|s: int| #[trigger] self.send.refused(s) is Some ==> pre.send.refused(s) == self.send.refused(s)
-                || (pre.send.staged(s) is Some && self.send.refused(s) == Some(pre.send.staged(s)->0.leases) && !pre.send.staged(s)->0.detached),
-            self.send.spec_wqe_retired() == pre.send.spec_wqe_retired(),
-            self.send.spec_wqe_committed() == pre.send.spec_wqe_committed(),
-            self.send.spec_wqe_posted() == pre.send.spec_wqe_committed(),
-            self.send.spec_depth() == pre.send.spec_depth(),
-            self.send.spec_max_wqes() == pre.send.spec_max_wqes(),
-            self.send.spec_routed() == pre.send.spec_routed(),
-            self.send.keeps_dma(&pre.send),
-            forall|s: int| #[trigger] self.send.meta(s) == if pre.send.staged(s) is Some { None } else { pre.send.meta(s) },
-            self.send.detached_refused(&pre.send),
+            self.send.just_aborted(&pre.send, keep),
         ensures
             self.ok(index, n, sh, false, Seq::empty()),
     {
@@ -3519,7 +3437,10 @@ impl<C, N: Device> Hw<C, N> {
                     start.lemma_rely(t0, m0, n);
                     lemma_rely_frame(sh, pinned(t0), m0, n);
                     assert(qp_ok(start.qps@[index as int], index as int, t0, n));
-                    self.qps@[index as int]->0.lemma_refused(&e_start, index as u16, n, sh, t0.written(q));
+                    self.qps@[index as int]->0.lemma_refused(&e_start, index as u16, n, sh, t0.written(q), match keep {
+                        Some(seq) => seq as int,
+                        None => e_start.send.spec_posted() as int,
+                    });
                     assert(self.entry_ok(index as int, t, n));
                     self.lemma_one(&start, t0, t, n, n, index as int);
                 }
@@ -3704,23 +3625,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& !e.started
                 &&& e.recv == staged.recv
                 &&& e.send_tails@ == e0.send_tails@.insert(e0.send.spec_posted() as int, wr)
-                &&& e.send.inv()
-                &&& e.send.spec_head() == staged.send.spec_head()
-                &&& e.send.spec_retired() == staged.send.spec_retired()
-                &&& e.send.spec_committed() == staged.send.spec_posted()
-                &&& e.send.spec_posted() == staged.send.spec_posted()
-                &&& forall|s: int| #[trigger] e.send.req(s) == if staged.send.staged(s) is Some { staged.send.staged(s) } else { staged.send.req(s) }
-                &&& forall|s: int| #[trigger] e.send.staged(s) is None
-                &&& forall|s: int| #[trigger] e.send.refused(s) == staged.send.refused(s)
-                &&& e.send.spec_wqe_retired() == staged.send.spec_wqe_retired()
-                &&& e.send.spec_wqe_committed() == staged.send.spec_wqe_posted()
-                &&& e.send.spec_wqe_posted() == staged.send.spec_wqe_posted()
-                &&& e.send.spec_depth() == staged.send.spec_depth()
-                &&& e.send.spec_max_wqes() == staged.send.spec_max_wqes()
-                &&& e.send.spec_routed() == staged.send.spec_routed()
-                &&& e.send.same_dma(&staged.send)
-                &&& e.send.same_meta(&staged.send)
-                &&& e.send.spec_detached_error() == staged.send.spec_detached_error()
+                &&& e.send.just_committed(&staged.send)
                 &&& wr.wr_id == spec_wr_id(index as u16, false, e0.send.spec_wqe_posted())
                 &&& m1.send_wr_ok(m1.qps[q].attr, wr)
                 &&& !wr.inline
@@ -4323,12 +4228,10 @@ impl<C, N: Device> Hw<C, N> {
         requires
             old(self).inv(),
             old(leases).inv(),
-            old(leases).fully_recorded(),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
             final(leases).inv(),
-            final(leases).fully_recorded(),
             final(leases).uniques() == old(leases).uniques(),
     {
         if index < self.qps.len() {
@@ -5474,7 +5377,7 @@ impl<C, N: Device> Hw<C, N> {
                         lemma_rely_frame(t0.share(), pinned(t0), m0, n);
                     }
                     assert(qp_ok(start.qps@[index as int], index as int, t0, n));
-                    e1.lemma_refused(&e0, index as u16, n, t0.share(), t0.written(q));
+                    e1.lemma_refused(&e0, index as u16, n, t0.share(), t0.written(q), e0.send.spec_posted() as int);
                     completion::lemma_same_kept(e1.send, e1.send);
                     completion::lemma_same_kept(e1.recv, e1.recv);
                 }

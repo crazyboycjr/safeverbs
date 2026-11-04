@@ -66,23 +66,6 @@ pub proof fn lemma_wr_id_fields(index: u16, recv: bool, wqe: u64)
         & 0x7fff_ffff_ffffu64 == wqe & 0x7fff_ffff_ffffu64)) by (bit_vector);
 }
 
-/// Two WQE numbers with the same low bits, both at or after `retired` and
-/// less than [`WQE_SPAN`] after it, are the same.
-pub proof fn lemma_low_bits_determine(a: u64, b: u64, retired: u64)
-    requires
-        retired <= a,
-        retired <= b,
-        a - retired < WQE_SPAN,
-        b - retired < WQE_SPAN,
-        a & WQE_MASK == b & WQE_MASK,
-    ensures
-        a == b,
-{
-    assert(retired <= a && retired <= b && sub(a, retired) < 0x8000_0000_0000u64 && sub(b, retired)
-        < 0x8000_0000_0000u64 && a & 0x7fff_ffff_ffffu64 == b & 0x7fff_ffff_ffffu64 ==> a == b)
-        by (bit_vector);
-}
-
 /// The `wr_id` of WQE `wqe` of QP `index`'s receive queue if `recv`, else
 /// of its send queue.
 #[inline]

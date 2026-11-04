@@ -595,6 +595,30 @@ pub(super) proof fn lemma_same_qps_trans<C, N: Device>(a: Seq<Option<HwQp<C, N>>
     }
 }
 
+/// Tables that differ in one entry, which keeps its configuration, have the same QPs.
+pub(super) proof fn lemma_same_qps_but_one<C, N: Device>(pre: Seq<Option<HwQp<C, N>>>, post: Seq<Option<HwQp<C, N>>>, i: int)
+    requires
+        0 <= i < pre.len(),
+        pre[i] is Some,
+        post.len() == pre.len(),
+        forall|k: int| 0 <= k < pre.len() && k != i ==> #[trigger] post[k] == pre[k],
+        post[i] is Some,
+        post[i]->0.same_config(pre[i]->0),
+    ensures
+        same_qps(post, pre),
+{
+    assert forall|k: int| 0 <= k < post.len() implies (#[trigger] post[k] is Some) == (pre[k] is Some) by {
+        if k != i {
+            assert(post[k] == pre[k]);
+        }
+    }
+    assert forall|k: int| 0 <= k < post.len() && #[trigger] post[k] is Some implies post[k]->0.same_config(pre[k]->0) by {
+        if k != i {
+            assert(post[k] == pre[k]);
+        }
+    }
+}
+
 /// A step of the walk of the oldest CQE read, on its ring: the CQEs still to come say the same.
 proof fn lemma_pending_walked<C, N: Device>(pre: Seq<Option<HwQp<C, N>>>, post: Seq<Option<HwQp<C, N>>>, m: Nic::State, pending: Seq<Cqe>, spent: bool)
     requires
@@ -724,42 +748,8 @@ proof fn lemma_table_entry<C, N: Device>(pre: Seq<Option<HwQp<C, N>>>, post: Seq
             assert(qp_ok(pre[k], k, t, m));
         }
     }
-    assert forall|a: int, b: int|
-        #![trigger post[a], post[b]]
-        0 <= a < post.len() && 0 <= b < post.len() && a != b && post[a] is Some
-            && post[b] is Some implies post[a]->0.id() != post[b]->0.id() by {
-        if a != i && b != i {
-            assert(post[a] == pre[a] && post[b] == pre[b]);
-        } else if a == i {
-            assert(post[b] == pre[b]);
-        } else {
-            assert(post[a] == pre[a]);
-        }
-    }
-    assert forall|q: QpId| #[trigger] m.qps.contains_key(q) && t.share().owns.contains(q) implies exists|k: int|
-        0 <= k < post.len() && #[trigger] post[k] is Some && post[k]->0.id() == q by {
-        let k = choose|k: int| 0 <= k < pre.len() && #[trigger] pre[k] is Some && pre[k]->0.id() == q;
-        if k != i {
-            assert(post[k] == pre[k]);
-        }
-    }
-    assert forall|q: QpId| #[trigger] writes(t, q) implies exists|k: int|
-        0 <= k < post.len() && #[trigger] post[k] is Some && post[k]->0.id() == q by {
-        let k = choose|k: int| 0 <= k < pre.len() && #[trigger] pre[k] is Some && pre[k]->0.id() == q;
-        if k != i {
-            assert(post[k] == pre[k]);
-        }
-    }
-    assert forall|k: int| 0 <= k < post.len() implies (#[trigger] post[k] is Some) == (pre[k] is Some) by {
-        if k != i {
-            assert(post[k] == pre[k]);
-        }
-    }
-    assert forall|k: int| 0 <= k < post.len() && #[trigger] post[k] is Some implies post[k]->0.same_config(pre[k]->0) by {
-        if k != i {
-            assert(post[k] == pre[k]);
-        }
-    }
+    lemma_same_qps_but_one(pre, post, i);
+    lemma_names_kept(pre, post, name, t, t, m, m);
 }
 
 /// A step of a walk of the oldest CQE read: the table stays coupled, with M as it is, and the CQE
@@ -867,17 +857,7 @@ proof fn lemma_table_popped<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, name: na
             }
         }
     }
-    assert forall|p: QpId| #[trigger] after.qps.contains_key(p) && sh.owns.contains(p) implies exists|k: int|
-        0 <= k < qps.len() && #[trigger] qps[k] is Some && qps[k]->0.id() == p by {
-        assert(before.qps.contains_key(p));
-    }
-    assert forall|k: nat| k >= name implies !(#[trigger] after.qps.contains_key(t.name(k))) by {
-        assert(!before.qps.contains_key(t.name(k)));
-    }
-    assert forall|k: nat, w: WqeRef| k >= name && #[trigger] after.retired.contains_key(w)
-        implies w.qp != #[trigger] t.name(k) by {
-        assert(!before.qps.contains_key(t.name(k)));
-    }
+    lemma_names_kept(qps, qps, name, t, t, before, after);
     // The new CQE names what M just popped.
     lemma_wr_id_fields(i as u16, e.queue is Recv, e.seq as u64);
     let more = pending.push(e);
@@ -1208,9 +1188,8 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// What a step of a walk of the next CQE read leaves, with the ring of its queue `after` it took
-    /// the result it retired or left the ring `walked` as it was: the invariant, every request
-    /// where it was.
+    /// What a step of the walk of the next CQE read leaves, its ring `walked`, the result it retired
+    /// taken from there if `took`: the invariant, every request where it was.
     pub(super) proof fn lemma_step_left(&self, pre: &Self, wc: Wc, spent: bool, walked: Ring<Payload<C, N>>, seq: int, taken: bool, took: bool)
         requires
             pre.inv(),

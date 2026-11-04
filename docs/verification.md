@@ -1,16 +1,5 @@
 # Verification
 
-> **Status on this branch.** The executable data path of the core moved (one operation's
-> own path, a request being written as a value of its own, `hw/open.rs`, one pass per CQE,
-> smaller slots, `Ring<L>` without its `state` and `open` fields), and its proofs have not moved
-> with it yet. So `scripts/verify.sh`
-> verifies `crates/safeverbs-spec` in full and fails on `crates/safeverbs-core`, whose specs and
-> lemmas still describe the old representation. What this document says is proved of the
-> implementation was proved of the commit before the rewrite (`e28c2e8`); it is what the proofs must
-> be brought back to, nothing weaker, before this branch can land. Meanwhile the evidence for the
-> new code is the tests: the simulated NIC panics when a call breaks M's rules, and
-> `Ring::invariant` checks the ring at run time.
-
 SafeVerbs is verified with [Verus](https://github.com/verus-lang/verus). This page says
 what is proved, what is only tested, what is assumed and what remains, then how to run
 the proofs. [`design.md`](design.md) explains the design behind them.
@@ -55,7 +44,11 @@ conflicting ways.
   slicing and thawing (`buf/memory.rs`, `buf/view.rs`), each SGE is covered by the
   permission of the buffer its request retains (`buf/lease.rs`), the inputs of one request
   are disjoint where one is unique, and a buffer posted as a receive is disjoint from
-  every buffer the engine holds.
+  every buffer the engine holds. A request being written is a value of its own
+  (`OpenRequest`), the program's until it is closed: nothing of it is in M or in the rings, the
+  inputs of one such request are disjoint where one is unique (`Kept`), and what it holds is
+  apart from a receive by the ownership and linear permissions of its parts, not by the engine,
+  which does not hold it.
 - *Not proved:* that the engine's requests and buffers are requests and leases of A, so the
   coupling of A and M for the whole library. S1 of the library still rests on Rust's ownership of `BufMut`, `Buf`
   and `Part` together with these component proofs.
@@ -76,7 +69,11 @@ conflicting ways.
   with room in its queue and every WR one M accepts (scatter/gather count, operation,
   length, registered regions), receives, polls, and destruction of a queue pair only with
   empty queues and of a CQ only with no queue pair. Between two calls the engine's view
-  stays valid whatever the NIC and the other engines do (`lemma_rely`).
+  stays valid whatever the NIC and the other engines do (`lemma_rely`). A request being written
+  goes out only on a queue pair that takes what it was written for: its protection domain, its
+  message length, its number of WQEs and, if a WQE of it needs them, a reliable connection and
+  its scatter/gather elements are compared when it closes (`HwQp::takes`). A queue pair's
+  protection domain is its own, and of the engine's device (`same_device`).
 - *Not proved:* the control path that allocates protection domains and registers and
   deregisters regions (`buf.rs`, `pd.rs`). The engine's rely assumes it deregisters no
   region a written WR names, which leases ensure.
@@ -104,24 +101,34 @@ means the NIC never saw the request.
   payload is the request's buffers and its context (`ring/payload.rs`), so each context comes
   back exactly once with its own buffers by the same proof, with no new trust.
 - *Engine.* Each completion reaches the queue pair, queue and request of its own WQE
-  (`wr_id.rs` and the coupling of rings to M's queues). A receive request's result is the
-  outcome M retired for its WQE (`hw/outcomes.rs`). A send request, one WQE or a batch, agrees
-  with M's retired WQEs of its interval through every engine operation (`send_results` in
-  `hw/send_outcomes.rs`, part of the engine's invariant), refused doorbells, flushes after an
-  error and the drain before a destroy included. While it is in flight, its last WQE is
-  still in M's queue and the error it caches natively is the first error among the WQEs of
-  its interval M retired, none if they all succeeded. Once it is complete, all its WQEs
-  retired and its outcome is M's aggregate: the first error in posting order, else its last
-  WQE's success, which is what that WR's operation defines (the length a READ asked for, so
-  a batch of READs reports its last READ's length; the status alone for a SEND or WRITE).
-  `Hw::take` returns that outcome, as a typed result equal to it (`Completed::model`), with the
-  request's own context and buffers (`send_taken_matches`, `recv_taken_matches`). An error's
-  `position` is proved to be that of M's first failed WQE in the request's interval: it is
-  computed from the WQE number in the completion the ring cached (`names_wqe`), with one
-  subtraction, on the error path only. A request whose doorbell was refused, which M never saw,
-  comes back as `CompletionError::Refused`, a case of its own. A request with an owner that is
-  complete or refused is always handed back (`takeable`), and one without an owner holds no
-  context, so a poll runs no destructor of the user's.
+  (`wr_id.rs` and the coupling of rings to M's queues). M pops a CQE when it is read and the
+  ring hears of it when the event loop routes it, the program posting and polling in between, so
+  M is ahead of the rings: the invariant keeps the CQEs read and not routed (`Hw::pending`,
+  `pending_ok`), each naming a queue pair of the table and a WQE in flight there, and every WQE M
+  popped that a ring has not heard of succeeded without a completion or is named by a CQE to
+  come. So routing changes nothing in M, and a queue pair with a CQE to come cannot be destroyed.
+  A receive request's result is the outcome M retired for its WQE (`hw/outcomes.rs`). A send
+  request, one WQE or a batch, agrees with M's retired WQEs of its interval through every engine
+  operation (`send_results` in `hw/send_outcomes.rs`, part of the engine's invariant), refused
+  doorbells, flushes after an error and the drain before a destroy included. While it is in
+  flight, no completion the ring heard of named its last WQE or one after it, and the error it
+  caches natively is the first error among the WQEs of its interval the ring heard of, none if
+  they all succeeded. Once
+  it is complete, all its WQEs retired and its outcome is M's aggregate: the first error in
+  posting order, else its last WQE's success, which is what that WR's operation defines (the
+  length a READ asked for, so a batch of READs reports its last READ's length; the status alone
+  for a SEND or WRITE). `Hw::take` returns that outcome, as a typed result equal to it
+  (`Completed::model`), with the request's own context and buffers (`send_taken_matches`,
+  `recv_taken_matches`), and so does the event loop, one request at a time as it routes the CQEs
+  read (`Hw::next_completion`, `hands_out`), with the buffers that may leave a request of several
+  (the frozen ones are released there). An error's `position` is proved to be that of M's first
+  failed WQE in the request's interval: it is computed from the WQE number of the completion
+  that ended the walk or lay inside the request, with one subtraction, on the error path only. A
+  request whose doorbell was refused, which M never saw, comes back as
+  `CompletionError::Refused`, a case of its own. A request with an owner that is complete or
+  refused is always handed back (`takeable`), and one without an owner holds no context, so a
+  poll runs no destructor of the user's. The event loop's walk of one CQE ends: it retires a
+  request at each step, or the CQE is spent.
 - *Detached.* The first error of a queue's requests without an owner, which
   `Engine::take_send_error` reports (a sink's error), is tied to M the same way
   (`detached_result`, `detached_taken_matches`): the request it came from retired all its WQEs,
@@ -217,6 +224,11 @@ that real NICs conform to M will come from differential testing on hardware and 
 Where unverified code calls a verified function, that function's precondition is assumed,
 not proved:
 
+- `OpenRequest::try_push_lent` and `try_push_write` are generic over `Lend`, outside `verus!`, and
+  rely on `Lend::peek` giving bytes of the allocation it names and that allocation's `lkey`
+  (`Peek::inv`);
+- every `Hw` method that takes an `OpenRequest` or `Leases` relies on its invariant, which only
+  verified code can change (the fields are private) and every verified maker and method keeps;
 - `BufMut::freeze` relies on its buffer fitting `T` (`Buf::from_frozen`);
 - `BufMut::into_part` on at most `u32::MAX` bytes (`Part::unique`; also checked at run
   time), and `BufMut::split_at` on an index in bounds (also checked);
@@ -242,9 +254,13 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `ring/wake.rs` `resume` | `resume_unwind` never returns |
 | `ring.rs` `will_wake` | when `Waker::will_wake` says two wakers wake the same task, they have one name in A |
 | `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name |
-| `ring.rs` `forget_free` | forgetting an `Option` that is `None` releases nothing: it writes a free slot with no drop glue, which would be a landing pad on the data path, and that would keep the request's buffers in memory |
+| `buf/lease.rs` `forget_free` | forgetting a value the caller proved holds nothing releases nothing: it writes a free slot with no drop glue, which would be a landing pad on the data path |
+| `buf/lease.rs` `replace_value` | `core::mem::replace` leaves the new value and returns the old one |
+| `buf/lease.rs` `capacity_of` | `Vec::capacity` is at least its length |
+| `buf/lease.rs` `swap_in` | `slice::swap` swaps the two elements, in bounds |
+| `hw/open.rs` `one_of` | `core::slice::from_ref` is a list of that one element |
 | `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
-| `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
+| `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExContext`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
 | `buf/memory.rs` `ExRegion` | a registered region is opaque: registration and its final cleanup are not verified |
 | `buf/memory.rs` `allocate_zeroed_raw` | the fallible zeroed allocator returns the address, layout, provenance and linear permissions vstd expects, or nothing; no claim about initialized contents |
 | `buf/memory.rs` `arc_try_unwrap` | `Arc::try_unwrap` returns the exact contents, or an `Arc` to the same contents |
@@ -254,11 +270,14 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's |
 | `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a fresh name, in a state where M's invariants hold; the new engine's share is that CQ and queue pair names nobody uses (this is where tokens come from) |
-| `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these are M's `create_qp`, three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or nothing on error, after rely steps |
+| `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these are M's `create_qp`, three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or nothing on error, after rely steps; a queue pair's thread domain changes which locks the driver takes, not what the NIC does |
 | `trusted.rs` `qp_num_of`, `qp_lock_free` | facts that mean nothing in M (no contract) |
 | `trusted.rs` `no_qp` | a key that names no queue pair panics and never returns |
 | `trusted.rs` `pd_id_of` | the protection domain's run-time identity is its identity in the model |
-| `trusted.rs` `registered`, `registered_all` | a part's region is registered in its domain (writable if the part is unique) and stays so while the part lives |
+| `trusted.rs` `same_device` | `Context::same_device` says whether a protection domain is of the device an engine's M models |
+| `trusted.rs` `clone_pd` | a clone of a handle is a handle of the same protection domain |
+| `trusted.rs` `pd_alive` | a protection domain of the device exists in M as long as a handle to it does |
+| `trusted.rs` `registered`, `registered_all` | a part's region is registered in its domain (writable if the part is unique) and stays so while the part lives; `registered_all` says so of the inputs of a request being written, each kept alive by what the request holds (one that a `Peek` added is of the allocation of an input before it, which the request compared by its `Arc`, so of that input's domain) |
 | `trusted.rs` `start`, `post`, `abort` | `ibv_wr_start`, `ibv_wr_*`, `ibv_wr_abort`: writing WRs changes nothing in M until the doorbell, and an abort discards them |
 | `trusted.rs` `doorbell` | `ibv_wr_complete` is M's `post_send` of the WRs written since the start, after rely steps, or nothing on error |
 | `trusted.rs` `post_recv` | `ibv_post_recv` of one WR is M's `post_recv`, or nothing on error |
@@ -324,7 +343,7 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 149 verified, 0 errors
-safeverbs-core: verification results:: 415 verified, 0 errors
+safeverbs-core: verification results:: 595 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

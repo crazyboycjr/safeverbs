@@ -105,10 +105,9 @@
 //! 6. A retired, refused or free slot holds no waker: the waker registered
 //!    on a slot is woken when it retires or is refused.
 //! 7. A detached slot holds no waker, and a retired or refused slot is
-//!    never detached (it is freed instead); a refused slot's outcome is a
-//!    flush error.
-//! 8. Outside an open request, the WQEs posted after the last signaled
-//!    request (and not retired) number at most `depth - max_wqes`.
+//!    never detached (it is freed instead); a refused slot's outcome says so.
+//! 8. The WQEs posted after the last signaled request (and not retired) number
+//!    at most `depth - max_wqes`.
 //!
 //! No counter overflows: [`Ring::has_free_slot`] refuses a new request once
 //! the WQE or request numbers reach [`COUNTERS_END`], which no NIC does. The proofs also rely on a few facts about wakers that
@@ -1994,35 +1993,66 @@ impl<L> Ring<L> {
     // -------------------------------------------------------------------------
     // Committing and aborting
 
+    /// The doorbell rang over `pre`: every staged request is in flight.
+    pub open spec fn just_committed(&self, pre: &Self) -> bool {
+        &&& self.inv()
+        &&& self.spec_head() == pre.spec_head()
+        &&& self.spec_retired() == pre.spec_retired()
+        &&& self.spec_committed() == pre.spec_posted()
+        &&& self.spec_posted() == pre.spec_posted()
+        &&& forall|s: int| #[trigger] self.req(s) == if pre.staged(s) is Some {
+            pre.staged(s)
+        } else {
+            pre.req(s)
+        }
+        &&& forall|s: int| #[trigger] self.staged(s) is None
+        &&& forall|s: int| #[trigger] self.refused(s) == pre.refused(s)
+        &&& self.woken() == pre.woken()
+        &&& self.spec_wqe_retired() == pre.spec_wqe_retired()
+        &&& self.spec_wqe_committed() == pre.spec_wqe_posted()
+        &&& self.spec_wqe_posted() == pre.spec_wqe_posted()
+        &&& self.spec_depth() == pre.spec_depth()
+        &&& self.spec_max_wqes() == pre.spec_max_wqes()
+        &&& self.spec_routed() == pre.spec_routed()
+        &&& self.same_dma(pre)
+        &&& self.same_meta(pre)
+        &&& self.spec_detached_error() == pre.spec_detached_error()
+    }
+
+    /// The doorbell was refused over `pre`: every staged request is refused, but `keep`, which goes
+    /// back to its caller, and the WQE numbers the NIC never saw go to the next requests.
+    pub open spec fn just_aborted(&self, pre: &Self, keep: int) -> bool {
+        &&& self.inv()
+        &&& self.spec_posted() == pre.spec_posted()
+        &&& forall|s: int| #[trigger] self.req(s) == pre.req(s)
+        &&& forall|s: int| #[trigger] self.staged(s) is None
+        &&& forall|s: int| #[trigger] self.refused(s) == if pre.staged(s) is Some && s != keep
+            && !pre.staged(s)->0.detached {
+            Some(pre.staged(s)->0.leases)
+        } else {
+            pre.refused(s)
+        }
+        &&& self.woken() == pre.woken() + pre.wakers(pre.spec_committed() as int, pre.spec_posted() as int)
+        &&& self.spec_wqe_retired() == pre.spec_wqe_retired()
+        &&& self.spec_wqe_committed() == pre.spec_wqe_committed()
+        &&& self.spec_wqe_posted() == pre.spec_wqe_committed()
+        &&& self.spec_depth() == pre.spec_depth()
+        &&& self.spec_max_wqes() == pre.spec_max_wqes()
+        &&& self.spec_routed() == pre.spec_routed()
+        &&& self.spec_detached_error() is None ==> forall|s: int|
+            #[trigger] pre.staged(s) is Some && s != keep ==> !pre.staged(s)->0.detached
+        &&& self.keeps_dma(pre)
+        &&& forall|s: int| #[trigger] self.meta(s) == if pre.staged(s) is Some { None } else { pre.meta(s) }
+        &&& self.detached_refused(pre)
+    }
+
     /// The doorbell rang: every staged request is in flight.
     #[inline(always)]
     pub fn commit(&mut self)
         requires
             old(self).inv(),
         ensures
-            final(self).inv(),
-            final(self).spec_head() == old(self).spec_head(),
-            final(self).spec_retired() == old(self).spec_retired(),
-            final(self).spec_committed() == old(self).spec_posted(),
-            final(self).spec_posted() == old(self).spec_posted(),
-            forall|s: int|
-                #[trigger] final(self).req(s) == if old(self).staged(s) is Some {
-                    old(self).staged(s)
-                } else {
-                    old(self).req(s)
-                },
-            forall|s: int| #[trigger] final(self).staged(s) is None,
-            forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
-            final(self).woken() == old(self).woken(),
-            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
-            final(self).spec_wqe_committed() == old(self).spec_wqe_posted(),
-            final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
-            final(self).spec_depth() == old(self).spec_depth(),
-            final(self).spec_max_wqes() == old(self).spec_max_wqes(),
-            final(self).spec_routed() == old(self).spec_routed(),
-            final(self).same_dma(old(self)),
-            final(self).same_meta(old(self)),
-            final(self).spec_detached_error() == old(self).spec_detached_error(),
+            final(self).just_committed(old(self)),
     {
         self.committed = self.posted;
         self.wqe_committed = self.wqe_posted;
@@ -2122,32 +2152,7 @@ impl<L> Ring<L> {
         requires
             old(self).inv(),
         ensures
-            final(self).inv(),
-            final(self).spec_posted() == old(self).spec_posted(),
-            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
-            forall|s: int| #[trigger] final(self).staged(s) is None,
-            forall|s: int|
-                #[trigger] final(self).refused(s) == if old(self).staged(s) is Some && !old(
-                    self,
-                ).staged(s)->0.detached {
-                    Some(old(self).staged(s)->0.leases)
-                } else {
-                    old(self).refused(s)
-                },
-            final(self).woken() == old(self).woken() + old(self).wakers(
-                old(self).spec_committed() as int,
-                old(self).spec_posted() as int,
-            ),
-            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
-            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
-            final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
-            final(self).spec_depth() == old(self).spec_depth(),
-            final(self).spec_max_wqes() == old(self).spec_max_wqes(),
-            final(self).spec_routed() == old(self).spec_routed(),
-            final(self).keeps_dma(old(self)),
-            forall|s: int| #[trigger] final(self).meta(s) ==
-                if old(self).staged(s) is Some { None } else { old(self).meta(s) },
-            final(self).detached_refused(old(self)),
+            final(self).just_aborted(old(self), old(self).spec_posted() as int),
     {
         let mut wakes = WakeBatch::new();
         let result = self.abort_with_wakes(&mut wakes);
@@ -2160,32 +2165,7 @@ impl<L> Ring<L> {
         requires
             old(self).inv(),
         ensures
-            final(self).inv(),
-            final(self).spec_posted() == old(self).spec_posted(),
-            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
-            forall|s: int| #[trigger] final(self).staged(s) is None,
-            forall|s: int|
-                #[trigger] final(self).refused(s) == if old(self).staged(s) is Some && !old(
-                    self,
-                ).staged(s)->0.detached {
-                    Some(old(self).staged(s)->0.leases)
-                } else {
-                    old(self).refused(s)
-                },
-            final(self).woken() == old(self).woken() + old(self).wakers(
-                old(self).spec_committed() as int,
-                old(self).spec_posted() as int,
-            ),
-            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
-            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
-            final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
-            final(self).spec_depth() == old(self).spec_depth(),
-            final(self).spec_max_wqes() == old(self).spec_max_wqes(),
-            final(self).spec_routed() == old(self).spec_routed(),
-            final(self).keeps_dma(old(self)),
-            forall|s: int| #[trigger] final(self).meta(s) ==
-                if old(self).staged(s) is Some { None } else { old(self).meta(s) },
-            final(self).detached_refused(old(self)),
+            final(self).just_aborted(old(self), old(self).spec_posted() as int),
     {
         let dropped = self.posted - self.committed;
         // No request is staged at `posted`: none is handed back.
@@ -2205,39 +2185,11 @@ impl<L> Ring<L> {
         requires
             old(self).inv(),
         ensures
-            final(self).inv(),
-            final(self).spec_posted() == old(self).spec_posted(),
-            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
-            forall|s: int| #[trigger] final(self).staged(s) is None,
-            forall|s: int|
-                #[trigger] final(self).refused(s) == if old(self).staged(s) is Some && s != keep
-                    && !old(self).staged(s)->0.detached {
-                    Some(old(self).staged(s)->0.leases)
-                } else {
-                    old(self).refused(s)
-                },
-            final(self).woken() == old(self).woken() + old(self).wakers(
-                old(self).spec_committed() as int,
-                old(self).spec_posted() as int,
-            ),
+            final(self).just_aborted(old(self), keep as int),
             kept == match old(self).staged(keep as int) {
                 Some(r) => Some(r.leases),
                 None => None,
             },
-            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
-            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
-            final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
-            final(self).spec_depth() == old(self).spec_depth(),
-            final(self).spec_max_wqes() == old(self).spec_max_wqes(),
-            final(self).spec_routed() == old(self).spec_routed(),
-            final(self).spec_detached_error() is None ==> forall|s: int|
-                #[trigger] old(self).staged(s) is Some && s != keep ==> !old(self).staged(
-                    s,
-                )->0.detached,
-            final(self).keeps_dma(old(self)),
-            forall|s: int| #[trigger] final(self).meta(s) ==
-                if old(self).staged(s) is Some { None } else { old(self).meta(s) },
-            final(self).detached_refused(old(self)),
     {
         let mut wakes = WakeBatch::new();
         let result = self.abort_keeping_with_wakes(keep, &mut wakes);
@@ -2250,39 +2202,11 @@ impl<L> Ring<L> {
         requires
             old(self).inv(),
         ensures
-            final(self).inv(),
-            final(self).spec_posted() == old(self).spec_posted(),
-            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
-            forall|s: int| #[trigger] final(self).staged(s) is None,
-            forall|s: int|
-                #[trigger] final(self).refused(s) == if old(self).staged(s) is Some && s != keep
-                    && !old(self).staged(s)->0.detached {
-                    Some(old(self).staged(s)->0.leases)
-                } else {
-                    old(self).refused(s)
-                },
-            final(self).woken() == old(self).woken() + old(self).wakers(
-                old(self).spec_committed() as int,
-                old(self).spec_posted() as int,
-            ),
+            final(self).just_aborted(old(self), keep as int),
             kept == match old(self).staged(keep as int) {
                 Some(r) => Some(r.leases),
                 None => None,
             },
-            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
-            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
-            final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
-            final(self).spec_depth() == old(self).spec_depth(),
-            final(self).spec_max_wqes() == old(self).spec_max_wqes(),
-            final(self).spec_routed() == old(self).spec_routed(),
-            final(self).spec_detached_error() is None ==> forall|s: int|
-                #[trigger] old(self).staged(s) is Some && s != keep ==> !old(self).staged(
-                    s,
-                )->0.detached,
-            final(self).keeps_dma(old(self)),
-            forall|s: int| #[trigger] final(self).meta(s) ==
-                if old(self).staged(s) is Some { None } else { old(self).meta(s) },
-            final(self).detached_refused(old(self)),
     {
         let ghost pre = *self;
         let wqe = self.wqe_committed;
@@ -3382,6 +3306,7 @@ impl<L> Ring<L> {
                 &&& old(self).req(s) is Some
                 &&& old(self).req(s)->0.phase is InFlight
                 &&& !old(self).req(s)->0.detached
+                &&& old(self).req(s)->0.waker is None
                 &&& old(self).meta(s)->0.end as int <= wqe as int + 1
                 &&& slot.end_wqe == old(self).meta(s)->0.end
                 &&& slot.outcome == old(self).retire_outcome(s, recv, wqe, *wc)

@@ -5,6 +5,10 @@
 //! What it is written into comes from its QP and goes back there (`Hw::open_request`,
 //! `Hw::give_back`): nothing is allocated per request. WQEs of one frozen buffer keep one reference
 //! to it, and a list of several buffers is reused too, by the requests that hand it back.
+//!
+//! Its invariant (`OpenRequest::inv`) says that its WQEs are what its ledger of inputs says, each
+//! input kept alive by what it holds. It is a value of its own, so what a WQE asks of a QP is asked
+//! again of the QP it goes out on (`HwQp::takes`).
 #![allow(unused_imports)]
 use super::*;
 #[cfg(verus_keep_ghost)]

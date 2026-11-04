@@ -860,12 +860,6 @@ pub(super) proof fn lemma_reports(
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// The WQEs of send request `seq` of QP `index`, as M names them.
-    pub(super) open spec fn send_range_of(&self, index: usize, seq: RingSeq) -> WqeRange {
-        let e = self.qps@[index as int]->0;
-        send_range(e.id(), e.send.meta(seq as int)->0)
-    }
-
     /// `t` is what the send ring of QP `index` hands back of request `seq`.
     pub(super) open spec fn send_taken_from(&self, index: usize, seq: RingSeq, t: Taken<Payload<C, N>>) -> bool {
         self.qps@[index as int]->0.send.taken_from(seq as int, t)

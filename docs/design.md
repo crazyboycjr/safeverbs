@@ -631,8 +631,8 @@ async style of the API carry over.
 ## 12. Open questions
 
 - Theorem 1 for the engine: each engine's share of M is settled by rely and guarantee
-  (`safeverbs-spec/src/share.rs`), and M's side of the refinement was proved for the engine's
-  hardware side before the fast data path (`verification.md` says where that stands). Open: A's
+  (`safeverbs-spec/src/share.rs`), and M's side of the refinement is proved for the engine's
+  hardware side (`verification.md` says where that stands). Open: A's
   side for the engine (the map from its requests and buffers to A's requests and leases), the rest
   of the buffers (the typed wrappers, `RingBuf`, exposure) and how several engines compose. Undefined
   SEND/WRITE lengths are already projected out of outcomes; READ and receive metadata have
