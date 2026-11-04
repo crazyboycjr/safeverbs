@@ -16,7 +16,7 @@
 //! | its owner takes it | `take`, and `drop` of its shared leases (`lemma_take`); of a refused one, those `drop`s alone (`lemma_forget`) |
 //! | its owner gives it up | `detach`, none for a staged one, `drop` of each lease of a refused one (`lemma_detach`) |
 //! | a future registers a waker | `register`, none for a staged one (`lemma_register`) |
-//! | its queue pair goes, nothing in flight | `detach` (`lemma_release_one`), and `drop` of each lease of a refused one |
+//! | its queue pair goes, nothing in flight | `detach`, and `drop` of each lease of a refused one (`lemma_release`) |
 //!
 //! A request whose doorbell was refused never reached A: its leases stay the program's, and the
 //! ring only keeps them for the owner, who takes them back with a refusal or drops them. A shared

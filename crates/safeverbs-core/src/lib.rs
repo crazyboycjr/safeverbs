@@ -12,15 +12,16 @@
 //!   [`Exposed`], [`RingBuf`]) and the leases that keep it alive while the
 //!   NIC uses it;
 //! - [`ring`]: the completion ring of a work queue, pure bookkeeping
-//!   without FFI or `unsafe`, verified with Verus; [`refine`] proves that
-//!   it refines the abstract machine of `safeverbs-spec`;
+//!   without FFI or `unsafe`, verified with Verus; [`refine`] has the steps of
+//!   the abstract machine of `safeverbs-spec` behind each change of a request;
 //! - the internal `trusted` module: verbs with contracts from the NIC model;
 //! - the internal `wr_id` module: the `wr_id` of a WQE and how a completion is
 //!   routed back by it, verified;
 //! - the internal `hw` module: the hardware side of an engine (its CQ, its QPs' queues and
 //!   rings, its share of the NIC model), verified against the trusted verbs:
 //!   every verb meets the model's precondition, the rings stay coupled to the
-//!   model's queues, and QPs are destroyed only once drained;
+//!   model's queues, QPs are destroyed only once drained, and its state refines the
+//!   abstract machine (Theorem 1, under the premises `docs/verification.md` lists);
 //! - [`engine`]: a completion queue and the queue pairs attached to it,
 //!   driven synchronously and by index ([`Engine`]): post requests into the rings and the
 //!   hardware queues, commit them with one doorbell, poll the CQ, and get

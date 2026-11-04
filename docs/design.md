@@ -235,7 +235,10 @@ function to A, its ghost view of the NIC in M, the map from requests to disjoint
 obligations (start states, every API call is zero or more steps of A and of M, the invariant
 couples A and M). `theorem_1` proves, for every implementation meeting the obligations, that
 along any execution A's and M's invariants hold, every verb met its precondition, and A and
-M stay coupled.
+M stay coupled. One engine's verified state implements it (`EngineState` in `hw/refines.rs`),
+under the premises `verification.md` lists: that the buffers lend what they say, that what the
+program does with its leases are steps of A, and that A gives whatever the NIC may touch beyond the
+engine's own queues.
 
 **Theorem 2 (later; stated only)** covers two endpoints that both run SafeVerbs' protocol
 layer: credit-based flow control for sends and rkey leases for one-sided access. Each side
@@ -621,7 +624,7 @@ says.
 | CQ size unrelated to queue depths | attachment reserves CQ capacity |
 | everything `Send + Sync`, a CQ per queue pair | a CQ per thread, shared by its queue pairs, no locks; `SharedQp` when sharing is needed |
 | `unsafe` spread through the crate | all `unsafe` in `safeverbs-core`, the rest `forbid(unsafe_code)` |
-| no statement of the guarantee | a conditional Theorem 1 over M and A; the real implementation's refinement is still being completed |
+| no statement of the guarantee | a conditional Theorem 1 over M and A, proved of one engine's verified state under the premises of `verification.md`; the layers around it are still being completed |
 | a user-chosen `wr_id` looked up in a slab | a `wr_id` of any type in each request's slot, handed back once; the hardware's `wr_id` is the library's own |
 | `Wc` fields read by hand, some undefined | typed results with only what each operation defines; an error names the failing WQE |
 
@@ -630,13 +633,12 @@ async style of the API carry over.
 
 ## 12. Open questions
 
-- Theorem 1 for the engine: each engine's share of M is settled by rely and guarantee
-  (`safeverbs-spec/src/share.rs`), and M's side of the refinement is proved for the engine's
-  hardware side (`verification.md` says where that stands). Open: A's
-  side for the engine (the map from its requests and buffers to A's requests and leases), the rest
-  of the buffers (the typed wrappers, `RingBuf`, exposure) and how several engines compose. Undefined
-  SEND/WRITE lengths are already projected out of outcomes; READ and receive metadata have
-  operation-specific contracts (section 8).
+- Theorem 1 beyond one engine's verified state: each engine's share of M is settled by rely and
+  guarantee (`safeverbs-spec/src/share.rs`), and the refinement is proved for the engine's hardware
+  side (`verification.md` says where that stands, with its premises). Open: the buffers (the typed
+  wrappers, `RingBuf`, exposure), which are to prove the leases the engine is lent, and how several
+  engines compose. Undefined SEND/WRITE lengths are already projected out of outcomes; READ and
+  receive metadata have operation-specific contracts (section 8).
 - A thread-safe `Cq` and `Qp` in the same shape as the local ones. A whole `LocalCq` with all its
   QPs could also move between threads, since the engine is `Send` and `Rc::try_unwrap` proves no
   handle is left; one `LocalQp` alone cannot leave its CQ, since verbs has no way to change a QP's CQ.

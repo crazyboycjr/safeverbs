@@ -1,8 +1,8 @@
 //! An engine refines A: Theorem 1 for its verified state.
 //!
-//! What A sees of an engine is one [`View`] of all its rings (`table_view`), a request by its key
+//! What A sees of an engine is one `refine::View` of all its rings (`table_view`), a request by its key
 //! (`key`: its entry of the table, its queue, its sequence number), so that what happens to one
-//! request leaves the others as they are, in every ring. Its ghost state ([`Refinement`]) is the
+//! request leaves the others as they are, in every ring. Its ghost state (`Refinement`) is the
 //! state of A it stands for, the name in A of each of its requests, each request's WQEs and the
 //! WR of each send WQE.
 //!
@@ -16,9 +16,12 @@
 //!   one gets a new lease, `share`d from the one the program holds, which comes to nothing with the
 //!   request. That the program holds such a lease is what the buffers promise (`Hw::lends`).
 //!
-//! The invariant ([`linked`]) is part of `Hw::inv`. Each operation of `Hw` moves the state of A by
+//! The invariant (`linked`) is part of `Hw::inv`. Each operation of `Hw` moves the state of A by
 //! the steps of the lemmas here, and says so (`Hw::moved_from`). What `Refines` asks of it is at the
-//! end ([`EngineState`]).
+//! end (`EngineState`), with the theorem (`theorem_1_engine`) and a run of the operations under
+//! it (`example_run`). What the engine cannot see stays a premise: what it is lent (`Hw::lends`),
+//! what the program does with its own leases (`Hw::program_moved`) and what the NIC may touch beyond
+//! its queues (`Hw::outside_ok`).
 //!
 //! Everything here is ghost code: a plain build erases it.
 #![allow(unused_imports)]
@@ -1314,6 +1317,127 @@ pub(super) proof fn lemma_linked_named<C, N: Device>(qps: Seq<Option<HwQp<C, N>>
     (g1, h)
 }
 
+/// What A sees of request `s` of ring `queue` of entry `i` is what that ring says.
+proof fn lemma_table_at<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, m: Nic::State, i: int, queue: Queue, s: int)
+    requires
+        has_entry(qps, i),
+        0 <= s < key_span(),
+    ensures ({
+        let (e, k) = (qps[i]->0, key(i, queue, s));
+        &&& table_req(qps, m, k) == seen(ring_of(e, queue), m, e.id(), queue, s)
+        &&& table_staged(qps, k) == staged_seen(ring_of(e, queue), e.id(), s)
+        &&& table_refused(qps, k) == refused_seen(ring_of(e, queue), e.id(), s)
+    }),
+{
+    lemma_key_fields(i, queue, s);
+}
+
+/// One ring of the table changed and A moved to `a2`, with no new request or outcome: `w` is what A
+/// sees now, placed there, and the requests A sees keep their WQEs.
+proof fn lemma_linked_ring<C, N: Device>(w: Seen<Lent>, pre: Seq<Option<HwQp<C, N>>>, post: Seq<Option<HwQp<C, N>>>, m: Nic::State, g: Refinement, a2: Abs::State, i: int, queue: Queue)
+    requires
+        linked(pre, m, g),
+        same_but_ring(pre, post, i, queue),
+        placed(w, a2, lent_qp(), g.reqs, lent_holds()),
+        kept_requests(g.abs, a2),
+        forall|k: int| !(key_entry(k) == i && key_queue(k) == queue) ==> {
+            &&& (w.req)(k) == table_req(pre, m, k)
+            &&& (w.staged)(k) == table_staged(pre, k)
+            &&& (w.refused)(k) == table_refused(pre, k)
+        },
+        forall|s: int| 0 <= s < key_span() ==> {
+            &&& (w.req)(#[trigger] key(i, queue, s)) == seen(ring_of(post[i]->0, queue), m, post[i]->0.id(), queue, s)
+            &&& (w.staged)(key(i, queue, s)) == staged_seen(ring_of(post[i]->0, queue), post[i]->0.id(), s)
+            &&& (w.refused)(key(i, queue, s)) == refused_seen(ring_of(post[i]->0, queue), post[i]->0.id(), s)
+        },
+        forall|s: int| 0 <= s < key_span() && #[trigger] seen(ring_of(post[i]->0, queue), m, post[i]->0.id(), queue, s) is Some ==> {
+            let (r0, r1) = (ring_of(pre[i]->0, queue), ring_of(post[i]->0, queue));
+            &&& seen(r0, m, pre[i]->0.id(), queue, s) is Some
+            &&& r1.meta(s)->0.first == r0.meta(s)->0.first
+            &&& r1.meta(s)->0.end == r0.meta(s)->0.end
+        },
+    ensures
+        linked(post, m, Refinement { abs: a2, ..g }),
+        same(w, table_view(post, m)),
+{
+    lemma_same_by_ring(w, pre, post, m, i, queue);
+    lemma_same(w, table_view(post, m), a2, lent_qp(), g.reqs, lent_holds());
+    lemma_ranges_kept(g, a2, m);
+    lemma_rest_by_ring(pre, post, m, g, Refinement { abs: a2, ..g }, i, queue);
+}
+
+/// [`lemma_linked_ring`], request `seq` the only one of the ring that changed.
+proof fn lemma_linked_one_key<C, N: Device>(w: Seen<Lent>, pre: Seq<Option<HwQp<C, N>>>, post: Seq<Option<HwQp<C, N>>>, m: Nic::State, g: Refinement, a2: Abs::State, i: int, queue: Queue, seq: int)
+    requires
+        linked(pre, m, g),
+        same_but_ring(pre, post, i, queue),
+        0 <= seq < key_span(),
+        placed(w, a2, lent_qp(), g.reqs, lent_holds()),
+        kept_requests(g.abs, a2),
+        forall|t: int| t != key(i, queue, seq) ==> {
+            &&& (w.req)(t) == table_req(pre, m, t)
+            &&& (w.staged)(t) == table_staged(pre, t)
+            &&& (w.refused)(t) == table_refused(pre, t)
+        },
+        forall|u: int| u != seq ==> {
+            &&& #[trigger] ring_of(post[i]->0, queue).req(u) == ring_of(pre[i]->0, queue).req(u)
+            &&& ring_of(post[i]->0, queue).staged(u) == ring_of(pre[i]->0, queue).staged(u)
+            &&& ring_of(post[i]->0, queue).refused(u) == ring_of(pre[i]->0, queue).refused(u)
+            &&& ring_of(post[i]->0, queue).meta(u) == ring_of(pre[i]->0, queue).meta(u)
+        },
+        ({
+            let r1 = ring_of(post[i]->0, queue);
+            let k = key(i, queue, seq);
+            let q = pre[i]->0.id();
+            &&& (w.req)(k) == seen(r1, m, q, queue, seq)
+            &&& (w.staged)(k) == staged_seen(r1, q, seq)
+            &&& (w.refused)(k) == refused_seen(r1, q, seq)
+            &&& seen(r1, m, q, queue, seq) is Some ==> {
+                let r0 = ring_of(pre[i]->0, queue);
+                &&& seen(r0, m, q, queue, seq) is Some
+                &&& r1.meta(seq)->0.first == r0.meta(seq)->0.first
+                &&& r1.meta(seq)->0.end == r0.meta(seq)->0.end
+            }
+        }),
+    ensures
+        linked(post, m, Refinement { abs: a2, ..g }),
+{
+    let (r0, r1) = (ring_of(pre[i]->0, queue), ring_of(post[i]->0, queue));
+    let q = pre[i]->0.id();
+    assert forall|t: int| !(key_entry(t) == i && key_queue(t) == queue) implies {
+        &&& (w.req)(t) == table_req(pre, m, t)
+        &&& (w.staged)(t) == table_staged(pre, t)
+        &&& (w.refused)(t) == table_refused(pre, t)
+    } by {
+        lemma_key_fields(i, queue, seq);
+        assert(t != key(i, queue, seq));
+    }
+    assert forall|u: int| 0 <= u < key_span() implies {
+        &&& (w.req)(#[trigger] key(i, queue, u)) == seen(r1, m, q, queue, u)
+        &&& (w.staged)(key(i, queue, u)) == staged_seen(r1, q, u)
+        &&& (w.refused)(key(i, queue, u)) == refused_seen(r1, q, u)
+    } by {
+        lemma_key_fields(i, queue, u);
+        lemma_table_at(pre, m, i, queue, u);
+        if u != seq {
+            assert(r1.req(u) == r0.req(u));
+            assert(key(i, queue, u) != key(i, queue, seq)) by {
+                lemma_key_fields(i, queue, seq);
+            }
+        }
+    }
+    assert forall|u: int| 0 <= u < key_span() && #[trigger] seen(r1, m, q, queue, u) is Some implies {
+        &&& seen(r0, m, q, queue, u) is Some
+        &&& r1.meta(u)->0.first == r0.meta(u)->0.first
+        &&& r1.meta(u)->0.end == r0.meta(u)->0.end
+    } by {
+        if u != seq {
+            assert(r1.req(u) == r0.req(u));
+        }
+    }
+    lemma_linked_ring(w, pre, post, m, g, a2, i, queue);
+}
+
 /// A request is staged on ring `queue` of entry `i`, holding leases the program holds free: no step
 /// of A.
 pub(super) proof fn lemma_linked_staged<C, N: Device>(pre: Seq<Option<HwQp<C, N>>>, post: Seq<Option<HwQp<C, N>>>, m: Nic::State, g: Refinement, i: int, queue: Queue, wqes: u64, view: ReqView<Payload<C, N>>, outcome: CompletionResult)
@@ -1825,16 +1949,6 @@ pub(super) proof fn lemma_ok_complete_popped<C, N: Device>(e: HwQp<C, N>, index:
     }
 }
 
-/// `seen` is what the ring says of a request of its with the same requests and WQEs, M as it is.
-proof fn lemma_seen_same<C, N: Device>(r0: Ring<Payload<C, N>>, r1: Ring<Payload<C, N>>, m: Nic::State, q: QpId, queue: Queue, u: int)
-    requires
-        r1.req(u) == r0.req(u),
-        r1.meta(u) == r0.meta(u),
-    ensures
-        seen(r1, m, q, queue, u) == seen(r0, m, q, queue, u),
-{
-}
-
 /// What taking a result leaves of ring `queue` of entry `i`: A's `take`, and the `drop` of its shared
 /// leases, or those `drop`s alone for a refused one.
 pub(super) proof fn lemma_linked_taken<C, N: Device>(pre: Seq<Option<HwQp<C, N>>>, post: Seq<Option<HwQp<C, N>>>, m: Nic::State, g: Refinement, i: int, queue: Queue, seq: int, taken: bool) -> (g2: Refinement)
@@ -1857,11 +1971,9 @@ pub(super) proof fn lemma_linked_taken<C, N: Device>(pre: Seq<Option<HwQp<C, N>>
     let v = table_view(pre, m);
     let k = key(i, queue, seq);
     lemma_key_fields(i, queue, seq);
+    lemma_table_at(pre, m, i, queue, seq);
     r0.lemma_view();
     assert(crate::refine::wf_at(r0.view(), seq));
-    assert(table_req(pre, m, k) == seen(r0, m, q, queue, seq));
-    assert(table_refused(pre, k) == refused_seen(r0, q, seq));
-    assert(table_staged(pre, k) == staged_seen(r0, q, seq));
     let (a2, w) = if r0.refused(seq) is Some {
         let a2 = lemma_take_refused(v, g.abs, lent_qp(), g.reqs, lent_holds(), k);
         (a2, crate::refine::without_refused(v, k))
@@ -1878,43 +1990,9 @@ pub(super) proof fn lemma_linked_taken<C, N: Device>(pre: Seq<Option<HwQp<C, N>>
         lemma_same(v, v, g.abs, lent_qp(), g.reqs, lent_holds());
         (g.abs, v)
     };
-    assert(crate::refine::kept_requests(g.abs, a2));
-    assert forall|t: int| !(key_entry(t) == i && key_queue(t) == queue) implies {
-        &&& (w.req)(t) == table_req(pre, m, t)
-        &&& (w.staged)(t) == table_staged(pre, t)
-        &&& (w.refused)(t) == table_refused(pre, t)
-    } by {
-        assert(t != k);
-    }
-    assert forall|u: int| 0 <= u < key_span() implies {
-        &&& (w.req)(#[trigger] key(i, queue, u)) == seen(r1, m, q, queue, u)
-        &&& (w.staged)(key(i, queue, u)) == staged_seen(r1, q, u)
-        &&& (w.refused)(key(i, queue, u)) == refused_seen(r1, q, u)
-    } by {
-        lemma_key_fields(i, queue, u);
-        let ku = key(i, queue, u);
-        assert(table_req(pre, m, ku) == seen(r0, m, q, queue, u));
-        assert(table_staged(pre, ku) == staged_seen(r0, q, u));
-        assert(table_refused(pre, ku) == refused_seen(r0, q, u));
-        if u != seq {
-            assert(ku != k);
-            lemma_seen_same(r0, r1, m, q, queue, u);
-        }
-    }
-    lemma_same_by_ring(w, pre, post, m, i, queue);
-    lemma_same(w, table_view(post, m), a2, lent_qp(), g.reqs, lent_holds());
-    let g2 = Refinement { abs: a2, ..g };
-    lemma_ranges_kept(g, a2, m);
-    assert forall|u: int| 0 <= u < key_span() && #[trigger] seen(r1, m, q, queue, u) is Some implies {
-        &&& seen(r0, m, q, queue, u) is Some
-        &&& r1.meta(u)->0.first == r0.meta(u)->0.first
-        &&& r1.meta(u)->0.end == r0.meta(u)->0.end
-    } by {
-        assert(r1.req(u) == r0.req(u));
-        assert(r1.meta(u) == r0.meta(u));
-    }
-    lemma_rest_by_ring(pre, post, m, g, g2, i, queue);
-    g2
+    assert(kept_requests(g.abs, a2));
+    lemma_linked_one_key(w, pre, post, m, g, a2, i, queue, seq);
+    Refinement { abs: a2, ..g }
 }
 
 /// The event loop's way with the oldest request of a ring, M having popped it, its slot emptied:
@@ -1937,56 +2015,19 @@ pub(super) proof fn lemma_linked_oldest<C, N: Device>(pre: Seq<Option<HwQp<C, N>
         g2 == (Refinement { abs: g2.abs, ..g }),
         g2.extends(g),
 {
-    let (r0, r1) = (ring_of(pre[i]->0, queue), ring_of(post[i]->0, queue));
+    let r0 = ring_of(pre[i]->0, queue);
     let q = pre[i]->0.id();
-    let v = table_view(pre, m);
     let s = r0.spec_retired() as int;
     let k = key(i, queue, s);
-    r1.lemma_retired_and_taken(&r0);
+    ring_of(post[i]->0, queue).lemma_retired_and_taken(&r0);
     lemma_key_fields(i, queue, s);
-    assert(table_req(pre, m, k) == seen(r0, m, q, queue, s));
+    lemma_table_at(pre, m, i, queue, s);
     let rv = r0.req(s)->0;
-    let range = range_of(q, queue, r0.meta(s)->0);
-    let o = range.aggregate(m.retired);
+    let o = range_of(q, queue, r0.meta(s)->0).aggregate(m.retired);
     let lent = Lent { qp: q, holds: rv.leases.holds@ };
-    let a2 = lemma_take(v, g.abs, lent_qp(), g.reqs, lent_holds(), k, o, lent);
-    let w = without(v, k);
-    assert forall|t: int| !(key_entry(t) == i && key_queue(t) == queue) implies {
-        &&& (w.req)(t) == table_req(pre, m, t)
-        &&& (w.staged)(t) == table_staged(pre, t)
-        &&& (w.refused)(t) == table_refused(pre, t)
-    } by {
-        assert(t != k);
-    }
-    assert forall|u: int| 0 <= u < key_span() implies {
-        &&& (w.req)(#[trigger] key(i, queue, u)) == seen(r1, m, q, queue, u)
-        &&& (w.staged)(key(i, queue, u)) == staged_seen(r1, q, u)
-        &&& (w.refused)(key(i, queue, u)) == refused_seen(r1, q, u)
-    } by {
-        lemma_key_fields(i, queue, u);
-        let ku = key(i, queue, u);
-        assert(table_req(pre, m, ku) == seen(r0, m, q, queue, u));
-        assert(table_staged(pre, ku) == staged_seen(r0, q, u));
-        assert(table_refused(pre, ku) == refused_seen(r0, q, u));
-        if u != s {
-            assert(ku != k);
-            lemma_seen_same(r0, r1, m, q, queue, u);
-        }
-    }
-    lemma_same_by_ring(w, pre, post, m, i, queue);
-    lemma_same(w, table_view(post, m), a2, lent_qp(), g.reqs, lent_holds());
-    let g2 = Refinement { abs: a2, ..g };
-    lemma_ranges_kept(g, a2, m);
-    assert forall|u: int| 0 <= u < key_span() && #[trigger] seen(r1, m, q, queue, u) is Some implies {
-        &&& seen(r0, m, q, queue, u) is Some
-        &&& r1.meta(u)->0.first == r0.meta(u)->0.first
-        &&& r1.meta(u)->0.end == r0.meta(u)->0.end
-    } by {
-        assert(r1.req(u) == r0.req(u));
-        assert(r1.meta(u) == r0.meta(u));
-    }
-    lemma_rest_by_ring(pre, post, m, g, g2, i, queue);
-    g2
+    let a2 = lemma_take(table_view(pre, m), g.abs, lent_qp(), g.reqs, lent_holds(), k, o, lent);
+    lemma_linked_one_key(without(table_view(pre, m), k), pre, post, m, g, a2, i, queue, s);
+    Refinement { abs: a2, ..g }
 }
 
 /// A completion routed to its ring, M having popped its WQE: no step of A, which knew. M popped each
@@ -2005,26 +2046,14 @@ pub(super) proof fn lemma_linked_walked<C, N: Device>(pre: Seq<Option<HwQp<C, N>
     let (r0, r1) = (ring_of(pre[i]->0, queue), ring_of(post[i]->0, queue));
     let q = pre[i]->0.id();
     let v = table_view(pre, m);
-    assert forall|t: int| !(key_entry(t) == i && key_queue(t) == queue) implies {
-        &&& (v.req)(t) == table_req(pre, m, t)
-        &&& (v.staged)(t) == table_staged(pre, t)
-        &&& (v.refused)(t) == table_refused(pre, t)
-    } by {
-    }
     assert forall|u: int| 0 <= u < key_span() implies {
         &&& (v.req)(#[trigger] key(i, queue, u)) == seen(r1, m, q, queue, u)
         &&& (v.staged)(key(i, queue, u)) == staged_seen(r1, q, u)
         &&& (v.refused)(key(i, queue, u)) == refused_seen(r1, q, u)
     } by {
-        lemma_key_fields(i, queue, u);
-        let ku = key(i, queue, u);
-        assert(table_req(pre, m, ku) == seen(r0, m, q, queue, u));
-        assert(table_staged(pre, ku) == staged_seen(r0, q, u));
-        assert(table_refused(pre, ku) == refused_seen(r0, q, u));
+        lemma_table_at(pre, m, i, queue, u);
         lemma_walked_seen(r0, r1, m, q, queue, wqe, wc, spent, u);
     }
-    lemma_same_by_ring(v, pre, post, m, i, queue);
-    lemma_same(v, table_view(post, m), g.abs, lent_qp(), g.reqs, lent_holds());
     assert forall|u: int| 0 <= u < key_span() && #[trigger] seen(r1, m, q, queue, u) is Some implies {
         &&& seen(r0, m, q, queue, u) is Some
         &&& r1.meta(u)->0.first == r0.meta(u)->0.first
@@ -2032,7 +2061,10 @@ pub(super) proof fn lemma_linked_walked<C, N: Device>(pre: Seq<Option<HwQp<C, N>
     } by {
         lemma_walked_seen(r0, r1, m, q, queue, wqe, wc, spent, u);
     }
-    lemma_rest_by_ring(pre, post, m, g, g, i, queue);
+    lemma_same(v, v, g.abs, lent_qp(), g.reqs, lent_holds());
+    lemma_linked_ring(v, pre, post, m, g, g.abs, i, queue);
+    assert(Refinement { abs: g.abs, ..g } == g);
+    lemma_same(v, table_view(post, m), g.abs, lent_qp(), g.reqs, lent_holds());
 }
 
 /// [`lemma_linked_walked`] of one request.
@@ -2081,60 +2113,21 @@ pub(super) proof fn lemma_linked_given_up<C, N: Device>(pre: Seq<Option<HwQp<C, 
     let v = table_view(pre, m);
     let k = key(i, queue, seq);
     lemma_key_fields(i, queue, seq);
+    lemma_table_at(pre, m, i, queue, seq);
     let a2 = lemma_detach(v, g.abs, lent_qp(), g.reqs, lent_holds(), k);
-    let w = detached(v, k);
     r0.lemma_view();
-    assert forall|t: int| !(key_entry(t) == i && key_queue(t) == queue) implies {
-        &&& (w.req)(t) == table_req(pre, m, t)
-        &&& (w.staged)(t) == table_staged(pre, t)
-        &&& (w.refused)(t) == table_refused(pre, t)
-    } by {
-        assert(t != k);
+    assert(crate::refine::wf_at(r0.view(), seq));
+    if r0.req(seq) is Some && r0.req(seq)->0.phase is Complete {
+        assert(popped(m, range_of(q, queue, r0.meta(seq)->0)));
     }
-    assert forall|u: int| 0 <= u < key_span() implies {
-        &&& (w.req)(#[trigger] key(i, queue, u)) == seen(r1, m, q, queue, u)
-        &&& (w.staged)(key(i, queue, u)) == staged_seen(r1, q, u)
-        &&& (w.refused)(key(i, queue, u)) == refused_seen(r1, q, u)
-    } by {
-        lemma_key_fields(i, queue, u);
-        let ku = key(i, queue, u);
-        assert(table_req(pre, m, ku) == seen(r0, m, q, queue, u));
-        assert(table_staged(pre, ku) == staged_seen(r0, q, u));
-        assert(table_refused(pre, ku) == refused_seen(r0, q, u));
-        if u != seq {
-            assert(ku != k);
-            lemma_seen_same(r0, r1, m, q, queue, u);
-        } else {
-            assert(ku == k);
-            assert(crate::refine::wf_at(r0.view(), u));
-            if r0.req(u) is Some {
-                if r0.req(u)->0.phase is Complete {
-                    assert(popped(m, range_of(q, queue, r0.meta(u)->0)));
-                } else {
-                    assert(r1.meta(u) == r0.meta(u));
-                }
-            }
-        }
-    }
-    lemma_same_by_ring(w, pre, post, m, i, queue);
-    lemma_same(w, table_view(post, m), a2, lent_qp(), g.reqs, lent_holds());
-    let g2 = Refinement { abs: a2, ..g };
-    lemma_ranges_kept(g, a2, m);
-    assert forall|u: int| 0 <= u < key_span() && #[trigger] seen(r1, m, q, queue, u) is Some implies {
-        &&& seen(r0, m, q, queue, u) is Some
-        &&& r1.meta(u)->0.first == r0.meta(u)->0.first
-        &&& r1.meta(u)->0.end == r0.meta(u)->0.end
-    } by {
-        assert(r0.req(u) is Some);
-        assert(r1.meta(u) == r0.meta(u));
-    }
-    lemma_rest_by_ring(pre, post, m, g, g2, i, queue);
+    assert(r0.req(seq) is Some ==> r1.meta(seq) == r0.meta(seq) || r0.req(seq)->0.phase is Complete);
+    lemma_linked_one_key(detached(v, k), pre, post, m, g, a2, i, queue, seq);
     assert forall|u: int| #[trigger] r1.req(u) is Some && r1.req(u)->0.phase is Complete
         implies popped(m, range_of(q, queue, r1.meta(u)->0)) by {
         assert(r0.req(u) is Some);
         assert(r1.meta(u) == r0.meta(u));
     }
-    g2
+    Refinement { abs: a2, ..g }
 }
 
 /// What registering a waker on request `seq` leaves of its ring.
@@ -2174,50 +2167,21 @@ pub(super) proof fn lemma_linked_waker<C, N: Device>(pre: Seq<Option<HwQp<C, N>>
     let v = table_view(pre, m);
     let k = key(i, queue, seq);
     lemma_key_fields(i, queue, seq);
+    lemma_table_at(pre, m, i, queue, seq);
     let a2 = lemma_register(v, g.abs, lent_qp(), g.reqs, lent_holds(), k, wk);
-    let w = registered(v, k, wk);
-    r0.lemma_view();
-    assert forall|t: int| !(key_entry(t) == i && key_queue(t) == queue) implies {
-        &&& (w.req)(t) == table_req(pre, m, t)
-        &&& (w.staged)(t) == table_staged(pre, t)
-        &&& (w.refused)(t) == table_refused(pre, t)
-    } by {
-        assert(t != k);
+    assert(r1.meta(seq) == r0.meta(seq));
+    if r0.req(seq) is Some && r0.req(seq)->0.phase is Complete {
+        assert(popped(m, range_of(q, queue, r0.meta(seq)->0)));
     }
-    assert forall|u: int| 0 <= u < key_span() implies {
-        &&& (w.req)(#[trigger] key(i, queue, u)) == seen(r1, m, q, queue, u)
-        &&& (w.staged)(key(i, queue, u)) == staged_seen(r1, q, u)
-        &&& (w.refused)(key(i, queue, u)) == refused_seen(r1, q, u)
+    assert forall|u: int| u != seq implies {
+        &&& #[trigger] r1.req(u) == r0.req(u)
+        &&& r1.staged(u) == r0.staged(u)
+        &&& r1.refused(u) == r0.refused(u)
+        &&& r1.meta(u) == r0.meta(u)
     } by {
-        lemma_key_fields(i, queue, u);
-        let ku = key(i, queue, u);
-        assert(table_req(pre, m, ku) == seen(r0, m, q, queue, u));
-        assert(table_staged(pre, ku) == staged_seen(r0, q, u));
-        assert(table_refused(pre, ku) == refused_seen(r0, q, u));
-        assert(r1.meta(u) == r0.meta(u));
-        if u != seq {
-            assert(ku != k);
-            lemma_seen_same(r0, r1, m, q, queue, u);
-        } else {
-            assert(ku == k);
-            if r0.req(u) is Some && r0.req(u)->0.phase is Complete {
-                assert(popped(m, range_of(q, queue, r0.meta(u)->0)));
-            }
-        }
     }
-    lemma_same_by_ring(w, pre, post, m, i, queue);
-    lemma_same(w, table_view(post, m), a2, lent_qp(), g.reqs, lent_holds());
-    let g2 = Refinement { abs: a2, ..g };
-    lemma_ranges_kept(g, a2, m);
-    assert forall|u: int| 0 <= u < key_span() && #[trigger] seen(r1, m, q, queue, u) is Some implies {
-        &&& seen(r0, m, q, queue, u) is Some
-        &&& r1.meta(u)->0.first == r0.meta(u)->0.first
-        &&& r1.meta(u)->0.end == r0.meta(u)->0.end
-    } by {
-        assert(r1.meta(u) == r0.meta(u));
-    }
-    lemma_rest_by_ring(pre, post, m, g, g2, i, queue);
-    g2
+    lemma_linked_one_key(registered(v, k, wk), pre, post, m, g, a2, i, queue, seq);
+    Refinement { abs: a2, ..g }
 }
 
 /// A ring whose requests look the same: nothing changes for A.
@@ -2235,28 +2199,15 @@ pub(super) proof fn lemma_linked_same_view<C, N: Device>(pre: Seq<Option<HwQp<C,
     let (r0, r1) = (ring_of(pre[i]->0, queue), ring_of(post[i]->0, queue));
     let q = pre[i]->0.id();
     let v = table_view(pre, m);
-    assert forall|t: int| !(key_entry(t) == i && key_queue(t) == queue) implies {
-        &&& (v.req)(t) == table_req(pre, m, t)
-        &&& (v.staged)(t) == table_staged(pre, t)
-        &&& (v.refused)(t) == table_refused(pre, t)
-    } by {
-    }
     assert forall|u: int| 0 <= u < key_span() implies {
         &&& (v.req)(#[trigger] key(i, queue, u)) == seen(r1, m, q, queue, u)
         &&& (v.staged)(key(i, queue, u)) == staged_seen(r1, q, u)
         &&& (v.refused)(key(i, queue, u)) == refused_seen(r1, q, u)
     } by {
-        lemma_key_fields(i, queue, u);
-        let ku = key(i, queue, u);
-        assert(table_req(pre, m, ku) == seen(r0, m, q, queue, u));
-        assert(table_staged(pre, ku) == staged_seen(r0, q, u));
-        assert(table_refused(pre, ku) == refused_seen(r0, q, u));
+        lemma_table_at(pre, m, i, queue, u);
         assert(r1.req(u) == r0.req(u));
         assert(r1.meta(u) == r0.meta(u));
-        lemma_seen_same(r0, r1, m, q, queue, u);
     }
-    lemma_same_by_ring(v, pre, post, m, i, queue);
-    lemma_same(v, table_view(post, m), g.abs, lent_qp(), g.reqs, lent_holds());
     assert forall|u: int| 0 <= u < key_span() && #[trigger] seen(r1, m, q, queue, u) is Some implies {
         &&& seen(r0, m, q, queue, u) is Some
         &&& r1.meta(u)->0.first == r0.meta(u)->0.first
@@ -2265,7 +2216,8 @@ pub(super) proof fn lemma_linked_same_view<C, N: Device>(pre: Seq<Option<HwQp<C,
         assert(r1.req(u) == r0.req(u));
         assert(r1.meta(u) == r0.meta(u));
     }
-    lemma_rest_by_ring(pre, post, m, g, g, i, queue);
+    lemma_linked_ring(v, pre, post, m, g, g.abs, i, queue);
+    assert(Refinement { abs: g.abs, ..g } == g);
 }
 
 /// `post` has the rings and QP names of `pre`.
@@ -3337,13 +3289,6 @@ impl<C, N: Device> Hw<C, N> {
         );
     }
 
-    /// Nothing changed of what the program holds free.
-    pub(super) proof fn lemma_keeps_free_refl(&self)
-        ensures
-            self.keeps_free(self),
-    {
-    }
-
     /// What the NIC may touch beyond the engine's own queues is A's to give (`outside_covered`): the
     /// premise of each state of a run, about what the engine cannot see.
     pub open(super) spec fn outside_ok(&self) -> bool {
@@ -3533,6 +3478,77 @@ pub proof fn theorem_1_engine<C, N: Device>(run: Seq<EngineState<C, N>>)
         },
 {
     theorem_1(run);
+}
+
+/// Theorem 1 through the engine's own operations: what they ensure is a step of [`EngineState`], so
+/// a run of them from the device just opened stands for runs of A and M, coupled at every point.
+/// The program allocates the buffer of `part`, a lease of A, by a step of its own, and the engine
+/// is lent it. What the NIC may touch beyond the engine's queues stays the premise it is
+/// (`Hw::outside_ok`).
+#[cfg(verus_keep_ghost)]
+#[allow(dead_code)]
+fn example_run<C, N: Device>(ctx: Context<N>, pd: &Pd<N>, caps: QpCaps, part: Part<N>)
+    requires
+        part.spec_writable(),
+{
+    let mut hw = match Hw::<C, N>::new(ctx, 16) {
+        Ok(hw) => hw,
+        Err(_) => return,
+    };
+    let ghost h1 = hw;
+    let ghost m0 = choose|m0: Nic::State| nic_init(m0) && #[trigger] h1.born_from(m0);
+    let ghost bytes = sge_model(part.spec_sge()).span().bytes();
+    let ghost a2 = Abs::State {
+        leases: h1.refined@.abs.leases.insert(0, Lease { mem: bytes, unique: true, any_bytes: true, holder: Holder::Program }),
+        next_id: 1,
+        ..h1.refined@.abs
+    };
+    proof {
+        hw.refined@ = Refinement { abs: a2, ..h1.refined@ };
+        assert(abs_step(h1.refined@.abs, a2, Abs::Step::alloc(bytes, true)));
+        assert(program_step(table_view(h1.qps@, h1.token@.nic()), Abs::Step::alloc(bytes, true)));
+        hw.lemma_program_moved(&h1);
+        let v = table_view(hw.qps@, hw.token@.nic());
+        assert(free_lease(v, a2, lent_holds(), 0)) by {
+            assert forall|s: int| !(#[trigger] leases_of(v, lent_holds(), s).contains_key(0)) by {
+                if leases_of(v, lent_holds(), s).contains_key(0) {
+                    crate::refine::lemma_held_exists(table_view(h1.qps@, h1.token@.nic()), h1.refined@.abs, lent_qp(), h1.refined@.reqs, lent_holds(), s, 0);
+                }
+            }
+        }
+        assert(hw.lends(part, Dir::In));
+    }
+    let ghost h2 = hw;
+    let _ = hw.post_recv(0, part, None);
+    let ghost h3 = hw;
+    let _ = hw.create_qp(pd, None, QpType::Rc, caps, 1);
+    let ghost h4 = hw;
+    let _ = hw.progress();
+    let ghost h5 = hw;
+    proof {
+        if h1.outside_ok() && h2.outside_ok() && h3.outside_ok() && h4.outside_ok() && h5.outside_ok() {
+            let run = seq![
+                EngineState::<C, N>::Start { nic: m0 },
+                EngineState::Running { hw: h1 },
+                EngineState::Running { hw: h2 },
+                EngineState::Running { hw: h3 },
+                EngineState::Running { hw: h4 },
+                EngineState::Running { hw: h5 },
+            ];
+            assert forall|i: int| 0 <= i < run.len() - 1 implies (#[trigger] run[i]).step(&run[i + 1]) by {
+                assert(run[0] == EngineState::<C, N>::Start { nic: m0 });
+                assert(run[1] == EngineState::<C, N>::Running { hw: h1 });
+                assert(run[2] == EngineState::<C, N>::Running { hw: h2 });
+                assert(run[3] == EngineState::<C, N>::Running { hw: h3 });
+                assert(run[4] == EngineState::<C, N>::Running { hw: h4 });
+                assert(run[5] == EngineState::<C, N>::Running { hw: h5 });
+            }
+            theorem_1_engine(run);
+            assert(run[5] == EngineState::<C, N>::Running { hw: h5 });
+            assert(run[5].abs() == h5.refinement().abs);
+            assert(coupled(h5.refinement().abs, h5.nic(), h5.refinement().ranges, h5.refinement().wrs));
+        }
+    }
 }
 
 } // verus!

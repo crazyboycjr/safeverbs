@@ -45,6 +45,9 @@
 //!   precondition, and no CQE read names it ([`Hw::destroy`]).
 //! - **State.** The engine posts work only on a QP it connected or moved to
 //!   the error state, which M sees in `Rts` or `Err`.
+//! - **A.** The engine stands for a state of the abstract machine, and each
+//!   public method moves it by A's own steps ([`refines`]): Theorem 1, for one
+//!   engine, with what the buffers are to promise as its premises.
 //!
 //! The unverified engine (`crate::engine`) drives a `Hw` through its public
 //! methods only; each requires and keeps the invariant, and that of the
@@ -2518,7 +2521,7 @@ impl<C, N: Device> Hw<C, N> {
         assert(e.ok(i, n, sh, t1.started(q), written));
         assert(self.entry_ok(index, t1, n));
         self.lemma_one(start, t1, t, mid, n, index);
-        // A's `post_request`, at last.
+        // A's `post_request`.
         let g1 = refines::lemma_linked_rely(start.qps@, start.next_name@, t1, m1, mid, start.pending@, pinned(t1), g);
         refines::lemma_recv_queued(mid, n, q, seq![wr]);
         refines::lemma_verb_keeps(start.qps@, start.next_name@, t1, mid, n, start.pending@, q);
@@ -3783,7 +3786,7 @@ impl<C, N: Device> Hw<C, N> {
             }
         }
         self.lemma_one(start, t1, t, mid, n, index);
-        // A's `post_request`, at last.
+        // A's `post_request`.
         assert(qp_ok(start.qps@[index], index, t1, mid));
         e0.send.lemma_wqes();
         let g1 = refines::lemma_linked_rely(start.qps@, start.next_name@, t1, m1, mid, start.pending@, pinned(t1), g);

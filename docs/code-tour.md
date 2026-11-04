@@ -125,8 +125,12 @@ Start with [verification.md](verification.md), then:
 4. [`refinement.rs`](../crates/safeverbs-spec/src/refinement.rs): the `Refines`
    obligations, the coupling of requests to WQE intervals and outcomes, and Theorem 1.
 5. [`examples.rs`](../crates/safeverbs-spec/src/examples.rs): concrete checked traces.
-6. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the ring-to-A adapters;
-   return to `Hw::inv` and [`trusted.rs`](../crates/safeverbs-core/src/trusted.rs)
+6. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the steps of A behind each change
+   of a request, one request at a time, over any view of requests. Then
+   [`hw/refines.rs`](../crates/safeverbs-core/src/hw/refines.rs): the view of an engine's rings,
+   its ghost state, the invariant that ties them to A (`linked`), and at the end
+   `impl Refines`, the theorem, and a run of real operations under it (`example_run`).
+   Return to `Hw::inv` and [`trusted.rs`](../crates/safeverbs-core/src/trusted.rs)
    for the hardware-facing contracts. `share.rs` provides the hardware side's framing
    rules. [`hw/send_outcomes.rs`](../crates/safeverbs-core/src/hw/send_outcomes.rs) and
    [`hw/outcomes.rs`](../crates/safeverbs-core/src/hw/outcomes.rs) tie requests' results

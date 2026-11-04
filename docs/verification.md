@@ -10,11 +10,33 @@ The guarantee is one refinement theorem: under a model **M** of the NIC
 (`crates/safeverbs-spec/src/nic.rs`), the library behaves like a small abstract machine
 **A** (`abs.rs`), and the properties S1, F1, R1 and L1 are lemmas about A. The theorem
 (`theorem_1` in `refinement.rs`) is proved for every implementation that discharges the
-obligations of the `Refines` trait. **The library does not discharge them yet.** What is
-proved of it are components: the completion ring refines A, and the engine's hardware
-side keeps the NIC within M, its rings coupled to M's queues and its requests' results equal
-to what M retired. The step that would tie them together, mapping the engine's requests
-and buffers onto A's requests and leases, is the main open item (see "Remaining").
+obligations of the `Refines` trait.
+
+**One engine's verified state discharges them** (`EngineState`, `theorem_1_engine` in
+`crates/safeverbs-core/src/hw/refines.rs`). That state is `Hw`, the hardware side of one engine:
+its CQ, its queue pairs, their rings, and the requests in them. Each public operation of `Hw`
+keeps its invariant, is zero or more steps of A, and moves the NIC only by legal steps of M, and
+A and M are coupled at every point (`coupled`). `example_run` there drives the operations
+themselves through the theorem.
+
+The theorem takes three premises, which nothing verified establishes yet, and which belong to the
+layers around `Hw`:
+
+- **The buffers lend what they say** (`Hw::lends`, `Hw::lends_all`, preconditions of the paths
+  that post): the program holds a lease of A for each input of a request, unique with exactly its
+  bytes for a unique buffer, shared over them for a frozen one, and accepting any bytes if the NIC
+  writes it. The typed wrappers of `buf.rs`, which are outside `verus!`, are to promise this.
+- **What the program does with its leases are steps of A** (`Hw::program_moved`): allocating,
+  splitting, freezing, sharing, thawing, dropping, exposing and unexposing, on leases no request
+  holds.
+- **What the NIC may touch beyond the engine's queues, A gives it** (`outside_covered` in
+  `share.rs`): the WQEs of other engines' queue pairs and the regions open to a peer are leases of
+  A in the NIC's hands. For an engine alone on its device with no region open to a peer, there is
+  nothing to say. It is stated of each state, in `Refines::inv` and `Refines::step`.
+
+**So what the theorem does not cover yet:** the public API over `Hw` (`engine.rs` and the handles
+of the `safeverbs` crate, tested and not verified), the buffer layer the first two premises ask
+of, one device history shared by several engines, and liveness (see "Remaining").
 
 `scripts/verify.sh` checks everything below that is called proved. The specification
 crate uses no `assume`, `admit`, `external_body` or assumed specification; the code of
@@ -49,9 +71,11 @@ conflicting ways.
   inputs of one such request are disjoint where one is unique (`Kept`), and what it holds is
   apart from a receive by the ownership and linear permissions of its parts, not by the engine,
   which does not hold it.
-- *Not proved:* that the engine's requests and buffers are requests and leases of A, so the
-  coupling of A and M for the whole library. S1 of the library still rests on Rust's ownership of `BufMut`, `Buf`
-  and `Part` together with these component proofs.
+  Those buffers are leases of A: each input of a request is in a lease the request holds, in its
+  direction (`holds_cover`), so every byte M lets the NIC touch is one A gives it (`coupled`,
+  `lemma_wqe_byte`), and `corollary_s1` applies to the engine's states under the premises above.
+- *Not proved:* that the program's buffers are the leases the engine is lent, the first premise
+  above. S1 of the library rests on that, and on Rust's ownership of `BufMut`, `Buf` and `Part`.
 - *The one exception:* `Exposed::copy_to_slice` reads memory a peer may be writing. No
   reference to exposed memory is ever formed; it is read only through this copy, with volatile
   reads into a `T` that accepts any bytes, which is a trusted assumption (`volatile_copy`
@@ -96,8 +120,8 @@ means the NIC never saw the request.
   (`lemma_ack_outcome_unique`).
 - *Ring.* `take` returns exactly the outcome and the payload of a complete request, or of
   one whose doorbell was refused, and says which; a refused request never becomes a request of
-  A, and its leases stay the program's throughout (`lemma_ring_abort`,
-  `lemma_ring_take_refused`). Sequence numbers are never reused. An engine's
+  A, and its leases stay the program's throughout (`lemma_abort`,
+  `lemma_take_refused`). Sequence numbers are never reused. An engine's
   payload is the request's buffers and its context (`ring/payload.rs`), so each context comes
   back exactly once with its own buffers by the same proof, with no new trust.
 - *Engine.* Each completion reaches the queue pair, queue and request of its own WQE
@@ -135,6 +159,11 @@ means the NIC never saw the request.
   and its status and position are M's first error among them; or it says a refused request,
   which M never saw. Which of those requests fails first across the queue is not claimed
   beyond what the ring keeps: the first one to retire with an error since the last take.
+- *Against A.* A request completes in A when M pops its last WQE, with M's aggregate of its WQEs,
+  which is what its ring then reports. The ring hears of it later, when the CQE is routed, which
+  is no step of A (`seen`). Under Theorem 1, `corollary_f1` and `corollary_f1_refused` apply to the
+  engine's states: distinct requests own disjoint WQE intervals for good, those complete or taken
+  too (`ranges_ok`), and no WQE of a request succeeds after one that failed.
 
 **R1, the library never loses track of a buffer.** Every lease is in exactly one place at every
 moment, moves only along the allowed transitions, and is released once, after the NIC is done.
@@ -148,7 +177,9 @@ moment, moves only along the allowed transitions, and is released once, after th
 - *Ring.* Leases stay in their slot until the request completes, is taken, refused,
   detached or released with its queue pair, and leave it once.
 - *Engine.* A queue pair is destroyed only when neither ring has a WQE in flight, which M
-  turns into empty queues: its buffers are released after the NIC retired their WQEs.
+  turns into empty queues: its buffers are released after the NIC retired their WQEs. Each
+  operation on a request is a move of its leases in A, and destroying a queue pair is A's `detach`
+  of what its rings still hold and `drop_qp`, with no outcome made up (`lemma_linked_destroyed`).
 - *A device that does not flush.* The engine keeps the queue pair and its buffers and reports
   `Error::NotFlushed`: their leases stay in flight, and nothing the NIC may still use is freed.
   This retention is tested, not proved.
@@ -159,7 +190,9 @@ been invoked.
   (`lemma_l1_no_waker_left`, `lemma_l1_completion_wakes`).
 - *Ring.* `complete` wakes exactly the wakers of the requests it retires.
 - *Engine.* A waker that panics is caught; the engine finishes the poll's bookkeeping, then
-  resumes the panic. Verus checks the normal path; the panicking one is tested.
+  resumes the panic. Verus checks the normal path; the panicking one is tested. In A a request
+  completes when M pops its last WQE, so A's waker runs ahead of the ring's: L1 of the real wakers
+  stays the ring's statement above, and a waker registered after M's pop is no step of A.
 
 **Liveness is stated, not proved.** F1-live (every request gets exactly one outcome) and R1-live
 (nothing stays in flight after its queue pair is dropped, and every buffer is returned or
@@ -236,7 +269,10 @@ not proved:
   trusted: `ring_chunk` below);
 - the failure path of `Region::new` hands `release_failed_allocation` what `allocate`
   returned;
-- every caller of `Leases::len` relies on the count fitting `usize`.
+- every caller of `Leases::len` relies on the count fitting `usize`;
+- `Hw::post_recv`, `post_one`, `post_one_slow`, `close`, `close_waiting`, `submit_open`,
+  `push_other` and `push_gathered` rely on being lent their inputs (`Hw::lends`, `Hw::lends_all`):
+  the first premise of the theorem. `engine.rs` calls them without proving it.
 
 ### Trusted computing base
 
@@ -269,7 +305,7 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `buf/lease.rs` `same_frozen_arc` | `Arc::ptr_eq` means both hold the same frozen allocation |
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's |
-| `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a fresh name, in a state where M's invariants hold; the new engine's share is that CQ and queue pair names nobody uses (this is where tokens come from) |
+| `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a fresh name, in a state M reaches from a start state (the device just opened), of which its invariants follow; the new engine's share is that CQ and queue pair names nobody uses (this is where tokens come from) |
 | `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these are M's `create_qp`, three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or nothing on error, after rely steps; a queue pair's thread domain changes which locks the driver takes, not what the NIC does |
 | `trusted.rs` `qp_num_of`, `qp_lock_free` | facts that mean nothing in M (no contract) |
 | `trusted.rs` `no_qp` | a key that names no queue pair panics and never returns |
@@ -294,15 +330,9 @@ data, so M sees a queue pair's inline limit as zero.
 
 ## Remaining
 
-- **The engine's `impl Refines`.** Give each buffer a lease of A and each ring request a
-  request of A, with each lease's direction (`refine::Held`) and the check that leases stay
-  compatible, and couple them to M (`coupled`). Requests' results already agree with M (F1);
-  what `coupled` still needs from the engine is that complete requests' WQE intervals stay
-  disjoint too (the ring keeps this for requests not retired); for a request in flight, that
-  M's `retired` map holds nothing of the rest of its interval (`WqeRange::pending`); the WR of
-  every send WQE (`records_wrs`: it keeps each request's last today); and that no WQE of a
-  request succeeded after one that failed (`WqeRange::errors_stick`, which `lemma_request_step`
-  keeps through every step of M).
+- **The premises of Theorem 1 for one engine** ("Where things stand"). A buffer should carry its
+  lease of A, so that `Hw::lends` is proved of the typed wrappers and `Hw::program_moved` of what
+  they do. The state of A an engine stands for holds the program's leases too (`Refinement::abs`).
 - **F1-live and R1-live**, stated in `design.md` (section 3.4), with the device's retiring every
   posted WQE as their premise.
 - **Buffers.** The typed wrappers of `buf.rs` are outside `verus!`; initialized contents
@@ -312,9 +342,13 @@ data, so M sees a queue pair's inline limit as zero.
   should become proved.
 - **Several engines.** Each engine's view of M is proved under rely, and each engine's
   verbs are foreign steps for the others, but one device history for all engines is not
-  built: `create_cq` makes each token rather than splitting one. Engine creation and
-  destruction, and moving buffers between engines, are part of this. This will be
-  designed with the tokens.
+  built: `create_cq` makes each token rather than splitting one, and each engine's A has its own
+  `next_id`. `outside_covered`, a premise for one engine, is what they would owe each other.
+  Engine creation and destruction, and moving buffers between engines, are part of this. This will
+  be designed with the tokens.
+- **The WR of a request's last WQE.** `Refines::wrs` keeps every send WQE's WR from M's history
+  (`wr_log`); the rings still keep each request's last one as well, from when it is written
+  (`send_tails`), for what a result reports. One record could serve both.
 - **The public API.** Connect the futures, sinks and streams of `safeverbs` to the
   verified engine, and state exactly which public operations the theorem covers, including
   reuse after a caught panic. Keep conditional release distinct from leak freedom.
@@ -342,8 +376,8 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 149 verified, 0 errors
-safeverbs-core: verification results:: 595 verified, 0 errors
+safeverbs-spec: verification results:: 163 verified, 0 errors
+safeverbs-core: verification results:: 657 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only
