@@ -9,8 +9,10 @@
 //! hardware queues and rings, its share of M) lives in the internal `Hw`,
 //! which is verified: every call into the NIC meets M's precondition, the
 //! rings stay coupled to M's queues, completions are routed to the WQEs they
-//! name, and QPs are destroyed only drained. This module is the unverified
-//! shell around it: keys, thread domains and the drain's timing.
+//! name, and QPs are destroyed only drained. The data path here is inside `verus!` too: each of its
+//! methods keeps the engine's invariant and is a step of Theorem 1. What Verus cannot read is
+//! an unverified shell around them: thread domains, the drain's timing, callbacks and [`Request`],
+//! which only call methods whose preconditions are invariants.
 //!
 //! The efficient way to use RDMA is one CQ per thread, shared by all of that
 //! thread's QPs, and a loop that polls it, dispatches each completion and

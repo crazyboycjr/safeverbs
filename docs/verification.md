@@ -12,38 +12,46 @@ The guarantee is one refinement theorem: under a model **M** of the NIC
 (`theorem_1` in `refinement.rs`) is proved for every implementation that discharges the
 obligations of the `Refines` trait.
 
-**One engine's verified state discharges them** (`EngineState`, `theorem_1_engine` in
-`crates/safeverbs-core/src/hw/refines.rs`). That state is `Hw`, the hardware side of one engine:
-its CQ, its queue pairs, their rings, and the requests in them. Each public operation of `Hw`
-keeps its invariant, is zero or more steps of A, and moves the NIC only by legal steps of M, and
-A and M are coupled at every point (`coupled`). `example_run` there drives the operations
-themselves through the theorem.
+**One engine and its buffers discharge them** (`EngineState`, `theorem_1_engine` in
+`crates/safeverbs-core/src/hw/refines.rs`). Its state is the `Hw` inside an `Engine`: its CQ, its
+queue pairs, their rings, and the requests in them. Each method of `Engine` on the data path keeps
+the invariant, is zero or more steps of A, and moves the NIC only by legal steps of M, and A and M
+are coupled at every point (`coupled`). `example_run` there drives `Engine`'s public methods, on
+typed buffers, through the theorem.
 
-The theorem takes three premises, which nothing verified establishes yet, and which belong to the
-layers around `Hw`:
+**A buffer needs no lease until it meets an engine.** Until then its linear byte permission is all
+there is to it, so what the program does with its buffers (allocating, splitting, freezing, sharing,
+thawing, dropping) goes through no engine and owes A nothing. When a request is written, what keeps
+its inputs alive is shown apart from everything in the rings, by a traversal a plain build does not
+have (`Hw::separate_lease`), and A's own steps make it a lease of the program's: `drop` of the free
+leases over those bytes, which no live buffer can stand for, then `alloc`, then `freeze` for a frozen
+allocation (`lemma_adopt_loans`). For any buffer the program holds, at any moment, the same steps
+reach a state of A the engine stands for too (`Hw::adopt`), so A's S1 is said of the buffer itself:
+the NIC touches none of its bytes (`BufMut::apart_from_nic`, `Buf::apart_from_nic`).
 
-- **The buffers lend what they say** (`Hw::lends`, `Hw::lends_all`, preconditions of the paths
-  that post): the program holds a lease of A for each input of a request, unique with exactly its
-  bytes for a unique buffer, shared over them for a frozen one, and accepting any bytes if the NIC
-  writes it. The typed wrappers of `buf.rs`, which are outside `verus!`, are to promise this.
-- **What the program does with its leases are steps of A** (`Hw::program_moved`): allocating,
-  splitting, freezing, sharing, thawing, dropping, exposing and unexposing, on leases no request
-  holds.
-- **What the NIC may touch beyond the engine's queues, A gives it** (`outside_covered` in
-  `share.rs`): the WQEs of other engines' queue pairs and the regions open to a peer are leases of
-  A in the NIC's hands. For an engine alone on its device with no region open to a peer, there is
-  nothing to say. It is stated of each state, in `Refines::inv` and `Refines::step`.
+So the buffers carry no ghost name and take no step: a shared authority over A's leases would have
+to be opened by every buffer's `Drop`, which Verus does not allow, and tied to `Arc`'s counts on
+trust. And this composes: each engine has its A, what one adopts is apart from what the others hold
+by the same permissions, and what they owe each other is the one premise left.
 
-**So what the theorem does not cover yet:** the public API over `Hw` (`engine.rs` and the handles
-of the `safeverbs` crate, tested and not verified), the buffer layer the first two premises ask
-of, one device history shared by several engines, and liveness (see "Remaining").
+**The premise left: what the NIC may touch beyond the engine's queues, A gives it**
+(`outside_covered` in `share.rs`): the WQEs of other engines' queue pairs and the regions open to a
+peer are leases of A in the NIC's hands. For an engine alone on its device with no region open to a
+peer, there is nothing to say. It is stated of each state, in `Refines::inv` and `Refines::step`.
+
+**So what the theorem does not cover yet:** the handles of the `safeverbs` crate, one device history
+shared by several engines, exposure, `RingBuf`'s placement and liveness (see "Remaining").
 
 `scripts/verify.sh` checks everything below that is called proved. The specification
 crate uses no `assume`, `admit`, `external_body` or assumed specification; the code of
 `crates/safeverbs-core` written inside `verus!` uses no `assume` or `admit` and trusts
-only the items of `scripts/trusted.txt` (see "Trusted computing base"). The rest of the
-core (`buf.rs`, `engine.rs`, `pd.rs`, `verbs.rs`, `model.rs`) and the `safeverbs` crate
-are ordinary Rust: not trusted by the proofs, and not verified either.
+only the items of `scripts/trusted.txt` (see "Trusted computing base"). The rest is ordinary Rust,
+not trusted by the proofs and not verified either: `pd.rs`, `verbs.rs`, `model.rs`, the `safeverbs`
+crate, and the shells of `buf.rs` and `engine.rs`. A shell is what Verus cannot read: the methods
+with zerocopy's bounds, `Region::new`'s layout, `Exposed` and `RingBuf`; an engine's callbacks
+(`poll`), clocks (`drain`), parent domains (`create_qp`), and `Request`, whose `Drop` writes. They
+have no proof obligations to get wrong: they reach verified code only by calling it, and every
+method they call needs no more than the invariants below ("What is assumed").
 
 ## The properties
 
@@ -73,9 +81,12 @@ conflicting ways.
   which does not hold it.
   Those buffers are leases of A: each input of a request is in a lease the request holds, in its
   direction (`holds_cover`), so every byte M lets the NIC touch is one A gives it (`coupled`,
-  `lemma_wqe_byte`), and `corollary_s1` applies to the engine's states under the premises above.
-- *Not proved:* that the program's buffers are the leases the engine is lent, the first premise
-  above. S1 of the library rests on that, and on Rust's ownership of `BufMut`, `Buf` and `Part`.
+  `lemma_wqe_byte`), and `corollary_s1` applies to the engine's states.
+- *Real buffers.* A buffer the program holds is apart from whatever the NIC may touch
+  (`Hw::keeper_apart`, `BufMut::apart_from_nic`, `Buf::apart_from_nic`): `corollary_s1` in a state
+  of A where it is a lease of the program's. A `BufMut` and a `Part` keep what they say as type
+  invariants, `Peek` too, so no caller has to promise anything. This rests on Rust's ownership of
+  the buffers, which is what their linear permissions model, and on `any_bytes`, below.
 - *The one exception:* `Exposed::copy_to_slice` reads memory a peer may be writing. No
   reference to exposed memory is ever formed; it is read only through this copy, with volatile
   reads into a `T` that accepts any bytes, which is a trusted assumption (`volatile_copy`
@@ -99,8 +110,8 @@ conflicting ways.
   its scatter/gather elements are compared when it closes (`HwQp::takes`). A queue pair's
   protection domain is its own, and of the engine's device (`same_device`).
 - *Not proved:* the control path that allocates protection domains and registers and
-  deregisters regions (`buf.rs`, `pd.rs`). The engine's rely assumes it deregisters no
-  region a written WR names, which leases ensure.
+  deregisters regions (`register_region`, the region's `Drop`, `pd.rs`). The engine's rely assumes
+  it deregisters no region a written WR names, which leases ensure.
 
 **F1, what a request's outcome means.** Each request gets at most one outcome, with its own
 buffers. Success means every WQE succeeded; an error names the first that failed, those before
@@ -199,7 +210,10 @@ been invoked.
 **Liveness is stated, not proved.** F1-live (every request gets exactly one outcome) and R1-live
 (nothing stays in flight after its queue pair is dropped, and every buffer is returned or
 released) share one premise, that the device retires every posted WQE: `design.md`, section 3.4.
-Waking a future also needs the executor to poll woken tasks.
+Waking a future also needs the executor to poll woken tasks. One step of it is proved:
+`make_send_room` waits only for a signaled WQE out (`Ring::lemma_room_or_signal`), whose completion
+makes room, so that premise is all its end rests on; and it fails rather than wait when no completion
+could give it a slot.
 
 ## Tested, not proved
 
@@ -213,7 +227,7 @@ Waking a future also needs the executor to poll woken tasks.
   callbacks and destructors is not covered.
 - Memory: a refused registration frees its memory; split, frozen, exposed and streamed
   buffers free theirs once (`crates/safeverbs/tests/allocation.rs`).
-- Batches on the model and on rxe, through the unverified `Engine` and evidence that rxe
+- Batches on the model and on rxe, through `Engine` and evidence that rxe
   conforms to M: an error in a batch is its outcome, at its position, the WQEs after it flush
   and its context and buffers come back once; on rxe a batch of READs, signaled or retired by
   a later CQE, reports its last READ's length (`tests/batch.rs`). On the model, an error stays
@@ -227,8 +241,7 @@ Waking a future also needs the executor to poll woken tasks.
   gets its case of `Received`, zero-SGE and zero-byte notifications included (`tests/wc.rs`, on
   the model and rxe). A remote WRITE with immediate is read with the safe copy, the same rkey
   still valid after it (`tests/rxe.rs`).
-- That the engine's typed API hands out what `Hw` returns, and a sink's item number: both are
-  in unverified code (`engine.rs`, `sink.rs`), tested on the model and rxe.
+- A sink's item number, in unverified code (`sink.rs`), tested on the model and rxe.
 - `RingBuf`'s placement and the reuse of its chunks.
 - The simulated NIC (`model.rs`) checks some of M's rules at run time: no queue pair
   destroyed with WQEs not retired, no CQ destroyed with a queue pair attached, no work
@@ -256,25 +269,19 @@ completions and registration deserve a note:
 Errors report their status only: their opcode, length and immediate are undefined. Evidence
 that real NICs conform to M will come from differential testing on hardware and soft-RoCE.
 
-Where unverified code calls a verified function, that function's precondition is assumed,
-not proved:
+Where a shell calls a verified function, that function's precondition is assumed, not proved. Few
+are left, and each is an invariant only verified code can change:
 
-- `OpenRequest::try_push_lent` and `try_push_write` are generic over `Lend`, outside `verus!`, and
-  rely on `Lend::peek` giving bytes of the allocation it names and that allocation's `lkey`
-  (`Peek::inv`);
-- every `Hw` method that takes an `OpenRequest` or `Leases` relies on its invariant, which only
-  verified code can change (the fields are private) and every verified maker and method keeps;
-- `BufMut::freeze` relies on its buffer fitting `T` (`Buf::from_frozen`);
-- `BufMut::into_part` on at most `u32::MAX` bytes (`Part::unique`; also checked at run
-  time), and `BufMut::split_at` on an index in bounds (also checked);
-- `RingBuf` relies on its chunks' base when placing them (their byte permissions are
-  trusted: `ring_chunk` below);
-- the failure path of `Region::new` hands `release_failed_allocation` what `allocate`
-  returned;
-- every caller of `Leases::len` relies on the count fitting `usize`;
-- `Hw::post_recv`, `post_one`, `post_one_slow`, `close`, `close_waiting`, `submit_open`,
-  `push_other` and `push_gathered` rely on being lent their inputs (`Hw::lends`, `Hw::lends_all`):
-  the first premise of the theorem. `engine.rs` calls them without proving it.
+- `Engine::inv` and `Hw::inv`: the fields are private, only `Hw::new` makes a `Hw`, which ensures it,
+  and each method keeps it;
+- `OpenRequest::inv` and `Leases::inv`, of what `Engine`'s methods take: the fields are private, each
+  maker ensures it and each method keeps it. They are no type invariants because a request's fields
+  change one at a time on the data path;
+- `RingBuf`'s chunks: their byte permissions are trusted (`ring_chunk`), and placing one relies on
+  its base.
+
+A `BufMut`, a `Buf`, a `Part` and a `Peek` need no such word: what they say is a type invariant, and
+a post takes them as they are.
 
 ### Trusted computing base
 
@@ -299,12 +306,16 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `hw/open.rs` `one_of` | `core::slice::from_ref` is a list of that one element |
 | `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
 | `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExContext`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
-| `buf/memory.rs` `ExRegion` | a registered region is opaque: registration and its final cleanup are not verified |
+| `buf.rs` `bytes_back` | when a region goes, the permissions split from it are its own again: each lives in a `RawMut`, which holds an `Arc` of the region, so none is left when the last `Arc` goes. The rest of freeing it is verified (`Region::free_memory`, vstd's `deallocate` with the allocation's `Dealloc`) |
+| `buf.rs` `sge_too_long` | a panic never returns |
+| `engine.rs` `ExTransport` | the transport trait may bound a key's generics (declared without specifications) |
+| `engine.rs` `hw_mut` | `ManuallyDrop::deref_mut` is a reference to its contents |
 | `buf/memory.rs` `allocate_zeroed_raw` | the fallible zeroed allocator returns the address, layout, provenance and linear permissions vstd expects, or nothing; no claim about initialized contents |
 | `buf/memory.rs` `arc_try_unwrap` | `Arc::try_unwrap` returns the exact contents, or an `Arc` to the same contents |
 | `buf/memory.rs` `ring_chunk` | a `RingBuf` chunk comes with the byte permission for exactly its bytes: the ring's placement, which is not verified, keeps its chunks apart |
 | `buf/memory.rs` `volatile_copy` | volatile reads of memory a device may write concurrently are defined and yield arbitrary bytes; its one caller, `Exposed::copy_to_slice`, passes a range it owns and copies into a type that accepts any bytes (S1's one exception) |
 | `buf/lease.rs` `same_frozen_arc` | `Arc::ptr_eq` means both hold the same frozen allocation |
+| `buf/lease.rs` `frozen_apart` | a frozen allocation and another real buffer are that one allocation or own different bytes. Linear permissions make it so, but vstd shows two permissions disjoint only with one of them borrowed exclusively, and a frozen allocation's is behind its `Arc`. An exclusive one needs no trust (`Lease::separate_input`) |
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's |
 | `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a fresh name, in a state M reaches from a start state (the device just opened), of which its invariants follow; the new engine's share is that CQ and queue pair names nobody uses (this is where tokens come from) |
@@ -314,12 +325,31 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `trusted.rs` `pd_id_of` | the protection domain's run-time identity is its identity in the model |
 | `trusted.rs` `same_device` | `Context::same_device` says whether a protection domain is of the device an engine's M models |
 | `trusted.rs` `clone_pd` | a clone of a handle is a handle of the same protection domain |
+| `trusted.rs` `register_region` | `ibv_reg_mr` of the bytes given, with no contract of M's: what an engine learns of it is `registered` |
 | `trusted.rs` `pd_alive` | a protection domain of the device exists in M as long as a handle to it does |
 | `trusted.rs` `registered`, `registered_all` | a part's region is registered in its domain (writable if the part is unique) and stays so while the part lives; `registered_all` says so of the inputs of a request being written, each kept alive by what the request holds (one that a `Peek` added is of the allocation of an input before it, which the request compared by its `Arc`, so of that input's domain) |
 | `trusted.rs` `start`, `post`, `abort` | `ibv_wr_start`, `ibv_wr_*`, `ibv_wr_abort`: writing WRs changes nothing in M until the doorbell, and an abort discards them |
 | `trusted.rs` `doorbell` | `ibv_wr_complete` is M's `post_send` of the WRs written since the start, after rely steps, or nothing on error |
 | `trusted.rs` `post_recv` | `ibv_post_recv` of one WR is M's `post_recv`, or nothing on error |
 | `trusted.rs` `poll` | each CQE `ibv_poll_cq` returns is the one M's `poll_cq` pops, with its `wr_id` and outcome |
+
+**Why `FromBytes`, `IntoBytes` and `Immutable`, and what a reference to a buffer is, stay out of the
+proofs.** The proofs read bytes and permissions, never a value of `T`: M and A say which bytes the NIC
+may touch, and no more. So what those traits give is trusted, as rustc and zerocopy's own contracts:
+
+- *Initialized contents.* Memory comes zeroed from the allocator, which nothing here states
+  (`allocate_zeroed_raw` claims no contents), and `T: FromBytes` makes zeroes and any bytes a valid
+  `T`, which is what `Pd::alloc` and `BufMut`'s other makers ask of `T`. A says of a lease that it
+  accepts any bytes (`any_bytes`), true of every lease the engine adopts for that reason: a `BufMut<T>`
+  exists only for such a `T`, a bound on the shell's methods that the proofs take as given.
+- *Sending.* `T: IntoBytes` says that a `T` has no padding, so that sending one reads only
+  initialized bytes: a bound on `into_part` and the `Lend` impls.
+- *Sharing.* `T: Immutable` says that no `T` has interior mutability, so that a frozen buffer's bytes
+  do not change while the NIC reads them: a bound on `freeze`.
+- *References.* `Deref` and `DerefMut` of a `BufMut` and `Deref` of a `Buf` make a `&[T]` or a `&mut
+  [T]` with `from_raw_parts`, which their linear permissions say nothing to Verus about: they stand
+  on the permission's being unique or frozen, on the type invariant's fit of `T` (`fits_type`), and on
+  the two facts above.
 
 Each wrapper requires M's precondition on the engine's token and ensures that M moved by
 rely steps (the NIC's own, and other engines' on their own queues) and then by the verb.
@@ -332,16 +362,14 @@ data, so M sees a queue pair's inline limit as zero.
 
 ## Remaining
 
-- **The premises of Theorem 1 for one engine** ("Where things stand"). A buffer should carry its
-  lease of A, so that `Hw::lends` is proved of the typed wrappers and `Hw::program_moved` of what
-  they do. The state of A an engine stands for holds the program's leases too (`Refinement::abs`).
 - **F1-live and R1-live**, stated in `design.md` (section 3.4), with the device's retiring every
   posted WQE as their premise.
-- **Buffers.** The typed wrappers of `buf.rs` are outside `verus!`; initialized contents
-  and the zerocopy contracts, `RingBuf`, exposure and revocation and the final cleanup of a
-  region are not verified, and the registration lifetime is trusted (`registered`,
-  `registered_all`). The preconditions listed above, which unverified callers rely on,
-  should become proved.
+- **Buffers.** A region's final cleanup trusts that the permissions split from it are back
+  (`bytes_back`). A deposit in a `RawMut`'s `Drop` would not remove that: Verus's `Drop` opens no
+  invariant, and the last step would still be to trust that no `Arc` is left. `RingBuf`'s placement
+  and the permissions of its chunks (`ring_chunk`) are not verified, nor exposure and revocation.
+  The registration lifetime is trusted (`registered`, `registered_all`): saying more needs the
+  control path in one device history, as below.
 - **Several engines.** Each engine's view of M is proved under rely, and each engine's
   verbs are foreign steps for the others, but one device history for all engines is not
   built: `create_cq` makes each token rather than splitting one, and each engine's A has its own
@@ -353,7 +381,8 @@ data, so M sees a queue pair's inline limit as zero.
   (`send_tails`), for what a result reports. One record could serve both.
 - **The public API.** Connect the futures, sinks and streams of `safeverbs` to the
   verified engine, and state exactly which public operations the theorem covers, including
-  reuse after a caught panic. Keep conditional release distinct from leak freedom.
+  reuse after a caught panic. `Engine`'s shell, `Request` above all, could come inside `verus!` when
+  Verus reads its callbacks. Keep conditional release distinct from leak freedom.
 - **Theorem 2**, for two endpoints that both run SafeVerbs, is stated in `refinement.rs`
   and `design.md` only.
 - **M.** Gather evidence that real NICs conform (differential tests on hardware and
@@ -379,7 +408,7 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 163 verified, 0 errors
-safeverbs-core: verification results:: 658 verified, 0 errors
+safeverbs-core: verification results:: 751 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

@@ -47,11 +47,10 @@
 //!   the error state, which M sees in `Rts` or `Err`.
 //! - **A.** The engine stands for a state of the abstract machine, and each
 //!   public method moves it by A's own steps ([`refines`]): Theorem 1, for one
-//!   engine, with what the buffers are to promise as its premises.
+//!   engine and the buffers it is lent.
 //!
-//! The unverified engine (`crate::engine`) drives a `Hw` through its public
-//! methods only; each requires and keeps the invariant, and that of the
-//! request being written it is given (`open`).
+//! An engine (`crate::engine`) drives a `Hw` through its public methods only; each requires and
+//! keeps the invariant, and that of the request being written it is given (`open`).
 //
 // The imports are used by ghost code too; `global` erases to a block. The
 // code keeps the plain forms the proofs reason about (explicit matches,

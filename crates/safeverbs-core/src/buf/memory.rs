@@ -1,9 +1,9 @@
 //! Linear raw-byte permissions carried by the buffer ranges.
 //!
 //! The allocator is one primitive boundary; splitting is checked bookkeeping. These
-//! tokens describe domains and provenance, not initialized typed contents or the final
-//! Arc-driven deallocation protocol. A streaming ring's chunks are the exception: their
-//! placement is not verified, so their permissions are trusted (`OwnedRange::ring_chunk`).
+//! tokens describe domains and provenance, not initialized typed contents. Two steps are trusted:
+//! a region's permissions coming back when its last `Arc` goes (`bytes_back` in `buf.rs`), and a
+//! streaming ring's chunks, whose placement is not verified (`OwnedRange::ring_chunk`).
 #![allow(unused_imports)]
 
 use core::alloc::Layout;

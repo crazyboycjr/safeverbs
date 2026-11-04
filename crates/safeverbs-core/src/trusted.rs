@@ -646,7 +646,7 @@ pub fn destroy_cq<C: NicCq>(cq: C, Tracked(token): Tracked<NicToken>)
 }
 
 // =============================================================================
-// Buffers (`buf.rs`, not verified yet)
+// Buffers (`buf.rs`)
 
 /// [`Pd::id`].
 #[verifier::external_body]
