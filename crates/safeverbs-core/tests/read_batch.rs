@@ -11,7 +11,7 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
     const TAIL: usize = 7;
     let model = Model::new(83);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let mut worker: Engine<(), _> = Engine::new(pd.context(), 32).unwrap();
+    let mut engine: Engine<(), _> = Engine::new(pd.context(), 32).unwrap();
     let caps = QpCaps {
         max_send_wr: 8,
         max_recv_wr: 8,
@@ -20,8 +20,8 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
         max_inline_data: 0,
     };
     // Two WQEs fit below depth - max_batch, so finish(false) is unsignaled.
-    let local = worker.create_qp::<RC>(&pd, caps, 2).unwrap();
-    let peer = worker.create_qp::<RC>(&pd, caps, 2).unwrap();
+    let local = engine.create_qp::<RC>(&pd, caps, 2).unwrap();
+    let peer = engine.create_qp::<RC>(&pd, caps, 2).unwrap();
     let attr = ConnectAttr {
         port: 1,
         access: Access::LOCAL_WRITE | Access::REMOTE_READ,
@@ -37,10 +37,10 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
         max_rd_atomic: 16,
         max_dest_rd_atomic: 16,
     };
-    let endpoint = worker.endpoint(peer, 1, None).unwrap();
-    worker.connect(local, &attr, &endpoint).unwrap();
-    let endpoint = worker.endpoint(local, 1, None).unwrap();
-    worker.connect(peer, &attr, &endpoint).unwrap();
+    let endpoint = engine.endpoint(peer, 1, None).unwrap();
+    engine.connect(local, &attr, &endpoint).unwrap();
+    let endpoint = engine.endpoint(local, 1, None).unwrap();
+    engine.connect(peer, &attr, &endpoint).unwrap();
 
     let payload: Vec<u8> = (0..128).map(|i| (i * 29 + 7) as u8).collect();
     let mut source = pd.alloc::<u8>(payload.len()).unwrap();
@@ -49,7 +49,7 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
     // Disjoint unique destinations, not repeated READs into one allocation view.
     let (first, last) = pd.alloc::<u8>(FIRST + LAST).unwrap().split_at(FIRST);
     let first_ptr = first.as_ptr();
-    let mut request = worker.request(local);
+    let mut request = engine.request(local);
     request
         .push(
             WrOp::Read(source.remote().slice(..FIRST as u64)),
@@ -66,13 +66,13 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
     assert_eq!(model.run(), 2);
 
     if signal {
-        assert_eq!(worker.progress(), 1);
+        assert_eq!(engine.progress(), 1);
     } else {
-        assert_eq!(worker.progress(), 0, "the two READs produced no CQE");
-        assert!(worker.take_send(local, batch).is_none());
-        assert_eq!(worker.send_ring(local).in_flight_wqes(), 2);
+        assert_eq!(engine.progress(), 0, "the two READs produced no CQE");
+        assert!(engine.take_send(local, batch).is_none());
+        assert_eq!(engine.send_ring(local).in_flight_wqes(), 2);
         // A different length makes an accidental reuse of this later CQE fail too.
-        let mut request = worker.request(local);
+        let mut request = engine.request(local);
         request
             .push(
                 WrOp::Read(source.remote().offset(89).slice(..TAIL as u64)),
@@ -81,8 +81,8 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
             .unwrap();
         let tail = request.submit(true, ()).unwrap();
         assert_eq!(model.run(), 1);
-        assert_eq!(worker.progress(), 1);
-        let done = worker.take_send(local, tail).unwrap();
+        assert_eq!(engine.progress(), 1);
+        let done = engine.take_send(local, tail).unwrap();
         assert_eq!(done.result, Ok(Completed::Read { len: TAIL as u32 }));
         assert_eq!(
             &*done.leases.into_buf_mut::<u8>().unwrap(),
@@ -90,7 +90,7 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
         );
     }
 
-    let done = worker.take_send(local, batch).unwrap();
+    let done = engine.take_send(local, batch).unwrap();
     let result = done.result;
     assert_eq!(result, Ok(Completed::Read { len: LAST as u32 }));
     assert_eq!(
@@ -101,10 +101,10 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
     let first = done.leases.into_buf_mut::<u8>().unwrap();
     assert_eq!(first.as_ptr(), first_ptr);
     assert_eq!(&*first, &payload[..FIRST]);
-    assert!(worker.take_send(local, batch).is_none());
-    assert_eq!(worker.send_ring(local).in_flight_wqes(), 0);
+    assert!(engine.take_send(local, batch).is_none());
+    assert_eq!(engine.send_ring(local).in_flight_wqes(), 0);
     drop(first);
-    drop(worker);
+    drop(engine);
     let source = source.try_reclaim().unwrap();
     assert_eq!(&*source, payload.as_slice());
     drop(source);

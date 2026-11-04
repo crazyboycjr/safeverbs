@@ -5,7 +5,7 @@
 //! iterator chains. It is written inside `verus!` and proved: Verus checks
 //! that every normal return keeps the invariants below and that arithmetic
 //! and indexing never panic or overflow (`scripts/verify.sh`; a plain `cargo build` erases the proofs).
-//! The worker (`crate::worker`) drives it next to the hardware queue.
+//! The engine (`crate::engine`) drives it next to the hardware queue.
 //!
 //! # Requests, WQEs and sequence numbers
 //!
@@ -115,7 +115,7 @@
 //! Verus takes on trust: [`core::task::Waker`] is opaque to them, and waking,
 //! comparing and cloning one are the standard library's (see the TCB in
 //! `docs/verification.md`). User wake panics are retained until the ring operation
-//! finishes; a worker shares that retention across the whole already-polled CQ batch.
+//! finishes; an engine shares that retention across the whole already-polled CQ batch.
 //! The panic then propagates with the bookkeeping consistent.
 
 use core::task::Waker;
@@ -133,6 +133,9 @@ pub use payload::Payload;
 
 use wake::WakeBatch;
 
+// On this branch the specs and proofs in this file still describe the representation before the
+// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
+// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
 /// A request's sequence number in its queue.
@@ -338,6 +341,8 @@ impl<L> Slot<L> {
 
     /// The slot freed of everything it holds.
     fn free() -> (slot: Slot<L>)
+        ensures
+            slot.is_empty(),
     {
         Slot {
             end_wqe: 0,
@@ -1038,6 +1043,21 @@ impl<L> Ring<L> {
     /// Unless `slots >= 1` and `1 <= max_wqes <= depth` (checked at run
     /// time too, for callers outside the proofs).
     pub fn new(slots: usize, depth: u32, max_wqes: u32) -> (ring: Ring<L>)
+        requires
+            slots >= 1,
+            1 <= max_wqes <= depth,
+        ensures
+            ring.inv(),
+            ring.spec_wqe_retired() == 0,
+            ring.spec_wqe_committed() == 0,
+            ring.spec_wqe_posted() == 0,
+            ring.spec_depth() == depth,
+            !ring.spec_is_open(),
+            forall|s: int| #[trigger] ring.req(s) is None,
+            forall|s: int| #[trigger] ring.staged(s) is None,
+            forall|s: int| #[trigger] ring.refused(s) is None,
+            ring.woken() == vstd::seq::Seq::<WakerId>::empty(),
+            ring.spec_detached_error() is None,
     {
         assert!(slots >= 1, "a ring needs a slot");
         assert!(slots <= 1 << 40, "a ring of at most 2^40 slots");
@@ -1078,6 +1098,11 @@ impl<L> Ring<L> {
 
     #[inline(always)]
     fn index(&self, seq: Seq) -> (i: usize)
+        requires
+            self.slots@.len() >= 1,
+        ensures
+            i == seq as int % self.n(),
+            i < self.slots@.len(),
     {
         (seq & self.mask) as usize
     }
@@ -1243,6 +1268,10 @@ impl<L> Ring<L> {
     /// covers both: neither number exceeds their bitwise or.
     #[inline(always)]
     pub fn has_free_slot(&self) -> (free: bool)
+        requires
+            self.inv(),
+        ensures
+            free == self.spec_has_free_slot(),
     {
         self.posted - self.head <= self.mask && (self.wqe_posted | self.posted) < COUNTERS_END
     }
@@ -1267,6 +1296,11 @@ impl<L> Ring<L> {
     /// room for a WQE.
     #[inline(always)]
     pub fn can_post(&self) -> (can: bool)
+        requires
+            self.inv(),
+        ensures
+            can == (!self.spec_is_open() && self.spec_has_free_slot() && self.spec_wqe_posted()
+                - self.spec_wqe_retired() < self.spec_depth()),
     {
         self.has_free_slot() && self.wqe_posted - self.wqe_retired < self.depth
     }
@@ -1355,6 +1389,10 @@ impl<L> Ring<L> {
 
     /// The state of request `seq`: `Free` once it was taken, freed or never posted.
     pub fn state(&self, seq: Seq) -> (state: State)
+        requires
+            self.inv(),
+        ensures
+            state == self.state_of(seq as int),
     {
         if seq < self.head || seq >= self.posted {
             return State::Free;
@@ -1382,6 +1420,10 @@ impl<L> Ring<L> {
     /// How many more WQEs the queue may take now.
     #[inline]
     pub fn wqe_room(&self) -> (room: u32)
+        requires
+            self.inv(),
+        ensures
+            room == 0 <==> !self.spec_has_wqe_room(),
     {
         (self.depth - (self.wqe_posted - self.wqe_retired)) as u32
     }
@@ -1408,6 +1450,10 @@ impl<L> Ring<L> {
     /// would exceed `depth - max_wqes`.
     #[inline]
     pub fn must_signal(&self, wqes: u64) -> (must: bool)
+        requires
+            self.inv(),
+        ensures
+            must == self.spec_must_signal(),
     {
         let base = if self.sig_end > self.wqe_retired {
             self.sig_end
@@ -1582,6 +1628,28 @@ impl<L> Ring<L> {
     /// The doorbell rang: every staged request is in flight.
     #[inline(always)]
     pub fn commit(&mut self)
+        requires
+            old(self).inv(),
+            !old(self).is_open(),
+        ensures
+            final(self).inv(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if old(self).staged(s) is Some {
+                    old(self).staged(s)
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int| #[trigger] final(self).staged(s) is None,
+            forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
+            final(self).woken() == old(self).woken(),
+            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_posted(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            !final(self).spec_is_open(),
+            final(self).same_dma(old(self)),
+            final(self).same_meta(old(self)),
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         self.committed = self.posted;
         self.wqe_committed = self.wqe_posted;
@@ -1822,6 +1890,41 @@ impl<L> Ring<L> {
     }
 
     pub(crate) fn abort_keeping_with_wakes(&mut self, keep: Seq, wakes: &mut WakeBatch) -> (kept: Option<L>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            !final(self).is_open(),
+            final(self).spec_posted() == old(self).spec_posted(),
+            forall|s: int| #[trigger] final(self).req(s) == old(self).req(s),
+            forall|s: int| #[trigger] final(self).staged(s) is None,
+            forall|s: int|
+                #[trigger] final(self).refused(s) == if old(self).staged(s) is Some && s != keep
+                    && !old(self).staged(s)->0.detached {
+                    Some(old(self).staged(s)->0.leases)
+                } else {
+                    old(self).refused(s)
+                },
+            final(self).woken() == old(self).woken() + old(self).wakers(
+                old(self).spec_committed() as int,
+                old(self).spec_posted() as int,
+            ),
+            kept == match old(self).staged(keep as int) {
+                Some(r) => Some(r.leases),
+                None => None,
+            },
+            final(self).spec_wqe_retired() == old(self).spec_wqe_retired(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_committed(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            final(self).spec_detached_error() is None ==> forall|s: int|
+                #[trigger] old(self).staged(s) is Some && s != keep ==> !old(self).staged(
+                    s,
+                )->0.detached,
+            final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) ==
+                if old(self).staged(s) is Some { None } else { old(self).meta(s) },
+            final(self).detached_refused(old(self)),
     {
         let wqe = self.wqe_committed;
         let mut kept = None;
@@ -1973,6 +2076,23 @@ impl<L> Ring<L> {
     /// Moves `retired` past the requests at the front of the committed ones that have no WQEs:
     /// no completion would retire them.
     fn skip_refused(&mut self)
+        requires
+            old(self).inv_body(),
+        ensures
+            final(self).inv_body(),
+            final(self).slots@ == old(self).slots@,
+            final(self).head == old(self).head,
+            final(self).retired >= old(self).retired,
+            final(self).committed == old(self).committed,
+            final(self).posted == old(self).posted,
+            final(self).wqe_retired == old(self).wqe_retired,
+            final(self).wqe_committed == old(self).wqe_committed,
+            final(self).wqe_posted == old(self).wqe_posted,
+            final(self).depth == old(self).depth,
+            final(self).open == old(self).open,
+            final(self).open_wqes == old(self).open_wqes,
+            final(self).detached_error == old(self).detached_error,
+            final(self).same_view(old(self)),
     {
         while self.retired < self.committed && self.slots[self.index(self.retired)].end_wqe == self.wqe_retired
         {
@@ -2172,6 +2292,43 @@ impl<L> Ring<L> {
     /// Records the completion of WQE `wqe` of a send queue: retires every committed request whose
     /// WQEs all lie at or before it. Wakes the wakers of the requests that retire.
     pub fn complete(&mut self, wqe: u64, wc: Wc) -> (known: bool)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            known == (wqe < old(self).spec_wqe_committed()),
+            old(self).spec_retired() <= final(self).spec_retired() <= old(self).spec_committed(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if old(self).spec_retired() <= s < final(self).spec_retired() {
+                    old(self).retired_view(s, old(self).retire_outcome(s, wqe, wc))
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int| #[trigger] final(self).staged(s) == old(self).staged(s),
+            forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
+            final(self).woken() == old(self).woken() + old(self).wakers(
+                old(self).spec_retired() as int,
+                final(self).spec_retired() as int,
+            ),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            old(self).spec_wqe_retired() <= final(self).spec_wqe_retired(),
+            wqe >= old(self).spec_wqe_retired() ==> final(self).spec_wqe_retired() <= wqe + 1,
+            final(self).same_open(old(self)),
+            final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) ==
+                old(self).completion_meta(s, wqe, wc, final(self).spec_retired() as int),
+            known && wqe >= old(self).spec_wqe_retired() ==> forall|s: int|
+                #[trigger] final(self).req(s) is Some && final(self).req(s)->0.phase is InFlight
+                ==> final(self).meta(s)->0.end > wqe as int + 1,
+            forall|s: int| old(self).spec_retired() <= s < final(self).spec_retired()
+                && #[trigger] old(self).req(s) is Some
+                ==> old(self).meta(s)->0.end as int <= wqe as int + 1,
+            known && wqe >= old(self).spec_wqe_retired()
+                ==> final(self).pending_cache(*old(self), wqe, wc),
+            old(self).detached_completed(final(self).spec_detached_error(), wqe, wc,
+                final(self).spec_retired() as int),
     {
         let mut wakes = WakeBatch::new();
         let result = self.complete_with_wakes(false, wqe, &wc, &mut wakes);
@@ -2189,6 +2346,43 @@ impl<L> Ring<L> {
     /// ignored. Returns `false`, and changes nothing, for a WQE that was never committed.
     #[inline(always)]
     pub(crate) fn complete_with_wakes(&mut self, recv: bool, wqe: u64, wc: &Wc, wakes: &mut WakeBatch) -> (known: bool)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            known == (wqe < old(self).spec_wqe_committed()),
+            old(self).spec_retired() <= final(self).spec_retired() <= old(self).spec_committed(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if old(self).spec_retired() <= s < final(self).spec_retired() {
+                    old(self).retired_view(s, old(self).retire_outcome(s, wqe, wc))
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int| #[trigger] final(self).staged(s) == old(self).staged(s),
+            forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
+            final(self).woken() == old(self).woken() + old(self).wakers(
+                old(self).spec_retired() as int,
+                final(self).spec_retired() as int,
+            ),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_committed(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            old(self).spec_wqe_retired() <= final(self).spec_wqe_retired(),
+            wqe >= old(self).spec_wqe_retired() ==> final(self).spec_wqe_retired() <= wqe + 1,
+            final(self).same_open(old(self)),
+            final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) ==
+                old(self).completion_meta(s, wqe, wc, final(self).spec_retired() as int),
+            known && wqe >= old(self).spec_wqe_retired() ==> forall|s: int|
+                #[trigger] final(self).req(s) is Some && final(self).req(s)->0.phase is InFlight
+                ==> final(self).meta(s)->0.end > wqe as int + 1,
+            forall|s: int| old(self).spec_retired() <= s < final(self).spec_retired()
+                && #[trigger] old(self).req(s) is Some
+                ==> old(self).meta(s)->0.end as int <= wqe as int + 1,
+            known && wqe >= old(self).spec_wqe_retired()
+                ==> final(self).pending_cache(*old(self), wqe, wc),
+            old(self).detached_completed(final(self).spec_detached_error(), wqe, wc,
+                final(self).spec_retired() as int),
     {
         if wqe >= self.wqe_committed {
             return false;
@@ -2533,6 +2727,23 @@ impl<L> Ring<L> {
     /// Moves `head` past the free slots at the front of the window.
     #[inline(never)]
     pub(crate) fn advance_head(&mut self)
+        requires
+            old(self).inv_body(),
+        ensures
+            final(self).inv(),
+            final(self).slots@ == old(self).slots@,
+            final(self).head >= old(self).head,
+            final(self).retired == old(self).retired,
+            final(self).committed == old(self).committed,
+            final(self).posted == old(self).posted,
+            final(self).wqe_retired == old(self).wqe_retired,
+            final(self).wqe_committed == old(self).wqe_committed,
+            final(self).wqe_posted == old(self).wqe_posted,
+            final(self).depth == old(self).depth,
+            final(self).open == old(self).open,
+            final(self).open_wqes == old(self).open_wqes,
+            final(self).detached_error == old(self).detached_error,
+            final(self).same_view(old(self)),
     {
         while self.head < self.retired && self.slots[self.index(self.head)].leases.is_none()
         {
@@ -2627,6 +2838,37 @@ impl<L> Ring<L> {
     /// unless it is retired or refused and not taken yet.
     #[inline(always)]
     pub fn take(&mut self, seq: Seq) -> (taken: Option<Taken<L>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            match taken {
+                Some(t) => old(self).taken_from(seq as int, t),
+                None => !(old(self).req(seq as int) is Some && old(self).req(
+                    seq as int,
+                )->0.phase is Complete) && old(self).refused(seq as int) is None,
+            },
+            forall|s: int|
+                #[trigger] final(self).req(s) == if taken is Some && s == seq {
+                    None
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int| #[trigger] final(self).staged(s) == old(self).staged(s),
+            forall|s: int|
+                #[trigger] final(self).refused(s) == if s == seq {
+                    None
+                } else {
+                    old(self).refused(s)
+                },
+            final(self).woken() == old(self).woken(),
+            final(self).same_wqes(old(self)),
+            final(self).same_open(old(self)),
+            final(self).same_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) == if taken is Some && s == seq {
+                None
+            } else { old(self).meta(s) },
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         if seq < self.head || seq >= self.committed {
             return None;
@@ -2811,6 +3053,41 @@ impl<L> Ring<L> {
     /// freed and its leases released now, a staged or in-flight one when it
     /// retires.
     pub fn detach(&mut self, seq: Seq)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if s == seq && old(self).req(s) is Some {
+                    if old(self).req(s)->0.phase is Complete {
+                        None
+                    } else {
+                        Some(old(self).req(s)->0.detach())
+                    }
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int|
+                #[trigger] final(self).staged(s) == if s == seq && old(self).staged(s) is Some {
+                    Some(old(self).staged(s)->0.detach())
+                } else {
+                    old(self).staged(s)
+                },
+            forall|s: int|
+                #[trigger] final(self).refused(s) == if s == seq {
+                    None
+                } else {
+                    old(self).refused(s)
+                },
+            final(self).woken() == old(self).woken(),
+            final(self).same_wqes(old(self)),
+            final(self).same_open(old(self)),
+            final(self).spec_posted() == old(self).spec_posted(),
+            final(self).same_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) == if s == seq && old(self).req(s) is Some && old(self).req(s)->0.phase is Complete {
+                None
+            } else { old(self).meta(s) },
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         if seq < self.head || seq >= self.posted {
             return;
@@ -2951,6 +3228,30 @@ impl<L> Ring<L> {
     /// in-flight request with an owner); replaces the one before unless it
     /// would wake the same task.
     pub fn set_waker(&mut self, seq: Seq, waker: &Waker)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            forall|s: int|
+                #[trigger] final(self).req(s) == if s == seq && old(self).req(s) is Some && old(self).req(s)->0.phase is InFlight && !old(self).req(s)->0.detached {
+                    Some(old(self).req(s)->0.with_waker(waker_id(*waker)))
+                } else {
+                    old(self).req(s)
+                },
+            forall|s: int|
+                #[trigger] final(self).staged(s) == if s == seq && old(self).staged(s) is Some
+                    && !old(self).staged(s)->0.detached {
+                    Some(old(self).staged(s)->0.with_waker(waker_id(*waker)))
+                } else {
+                    old(self).staged(s)
+                },
+            forall|s: int| #[trigger] final(self).refused(s) == old(self).refused(s),
+            final(self).woken() == old(self).woken(),
+            final(self).same_wqes(old(self)),
+            final(self).same_open(old(self)),
+            final(self).same_dma(old(self)),
+            final(self).same_meta(old(self)),
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         let state = self.state(seq);
         if !matches!(state, State::Staged) && !matches!(state, State::InFlight) {
@@ -2985,6 +3286,20 @@ impl<L> Ring<L> {
     /// every slot releases its leases and the ring is empty. Wakers are
     /// dropped (nobody can wait on a destroyed QP).
     pub fn release_all(&mut self)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            forall|s: int| #[trigger] final(self).req(s) is None,
+            forall|s: int| #[trigger] final(self).staged(s) is None,
+            forall|s: int| #[trigger] final(self).refused(s) is None,
+            final(self).woken() == old(self).woken(),
+            final(self).spec_wqe_retired() == old(self).spec_wqe_posted(),
+            final(self).spec_wqe_committed() == old(self).spec_wqe_posted(),
+            final(self).spec_wqe_posted() == old(self).spec_wqe_posted(),
+            final(self).spec_depth() == old(self).spec_depth(),
+            final(self).keeps_dma(old(self)),
+            forall|s: int| #[trigger] final(self).meta(s) is None,
     {
         let mut i = 0;
         while i < self.slots.len()

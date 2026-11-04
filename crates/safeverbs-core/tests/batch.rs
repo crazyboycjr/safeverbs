@@ -30,7 +30,7 @@ fn rxe() -> Option<Context<Verbs>> {
     Some(Context::open(Some(&name)).unwrap())
 }
 
-/// A worker on `ctx` with two RC QPs connected to each other; the first.
+/// An engine on `ctx` with two RC QPs connected to each other; the first.
 fn connected<C, N: Nic>(ctx: &Context<N>) -> (Pd<N>, Engine<C, N>, QpKey<RC>) {
     let pd = ctx.alloc_pd().unwrap();
     let caps = QpCaps {
@@ -40,9 +40,9 @@ fn connected<C, N: Nic>(ctx: &Context<N>) -> (Pd<N>, Engine<C, N>, QpKey<RC>) {
         max_recv_sge: 1,
         max_inline_data: 0,
     };
-    let mut worker = Engine::new(ctx, 64).unwrap();
-    let local = worker.create_qp::<RC>(&pd, caps, 4).unwrap();
-    let peer = worker.create_qp::<RC>(&pd, caps, 4).unwrap();
+    let mut engine = Engine::new(ctx, 64).unwrap();
+    let local = engine.create_qp::<RC>(&pd, caps, 4).unwrap();
+    let peer = engine.create_qp::<RC>(&pd, caps, 4).unwrap();
     let port = ctx.port(1).unwrap();
     let gid_index = match std::env::var("SAFEVERBS_TEST_GID_INDEX") {
         Ok(i) if port.ethernet => Some(i.parse().expect("SAFEVERBS_TEST_GID_INDEX")),
@@ -63,19 +63,19 @@ fn connected<C, N: Nic>(ctx: &Context<N>) -> (Pd<N>, Engine<C, N>, QpKey<RC>) {
         max_rd_atomic: 1,
         max_dest_rd_atomic: 1,
     };
-    let endpoint = worker.endpoint(peer, 1, gid_index).unwrap();
-    worker.connect(local, &attr, &endpoint).unwrap();
-    let endpoint = worker.endpoint(local, 1, gid_index).unwrap();
-    worker.connect(peer, &attr, &endpoint).unwrap();
-    (pd, worker, local)
+    let endpoint = engine.endpoint(peer, 1, gid_index).unwrap();
+    engine.connect(local, &attr, &endpoint).unwrap();
+    let endpoint = engine.endpoint(local, 1, gid_index).unwrap();
+    engine.connect(peer, &attr, &endpoint).unwrap();
+    (pd, engine, local)
 }
 
 /// Polls until request `seq` of `qp`'s send queue completes.
-fn wait_send<C, N: Nic>(worker: &mut Engine<C, N>, qp: QpKey<RC>, seq: Seq) -> Completion<C, N> {
+fn wait_send<C, N: Nic>(engine: &mut Engine<C, N>, qp: QpKey<RC>, seq: Seq) -> Completion<C, N> {
     let start = Instant::now();
     loop {
-        worker.progress();
-        if let Some(done) = worker.take_send(qp, seq) {
+        engine.progress();
+        if let Some(done) = engine.take_send(qp, seq) {
             return done;
         }
         assert!(
@@ -91,7 +91,7 @@ fn wait_send<C, N: Nic>(worker: &mut Engine<C, N>, qp: QpKey<RC>, seq: Seq) -> C
 /// its own first WQE.
 fn error_in_a_batch<N: Nic>(ctx: Context<N>, bad: usize) {
     const LEN: usize = 8;
-    let (pd, mut worker, local) = connected::<&'static str, N>(&ctx);
+    let (pd, mut engine, local) = connected::<&'static str, N>(&ctx);
     let target = pd.alloc::<u8>(4 * LEN).unwrap().expose().unwrap();
     let slot = |i: usize| {
         target
@@ -106,7 +106,7 @@ fn error_in_a_batch<N: Nic>(ctx: Context<N>, bad: usize) {
             b.freeze()
         })
         .collect();
-    let mut request = worker.request(local);
+    let mut request = engine.request(local);
     for (i, src) in sources.iter().enumerate() {
         let mut dst = slot(i);
         if i == bad {
@@ -117,14 +117,14 @@ fn error_in_a_batch<N: Nic>(ctx: Context<N>, bad: usize) {
             .unwrap();
     }
     let batch = request.finish(true, "the batch").unwrap();
-    let mut request = worker.request(local);
+    let mut request = engine.request(local);
     request
         .push(WrOp::Write(slot(3)), sources[1].slice(..).into_part())
         .unwrap();
     let after = request.finish(true, "the WRITE after it").unwrap();
-    worker.commit(local).unwrap();
+    engine.commit(local).unwrap();
 
-    let done = wait_send(&mut worker, local, batch);
+    let done = wait_send(&mut engine, local, batch);
     assert_eq!(done.wr_id, "the batch");
     let Err(CompletionError::Failed {
         status, position, ..
@@ -139,9 +139,9 @@ fn error_in_a_batch<N: Nic>(ctx: Context<N>, bad: usize) {
     );
     assert_eq!(position as usize, bad, "the WQE that failed");
     assert_eq!(done.leases.len(), 4, "every buffer of the batch");
-    assert!(worker.take_send(local, batch).is_none(), "taken once");
+    assert!(engine.take_send(local, batch).is_none(), "taken once");
     drop(done);
-    let done = wait_send(&mut worker, local, after);
+    let done = wait_send(&mut engine, local, after);
     assert_eq!(done.wr_id, "the WRITE after it");
     assert_eq!(
         done.result.unwrap_err().status(),
@@ -155,11 +155,11 @@ fn error_in_a_batch<N: Nic>(ctx: Context<N>, bad: usize) {
         "the earlier request's error did not spill into it"
     );
     drop(done);
-    assert_eq!(worker.send_ring(local).in_flight_wqes(), 0);
+    assert_eq!(engine.send_ring(local).in_flight_wqes(), 0);
     for src in sources {
         assert!(src.try_thaw().is_ok(), "nothing holds the buffer any more");
     }
-    drop(worker);
+    drop(engine);
     let target = target.try_reclaim().unwrap();
     for i in 0..4 {
         // Only what these devices do here: an error says nothing of the remote effects
@@ -194,10 +194,10 @@ fn position_counts_the_wqes_that_completed() {
         let model = Model::new(92);
         model.set_pace(0, 1);
         let ctx = Context::new(model.clone());
-        let (pd, mut worker, local) = connected::<(), Model>(&ctx);
+        let (pd, mut engine, local) = connected::<(), Model>(&ctx);
         let target = pd.alloc::<u8>(8).unwrap().expose().unwrap();
         let source = pd.alloc::<u8>(8).unwrap().freeze();
-        let mut request = worker.request(local);
+        let mut request = engine.request(local);
         for _ in 0..4 {
             request
                 .push(WrOp::Write(target.remote()), source.slice(..).into_part())
@@ -206,10 +206,10 @@ fn position_counts_the_wqes_that_completed() {
         let batch = request.submit(true, ()).unwrap();
         // Each poll executes one WQE, leaving a CQE only for an error or the signaled last.
         for _ in 0..done {
-            assert_eq!(worker.progress(), 0);
+            assert_eq!(engine.progress(), 0);
         }
-        model.inject_error(worker.qp_num(local), Status::REM_OP_ERR);
-        let finished = wait_send(&mut worker, local, batch);
+        model.inject_error(engine.qp_num(local), Status::REM_OP_ERR);
+        let finished = wait_send(&mut engine, local, batch);
         assert!(
             matches!(
                 finished.result,
@@ -229,13 +229,13 @@ fn read_batch<N: Nic>(ctx: Context<N>, signal: bool) {
     const FIRST: usize = 17;
     const LAST: usize = 31;
     const TAIL: usize = 7;
-    let (pd, mut worker, local) = connected::<(), N>(&ctx);
+    let (pd, mut engine, local) = connected::<(), N>(&ctx);
     let payload: Vec<u8> = (0..128).map(|i| (i * 29 + 7) as u8).collect();
     let mut source = pd.alloc::<u8>(payload.len()).unwrap();
     source.copy_from_slice(&payload);
     let source = source.expose().unwrap();
     let (first, last) = pd.alloc::<u8>(FIRST + LAST).unwrap().split_at(FIRST);
-    let mut request = worker.request(local);
+    let mut request = engine.request(local);
     request
         .push(
             WrOp::Read(source.remote().slice(..FIRST as u64)),
@@ -250,7 +250,7 @@ fn read_batch<N: Nic>(ctx: Context<N>, signal: bool) {
         .unwrap();
     let batch = request.submit(signal, ()).unwrap();
     if !signal {
-        let mut request = worker.request(local);
+        let mut request = engine.request(local);
         request
             .push(
                 WrOp::Read(source.remote().offset(89).slice(..TAIL as u64)),
@@ -258,25 +258,25 @@ fn read_batch<N: Nic>(ctx: Context<N>, signal: bool) {
             )
             .unwrap();
         let tail = request.submit(true, ()).unwrap();
-        let done = wait_send(&mut worker, local, tail);
+        let done = wait_send(&mut engine, local, tail);
         assert_eq!(done.result, Ok(Completed::Read { len: TAIL as u32 }));
         assert_eq!(
             &*done.leases.into_buf_mut::<u8>().unwrap(),
             &payload[89..89 + TAIL]
         );
     }
-    let done = wait_send(&mut worker, local, batch);
+    let done = wait_send(&mut engine, local, batch);
     assert_eq!(
         done.result,
         Ok(Completed::Read { len: LAST as u32 }),
         "the last READ's length"
     );
     assert_eq!(done.leases.len(), 2, "both destinations, together");
-    assert!(worker.take_send(local, batch).is_none(), "taken once");
+    assert!(engine.take_send(local, batch).is_none(), "taken once");
     let first = done.leases.into_buf_mut::<u8>().unwrap();
     assert_eq!(&*first, &payload[..FIRST]);
     drop(first);
-    drop(worker);
+    drop(engine);
     assert_eq!(&*source.try_reclaim().unwrap(), payload.as_slice());
 }
 

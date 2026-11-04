@@ -49,7 +49,7 @@ pub struct Args {
     #[arg(long, default_value = "0")]
     pub traffic_class: u8,
 
-    /// Number of QPs, all on one worker (one CQ); the iterations are
+    /// Number of QPs, all on one CQ; the iterations are
     /// spread over them.
     #[arg(short, long, default_value = "1")]
     pub qps: usize,
@@ -60,7 +60,7 @@ pub struct Args {
     pub cq_mod: usize,
 
     /// Drive the QPs with futures (a sink per QP) instead of the
-    /// worker's event loop.
+    /// event loop.
     #[arg(long = "async")]
     pub use_async: bool,
 }

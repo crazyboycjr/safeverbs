@@ -183,7 +183,7 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
         });
     }
 
-    /// Takes the result and buffers of retired request `seq`, from its slot
+    /// Takes the result and buffers of completed request `seq`, from its slot
     /// or the side list.
     #[inline(always)]
     pub(crate) fn take_request(
@@ -226,7 +226,7 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
         seq < ring.retired()
     }
 
-    /// Wakes `waker` when request `seq` retires.
+    /// Wakes `waker` when request `seq` completes.
     pub(crate) fn set_waker(&mut self, side: Queue, seq: Seq, waker: &core::task::Waker) {
         let w = &mut self.state.engine;
         match side {
@@ -339,7 +339,7 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
     }
 
     /// Gives up a posted request (its buffers are released when it
-    /// retires).
+    /// completes).
     pub(crate) fn detach(&mut self, side: Queue, seq: Seq) {
         let key = self.key;
         if self.state.pending != 0 {

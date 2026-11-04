@@ -161,12 +161,12 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
   completions with errors and flushes, takes and detaches, checking the
   invariant after every step (a run-time cross-check of what Verus proves,
   `scripts/verify.sh`) and that every lease is released exactly once; of
-  the worker (`worker.rs`): `wr_id` routing, CQ reservations, a refused
-  doorbell, removing QPs and dropping a worker with work in flight (the
+  the engine (`engine.rs`): `wr_id` routing, CQ reservations, a refused
+  doorbell, removing QPs and dropping an engine with work in flight (the
   drain before the destroy) and a device that never flushes; and
-  (`crates/safeverbs-core/tests/worker.rs`) QPs removed and workers dropped
+  (`crates/safeverbs-core/tests/engine.rs`) QPs removed and engines dropped
   at random moments with work in flight, and pairs of QPs on
-  one worker, whose CQ is exactly as large as they reserve, driven by the
+  one engine, whose CQ is exactly as large as they reserve, driven by the
   event loop through random operations, dropped requests, injected errors,
   flushes and refused doorbells, checking that every completion reaches
   its own QP and request once, with its own buffer, and that the simulated
@@ -182,27 +182,40 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
   every kind of receive gets its case of `Received`, and `batch.rs`, on both,
   that an error in a batch is its outcome, at its position, while the WQEs
   after it flush and its context and buffers come back once, and on a device
-  that a batch of READs reports its last READ's length. `worker.rs` also checks
+  that a batch of READs reports its last READ's length. `engine.rs` also checks
   that contexts come back with their own requests, exactly once by their
   destructors, that refused requests are told from flushed ones, and that a
   detached error has its position.
 - `safeverbs` (`crates/safeverbs/tests/allocation.rs`): every buffer's
   memory is freed exactly once, after a refused registration too.
-- `safeverbs` (`crates/safeverbs/tests/model.rs`): the public API on the
+- `safeverbs` (`crates/safeverbs/tests/local.rs`): the event loop's handles
+  on the simulated NIC: `wr_id`s back exactly once with their buffers (their
+  destructors count), a closure that posts on any QP with every queue full,
+  polls again, drops QPs or panics, a full queue as an error, refused
+  doorbells, batches, CQ capacity to the entry, and random operation sequences.
+- `safeverbs` (`crates/safeverbs/tests/model.rs`): the futures' API on the
   simulated NIC (`Model`), which needs no device: every operation, the sink
   and the stream, dropped futures, errors and flushes, QPs sharing one
-  worker, and random operation sequences (on two QPs, and on several QPs of
-  one worker, with refused doorbells too) with injected errors after which
+  engine, and random operation sequences (on two QPs, and on several QPs of
+  one engine, with refused doorbells too) with injected errors after which
   every buffer is back or released once and nothing stays registered.
 - `safeverbs` (`crates/safeverbs/tests/rxe.rs`): one test per feature on a
   real device, two QPs of it connected to each other; four QPs on one
-  worker, connected pairwise, driven by the event loop, with contexts that
-  count their drops, and by futures; a sink's error naming its item; refused
+  CQ, connected pairwise, driven by the event loop (the handles', and the
+  engine's, with `wr_id`s that count their drops) and by futures; a sink's error naming its item; refused
   requests; a remote WRITE with immediate read with the safe copy, with the
-  same rkey after it; and QPs removed, and a worker dropped, with work in
+  same rkey after it; and QPs removed, and an engine dropped, with work in
   flight, among it unsignaled WQEs that only the drain WQE retires.
-- The crate documentation of `safeverbs` runs its example on the model
+- The crate documentation of `safeverbs` runs its examples on the model
   and has `compile_fail` tests for what the types rule out.
+
+`scripts/measure.sh` prints what one round of each public path costs on the
+simulated NIC against programs written by hand with the same structure
+(`crates/safeverbs/examples/measure.rs`): instructions per round, with the NIC
+subtracted, and the ratio to the baseline. `-v <workload>` gives one workload's
+cost function by function. It needs valgrind. Instruction counts say nothing of
+atomics, caches or MMIO; the numbers that finally count come from a real NIC
+against perftest.
 
 The tests on a device, the raw ones included, pass without doing anything
 on a host without RDMA devices. They pick an rxe device if there is one,

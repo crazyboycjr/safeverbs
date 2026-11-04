@@ -19,6 +19,9 @@ use super::*;
 use crate::ring::{DetachedRecord, RequestMeta};
 use safeverbs_spec::types::Outcome;
 
+// On this branch the specs and proofs in this file still describe the representation before the
+// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
+// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
 /// The recorded final WR authorizes exactly the inferred success.
@@ -832,7 +835,7 @@ impl<C, N: Device> Hw<C, N> {
     }
 
     /// What the ring handed back of a send request holds a context and its buffers, and its
-    /// error, if it failed, is what the worker's invariant says of it.
+    /// error, if it failed, is what the engine's invariant says of it.
     pub(super) proof fn lemma_send_taken(&self, index: usize, seq: RingSeq, t: Taken<Payload<C, N>>)
         requires
             self.inv(),
@@ -909,7 +912,7 @@ impl<C, N: Device> Hw<C, N> {
         detached_range(e.id(), e.send.spec_detached_error()->0)
     }
 
-    /// What the worker's invariant says of QP `index`'s detached error.
+    /// What the engine's invariant says of QP `index`'s detached error.
     pub(super) proof fn lemma_detached_record(&self, index: usize)
         requires
             self.inv(),

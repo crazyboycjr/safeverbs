@@ -4,7 +4,7 @@
 //! A verb's precondition is M's (`nic_enabled`): Verus checks it at every
 //! call site, which is S2. Its postcondition says that M moved by steps that
 //! do not touch the caller's share (`rely_reaches`: the NIC's own steps,
-//! executions and faults, and the verbs of other workers on their own CQs
+//! executions and faults, and the verbs of other engines on their own CQs
 //! and QPs) and then by the verb's step (`nic_step`), or, when the device
 //! refuses, only by such steps. The bodies are the calls of [`Device`],
 //! [`NicQp`] and [`NicCq`] and are not verified: together with M they are
@@ -18,17 +18,17 @@
 //! the start, and the doorbell posts that list.
 //!
 //! The NIC's state is a ghost token, [`NicToken`], that only these wrappers
-//! make and change. A token is one worker's: it holds M's state as that
-//! worker last saw it, the worker's share of M (`safeverbs_spec::share`: its
+//! make and change. A token is one engine's: it holds M's state as that
+//! engine last saw it, the engine's share of M (`safeverbs_spec::share`: its
 //! CQ and the names of its QPs), the protection domain of its QPs and the
 //! names it gives new QPs. Each verb is on the token's own share (`mine`),
-//! so it is within what the other workers rely on, and its precondition,
-//! checked in the state the worker last saw, still holds when the verb
+//! so it is within what the other engines rely on, and its precondition,
+//! checked in the state the engine last saw, still holds when the verb
 //! happens (`safeverbs_spec::share::lemma_rely_keeps_enabled`): that is why
-//! the contracts below are consistent. Between two calls the other workers
-//! deregister no region the worker's written WRs name (`pinned`): those
+//! the contracts below are consistent. Between two calls the other engines
+//! deregister no region the engine's written WRs name (`pinned`): those
 //! are held by leases, which keep their regions registered ([`registered`]
-//! is where the core learns it). The worker's hardware side
+//! is where the core learns it). The engine's hardware side
 //! ([`crate::hw`]) is verified against these contracts.
 //
 // The imports are used by ghost code too.
@@ -221,9 +221,9 @@ pub open spec fn transport_model(t: QpType) -> Transport {
     }
 }
 
-/// The attributes M sees for a QP the worker creates in protection domain
+/// The attributes M sees for a QP the engine creates in protection domain
 /// `pd` with both queues on CQ `cq`. M has one limit of scatter/gather
-/// elements for both queues: the smaller of the two (the worker checks
+/// elements for both queues: the smaller of the two (the engine checks
 /// every WQE against it). safeverbs posts no inline data, so M sees none.
 pub open spec fn qp_attr(pd: PdId, qp_type: QpType, cq: CqId, caps: QpCaps) -> QpAttr {
     QpAttr {
@@ -282,7 +282,7 @@ pub open spec fn send_access(op: WrOp) -> safeverbs_spec::abs::Dir {
 // =============================================================================
 // The token
 
-/// What one worker knows of the NIC: M's state as it last saw it, its share
+/// What one engine knows of the NIC: M's state as it last saw it, its share
 /// of M, the protection domain of its QPs, the names it gives new QPs, and
 /// for each of its queue pairs the send WRs written since its last start.
 /// Only the trusted wrappers make or change one: its fields are private, so
@@ -299,30 +299,30 @@ pub tracked struct NicToken {
 }
 
 impl NicToken {
-    /// The NIC's state in M, as the worker last saw it.
+    /// The NIC's state in M, as the engine last saw it.
     pub closed spec fn nic(&self) -> Nic::State {
         self.nic
     }
 
-    /// The worker's share of M: its CQ and the names of its QPs.
+    /// The engine's share of M: its CQ and the names of its QPs.
     pub closed spec fn share(&self) -> Share {
         self.share
     }
 
-    /// The protection domain of the worker's QPs.
+    /// The protection domain of the engine's QPs.
     pub closed spec fn pd(&self) -> PdId {
         self.pd
     }
 
-    /// The name of the worker's `n`-th QP: names it owns, all different,
-    /// none used before the worker was made.
+    /// The name of the engine's `n`-th QP: names it owns, all different,
+    /// none used before the engine was made.
     pub closed spec fn name(&self, n: nat) -> QpId {
         (self.name)(n)
     }
 
-    /// `self` is `other` after calls of the same worker: the same share,
+    /// `self` is `other` after calls of the same engine: the same share,
     /// protection domain and names.
-    pub open spec fn same_worker(&self, other: &NicToken) -> bool {
+    pub open spec fn same_engine(&self, other: &NicToken) -> bool {
         &&& self.share() == other.share()
         &&& self.pd() == other.pd()
         &&& forall|n: nat| #[trigger] self.name(n) == other.name(n)
@@ -361,8 +361,8 @@ impl NicToken {
     }
 }
 
-/// The regions the worker's written WRs name: their leases keep them
-/// registered, so no other worker deregisters one meanwhile.
+/// The regions the engine's written WRs name: their leases keep them
+/// registered, so no other engine deregisters one meanwhile.
 pub open spec fn pinned(t: NicToken) -> ISet<Key> {
     ISet::new(|k: Key| exists|q: QpId| #[trigger] send_keys(t.written(q)).contains(k))
 }
@@ -417,9 +417,9 @@ pub open spec fn connect_states() -> Seq<QpState> {
     seq![QpState::Init, QpState::Rtr, QpState::Rts]
 }
 
-/// A fresh worker: its names are its own, all different, and none is used
+/// A fresh engine: its names are its own, all different, and none is used
 /// yet; it has no QP and writes nothing.
-pub open spec fn fresh_worker(t: NicToken) -> bool {
+pub open spec fn fresh_engine(t: NicToken) -> bool {
     &&& forall|n: nat| #[trigger] t.share().owns.contains(t.name(n))
     &&& forall|a: nat, b: nat| #[trigger] t.name(a) == #[trigger] t.name(b) ==> a == b
     &&& forall|q: QpId| #[trigger] t.share().owns.contains(q) ==> !t.nic().qps.contains_key(q)
@@ -429,7 +429,7 @@ pub open spec fn fresh_worker(t: NicToken) -> bool {
 }
 
 // =============================================================================
-// Creating and destroying a worker's objects (the control path)
+// Creating and destroying an engine's objects (the control path)
 
 /// The device's limits (`ibv_query_device`, and the ports' message size),
 /// as a specification.
@@ -447,8 +447,8 @@ pub fn device_caps<N: Device>(ctx: &Context<N>) -> (caps: DeviceCaps)
 /// `ibv_create_cq_ex` (single-threaded) on the device of `ctx`: an engine's CQ
 /// of `entries` entries, and its token, with the device's limits as M has
 /// them. M's `create_cq` with a name never used, after whatever the device
-/// went through before; the worker's share is that CQ and QP names no other
-/// worker has, none used before. This is where tokens come from.
+/// went through before; the engine's share is that CQ and QP names no other
+/// engine has, none used before. This is where tokens come from.
 #[verifier::external_body]
 pub fn create_cq<N: Device>(ctx: &Context<N>, entries: u32) -> (r: Result<
     (N::Cq, DeviceCaps, Tracked<NicToken>),
@@ -466,7 +466,7 @@ pub fn create_cq<N: Device>(ctx: &Context<N>, entries: u32) -> (r: Result<
             &&& m.cqs[sh.cq].reserved.len() == 0
             &&& caps == spec_device_caps(*ctx)
             &&& caps_model(m.caps, caps)
-            &&& fresh_worker(t@)
+            &&& fresh_engine(t@)
         },
 {
     let nic = ctx.nic();
@@ -488,17 +488,17 @@ pub fn qp_lock_free<Q: NicQp>(qp: &Q) -> bool {
     qp.is_lock_free()
 }
 
-/// Panics: a QP key that names no QP of the worker (a logic error of the
+/// Panics: a QP key that names no QP of the engine (a logic error of the
 /// caller, not a memory-safety one). Never returns.
 #[verifier::external_body]
 pub fn no_qp(index: usize)
     ensures
         false,
 {
-    panic!("no QP {index} in this worker")
+    panic!("no QP {index} in this engine")
 }
 
-/// `ibv_create_qp_ex` on the worker's CQ and protection domain (on its
+/// `ibv_create_qp_ex` on the engine's CQ and protection domain (on its
 /// thread domain if any): M's `create_qp` of `q`, or nothing on error.
 #[verifier::external_body]
 pub fn create_qp<N: Device>(
@@ -521,7 +521,7 @@ pub fn create_qp<N: Device>(
             Nic::Step::create_qp(q, qp_attr(old(token).pd(), qp_type, old(token).share().cq, *caps)),
         ),
     ensures
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         r matches Ok(qp) ==> qp_of(qp) == q && exists|mid: Nic::State|
             rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid)
@@ -562,7 +562,7 @@ pub fn connect<Q: NicQp>(
         old(token).nic().qps[q].state is Reset,
     ensures
         qp_of(*final(qp)) == q,
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         r is Ok ==> modified(
             old(token).share(),
@@ -598,7 +598,7 @@ pub fn to_error<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tra
         nic_enabled(old(token).nic(), Nic::Step::modify_qp(q, QpState::Err)),
     ensures
         qp_of(*final(qp)) == q,
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         r is Ok ==> exists|mid: Nic::State|
             rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid)
@@ -623,7 +623,7 @@ pub fn destroy_qp<Q: NicQp>(qp: Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
         old(token).share().owns.contains(q),
         nic_enabled(old(token).nic(), Nic::Step::destroy_qp(q)),
     ensures
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         exists|mid: Nic::State|
             rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid) && nic_step(
@@ -635,7 +635,7 @@ pub fn destroy_qp<Q: NicQp>(qp: Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
     drop(qp)
 }
 
-/// `ibv_destroy_cq` of the worker's CQ: M's `destroy_cq`, which needs no QP
+/// `ibv_destroy_cq` of the engine's CQ: M's `destroy_cq`, which needs no QP
 /// attached. The token goes with it.
 #[verifier::external_body]
 pub fn destroy_cq<C: NicCq>(cq: C, Tracked(token): Tracked<NicToken>)
@@ -694,7 +694,7 @@ pub fn part_writable_of<N: Device>(part: &Part<N>) -> (writable: bool)
 /// registered in its protection domain, locally writable if the buffer is
 /// unique, and the region stays registered while the lease lives. Learning
 /// it moves the token's view to the present, since the region may be newer
-/// than what the worker last saw.
+/// than what the engine last saw.
 #[verifier::external_body]
 #[inline(always)]
 pub fn registered<N: Device>(_part: &Part<N>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
@@ -702,7 +702,7 @@ pub fn registered<N: Device>(_part: &Part<N>, _pd: &Pd<N>, Tracked(token): Track
         part_pd(*_part) == pd_id(*_pd),
         pd_of(*_pd) == old(token).pd(),
     ensures
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
         final(token).nic().registered(
@@ -722,7 +722,7 @@ pub fn registered_all<N: Device>(_leases: &Leases<N>, _pd: &Pd<N>, Tracked(token
         forall|j: int| 0 <= j < _parts@.len() ==> part_pd(#[trigger] _parts@[j]) == pd_id(*_pd),
         pd_of(*_pd) == old(token).pd(),
     ensures
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
         forall|j: int|
@@ -769,7 +769,7 @@ pub fn start<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
     ensures
         qp_of(*final(qp)) == q,
         final(token).nic() == old(token).nic(),
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
@@ -796,7 +796,7 @@ pub fn post<Q: NicQp>(
     ensures
         qp_of(*final(qp)) == q,
         final(token).nic() == old(token).nic(),
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).started(q),
         final(token).written(q) == old(token).written(q).push(send_wr(wr_id, signaled, *op, sges@)),
         final(token).same_writing_but(old(token), q),
@@ -825,7 +825,7 @@ pub fn doorbell<Q: NicQp>(
         nic_enabled(old(token).nic(), Nic::Step::post_send(q, old(token).written(q))),
     ensures
         qp_of(*final(qp)) == q,
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         !final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
@@ -854,7 +854,7 @@ pub fn abort<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
         old(token).started(q),
     ensures
         qp_of(*final(qp)) == q,
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         !final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
@@ -883,7 +883,7 @@ pub fn post_recv<Q: NicQp>(
         nic_enabled(old(token).nic(), Nic::Step::post_recv(q, seq![recv_wr(wr_id, sges@)])),
     ensures
         qp_of(*final(qp)) == q,
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         r is Ok ==> exists|mid: Nic::State|
             rely_reaches(
@@ -922,7 +922,7 @@ pub fn poll<C: NicCq>(cq: &mut C, out: &mut [Wc], limit: usize, Tracked(token): 
         cq_of(*final(cq)) == cq_of(*old(cq)),
         n <= limit,
         final(out)@.len() == old(out)@.len(),
-        final(token).same_worker(old(token)),
+        final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         polled(
             old(token).share(),

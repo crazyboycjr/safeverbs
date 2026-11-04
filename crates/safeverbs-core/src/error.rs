@@ -37,7 +37,7 @@ pub enum Error {
     },
     /// The receive queue is full.
     QueueFull,
-    /// A worker's CQ has no room for another QP's queues: every QP reserves
+    /// An engine's CQ has no room for another QP's queues: every QP reserves
     /// a CQ entry for each WQE its queues hold.
     CqFull {
         /// Entries the QP needs (its send and receive depths).

@@ -295,7 +295,7 @@ impl CompletionError {
 /// fields exist. What leaves the core is a [`Completed`] or a
 /// [`CompletionError`], which have none of them.
 ///
-/// Requests posted without a completion of their own (unsignaled) and retired
+/// Requests posted without a completion of their own (unsignaled) and completed
 /// by a later one get a completion made up from what was posted: success and
 /// the request's opcode, with the same metadata as a signaled completion.
 ///
@@ -325,7 +325,7 @@ pub struct Wc {
 }
 
 impl Wc {
-    /// A successful completion of `opcode`, for work requests that retire
+    /// A successful completion of `opcode`, for work requests that complete
     /// without a completion of their own. SEND and WRITE ignore `byte_len`.
     pub(crate) const fn success(opcode: Opcode, byte_len: u32) -> (wc: Wc)
         ensures

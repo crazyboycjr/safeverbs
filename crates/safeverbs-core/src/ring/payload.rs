@@ -1,4 +1,4 @@
-//! What a slot of a worker's rings holds for a request: its buffers and, if it
+//! What a slot of an engine's rings holds for a request: its buffers and, if it
 //! has an owner, its context. To the ring this is one value, its generic `L`:
 //! that it comes back exactly once, with its own request's outcome, is what the
 //! ring proves of every `L`.
@@ -12,9 +12,12 @@ use super::*;
 use crate::buf::Leases;
 use crate::nic::Nic;
 
+// On this branch the specs and proofs in this file still describe the representation before the
+// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
+// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
-/// What a slot of a worker's rings holds for a request.
+/// What a slot of an engine's rings holds for a request.
 #[verifier::reject_recursive_types(N)]
 pub struct Payload<C, N: Nic> {
     /// The owner's context, which comes back once with the request's outcome;
@@ -130,6 +133,47 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
     /// Gives up ownership of request `seq`, as [`Ring::detach`] does, and hands
     /// back its context, if it has one.
     pub fn give_up(&mut self, seq: Seq) -> (ctx: Option<C>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            old(self).req(seq as int) matches Some(r) ==> ctx == r.leases.ctx,
+            old(self).staged(seq as int) matches Some(r) ==> ctx == r.leases.ctx,
+            old(self).refused(seq as int) matches Some(p) ==> ctx == p.ctx,
+            forall|s: int| #[trigger] final(self).req(s) == if s == seq && old(self).req(s) is Some {
+                if old(self).req(s)->0.phase is Complete {
+                    None
+                } else {
+                    Some(ReqView { leases: old(self).req(s)->0.leases.without_ctx(), ..old(self).req(s)->0.detach() })
+                }
+            } else {
+                old(self).req(s)
+            },
+            forall|s: int| #[trigger] final(self).staged(s) == if s == seq && old(self).staged(s) is Some {
+                Some(ReqView { leases: old(self).staged(s)->0.leases.without_ctx(), ..old(self).staged(s)->0.detach() })
+            } else {
+                old(self).staged(s)
+            },
+            forall|s: int| #[trigger] final(self).refused(s) == if s == seq {
+                None
+            } else {
+                old(self).refused(s)
+            },
+            final(self).woken() == old(self).woken(),
+            final(self).same_wqes(old(self)),
+            final(self).same_open(old(self)),
+            final(self).spec_posted() == old(self).spec_posted(),
+            forall|s: int, w: int| #[trigger] final(self).dma(s, w) == if s == seq && old(self).dma(s, w) is Some {
+                Some(old(self).dma(s, w)->0.without_ctx())
+            } else {
+                old(self).dma(s, w)
+            },
+            forall|s: int| #[trigger] final(self).meta(s) == if s == seq && old(self).req(s) is Some && old(self).req(s)->0.phase is Complete {
+                None
+            } else {
+                old(self).meta(s)
+            },
+            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         let ctx = if seq < self.head || seq >= self.posted {
             None

@@ -3,6 +3,9 @@
 #![allow(unused_imports)]
 use super::*;
 
+// On this branch the specs and proofs in this file still describe the representation before the
+// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
+// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
 impl<C, N: Device> HwQp<C, N> {
@@ -26,6 +29,16 @@ impl<C, N: Device> HwQp<C, N> {
         Ghost(i): Ghost<int>, Ghost(t): Ghost<NicToken>,
         Ghost(before): Ghost<Nic::State>, Ghost(after): Ghost<Nic::State>,
     )
+        requires nic_inv(before), share_wf(before, t.share()), 0 <= i < MAX_QPS,
+            old(self).ok(i as u16, before, t.share(), t.pd(),
+                t.started(old(self).id()), t.written(old(self).id())),
+            nic_step(before, after, Nic::Step::poll_cq(t.share().cq)),
+            reports(*wc, before.cqs[t.share().cq].entries[0]),
+            before.cqs[t.share().cq].entries[0].qp == old(self).id(),
+        ensures nic_inv(after), share_wf(after, t.share()),
+            final(self).same_config(*old(self)),
+            final(self).ok(i as u16, after, t.share(), t.pd(),
+                t.started(old(self).id()), t.written(old(self).id())),
     {
         let recv = is_recv(wc.wr_id);
         let ring = if recv { &mut self.recv } else { &mut self.send };

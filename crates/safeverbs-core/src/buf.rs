@@ -44,7 +44,7 @@ mod lease;
 pub(crate) use lease::Lease;
 #[allow(unused_imports)] // Named only by contracts erased from plain cargo builds.
 pub(crate) use lease::Loan;
-#[allow(unused_imports)] // Erased WQE provenance used by the verified worker.
+#[allow(unused_imports)] // Erased WQE provenance used by the verified engine.
 pub(crate) use lease::WqeLoans;
 #[cfg(verus_keep_ghost)]
 pub(crate) use lease::covers_inputs;
@@ -737,7 +737,7 @@ impl<N: Nic> Part<N> {
 /// A ring of registered bytes for streaming variable-size messages: each
 /// message is written at the head into a chunk of its own, frozen and sent;
 /// a chunk's space is reused once every `Buf` of it is gone (its requests
-/// retired and the caller dropped its copies), oldest first.
+/// completed and the caller dropped its copies), oldest first.
 pub struct RingBuf<N: Nic = Verbs> {
     region: Arc<Region<N>>,
     capacity: usize,

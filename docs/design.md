@@ -62,8 +62,9 @@ library so that a verifier can check the guarantee.
    misuse a verb, mix up completions, lose track of or prematurely free a buffer, or lose a
    wakeup.
 2. **Zero cost on the data path.** Posting checks only what the hardware needs checked
-   (ring space). A thread's worker (its CQ and queue pairs) takes no lock. Unsignaled WRs, batches with one
-   doorbell and one completion, and repeated sends of the same buffer are all safe API.
+   (ring space). A thread's CQ and queue pairs take no lock. Unsignaled WRs, batches with one
+   doorbell and one completion, and repeated sends of the same buffer are all safe API. Every
+   public path is measured against code written by hand (`scripts/measure.sh`, section 10).
 3. **One verifier.** The whole claim is checked by Verus. No part of the guarantee depends
    on Kani, loom, Miri or testing; tests and differential runs on hardware gather evidence
    for the model, which is an assumption and says so.
@@ -86,7 +87,7 @@ Verus in `crates/safeverbs-spec`:
 > **Theorem 1.** Under M, for any behaviour of the peer and the network, every execution of
 > SafeVerbs corresponds to an execution of A, every verb the library issues satisfies its
 > precondition in M, and A and M stay coupled: each request owns a disjoint interval of
-> WQEs, its outcome aggregates that interval's retired outcomes, and the NIC touches only
+> WQEs, its outcome aggregates that interval's completed outcomes, and the NIC touches only
 > memory A gives it.
 
 Users need to read only M, A and this theorem. The properties below are invariants and
@@ -125,11 +126,11 @@ allowed in `Rts` *or* `Err`. M also proves that no step the NIC takes on its own
 a precondition the library checked earlier (`lemma_nic_steps_keep_verbs_enabled`).
 
 **F1, what a request's outcome means.** A request owns an interval of WQEs on one queue: one
-WQE, or several for a batch. It gets an outcome only once all of them retired, and the outcome
+WQE, or several for a batch. It gets an outcome only once all of them completed, and the outcome
 says this:
 
 - **Success** means every WQE of the request succeeded: for READs, every destination got its
-  full requested length. This follows from M: a polled completion retires every earlier WQE of
+  full requested length. This follows from M: a polled completion completes every earlier WQE of
   its queue, and those were unsignaled successes (`lemma_poll`). The typed result is the last
   WQE's: a batch of READs reports the length of its last READ, and SEND and WRITE successes
   report their status only.
@@ -143,7 +144,7 @@ says this:
   its leases throughout.
 - **At most one outcome** per request, handed back with its own leases and context.
 
-A proper prefix of a batch may retire, even with an error, while the request stays in flight
+A proper prefix of a batch may complete, even with an error, while the request stays in flight
 with its leases. In A: an outcome, once produced, never changes, and a request taken never comes
 back (`lemma_f1_one_outcome`); taking it returns exactly that outcome, and each lease under its
 own name (`lemma_f1_take`). Against M, in a state coupled to A, the outcome means what is said
@@ -158,7 +159,7 @@ or to the peer, or released by the program; from the peer back to the program; f
 completed, or released at once if the request has no owner left; from completed back to the
 program, or released. It is released once, and only after the NIC is done: a lease leaves a
 request in flight only when the NIC produced that request's outcome, for which all its WQEs must
-have retired. In A this is the invariant `inv_places` with `lemma_r1`; against M, `corollary_r1`.
+have completed. In A this is the invariant `inv_places` with `lemma_r1`; against M, `corollary_r1`.
 Leaks the user causes with `mem::forget` are out of scope, as they are for the standard library.
 
 **L1, no lost wakeup.** Once a request is complete, any waker its future registered has
@@ -184,15 +185,15 @@ errors and none of them affects S1 to L1 or S2.
 ### 3.4 Liveness, under one premise
 
 F1 and R1 above are safety: they say nothing wrong happens, not that anything happens. Two
-statements complete them, with one premise between them: *the device retires every posted WQE*.
-That is, it executes or flushes each one, and the completions that retire them reach a poll.
+statements complete them, with one premise between them: *the device finishes every posted WQE*.
+That is, it executes or flushes each one, and the completions that cover them reach a poll.
 
-- **F1-live.** If the device retires every posted WQE, every request gets exactly one outcome.
-- **R1-live.** If the device retires every posted WQE, nothing stays in flight after its queue
+- **F1-live.** If the device finishes every posted WQE, every request gets exactly one outcome.
+- **R1-live.** If the device finishes every posted WQE, nothing stays in flight after its queue
   pair is dropped, and every buffer is returned or released.
 
 Both are stated here and **not proved yet**. Without the premise neither is claimed: a device
-that never flushes keeps its requests in flight for good, and the worker keeps their queue pair
+that never flushes keeps its requests in flight for good, and the engine keeps their queue pair
 and buffers (`Error::NotFlushed`). That is R1 at work: it frees nothing the NIC may still use.
 
 ## 4. What is assumed
@@ -210,7 +211,7 @@ The trusted computing base is:
   that succeeds produces no CQE; that a failed WR produces a CQE even if unsignaled and moves
   the queue pair to the error state, after which every remaining WR completes with an error
   (normally a flush error), in order; that a CQE carries the `wr_id` of its WR; that once a
-  CQE is polled the NIC no longer touches the buffers of the WRs it retires; that inline data
+  CQE is polled the NIC no longer touches the buffers of the WRs it completes; that inline data
   is copied when it is posted; that the NIC never accesses memory outside the scatter/gather
   lists of posted WRs and the regions exposed for remote access; that after `ibv_dereg_mr`
   returns, the region's rkey stops working and the NIC no longer accesses it; and that a CQ
@@ -245,8 +246,23 @@ error completion is attributable to a fault step of M (link down, peer crash, ti
 
 ## 6. The API
 
-The public API is asynchronous, built on a synchronous core that does the posting and
-polling. A sketch:
+A program picks, per completion queue, how it drives it: an event loop or futures. Both have the
+shape of verbs (a CQ, QPs that refer to it), both are thin handles over one engine that does the
+posting and the polling (section 10), and a thread may own one CQ of each. An event loop:
+
+```rust
+let cq: LocalCq<Req> = ctx.create_local_cq(4096)?;     // the wr_id type belongs to the CQ
+let qp: LocalQp<RC, Req> = pd.create_qp(&cq, caps)?.handshake(remote)?;
+qp.post_send(buf.slice(..), Req::Reply { client: 7 })?; // also post_write, post_read, post_recv
+
+let n = cq.poll(32, |wc| match (wc.wr_id, wc.result) {  // reads at most 32 CQEs
+    (Req::Reply { client }, Ok(_)) => done(client),     // may post on any QP from here
+    (req, Err(e)) => retry(req, e),
+    _ => {}
+});
+```
+
+Futures, on an `AsyncCq` and `AsyncQp`:
 
 ```rust
 let mut buf = pd.alloc::<u8>(1 << 20)?;   // BufMut: unique and writable
@@ -269,11 +285,25 @@ while let Some((received, buf)) = rx.next().await {
 let buf = buf.try_thaw()?;                 // BufMut again once nothing else holds it
 ```
 
+The two differ where a full queue is concerned. A `LocalQp` post fails with `Error::QueueFull` (or
+`Error::Clogged`), handing the `wr_id` and the buffers back, since nothing polls for it; a future
+waits, in order, for room. `pd.create_qp(&cq, caps)` gives a `PreparedQp`, and `handshake` the
+handle that posts, whichever the CQ's kind: a QP that is not connected cannot post.
+
+**Polling.** `cq.poll(n, f)` is `ibv_poll_cq(cq, n, wcs)` with the array inside: the user picks `n`
+(1 to `POLL_MAX`), which also bounds the time a loop spends on completions. It reads the CQEs and
+updates the CQ's consumer index first and only then hands them to `f`, holding no borrow while `f`
+runs, so `f` may post on any QP, poll again (the next requests come in order) or drop QPs. An
+unsignaled request completes with the next signaled one of its queue, so a CQE may hand out several
+requests and `poll` returns the number of requests, not of CQEs. `cq.poll_one()` is there for loops
+that want `break`, `?` or `.await`, which a closure makes awkward. Whatever `f` does, a panic in it
+loses nothing: the CQEs read stay for the next poll.
+
 `send` and `write` take a `Buf` (or a slice of one); posting moves a lease on the buffer
 into the request's ring slot. Since the buffer is shared and read-only, sending the same
 buffer twice, or any sub-ranges of it, needs no check at all. `batch` posts many WRs with
 one doorbell and signals only the last; its future completes when that CQE arrives, which
-retires the whole batch. `sink` turns a queue pair into a `futures::Sink<WriteOp>`:
+completes the whole batch. `sink` turns a queue pair into a `futures::Sink<WriteOp>`:
 `poll_ready` waits for ring space, `start_send` writes a WQE, `poll_flush` rings the
 doorbell and `poll_close` waits until everything completed. `receiver` turns a set of
 buffers into a stream of received messages, each with its buffer, which the user may repost.
@@ -293,29 +323,18 @@ an earlier READ fails, and a lost acknowledgement can hide a WRITE that landed.
 request, and nothing of it happened anywhere. A sink's error also says which item failed, its
 position among the items sent through that sink (`Error::SinkItem`).
 
-The event loop of the synchronous core has no future to stand for a request, so each request
-carries a value of the user's own type, which replaces C's `wr_id`:
-
-```rust
-let mut w: Worker<Job> = Worker::new(&pd, 4096)?;
-w.send(qp, buf.slice(..), Job::Reply { client: 7 })?;
-w.poll(|w, c| match (c.ctx, c.result) {
-    (Job::Reply { client }, Ok(_)) => done(client),
-    (job, Err(e)) => retry(job, e),
-});
-```
-
-`Worker<C = (), N = Verbs>` keeps the context in the request's ring slot, as part of the slot's
-generic payload, so that "returned exactly once, with its own buffers" is what the ring already
-proves of every payload. C-style users pick `u64`. `C = ()` costs no work, only the word an
-`Option<()>` takes in the slot. A batch is one request with one context (`Request::submit(signal, ctx)`, the context
-given last, as in `Worker::send`). `c.result` is a `Result<Completed, CompletionError>`, with
-`Completed::Sent`, `Completed::Read { len }` and `Completed::Received(_)`. The hardware `wr_id`
-stays internal: it routes completions (section 10). The asynchronous layer needs no context,
-since each future is its own request's identity: `LocalWorker` is `C = ()`.
+An event loop has no future to stand for a request, so each request carries a value of the user's
+own type: the `wr_id` of verbs, but of any type, `u64` by default as in C. It lives in the request's
+ring slot, as part of the slot's generic payload, so that "returned exactly once, with its own
+buffers" is what the ring already proves of every payload. A batch is one request with one `wr_id`.
+A completion `wc` is an owned value with `wc.wr_id`, `wc.result` (a
+`Result<Completed, CompletionError>`, with `Completed::Sent`, `Completed::Read { len }` and
+`Completed::Received(_)`), `wc.qp_num()` and its buffers (`wc.buf_mut::<T>()`, `wc.leases`). The
+hardware `wr_id` stays internal: it routes completions (section 10). The futures need no `wr_id`,
+since each future is its own request's identity.
 
 A future holds only `(qp, seq)`: the queue pair and the sequence number of its slot. The
-waker lives in the slot. Futures poll their worker's CQ themselves when they are polled (section 10), so there is no
+waker lives in the slot. Futures poll their CQ themselves when they are polled (section 10), so there is no
 background task and no thread; an interrupt-driven mode through the completion channel can
 come later. Dropping a future detaches it (see 3.2): the slot keeps the buffers until the
 NIC completes the WR, and the completion is then discarded.
@@ -345,16 +364,16 @@ Send queues of RC, UC, XRC (the send side) and MRC complete in posting order, an
 receive queues without an SRQ. MRC places data out of order at the responder, but its
 completion semantics are unchanged; so arrival must be signalled by a write with immediate
 or a send, never by polling memory. On an in-order queue, a signaled completion for slot
-`j` retires every earlier slot: those WRs executed without a CQE, which M shows means they
+`j` completes every earlier slot: those WRs executed without a CQE, which M shows means they
 were unsignaled and succeeded. Unsignaled WRs and batches are therefore safe: their buffers
-stay in their slots until a later CQE retires them. When the queue pair enters the error
+stay in their slots until a later CQE completes them. When the queue pair enters the error
 state, the remaining WRs complete with an error (normally `FLUSH_ERR`), in order, signaled
 or not, and each releases its slot.
 
 A transport trait carries `IN_ORDER_COMPLETION`. Out-of-order transports (SRD on EFA, UEC's
 RUD) use a bitmap ring, in which a slot is freed when its own completion arrives and the
 ring's head advances past completed slots; they get no unsignaled API, since nothing would
-ever retire an unsignaled WR. A shared receive queue needs a free list instead of a ring.
+ever complete an unsignaled WR. A shared receive queue needs a free list instead of a ring.
 M today models the in-order transports (RC, UC, UD); out-of-order completion is a planned
 extension of M. A does not change: it never mentions order.
 
@@ -440,26 +459,43 @@ does not add a division. A single SGE has a native 32-bit byte length; `into_par
 a larger range instead of truncating it. Large registered buffers remain usable through
 splits and slices.
 
-## 10. Workers, queue pairs and completion queues
+## 10. Completion queues, queue pairs and the engine
 
 The efficient way to use RDMA is one CQ per thread, shared by all of that thread's queue
 pairs, and a loop that polls it, dispatches each completion and posts new work. SafeVerbs
-offers that directly: a thread drives its queue pairs through a **worker**, one completion
-queue and the queue pairs attached to it, the unit of thread affinity.
+offers that directly: a thread creates a `LocalCq` (or an `AsyncCq`) and its queue pairs, which
+stay on that thread (neither is `Send`). They are thin, safe handles, in `safeverbs`, over an
+**engine**: one completion queue and the queue pairs attached to it, by index, behind an `Rc` and
+a `RefCell` flag, with no atomics.
 
-In the synchronous core (`safeverbs-core::worker::Worker`) a worker is one value, `Send` but
-not `Sync`: it moves between threads as a whole, with its queue pairs, and is used by one
-thread at a time. Its CQ is created with `IBV_CREATE_CQ_ATTR_SINGLE_THREADED` and polled with
-the `ibv_start_poll` family. Where the device has thread domains, the worker allocates one
-(`ibv_alloc_td`) with a parent domain over its protection domain
-(`ibv_alloc_parent_domain`) and creates every queue pair there: mlx5 then takes no queue pair
-locks and gives the worker's queue pairs a doorbell page of their own, which they share.
-Where that fails (rxe) they are plain queue pairs. A worker belongs to one protection domain.
+The engine (`safeverbs_core::engine::Engine`) is one value, `Send` but not `Sync`, used by one
+thread at a time. It stays public as an escape hatch for anyone who wants to remove the `Rc` too
+(`cq.as_raw()`, `qp.as_raw()`). Its CQ is created with `IBV_CREATE_CQ_ATTR_SINGLE_THREADED` and
+polled with the `ibv_start_poll` family. Where the device has thread domains, the engine allocates
+one (`ibv_alloc_td`), with a parent domain over each protection domain its queue pairs are of
+(`ibv_alloc_parent_domain`), and creates every queue pair there: mlx5 then takes no queue pair
+locks and gives the engine's queue pairs a doorbell page of their own, which they share. Where that
+fails (rxe) they are plain queue pairs. An engine's queue pairs may be of several protection domains
+of one device: as in verbs, a CQ belongs to a device.
 
-**Verified hardware side.** Everything of a worker that M sees (the CQ, the queue pairs'
-hardware handles and rings, the WQE a request holds back with its buffers, the worker's
-share of M) lives in `hw::Hw`, inside `verus!`; the `Worker` is an unverified shell around it
-(keys, the event loop's cursors, the drain's clock). `verification.md` says what is proved.
+**Verified hardware side.** Everything of an engine that M sees (the CQ, the queue pairs' hardware
+handles and rings, the CQEs read, the engine's share of M) lives in `hw::Hw`, inside `verus!`; the
+`Engine` is an unverified shell around it (keys, thread domains, the drain's clock).
+`verification.md` says what is proved.
+
+**The data path.** A single operation has its own path: the checks (one comparison each: the buffer
+is of the QP's protection domain, fits, the queue has room), then the slot, so that it keeps the
+memory alive before the NIC hears of it, then the WQE and the doorbell. A batch collects its WQEs
+first, so the signaling decision is known before any is written, and writes them all with its slot.
+Polling handles each CQE in one pass: route it, walk its ring up to it, hand out or wake; one test
+covers the common case, and everything else is out of line (errors, refusals, drain, requests
+without an owner). A slot is its WQEs' end, its outcome, its owner flag and its buffers: states are
+derived from the ring's counters, and a success's outcome comes from the operation, a receive's
+from its CQE. `scripts/measure.sh` prints what a round of each public path costs against programs
+written by hand with the same structure (a table of QPs, a ring of requests per QP, routing by
+`wr_id`), since instruction counts on the simulated NIC are the one number that needs no hardware;
+they miss atomics, caches and MMIO, and the numbers that finally count come from real NICs against
+perftest.
 
 **Capacity.** Each queue pair reserves a CQ entry for every completion it may produce, its
 send and receive depths, when it is created, and one that does not fit in what is left is
@@ -468,12 +504,12 @@ and each WQE produces at most one completion, so the CQ cannot overrun. This is 
 M's `create_qp`, under which M proves that no CQ overflows.
 
 **Removal.** M's `destroy_qp` allows destroying a queue pair only with empty queues: until a
-WQE is retired the NIC may still use its buffers. Removing a queue pair (`remove_qp`, and
-dropping the worker, for all of them at once) therefore drains it first: the WQEs written
+WQE is completed the NIC may still use its buffers. Removing a queue pair (dropping its handle, or
+`remove_qp`, and dropping the engine, for all of them at once) therefore drains it first: the WQEs written
 since the last doorbell are discarded, every request is detached, and if anything is in
 flight the queue pair moves to the error state, where the NIC completes every WQE left with
 a flush error. That does not reach an unsignaled WQE that succeeded before the error: it has
-no completion of its own and only a later one of its queue retires it. So the worker also
+no completion of its own and only a later one of its queue completes it. So the engine also
 posts a *drain WQE*, a signaled SEND of nothing, which the error state flushes after all the
 others (the kernel's `ib_drain_sq` does the same); it goes through the ring as a request
 without an owner, so its number follows the others. The CQ is polled, the other queue pairs'
@@ -482,22 +518,22 @@ queue pair destroyed and its buffers released; no completion of it is left in th
 another queue pair may take its index and its reservation at once. A device that never
 flushes is a fatal error that never frees memory the NIC may use: after `DRAIN_TIMEOUT` (one
 second) without a completion, `remove_qp` fails with `Error::NotFlushed` and keeps the queue
-pair, its buffers, its index and its reservation; dropping the worker tries once more and
+pair, its buffers, its index and its reservation; dropping the engine tries once more and
 otherwise leaks them, with the CQ and the thread domain (destroying those needs the queue pair
-gone). The cost is waiting for the NIC's flush when a queue pair or a worker is dropped. The
-contexts of requests not delivered yet are dropped when the removal gives those requests up,
+gone). The cost is waiting for the NIC's flush when a queue pair or an engine is dropped. The
+`wr_id`s of requests not delivered yet are dropped when the removal gives those requests up,
 before any poll; their buffers follow once the NIC is done. A slot without an owner holds no
-context, so a poll never runs a destructor of the user's and none can unwind through it with
+`wr_id`, so a poll never runs a destructor of the user's and none can unwind through it with
 completions still to record.
 
 **State.** M accepts work only on a queue pair in RTS or ERR, and a connection starts from
-RESET. The worker records what it knows: a queue pair takes work once `connect` succeeded or
+RESET. The engine records what it knows: a queue pair takes work once `connect` succeeded or
 `to_error` moved it to the error state, and connects once, from RESET. A doorbell on a queue
 pair that takes no work is refused as a device would refuse it (`Error::NotConnected`: its
-requests retire with a flush error), and so is a receive.
+requests complete with a flush error), and so is a receive.
 
 **Routing.** One CQ serves all the queue pairs, so each completion must find its queue pair
-and queue. The `wr_id` the library gives a WQE holds the queue pair's index in the worker (16
+and queue. The hardware `wr_id` the library gives a WQE holds the queue pair's index in the engine (16
 bits), the queue (1 bit: a failed completion's opcode is undefined, so the queue must be in
 the `wr_id` in any case) and the low 47 bits of the WQE's number in its ring; the full number
 is recovered from the oldest WQE in flight, since the WQEs in flight span at most the
@@ -505,42 +541,43 @@ queue's depth. Routing is a shift, a mask and an array index, the same at any nu
 pairs. Finding the queue pair by its `qp_num` instead costs as much with a few queue pairs
 but grows with them when scanning (about 2 ns at 16 queue pairs, 11 ns at 64 and 35 ns at
 256, against 1.2 ns at any number for the `wr_id`, on the development machine), or takes a
-hash lookup (about 6 ns). The test `worker::tests::demux_cost` measures routing alone (`cargo
+hash lookup (about 6 ns). The test `engine::tests::demux_cost` measures routing alone (`cargo
 test --release -p safeverbs-core -- --ignored --nocapture demux_cost`); next to what the
 model NIC or the driver spends per completion it is small either way, and the `wr_id` keeps
 it constant.
 
-**Two ways to drive a worker.** The event loop (`Worker::poll`) polls the CQ and hands every
-request that retired with an owner to a callback, with its context, its result and its buffers,
-and the queue pair's index, the queue and the sequence number, in each queue's order; the
-callback may post new work. Nothing is allocated. Owners that take their results by sequence number
-(`Worker::progress`, then `take_send` or `take_recv`) are how the futures work: polling
-retires requests into their rings and wakes their wakers. One worker is driven one way or
-the other, since `poll` hands out the results owners would wait for. Giving up a request
-(`detach_send`, `detach_recv`) hands its context back and leaves its buffers until it retires.
+**Two ways to drive an engine.** The event loop (`Engine::poll`, `LocalCq::poll`) reads the CQEs,
+updates the consumer index and hands every request that completed with an owner to a callback, with
+its `wr_id`, its result and its buffers, in each queue's order; the callback may post new work.
+Nothing is allocated. Owners that take their results by sequence number (`Engine::progress`, then
+`take_send` or `take_recv`) are how the futures work: polling completes requests into their rings and
+wakes their wakers. A CQ is driven one way, which the types `LocalCq` and `AsyncCq` enforce. On the
+raw engine, results `progress` left in the rings, and those of refused doorbells, are found by a
+cold scan when a poll comes next, so nothing is lost. Giving up a request (`detach_send`,
+`detach_recv`) hands its `wr_id` back and leaves its buffers until it completes.
 
-**Futures.** The asynchronous layer puts a worker behind an `Rc<RefCell<..>>`
-(`LocalWorker`): one borrow flag, no atomics. Each `LocalQp` holds a handle to its worker;
-every pending future polls the worker's CQ once, which retires the requests of all its queue
-pairs and wakes their futures, and then takes its own result if it retired. A `LocalQp` is
-therefore neither `Send` nor `Sync`: it lives on its worker's thread, as thread-per-core
-runtimes want (tokio's `current_thread` runtime or `LocalSet`, or a plain `block_on`).
-`QueuePairBuilder::build_on` creates a queue pair on a given worker; `build` gives it a worker
-of its own, sized to its queues, which is the standalone queue pair of the first version.
-`SharedQp` is such a worker of one queue pair behind a `Mutex`: one lock covers the ring, the
-hardware queue and the CQ, so they can never disagree. The trade-off is that every thread
-using it takes the lock, and its CQ serves that one queue pair: threads that each drive queue
-pairs of their own do better with a worker each.
+**Futures.** An `AsyncCq` is an engine behind an `Rc<RefCell<..>>`: one borrow flag, no atomics.
+Each `AsyncQp` holds a handle to it; every pending future polls the CQ once, which completes the
+requests of all its queue pairs and wakes their futures, and then takes its own result if it
+completed. An `AsyncQp` is therefore neither `Send` nor `Sync`: it lives on its CQ's thread, as
+thread-per-core runtimes want (tokio's `current_thread` runtime or `LocalSet`, or a plain
+`block_on`). `QueuePairBuilder::build_on` creates a queue pair on a given CQ; `build` gives it an
+`AsyncCq` of its own, sized to its queues, which is the standalone queue pair of the first version.
+`SharedQp` is such a CQ of one queue pair behind a `Mutex`: one lock covers the ring, the hardware
+queue and the CQ, so they can never disagree. The trade-off is that every thread using it takes the
+lock, and its CQ serves that one queue pair: threads that each drive queue pairs of their own do
+better with a CQ each. The handles keep the seam for a thread-safe `Cq` and `Qp` in the same shape,
+`Arc` and `Mutex` where `Local` has `Rc` and `RefCell`.
 
 **Refused doorbells.** When the device refuses a doorbell (`ibv_wr_complete` fails), none of
-the requests written since the last doorbell was posted. A request with an owner retires at
+the requests written since the last doorbell was posted. A request with an owner completes at
 once as `CompletionError::Refused`, never a made-up flush error, and its owner takes that with
-its context and buffers (the event loop gets it at once too); one without an owner releases its
+its `wr_id` and buffers (the event loop gets it at once too); one without an owner releases its
 buffers and is reported as its queue's detached error. Sequence numbers are never reused, so no
 owner can take another request's result. The
 ring keeps the refused requests in its window with no WQEs, and their WQE numbers, which the
 NIC never saw, go to the next requests. A refused doorbell may take with it the signaled
-request that would have retired the unsignaled ones before it; those retire with the next
+request that would have completed the unsignaled ones before it; those complete with the next
 signaled request of their queue.
 
 Device capabilities (queue depths, scatter/gather elements, inline size, CQ size) are checked
@@ -560,14 +597,14 @@ says.
 | `MemoryRegion<T>` with `MemorySegment<T, RO \| RW>`, checked by an interval tree behind a mutex | `BufMut<T>` and `Buf<T>`: ownership and sharing in the types, no runtime tree |
 | one `sharded_slab` entry per request, filled by the CQ poller | a ring of slots per queue pair; futures hold `(qp, seq)` |
 | dropping a future frees its buffers while in flight | dropping detaches; buffers stay in the slot until completion |
-| unsignaled and batched posting `unsafe` | safe, through in-order retirement |
+| unsignaled and batched posting `unsafe` | safe, through in-order completion |
 | flushed completions looked up as slab keys | flushes complete their slots in order |
 | `remote_memory()` exposes a whole region while the program writes it | exposure takes the buffer away from the program and registers exactly it |
 | CQ size unrelated to queue depths | attachment reserves CQ capacity |
-| everything `Send + Sync`, a CQ per queue pair | a worker per thread: one CQ shared by its queue pairs, no locks; `SharedQp` when sharing is needed |
+| everything `Send + Sync`, a CQ per queue pair | a CQ per thread, shared by its queue pairs, no locks; `SharedQp` when sharing is needed |
 | `unsafe` spread through the crate | all `unsafe` in `safeverbs-core`, the rest `forbid(unsafe_code)` |
 | no statement of the guarantee | a conditional Theorem 1 over M and A; the real implementation's refinement is still being completed |
-| a user-chosen `wr_id` looked up in a slab | a typed context in each request's slot, handed back once; the `wr_id` is the library's own |
+| a user-chosen `wr_id` looked up in a slab | a `wr_id` of any type in each request's slot, handed back once; the hardware's `wr_id` is the library's own |
 | `Wc` fields read by hand, some undefined | typed results with only what each operation defines; an error names the failing WQE |
 
 The typestate builder for connection setup, the reference-counted resource handles and the
@@ -575,17 +612,16 @@ async style of the API carry over.
 
 ## 12. Open questions
 
-- Which thread owns a CQ shared by several queue pairs is answered by the worker (section
-  10): a group that owns the CQ and the queue pairs attached to it, reserves each queue pair's
-  depths on attach, routes completions by `wr_id` and moves between threads as one unit.
-- Theorem 1 for the worker: each worker's share of M is settled by rely and guarantee
-  (`safeverbs-spec/src/share.rs`), and M's side of the refinement is proved for the worker's
-  hardware side (`safeverbs-core/src/hw.rs`). Open: A's side for the worker (the map from
-  its requests and buffers to A's requests and leases), the rest of the buffers (the typed wrappers, `RingBuf`,
-  exposure) and how several workers compose. Undefined SEND/WRITE lengths are already projected
-  out of outcomes; READ and receive metadata have operation-specific contracts (section 8).
-- Whether a request should say who takes its result (the event loop or its owner), so that
-  futures and the event loop can share a worker.
+- Theorem 1 for the engine: each engine's share of M is settled by rely and guarantee
+  (`safeverbs-spec/src/share.rs`), and M's side of the refinement was proved for the engine's
+  hardware side before the fast data path (`verification.md` says where that stands). Open: A's
+  side for the engine (the map from its requests and buffers to A's requests and leases), the rest
+  of the buffers (the typed wrappers, `RingBuf`, exposure) and how several engines compose. Undefined
+  SEND/WRITE lengths are already projected out of outcomes; READ and receive metadata have
+  operation-specific contracts (section 8).
+- A thread-safe `Cq` and `Qp` in the same shape as the local ones. A whole `LocalCq` with all its
+  QPs could also move between threads, since the engine is `Send` and `Rc::try_unwrap` proves no
+  handle is left; one `LocalQp` alone cannot leave its CQ, since verbs has no way to change a QP's CQ.
 - Out-of-order transports and SRQs need their own completion rules in M before the core
   supports them.
 - The simulated NIC runs the integration scenarios and injected-error cases, and checks some

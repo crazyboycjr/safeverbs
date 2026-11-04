@@ -31,7 +31,7 @@
 //! The NIC reads and writes memory behind the compiler's back from the
 //! moment a work request is posted until it completes. Every request
 //! therefore holds leases of the memory it names, and those leases live in
-//! the request's ring slot until the request retires (a completion for it
+//! the request's ring slot until the request completes (a completion for it
 //! or a later request of the same in-order queue, including error and flush
 //! completions); a QP is destroyed only once it is drained (moved to the
 //! error state and polled until the NIC has flushed every work request);

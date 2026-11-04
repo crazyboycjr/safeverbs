@@ -57,8 +57,8 @@ verus! {
 
 /// Which leases of A a request's value `L` stands for, each with how the NIC
 /// touches it, given the request's sequence number: equal shared values in
-/// different requests stand for different leases. Building it from the worker's
-/// buffers is the worker's proof; these adapters prove that the ring preserves it.
+/// different requests stand for different leases. Building it from the engine's
+/// buffers is the engine's proof; these adapters prove that the ring preserves it.
 pub type Held<L> = spec_fn(int, L) -> Map<LeaseId, Dir>;
 
 /// What A sees of a ring: its requests and its staged requests, by sequence

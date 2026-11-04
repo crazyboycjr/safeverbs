@@ -1,9 +1,9 @@
-//! The hardware side of a worker, verified against the NIC model M: its CQ,
+//! The hardware side of an engine, verified against the NIC model M: its CQ,
 //! its QPs' hardware queues and rings, and its share of M.
 //!
-//! A [`Hw`] holds everything of a worker that M sees: the CQ, each QP's
-//! hardware handle with the rings of its two queues, and the worker's token
-//! (`crate::trusted::NicToken`: M's state as the worker last saw it, and its
+//! A [`Hw`] holds everything of an engine that M sees: the CQ, each QP's
+//! hardware handle with the rings of its two queues, and the engine's token
+//! (`crate::trusted::NicToken`: M's state as the engine last saw it, and its
 //! share of M). Every call into the NIC goes through the trusted verbs of
 //! `crate::trusted`, whose preconditions are M's, so Verus checks S2 at each
 //! call. The invariant (`Hw::inv`) couples the rings to M:
@@ -31,16 +31,16 @@
 //!   refused, which M never saw. A detached request's first error is held to
 //!   the same ([`Hw::take_send_error`]).
 //! - **Capacity.** The CQ's entries reserved in M are exactly what the
-//!   worker counts ([`Hw::reserved`]); a QP is created only if its depths fit
+//!   engine counts ([`Hw::reserved`]); a QP is created only if its depths fit
 //!   ([`Hw::create_qp`]), and each ring keeps at most its depth of WQEs in
 //!   flight, so the CQ never overruns (M's `lemma_cq_never_overflows`).
 //! - **Teardown.** A QP is destroyed only when neither ring has a WQE in
 //!   flight, which the coupling turns into M's empty queues, `destroy_qp`'s
 //!   precondition ([`Hw::destroy`]).
-//! - **State.** The worker posts work only on a QP it connected or moved to
+//! - **State.** The engine posts work only on a QP it connected or moved to
 //!   the error state, which M sees in `Rts` or `Err`.
 //!
-//! The unverified worker (`crate::worker`) drives a `Hw` through its public
+//! The unverified engine (`crate::engine`) drives a `Hw` through its public
 //! methods only; each requires and keeps the invariant.
 //
 // The imports are used by ghost code too; `global` erases to a block. The
@@ -80,11 +80,14 @@ mod outcomes;
 mod send_outcomes;
 mod separation;
 
+// On this branch the specs and proofs in this file still describe the representation before the
+// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
+// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
 global size_of usize == 8;
 
-/// The most QPs of one worker: their index takes the top 16 bits of a
+/// The most QPs of one engine: their index takes the top 16 bits of a
 /// `wr_id`.
 pub const MAX_QPS: usize = 0x1_0000;
 
@@ -133,15 +136,15 @@ pub struct DetachedError {
     pub error: CompletionError,
 }
 
-/// What the worker knows of a hardware QP's state: it decides which verbs
-/// the worker may call (M's preconditions: work is posted only in RTS or
+/// What the engine knows of a hardware QP's state: it decides which verbs
+/// the engine may call (M's preconditions: work is posted only in RTS or
 /// ERR, and a QP connects from RESET).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     /// Created (RESET): it may connect; it takes no work.
     Reset,
     /// Connected (RTS, or moved to ERR by the NIC since), or moved to ERR
-    /// by the worker: it takes work (in ERR, to flush it).
+    /// by the engine: it takes work (in ERR, to flush it).
     Ready,
     /// A connection failed part way (INIT or RTR): it neither connects
     /// again nor takes work, until it is moved to the error state.
@@ -680,7 +683,7 @@ proof fn lemma_queued_outcomes_rely(sh: Share, pins: ISet<Key>, m: Nic::State, n
     lemma_queued_outcomes_run(run, steps, q);
 }
 
-/// What the worker knows of the QP's state holds in M.
+/// What the engine knows of the QP's state holds in M.
 pub open spec fn phase_ok(phase: Phase, state: QpState) -> bool {
     match phase {
         Phase::Reset => state is Reset,
@@ -876,12 +879,12 @@ impl<C, N: Device> HwQp<C, N> {
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// The worker's token.
+    /// The engine's token.
     pub closed spec fn token(&self) -> NicToken {
         self.token@
     }
 
-    /// M's state, as the worker last saw it.
+    /// M's state, as the engine last saw it.
     pub closed spec fn nic(&self) -> Nic::State {
         self.token@.nic()
     }
@@ -957,7 +960,7 @@ impl<C, N: Device> Hw<C, N> {
         0 <= index < self.qps@.len() && self.qps@[index] is Some
     }
 
-    /// The invariant: the worker's state is coupled to M (see the module
+    /// The invariant: the engine's state is coupled to M (see the module
     /// documentation).
     pub closed spec fn inv(&self) -> bool {
         self.inv_with(self.token@, self.token@.nic())
@@ -1002,7 +1005,7 @@ proof fn lemma_written_pinned(t: NicToken, q: QpId, j: int)
 }
 
 impl<C, N: Device> HwQp<C, N> {
-    /// Coupling survives steps that do not touch the worker's share.
+    /// Coupling survives steps that do not touch the engine's share.
     proof fn lemma_framed(
         &self,
         index: u16,
@@ -1045,7 +1048,7 @@ impl<C, N: Device> HwQp<C, N> {
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// The invariant survives steps that do not touch the worker's share
+    /// The invariant survives steps that do not touch the engine's share
     /// (nor the regions its written WRs name).
     proof fn lemma_rely(&self, t: NicToken, m: Nic::State, n: Nic::State)
         requires
@@ -1080,7 +1083,7 @@ impl<C, N: Device> Hw<C, N> {
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// A local WQE in this worker's M state can access byte `a`.
+    /// A local WQE in this engine's M state can access byte `a`.
     /// Remote-rkey access belongs to the separate registration authority.
     pub(crate) closed spec fn local_access(&self, index: int, recv: bool, k: int, a: int) -> bool {
         self.has_qp(index) && {
@@ -1107,7 +1110,7 @@ impl<C, N: Device> Hw<C, N> {
         &&& byte_backed(r.dma(s, w)->0.leases, a)
     }
 
-    /// Every NIC access through this worker's SQ/RQ WQEs has a
+    /// Every NIC access through this engine's SQ/RQ WQEs has a
     /// retained source/destination guard in its unique live request interval.
     pub(crate) proof fn lemma_local_guard(&self, index: int, recv: bool, k: int, a: int) -> (s: int)
         requires self.inv(), self.local_access(index, recv, k, a),
@@ -1188,7 +1191,7 @@ impl<C, N: Device> Hw<C, N> {
     }
 
     /// The held SGE's native metadata and required destination role agree
-    /// with the part retained directly by the worker.
+    /// with the part retained directly by the engine.
     pub(crate) closed spec fn held_guarded(&self, index: int, i: int) -> bool {
         let e = self.qps@[index]->0;
         &&& 0 <= i < e.held_parts@.len()
@@ -1208,7 +1211,7 @@ impl<C, N: Device> Hw<C, N> {
 }
 
 // =============================================================================
-// Steps of the worker's own
+// Steps of the engine's own
 
 /// Coupling depends only on the QP's state in M, M's limits and its
 /// regions.
@@ -1243,11 +1246,11 @@ proof fn lemma_ok_same<C, N: Device>(
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// Two tokens of the same worker with the same writing give the same
+    /// Two tokens of the same engine with the same writing give the same
     /// invariant.
     proof fn lemma_same_token(&self, t1: NicToken, t2: NicToken, m: Nic::State)
         requires
-            t2.same_worker(&t1),
+            t2.same_engine(&t1),
             t2.same_writings(&t1),
             self.inv_with(t1, m),
         ensures
@@ -1301,6 +1304,8 @@ impl<C, N: Device> Hw<C, N> {
 
     /// An engine's hardware side on the device of `ctx`, with a CQ of `cq_size` entries.
     pub fn new(ctx: Context<N>, cq_size: u32) -> (r: Result<Hw<C, N>>)
+        ensures
+            r matches Ok(hw) ==> hw.inv() && hw.spec_reserved() == 0 && hw.spec_cq_size() == cq_size,
     {
         let caps = device_caps(&ctx);
         if cq_size == 0 || cq_size > caps.max_cqe {
@@ -1365,6 +1370,10 @@ impl<C, N: Device> Hw<C, N> {
 impl<C, N: Device> Hw<C, N> {
     #[verifier::spinoff_prover]
     pub fn create_qp(&mut self, pd: &Pd<N>, domain: Option<&N::Domain>, qp_type: QpType, caps: QpCaps, max_batch: u32) -> (r: Result<usize>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
     {
         let dev = self.caps;
         if caps.max_send_wr == 0 || caps.max_recv_wr == 0 {
@@ -1506,7 +1515,7 @@ pub open spec fn framed_but(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::S
         ==> n.retired[w] == m.retired[w]
 }
 
-/// What `modify_qp` steps of the worker's own QP `q` (to states other than
+/// What `modify_qp` steps of the engine's own QP `q` (to states other than
 /// `Reset`), with rely in between, keep: the share as `framed_but` says, and
 /// `q` in the last state asked for, or `Err`.
 proof fn lemma_modified(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State, q: QpId, tos: Seq<QpState>)
@@ -1662,6 +1671,11 @@ impl<C, N: Device> Hw<C, N> {
 
     #[verifier::spinoff_prover]
     pub fn set_error(&mut self, index: usize) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -1798,6 +1812,11 @@ impl<C, N: Device> Hw<C, N> {
 
     #[verifier::spinoff_prover]
     pub fn connect(&mut self, index: usize, attr: &ConnectAttr, remote: &Endpoint) -> (r: Result<()>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -1837,6 +1856,14 @@ impl<C, N: Device> Hw<C, N> {
     #[inline(always)]
     #[verifier::spinoff_prover]
     pub fn post_recv(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: core::result::Result<core::result::Result<RingSeq, Refusal<C, N>>, UnpostedRecv<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+            r matches Ok(seq) ==> old(self).admission_separated_from(part)
+                && final(self).recv_holds_input(index, seq, part),
+            r matches Err((error, back)) ==> error.buf == part && back == ctx,
     {
         if index < self.qps.len() {
             match &mut self.qps[index] {
@@ -2010,6 +2037,15 @@ impl<C, N: Device> Hw<C, N> {
     #[verifier::spinoff_prover]
     #[allow(clippy::ptr_arg)] // Vstd specifies indexing a `Vec`.
     fn dispatch(qps: &mut Vec<Option<HwQp<C, N>>>, wc: &Wc, wakes: &mut WakeBatch, Ghost(t): Ghost<NicToken>, Ghost(before): Ghost<Nic::State>, Ghost(after): Ghost<Nic::State>)
+        requires
+            old(self).inv_with(t, before),
+            nic_step(before, after, Nic::Step::poll_cq(t.share().cq)),
+            reports(*wc, before.cqs[t.share().cq].entries[0]),
+        ensures
+            final(self).inv_with(t, after),
+            final(self).token == old(self).token,
+            final(self).qps@.len() == old(self).qps@.len(),
+            final(self).same_table(old(self)),
     {
         let index = index_of(wc.wr_id);
         if index >= qps.len() {
@@ -2109,6 +2145,11 @@ impl<C, N: Device> Hw<C, N> {
     /// did not route yet goes first, in its order. Returns the number of completions.
     #[verifier::spinoff_prover]
     pub fn progress(&mut self) -> (n: usize)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
     {
         let mut wakes = WakeBatch::new();
         let mut n = self.polled_len - self.polled_at;
@@ -2338,6 +2379,12 @@ impl<C, N: Device> Hw<C, N> {
     #[inline]
     #[verifier::spinoff_prover]
     pub fn commit(&mut self, index: usize, keep: Option<RingSeq>) -> (r: core::result::Result<(), (Error, Option<Payload<C, N>>)>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+            r matches Err((_, Some(kept))) ==> kept.leases.inv() && kept.leases.fully_recorded(),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -2500,7 +2547,7 @@ impl<C, N: Device> Hw<C, N> {
             share_wf(n, t.share()),
             0 <= index < start.qps@.len(),
             start.qps@[index] is Some,
-            t.same_worker(&t0),
+            t.same_engine(&t0),
             t.same_writing_but(&t0, start.qps@[index]->0.id()),
             self.qps@.len() == start.qps@.len(),
             forall|i: int| 0 <= i < self.qps@.len() && i != index ==> #[trigger] self.qps@[i] == start.qps@[i],
@@ -2618,6 +2665,8 @@ impl<C, N: Device> Hw<C, N> {
     /// Whether QP `index` has a request open (between its first WQE and
     /// [`Hw::close`]).
     pub fn is_open(&self, index: usize) -> bool
+        requires
+            self.inv(),
     {
         if index >= self.qps.len() {
             return false;
@@ -2634,6 +2683,12 @@ impl<C, N: Device> Hw<C, N> {
     /// without an open request, `ctx` back. It goes out at the next doorbell.
     #[verifier::spinoff_prover]
     pub fn close(&mut self, index: usize, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+            r matches Err(back) ==> back == ctx,
     {
         if index >= self.qps.len() {
             return Err(ctx);
@@ -2803,6 +2858,11 @@ impl<C, N: Device> Hw<C, N> {
     /// `index`; refused (the part handed back) past [`MAX_SGES`] parts.
     #[verifier::spinoff_prover]
     pub fn gather(&mut self, index: usize, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -2917,6 +2977,11 @@ impl<C, N: Device> Hw<C, N> {
     /// nothing is added and the part is handed back.
     #[verifier::spinoff_prover]
     pub fn push(&mut self, index: usize, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index < self.qps.len() {
             match &mut self.qps[index] {
@@ -3053,7 +3118,7 @@ impl<C, N: Device> Hw<C, N> {
 // The rings, for their owners and the event loop
 
 impl<C, N: Device> Hw<C, N> {
-    /// Whether `index` names a QP of the worker (not one being removed).
+    /// Whether `index` names a QP of the engine (not one being removed).
     pub fn is_qp(&self, index: usize) -> (b: bool)
         requires
             self.inv(),
@@ -3067,7 +3132,7 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// QP `index`'s ring of `side`, if it is a QP of the worker.
+    /// QP `index`'s ring of `side`, if it is a QP of the engine.
     pub fn ring(&self, index: usize, side: Side) -> Option<&Ring<Payload<C, N>>>
         requires
             self.inv(),
@@ -3141,6 +3206,16 @@ impl<C, N: Device> Hw<C, N> {
     #[inline(always)]
     #[verifier::spinoff_prover]
     pub fn take(&mut self, index: usize, side: Side, seq: RingSeq) -> (r: Option<Completion<C, N>>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+            r matches Some(c) ==> c.qp == index && c.queue == side && c.seq == seq
+                && c.leases.inv() && c.leases.fully_recorded(),
+            side is Recv ==> (r matches Some(c) ==> old(self).recv_taken_matches(index, seq, c)),
+            side is Send ==> (r matches Some(c) ==> old(self).send_taken_matches(index, seq, c)),
+            old(self).takeable(index, side, seq) ==> r is Some,
     {
         if index >= self.qps.len() {
             return None;
@@ -3168,6 +3243,11 @@ impl<C, N: Device> Hw<C, N> {
     /// released when it retires (now, if it has). Its context comes back.
     #[verifier::spinoff_prover]
     pub fn detach(&mut self, index: usize, side: Side, seq: RingSeq) -> (ctx: Option<C>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             return None;
@@ -3242,6 +3322,12 @@ impl<C, N: Device> Hw<C, N> {
     /// refusal, which M never saw.
     #[verifier::spinoff_prover]
     pub fn take_send_error(&mut self, index: usize) -> (r: Option<DetachedError>)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+            r matches Some(error) ==> old(self).detached_taken_matches(index, error),
     {
         if index >= self.qps.len() {
             return None;
@@ -3259,10 +3345,10 @@ impl<C, N: Device> Hw<C, N> {
 }
 
 // =============================================================================
-// Removing QPs, and the worker
+// Removing QPs, and the engine
 
 impl<C, N: Device> Hw<C, N> {
-    /// Starts removing QP `index` (see `crate::worker`, "Removing QPs"):
+    /// Starts removing QP `index` (see `crate::engine`, "Removing QPs"):
     /// discards the request being written and the WQEs written since the
     /// last doorbell, gives up every request (each releases its buffers once
     /// the NIC is done with it) and, if anything is in flight, moves the QP
@@ -3318,6 +3404,12 @@ impl<C, N: Device> Hw<C, N> {
     /// removed (if `removed`).
     #[verifier::spinoff_prover]
     fn set_flags(&mut self, index: usize, drain: Option<bool>, removed: bool)
+        requires
+            old(self).inv(),
+            old(self).has_qp(index as int),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
     {
         match &mut self.qps[index] {
             Some(e) => {
@@ -3340,6 +3432,12 @@ impl<C, N: Device> Hw<C, N> {
     /// writing and gives up its requests; whether anything is in flight.
     #[verifier::spinoff_prover]
     fn discard(&mut self, index: usize) -> (busy: bool)
+        requires
+            old(self).inv(),
+            old(self).has_qp(index as int),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
     {
         let mut wakes = WakeBatch::new();
         let busy = match &mut self.qps[index] {
@@ -3403,6 +3501,12 @@ impl<C, N: Device> Hw<C, N> {
     /// (it goes out at the next doorbell).
     #[verifier::spinoff_prover]
     fn stage_drain(&mut self, index: usize) -> (written: bool)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+            written ==> final(self).has_qp(index as int),
     {
         if index >= self.qps.len() {
             return false;
@@ -3439,7 +3543,7 @@ impl<C, N: Device> Hw<C, N> {
     }
 
     /// Posts QP `index`'s drain WQE if it waits for one and has room (see
-    /// `crate::worker`, "Removing QPs"): it completes after every WQE before
+    /// `crate::engine`, "Removing QPs"): it completes after every WQE before
     /// it, with a flush error, and polling that completion retires them all,
     /// including unsignaled ones that succeeded before the error. A refused
     /// doorbell is tried again later.
@@ -3537,6 +3641,10 @@ impl<C, N: Device> Hw<C, N> {
     /// its share of the CQ. Whether it was destroyed.
     #[verifier::spinoff_prover]
     pub fn destroy(&mut self, index: usize) -> (destroyed: bool)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
     {
         if index >= self.qps.len() {
             return false;
@@ -3566,9 +3674,9 @@ impl<C, N: Device> Hw<C, N> {
         true
     }
 
-    /// Ends the worker: destroys its CQ if no QP is left (each destroyed
+    /// Ends the engine: destroys its CQ if no QP is left (each destroyed
     /// before: M's `destroy_cq` needs none attached). Otherwise hands the
-    /// worker back: a QP the device never flushed keeps it, and the caller
+    /// engine back: a QP the device never flushed keeps it, and the caller
     /// leaks it all (no memory the NIC may use is ever freed).
     #[allow(clippy::result_large_err)] // Once, at the very end: nothing to save.
     pub fn finish(self) -> (r: core::result::Result<(), Self>)
@@ -3610,6 +3718,11 @@ impl<C, N: Device> Hw<C, N> {
     /// pushed.
     #[verifier::spinoff_prover]
     pub fn drop_gathered(&mut self, index: usize)
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             return;

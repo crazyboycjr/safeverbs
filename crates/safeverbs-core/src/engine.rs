@@ -41,7 +41,7 @@
 //! depth, so the 47 bits never wrap ambiguously. Routing therefore costs a
 //! shift and an array index per completion, with no lookup; the queue's bit
 //! is needed in any case, since a failed completion's opcode is undefined.
-//! The QP's ring then retires its requests in order, as before.
+//! The QP's ring then completes its requests in order.
 //!
 //! There are two ways to drive an engine:
 //!
@@ -51,7 +51,7 @@
 //!   with its QP, queue and sequence number) to a callback that may post new work on any QP. Nothing
 //!   is allocated.
 //! - **Owners that take their results** ([`Engine::progress`] and [`Engine::take_send`]): polling
-//!   retires requests into their rings, where their results wait, and wakes their wakers; each
+//!   completes requests into their rings, where their results wait, and wakes their wakers; each
 //!   owner takes its request's result by sequence number. The futures of `safeverbs` work this
 //!   way.
 //!
@@ -101,12 +101,12 @@
 //! # Removing QPs
 //!
 //! The NIC may read and write the buffers of every WQE posted and not yet
-//! retired, and M (`destroy_qp`) allows destroying a QP only when its queues
+//! completed, and M (`destroy_qp`) allows destroying a QP only when its queues
 //! are empty. So a QP is never destroyed with work in flight: removing it
 //! ([`Engine::remove_qp`], and dropping the engine, for each of its QPs)
 //! first moves it to the error state, where the NIC completes every WQE
 //! left with a flush error, then posts a signaled *drain* WQE on its send
-//! queue (a SEND of nothing, which the error state flushes too: it retires
+//! queue (a SEND of nothing, which the error state flushes too: it completes
 //! the unsignaled WQEs that succeeded before the error and would never get
 //! a completion of their own) and polls the CQ until both rings have
 //! nothing in flight. Only then is the QP destroyed, and only after that
@@ -450,7 +450,7 @@ impl<C, N: Nic> Engine<C, N> {
     // -------------------------------------------------------------------------
     // Polling
 
-    /// Polls the CQ once, retiring what completed in the rings of its QPs
+    /// Polls the CQ once, recording what completed in the rings of its QPs
     /// (and waking the wakers registered there); returns the number of
     /// completions. Owners take their results by sequence number
     /// ([`Engine::take_send`], [`Engine::take_recv`]).
@@ -470,8 +470,8 @@ impl<C, N: Nic> Engine<C, N> {
     /// on any QP, take or detach requests, even poll or remove QPs. Nothing is allocated.
     ///
     /// Requests without an owner (detached) release their buffers when they
-    /// retire; their first error is reported by [`Engine::take_send_error`].
-    /// An unsignaled request retires with the next signaled one of its
+    /// complete; their first error is reported by [`Engine::take_send_error`].
+    /// An unsignaled request completes with the next signaled one of its
     /// queue: a loop that posts unsignaled requests also posts signaled
     /// ones.
     #[inline]
@@ -805,7 +805,7 @@ impl<C, N: Nic> Engine<C, N> {
     }
 
     /// [`Engine::stage`] of a request without an owner: nobody will take it back, its buffers are
-    /// released when it retires, and its first error is reported by
+    /// released when it completes, and its first error is reported by
     /// [`Engine::take_send_error`].
     #[inline]
     pub fn stage_detached<T: Transport>(
@@ -827,7 +827,7 @@ impl<C, N: Nic> Engine<C, N> {
 
     /// Rings the QP's doorbell for every request written since the last
     /// one. If the device refuses, none of them is posted: each one with an
-    /// owner retires at once as [`CompletionError::Refused`], which its owner
+    /// owner completes at once as [`CompletionError::Refused`], which its owner
     /// takes with its context and buffers ([`Engine::take_send`], or
     /// [`Engine::poll`]); each one without an owner releases its buffers and is
     /// reported by [`Engine::take_send_error`]. Sequence numbers are never
@@ -840,7 +840,7 @@ impl<C, N: Nic> Engine<C, N> {
         self.hw.commit(qp.index(), None).map_err(|(e, _)| e)
     }
 
-    /// Takes the context, result and buffers of retired (or refused) request `seq` of `queue`.
+    /// Takes the context, result and buffers of completed (or refused) request `seq` of `queue`.
     #[inline(always)]
     pub fn take<T: Transport>(
         &mut self,
@@ -851,26 +851,26 @@ impl<C, N: Nic> Engine<C, N> {
         self.hw.take(qp.index(), queue, seq)
     }
 
-    /// Takes the context, result and buffers of retired (or refused) send
+    /// Takes the context, result and buffers of completed (or refused) send
     /// request `seq`.
     #[inline]
     pub fn take_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<Completion<C, N>> {
         self.hw.take(qp.index(), Queue::Send, seq)
     }
 
-    /// Takes the context, result and buffer of retired receive `seq`.
+    /// Takes the context, result and buffer of completed receive `seq`.
     #[inline]
     pub fn take_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<Completion<C, N>> {
         self.hw.take(qp.index(), Queue::Recv, seq)
     }
 
-    /// Gives up send request `seq`: its buffers are released when it retires
+    /// Gives up send request `seq`: its buffers are released when it completes
     /// (now, if it has), and its context comes back, if it has one still.
     pub fn detach_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<C> {
         self.hw.detach(qp.index(), Queue::Send, seq)
     }
 
-    /// Gives up receive `seq`: its buffer is released when it retires (now, if
+    /// Gives up receive `seq`: its buffer is released when it completes (now, if
     /// it has), and its context comes back, if it has one still.
     pub fn detach_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> Option<C> {
         self.hw.detach(qp.index(), Queue::Recv, seq)
@@ -882,12 +882,12 @@ impl<C, N: Nic> Engine<C, N> {
         self.hw.take_send_error(qp.index())
     }
 
-    /// Wakes `waker` when send request `seq` retires.
+    /// Wakes `waker` when send request `seq` completes.
     pub fn set_send_waker<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq, waker: &Waker) {
         self.hw.set_waker(qp.index(), Queue::Send, seq, waker);
     }
 
-    /// Wakes `waker` when receive `seq` retires.
+    /// Wakes `waker` when receive `seq` completes.
     pub fn set_recv_waker<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq, waker: &Waker) {
         self.hw.set_waker(qp.index(), Queue::Recv, seq, waker);
     }
@@ -945,7 +945,7 @@ impl<C, N: Nic> Engine<C, N> {
     }
 
     /// [`Engine::post_recv`] of a receive without an owner: its buffer is released when it
-    /// retires, and its first error goes with the detached send errors' own.
+    /// completes, and its first error goes with the detached send errors' own.
     pub fn post_recv_detached<T: Transport>(
         &mut self,
         qp: QpKey<T>,
@@ -1001,7 +1001,7 @@ impl<C, N: Nic> Drop for Engine<C, N> {
 }
 
 /// A request being written on a QP of an engine: one or more WQEs that
-/// retire together.
+/// complete together.
 ///
 /// Nothing reaches the hardware until it is finished, when its signaling is known. A request
 /// longer than the QP's `max_batch` WQEs, or than the room in the send queue, is split: the part
@@ -1051,7 +1051,7 @@ impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
     /// Finishes the request, signaled if `signal` (else only if the ring needs
     /// it), with `ctx` to come back with its completion. Returns its sequence
     /// number, or `ctx` if it has no WQE. It goes out at the next commit; if the
-    /// device refuses that doorbell, it retires as
+    /// device refuses that doorbell, it completes as
     /// [`CompletionError::Refused`] (see [`Engine::commit`]).
     #[inline]
     pub fn finish(self, signal: bool, ctx: C) -> core::result::Result<Seq, C> {
@@ -1062,7 +1062,7 @@ impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
     }
 
     /// Finishes the request without an owner: nobody will take it back, and its
-    /// buffers are released when it retires. Returns its sequence number,
+    /// buffers are released when it completes. Returns its sequence number,
     /// `None` if it has no WQE.
     pub fn finish_detached(self, signal: bool) -> Option<Seq> {
         self.w.hw.close(self.index, signal, None).ok()
@@ -1144,9 +1144,9 @@ mod tests {
         assert!(wqe_of(wr_id(0, false, 5), 6) > 6 + (1 << 46));
     }
 
-    /// What routing a completion costs: the `wr_id` decoding the worker
+    /// What routing a completion costs: the `wr_id` decoding the engine
     /// does, against finding the QP by its number (a linear scan, as a
-    /// worker of a few QPs would, and a hash map). Run with `cargo test
+    /// engine of a few QPs would, and a hash map). Run with `cargo test
     /// --release -p safeverbs-core -- --ignored --nocapture demux_cost`.
     #[test]
     #[ignore = "a measurement"]
@@ -1220,7 +1220,7 @@ mod tests {
         assert_ne!(w.qp_num(c), w.qp_num(b));
     }
 
-    /// Two RC QPs of one worker connected to each other.
+    /// Two RC QPs of one engine connected to each other.
     fn connected_pair(
         w: &mut Engine<(), Model>,
         pd: &Pd<Model>,
@@ -1255,8 +1255,8 @@ mod tests {
 
     /// Removing QPs with work in flight drains them first: receives that
     /// will never match, and unsignaled sends that succeeded but have no
-    /// completion of their own (the drain WQE retires them). The model
-    /// panics if a QP is destroyed with a WQE not retired (M's
+    /// completion of their own (the drain WQE completes them). The model
+    /// panics if a QP is destroyed with a WQE not completed (M's
     /// `destroy_qp`); every buffer comes back.
     #[test]
     fn remove_qp_drains_work_in_flight() {
@@ -1292,9 +1292,9 @@ mod tests {
         assert_eq!(model.registered(), 0);
     }
 
-    /// Dropping a worker drains every QP before destroying it.
+    /// Dropping an engine drains every QP before destroying it.
     #[test]
-    fn dropping_a_worker_drains_its_qps() {
+    fn dropping_an_engine_drains_its_qps() {
         let model = Model::new(13);
         model.set_pace(900, 1);
         let pd = Context::new(model.clone()).alloc_pd().unwrap();
@@ -1318,8 +1318,8 @@ mod tests {
 
     /// A device that never flushes: removing the QP fails, and its buffers
     /// are kept, never freed, with its index and share of the CQ; once the
-    /// device moves again, dropping the worker drains and releases them.
-    /// If it never does, the worker leaks the QP, its buffers and its CQ.
+    /// device moves again, dropping the engine drains and releases them.
+    /// If it never does, the engine leaks the QP, its buffers and its CQ.
     #[test]
     fn a_device_that_never_flushes_keeps_the_buffers() {
         for recovers in [true, false] {
@@ -1347,13 +1347,13 @@ mod tests {
     }
 
     /// A refused doorbell drops the requests written before it: one
-    /// without an owner is reported as refused, one with an owner retires
+    /// without an owner is reported as refused, one with an owner completes
     /// as refused too (and `poll` hands it out), and numbers are not reused.
     #[test]
     fn refused_doorbell_retires_staged_requests() {
         let pd = Context::new(Model::new(7)).alloc_pd().unwrap();
         let mut w: Engine<u32, _> = Engine::new(pd.context(), 64).unwrap();
-        // Not connected: the worker refuses the doorbell, as a device would.
+        // Not connected: the engine refuses the doorbell, as a device would.
         let qp = w.create_qp::<RC>(&pd, caps(8), 4).unwrap();
         let buf = pd.alloc::<u8>(64).unwrap().freeze();
         let mut req = w.request(qp);

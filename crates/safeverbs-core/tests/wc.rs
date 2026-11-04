@@ -114,7 +114,7 @@ fn zero_sge_notification<N: Nic>(ctx: Context<N>) {
         completions.extend_from_slice(&out[..n]);
         if start.elapsed() >= Duration::from_secs(10) && completions.len() < 2 {
             // Retain every dependency if the device did not quiesce, as
-            // the production worker does, rather than freeing live DMA memory.
+            // the production engine does, rather than freeing live DMA memory.
             core::mem::forget((a, b, cq, src_mr, dst_mr, pd, src, dst, ctx));
             panic!("timed out waiting for the zero-SGE WRITE_WITH_IMM");
         }
@@ -159,7 +159,7 @@ fn attr<N: Nic>(ctx: &Context<N>) -> ConnectAttr {
     }
 }
 
-/// A worker on `ctx` with two RC QPs connected to each other.
+/// An engine on `ctx` with two RC QPs connected to each other.
 fn pair<N: Nic>(ctx: &Context<N>) -> (Pd<N>, Engine<u32, N>, QpKey<RC>, QpKey<RC>) {
     let pd = ctx.alloc_pd().unwrap();
     let caps = QpCaps {
@@ -169,24 +169,24 @@ fn pair<N: Nic>(ctx: &Context<N>) -> (Pd<N>, Engine<u32, N>, QpKey<RC>, QpKey<RC
         max_recv_sge: 1,
         max_inline_data: 0,
     };
-    let mut worker = Engine::new(ctx, 32).unwrap();
-    let a = worker.create_qp::<RC>(&pd, caps, 1).unwrap();
-    let b = worker.create_qp::<RC>(&pd, caps, 1).unwrap();
+    let mut engine = Engine::new(ctx, 32).unwrap();
+    let a = engine.create_qp::<RC>(&pd, caps, 1).unwrap();
+    let b = engine.create_qp::<RC>(&pd, caps, 1).unwrap();
     let attr = attr(ctx);
     let (ea, eb) = (
-        worker.endpoint(a, 1, attr.gid_index).unwrap(),
-        worker.endpoint(b, 1, attr.gid_index).unwrap(),
+        engine.endpoint(a, 1, attr.gid_index).unwrap(),
+        engine.endpoint(b, 1, attr.gid_index).unwrap(),
     );
-    worker.connect(a, &attr, &eb).unwrap();
-    worker.connect(b, &attr, &ea).unwrap();
-    (pd, worker, a, b)
+    engine.connect(a, &attr, &eb).unwrap();
+    engine.connect(b, &attr, &ea).unwrap();
+    (pd, engine, a, b)
 }
 
-/// Every kind of receive, through the worker: a message, one with immediate data, an empty
+/// Every kind of receive, through the engine: a message, one with immediate data, an empty
 /// one (a message of no bytes, still), and notifications, into a buffer too small for the
 /// WRITE and into a buffer of no bytes, which is all a notification needs.
 fn every_kind_of_receive<N: Nic>(ctx: Context<N>) {
-    let (pd, mut worker, a, b) = pair(&ctx);
+    let (pd, mut engine, a, b) = pair(&ctx);
     let mut small = pd.alloc::<u8>(8).unwrap();
     small.fill(0x5a);
     let (no_bytes, _) = pd.alloc::<u8>(8).unwrap().split_at(0);
@@ -194,24 +194,24 @@ fn every_kind_of_receive<N: Nic>(ctx: Context<N>) {
     let mut src = pd.alloc::<u8>(4096).unwrap();
     src.fill(0xa5);
     let src = src.freeze();
-    worker.recv(b, pd.alloc::<u8>(64).unwrap(), 0).unwrap();
-    worker.recv(b, pd.alloc::<u8>(64).unwrap(), 1).unwrap();
-    worker.recv(b, pd.alloc::<u8>(64).unwrap(), 2).unwrap();
-    worker.recv(b, small, 3).unwrap();
-    worker.recv(b, no_bytes, 4).unwrap();
-    worker.send(a, src.slice(..16), 10).unwrap();
-    worker.send_imm(a, src.slice(..32), 77, 11).unwrap();
-    worker.send(a, src.slice(..0), 12).unwrap();
-    worker
+    engine.recv(b, pd.alloc::<u8>(64).unwrap(), 0).unwrap();
+    engine.recv(b, pd.alloc::<u8>(64).unwrap(), 1).unwrap();
+    engine.recv(b, pd.alloc::<u8>(64).unwrap(), 2).unwrap();
+    engine.recv(b, small, 3).unwrap();
+    engine.recv(b, no_bytes, 4).unwrap();
+    engine.send(a, src.slice(..16), 10).unwrap();
+    engine.send_imm(a, src.slice(..32), 77, 11).unwrap();
+    engine.send(a, src.slice(..0), 12).unwrap();
+    engine
         .write_imm(a, src.slice(..), dst.remote(), 88, 13)
         .unwrap();
-    worker
+    engine
         .write_imm(a, src.slice(..100), dst.remote(), 99, 14)
         .unwrap();
     let mut got = Vec::new();
     let start = Instant::now();
     while got.len() < 10 {
-        worker.poll(32, |_, c| got.push((c.wr_id, c.result, c.leases)));
+        engine.poll(32, |_, c| got.push((c.wr_id, c.result, c.leases)));
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "timed out with {} completions",
@@ -252,7 +252,7 @@ fn every_kind_of_receive<N: Nic>(ctx: Context<N>) {
         "a notification leaves its buffer alone"
     );
     assert_eq!(got.next().unwrap().2.into_buf_mut::<u8>().unwrap().len(), 0);
-    drop(worker);
+    drop(engine);
     assert_eq!(&dst.reclaim()[..], &src[..]);
 }
 

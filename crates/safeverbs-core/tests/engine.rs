@@ -91,9 +91,9 @@ fn attr() -> ConnectAttr {
     }
 }
 
-/// `pairs` pairs of RC QPs on one worker, each connected to the other QP
-/// of its pair; the worker's CQ holds exactly their queues.
-fn worker(pd: &Pd<Model>, pairs: usize, depth: u32) -> (Engine<Job, Model>, Vec<QpKey<RC>>) {
+/// `pairs` pairs of RC QPs on one engine, each connected to the other QP
+/// of its pair; the engine's CQ holds exactly their queues.
+fn engine(pd: &Pd<Model>, pairs: usize, depth: u32) -> (Engine<Job, Model>, Vec<QpKey<RC>>) {
     let mut w = Engine::new(pd.context(), (4 * pairs) as u32 * depth).unwrap();
     let qps: Vec<QpKey<RC>> = (0..2 * pairs)
         .map(|_| {
@@ -144,7 +144,7 @@ fn event_loop_on_several_qps() {
         let pd = Context::new(model.clone()).alloc_pd().unwrap();
         let pairs = 1 + (seed % 3) as usize;
         let depth = 2 + (seed % 7) as u32;
-        let (mut w, qps) = worker(&pd, pairs, depth);
+        let (mut w, qps) = engine(&pd, pairs, depth);
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let dst = pd.alloc::<u8>(4096).unwrap().expose().unwrap();
         let frozen: Vec<Buf<u8, Model>> = (0..4)
@@ -473,7 +473,7 @@ fn event_loop_on_several_qps() {
 /// `destroy_qp`) or a CQ with a QP attached (M's `destroy_cq`); afterwards
 /// every buffer is back and nothing stays registered.
 #[test]
-fn removing_busy_qps_and_dropping_busy_workers() {
+fn removing_busy_qps_and_dropping_busy_engines() {
     let mut removed = 0;
     for seed in 1..120u64 {
         let model = Model::new(seed);
@@ -481,7 +481,7 @@ fn removing_busy_qps_and_dropping_busy_workers() {
         let pd = Context::new(model.clone()).alloc_pd().unwrap();
         let pairs = 1 + (seed % 3) as usize;
         let depth = 2 + (seed % 7) as u32;
-        let (mut w, qps) = worker(&pd, pairs, depth);
+        let (mut w, qps) = engine(&pd, pairs, depth);
         let mut live: Vec<QpKey<RC>> = qps.clone();
         let mut jobs = Jobs::default();
         let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
@@ -568,7 +568,7 @@ fn removing_busy_qps_and_dropping_busy_workers() {
                 }
             }
         }
-        // Drop the worker as it is, with whatever is in flight or written.
+        // Drop the engine as it is, with whatever is in flight or written.
         drop(w);
         assert_eq!(
             jobs.drops.get(),
@@ -591,7 +591,7 @@ fn removing_busy_qps_and_dropping_busy_workers() {
 fn contexts_come_back_with_their_own_requests() {
     let model = Model::new(201);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let (mut w, qps) = worker(&pd, 2, 16);
+    let (mut w, qps) = engine(&pd, 2, 16);
     let dst = pd.alloc::<u8>(4096).unwrap().expose().unwrap();
     let mut jobs = Jobs::default();
     let mut want = HashMap::new();
@@ -658,7 +658,7 @@ fn contexts_come_back_with_their_own_requests() {
 fn a_refused_request_is_not_a_flush() {
     let model = Model::new(202);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let (mut w, qps) = worker(&pd, 1, 8);
+    let (mut w, qps) = engine(&pd, 1, 8);
     let (a, _b) = (qps[0], qps[1]);
     let frozen = pd.alloc::<u8>(8).unwrap().freeze();
     let mut jobs = Jobs::default();
@@ -710,7 +710,7 @@ fn a_detached_batch_error_has_its_position() {
     let model = Model::new(203);
     model.set_pace(0, 1);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let (mut w, qps) = worker(&pd, 1, 8);
+    let (mut w, qps) = engine(&pd, 1, 8);
     let a = qps[0];
     let dst = pd.alloc::<u8>(8).unwrap().expose().unwrap();
     let frozen = pd.alloc::<u8>(8).unwrap().freeze();
@@ -746,14 +746,14 @@ fn a_detached_batch_error_has_its_position() {
 }
 
 /// Giving up a request hands its context back at once, while it is in flight, and retiring it
-/// later runs no destructor; removing a QP or dropping the worker drops the contexts of the
+/// later runs no destructor; removing a QP or dropping the engine drops the contexts of the
 /// requests not delivered.
 #[test]
 fn undelivered_contexts_are_dropped() {
     let model = Model::new(204);
     model.set_pace(1000, 1);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let (mut w, qps) = worker(&pd, 1, 8);
+    let (mut w, qps) = engine(&pd, 1, 8);
     let (a, b) = (qps[0], qps[1]);
     let frozen = pd.alloc::<u8>(8).unwrap().freeze();
     let mut jobs = Jobs::default();
@@ -778,7 +778,7 @@ fn undelivered_contexts_are_dropped() {
     w.recv(b, buf, jobs.next()).unwrap();
     assert_eq!(jobs.drops.get(), 3);
     drop(w);
-    assert_eq!(jobs.drops.get(), jobs.made, "gone with the worker");
+    assert_eq!(jobs.drops.get(), jobs.made, "gone with the engine");
     assert!(frozen.try_thaw().is_ok(), "and the buffers");
 }
 

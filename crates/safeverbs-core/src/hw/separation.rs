@@ -1,6 +1,6 @@
-//! Unique receive admission against every buffer the worker retains.
+//! Unique receive admission against every buffer the engine retains.
 //!
-//! The immutable worker borrow preserves its rings and resource snapshots exactly.
+//! The immutable engine borrow preserves its rings and resource snapshots exactly.
 //! Only the incoming unique byte permission is mutably borrowed, with its identity
 //! preserved. The traversal changes nothing, so it exists in Verus builds alone
 //! (`cfg(verus_keep_ghost)`).
@@ -25,8 +25,8 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// Admission-time separation against everything the worker stores.
-    /// This says nothing about other workers or untracked leases the program holds.
+    /// Admission-time separation against everything the engine stores.
+    /// This says nothing about other engines or untracked leases the program holds.
     pub closed spec fn admission_separated_from(&self, incoming: Part<N>) -> bool {
         forall|i: int| 0 <= i < self.qps@.len()
             ==> #[trigger] self.entry_separated_from(i, incoming)
@@ -54,7 +54,7 @@ impl<C, N: Device> Hw<C, N> {
         ensures self.recv_holds_input(index, seq, part),
     {}
 
-    /// The traversal is read-only on the worker, preserving every snapshot.
+    /// The traversal is read-only on the engine, preserving every snapshot.
     /// There is no native byte comparison; the linear token proofs are erased.
     #[cfg(verus_keep_ghost)]
     #[inline(always)]

@@ -15,6 +15,9 @@ use super::{Frozen, RawMut};
 use crate::nic::{Nic, Sge};
 use crate::verbs::Verbs;
 
+// On this branch the specs and proofs in this file still describe the representation before the
+// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
+// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
 /// What keeps a buffer's memory alive while the NIC uses it.
@@ -739,6 +742,16 @@ impl<N: Nic> Leases<N> {
     #[allow(clippy::collapsible_if)] // Keep the pattern and pointer primitive explicit for Verus.
     #[inline(always)]
     fn push_resource(&mut self, lease: Lease<N>)
+        ensures
+            final(self).loans() == old(self).loans(),
+            final(self).wqes() == old(self).wqes(),
+            old(self).repr_inv() ==> final(self).repr_inv(),
+            old(self).repr_inv() ==> (
+                final(self).view() == old(self).view().push(lease.observation())
+                || (old(self).view().len() > 0
+                    && old(self).view().last().same_frozen(lease.observation())
+                    && final(self).view() == old(self).view())
+            ),
     {
         let last = match &self.held {
             Held::Nothing => None,
@@ -871,6 +884,8 @@ impl<N: Nic> Leases<N> {
 
     /// The number of retained resources.
     pub fn len(&self) -> (len: usize)
+        requires self.view().len() <= usize::MAX,
+        ensures len == self.view().len(),
     {
         match &self.held {
             Held::Nothing => 0,
@@ -888,6 +903,12 @@ impl<N: Nic> Leases<N> {
     /// Type interpretation is handled by the buffer wrapper after this move.
     #[inline(always)]
     pub(super) fn into_unique_raw(self) -> (r: Option<RawMut<N>>)
+        ensures
+            r is Some ==> exists|i: int| 0 <= i < self.raw_view().len()
+                && self.raw_view()[i] == Lease::Unique(r->0)
+                && forall|j: int| 0 <= j < i ==> !(self.raw_view()[j] is Unique),
+            r is None ==> forall|i: int| 0 <= i < self.raw_view().len()
+                ==> !(self.raw_view()[i] is Unique),
     {
         let mut remaining = self;
         remaining.take_unique_raw()

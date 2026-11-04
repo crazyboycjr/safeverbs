@@ -1,8 +1,8 @@
 //! The `wr_id` of a WQE, and how a completion is routed back by it.
 //!
-//! One CQ serves every QP of a worker, so the `wr_id` the hardware reports
+//! One CQ serves every QP of an engine, so the `wr_id` the hardware reports
 //! must name the QP, the queue and the WQE. It holds the QP's index in the
-//! worker in its top 16 bits, the queue in the next bit (set for a receive)
+//! engine in its top 16 bits, the queue in the next bit (set for a receive)
 //! and the low 47 bits of the WQE's number in that queue's ring
 //! ([`wr_id`]). The index and the queue come back with a shift and a mask
 //! ([`index_of`], [`is_recv`]); the full number from the oldest WQE in
@@ -12,7 +12,7 @@
 //!
 //! Proved (inside `verus!`): the three decoders invert [`wr_id`]
 //! (`lemma_wr_id_fields` and the postconditions). This is the arithmetic
-//! half of the coupling between a request and its WQE in M: the worker sets
+//! half of the coupling between a request and its WQE in M: the engine sets
 //! each WQE's `wr_id` with [`wr_id`] and recovers the WQE a completion names
 //! with the decoders.
 

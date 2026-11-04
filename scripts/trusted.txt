@@ -12,6 +12,9 @@ crates/safeverbs-core/src/ring/wake.rs resume
 crates/safeverbs-core/src/ring.rs will_wake
 crates/safeverbs-core/src/ring.rs clone_waker
 
+# Writing a free slot with no drop glue, and so no landing pad, on the data path.
+crates/safeverbs-core/src/ring.rs forget_free
+
 # The exec types the verbs' contracts read: their definitions, as written.
 crates/safeverbs-core/src/trusted.rs ExSge
 crates/safeverbs-core/src/trusted.rs ExRemoteBuf
@@ -40,10 +43,9 @@ crates/safeverbs-core/src/buf/memory.rs volatile_copy
 crates/safeverbs-core/src/trusted.rs ExNic
 crates/safeverbs-core/src/trusted.rs ExNicQp
 crates/safeverbs-core/src/trusted.rs ExNicCq
-# The control path, each with its contract from M (create_cq makes a worker's token).
+# The control path, each with its contract from M (create_cq makes an engine's token).
 crates/safeverbs-core/src/trusted.rs device_caps
 crates/safeverbs-core/src/trusted.rs create_cq
-crates/safeverbs-core/src/trusted.rs alloc_domain
 crates/safeverbs-core/src/trusted.rs create_qp
 crates/safeverbs-core/src/trusted.rs connect
 crates/safeverbs-core/src/trusted.rs to_error
