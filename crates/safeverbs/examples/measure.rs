@@ -26,14 +26,14 @@ use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
+use futures::SinkExt;
 use futures::task::noop_waker;
 use safeverbs::{
-    Buf, Context, LocalQp, LocalWorker, Model, QueuePairBuilder, RC, Received, RemoteBuf,
+    AsyncQp, Buf, Context, LocalCq, LocalQp, Model, Pd, QueuePairBuilder, RC, Received, RemoteBuf,
+    WriteOp,
 };
 use safeverbs_core::nic::{Nic, NicCq, NicQp, QpType, Sge};
-use safeverbs_core::{
-    Access, ConnectAttr, Endpoint, Pd, QpCaps, QpKey, Queue, Seq, Wc, Worker, WrOp,
-};
+use safeverbs_core::{Access, ConnectAttr, Endpoint, Engine, QpCaps, QpKey, Seq, Wc, WrOp};
 
 /// The depth of every queue.
 const DEPTH: u64 = 256;
@@ -475,75 +475,53 @@ fn train_careful(rounds: usize) {
 }
 
 // -----------------------------------------------------------------------------
-// The library, by index
+// The library, through the event loop's handles
 
 struct Setup {
     model: Model,
     pd: Pd<Model>,
-    worker: Worker<u64, Model>,
-    local: QpKey<RC>,
-    peer: QpKey<RC>,
+    cq: LocalCq<u64, Model>,
+    local: LocalQp<RC, u64, Model>,
+    peer: LocalQp<RC, u64, Model>,
 }
 
 fn setup() -> Setup {
     let model = Model::new(7);
-    let pd = safeverbs_core::Context::new(model.clone())
-        .alloc_pd()
-        .unwrap();
-    let mut worker: Worker<u64, Model> = Worker::new(&pd, 4 * DEPTH as u32).unwrap();
-    let local = worker.create_qp::<RC>(caps(), TRAIN as u32).unwrap();
-    let peer = worker.create_qp::<RC>(caps(), TRAIN as u32).unwrap();
-    let e = worker.endpoint(peer, 1, None).unwrap();
-    worker.connect(local, &attr(), &e).unwrap();
-    let e = worker.endpoint(local, 1, None).unwrap();
-    worker.connect(peer, &attr(), &e).unwrap();
+    let ctx = Context::new(model.clone());
+    let pd = ctx.alloc_pd().unwrap();
+    let cq: LocalCq<u64, Model> = ctx.create_local_cq(4 * DEPTH as u32).unwrap();
+    let build = || {
+        QueuePairBuilder::<RC, Model>::new(&pd)
+            .set_caps(caps())
+            .set_max_batch(TRAIN as u32)
+            .build_on(&cq)
+            .unwrap()
+    };
+    let (a, b) = (build(), build());
+    let (ea, eb) = (a.endpoint(), b.endpoint());
+    let local = a.handshake(eb).unwrap();
+    let peer = b.handshake(ea).unwrap();
     Setup {
         model,
         pd,
-        worker,
+        cq,
         local,
         peer,
     }
 }
 
-fn frozen(pd: &Pd<Model>) -> safeverbs_core::Buf<u8, Model> {
+fn frozen(pd: &Pd<Model>) -> Buf<u8, Model> {
     let mut src = pd.alloc::<u8>(SIZE).unwrap();
     src.fill(1);
     src.freeze()
 }
 
-/// The owners' path, what the futures use: progress, then take by number.
-fn take(rounds: usize) {
-    let Setup {
-        model,
-        pd,
-        mut worker,
-        local,
-        peer,
-    } = setup();
-    let src = frozen(&pd);
-    let mut rbuf = pd.alloc::<u8>(SIZE).unwrap();
-    let mut ok = 0usize;
-    for i in 0..rounds {
-        let r: Seq = worker.post_recv(peer, rbuf.into_part(), i as u64).unwrap();
-        let s: Seq = worker.send(local, src.slice(..), i as u64).unwrap();
-        model.run();
-        worker.progress();
-        let c = worker.take_send(local, s).unwrap();
-        ok += c.result.is_ok() as usize;
-        let c = worker.take_recv(peer, r).unwrap();
-        ok += c.result.is_ok() as usize;
-        rbuf = c.leases.into_buf_mut::<u8>().unwrap();
-    }
-    black_box(ok);
-}
-
-/// The event loop: poll hands every completion to a closure.
+/// The event loop: `poll` hands every completion to a closure.
 fn eventloop(rounds: usize) {
     let Setup {
         model,
         pd,
-        mut worker,
+        cq,
         local,
         peer,
     } = setup();
@@ -551,18 +529,43 @@ fn eventloop(rounds: usize) {
     let mut rbuf = Some(pd.alloc::<u8>(SIZE).unwrap());
     let mut ok = 0usize;
     for i in 0..rounds {
-        worker
-            .post_recv(peer, rbuf.take().unwrap().into_part(), i as u64)
-            .unwrap();
-        worker.send(local, src.slice(..), i as u64).unwrap();
+        peer.post_recv(rbuf.take().unwrap(), i as u64).unwrap();
+        local.post_send(src.slice(..), i as u64).unwrap();
         model.run();
-        worker.poll(|_, c| {
-            ok += c.result.is_ok() as usize;
-            black_box(c.ctx);
-            if matches!(c.queue, Queue::Recv) {
-                rbuf = Some(c.leases.into_buf_mut::<u8>().unwrap());
+        cq.poll(16, |mut wc| {
+            ok += wc.result.is_ok() as usize;
+            black_box(wc.wr_id);
+            if let Some(buf) = wc.buf_mut() {
+                rbuf = Some(buf);
             }
         });
+    }
+    black_box(ok);
+}
+
+/// The event loop, one completion at a time.
+fn poll_one(rounds: usize) {
+    let Setup {
+        model,
+        pd,
+        cq,
+        local,
+        peer,
+    } = setup();
+    let src = frozen(&pd);
+    let mut rbuf = Some(pd.alloc::<u8>(SIZE).unwrap());
+    let mut ok = 0usize;
+    for i in 0..rounds {
+        peer.post_recv(rbuf.take().unwrap(), i as u64).unwrap();
+        local.post_send(src.slice(..), i as u64).unwrap();
+        model.run();
+        while let Some(mut wc) = cq.poll_one() {
+            ok += wc.result.is_ok() as usize;
+            black_box(wc.wr_id);
+            if let Some(buf) = wc.buf_mut() {
+                rbuf = Some(buf);
+            }
+        }
     }
     black_box(ok);
 }
@@ -572,25 +575,26 @@ fn batch(rounds: usize) {
     let Setup {
         model,
         pd,
-        mut worker,
+        cq,
         local,
-        ..
+        peer: _peer,
     } = setup();
     let src = frozen(&pd);
     let dst = pd.alloc::<u8>(SIZE).unwrap().expose().unwrap();
     let to = dst.remote();
     let mut ok = 0usize;
     for i in 0..rounds {
-        let mut req = worker.request(local);
-        for _ in 0..TRAIN {
-            req.push(WrOp::Write(to), src.slice(..).into_part())
-                .unwrap();
-        }
-        req.submit(true, i as u64).unwrap();
+        local
+            .post_batch(i as u64, |b| {
+                for _ in 0..TRAIN {
+                    b.write(src.slice(..), to);
+                }
+            })
+            .unwrap();
         model.run();
-        worker.poll(|_, c| {
-            ok += c.result.is_ok() as usize;
-            black_box(c.ctx);
+        cq.poll(16, |wc| {
+            ok += wc.result.is_ok() as usize;
+            black_box(wc.wr_id);
         });
     }
     black_box(ok);
@@ -602,7 +606,7 @@ fn train(rounds: usize) {
     let Setup {
         model,
         pd,
-        mut worker,
+        cq,
         local,
         peer,
     } = setup();
@@ -611,26 +615,118 @@ fn train(rounds: usize) {
     let mut ok = 0usize;
     for i in 0..rounds {
         while let Some(buf) = bufs.pop() {
-            worker.post_recv(peer, buf.into_part(), i as u64).unwrap();
+            peer.post_recv(buf, i as u64).unwrap();
         }
         for j in 0..TRAIN {
-            let mut req = worker.request(local);
-            req.push(WrOp::Send, src.slice(..).into_part()).unwrap();
-            let _ = req.finish(j + 1 == TRAIN, i as u64);
+            local
+                .stage(
+                    WrOp::Send,
+                    src.slice(..).into_part(),
+                    i as u64,
+                    j + 1 == TRAIN,
+                )
+                .unwrap();
         }
-        worker.commit(local).unwrap();
+        local.ring().unwrap();
         model.run();
         let mut seen = 0;
         while seen < 2 * TRAIN {
-            worker.poll(|_, c| {
-                seen += 1;
-                ok += c.result.is_ok() as usize;
-                black_box(c.ctx);
-                if matches!(c.queue, Queue::Recv) {
-                    bufs.push(c.leases.into_buf_mut::<u8>().unwrap());
+            seen += cq.poll(16, |mut wc| {
+                ok += wc.result.is_ok() as usize;
+                black_box(wc.wr_id);
+                if let Some(buf) = wc.buf_mut() {
+                    bufs.push(buf);
                 }
             });
         }
+    }
+    black_box(ok);
+}
+
+// -----------------------------------------------------------------------------
+// The library, by index
+
+struct RawLibSetup {
+    model: Model,
+    pd: safeverbs_core::Pd<Model>,
+    engine: Engine<u64, Model>,
+    local: QpKey<RC>,
+    peer: QpKey<RC>,
+}
+
+fn raw_lib_setup() -> RawLibSetup {
+    let model = Model::new(7);
+    let ctx = safeverbs_core::Context::new(model.clone());
+    let pd = ctx.alloc_pd().unwrap();
+    let mut engine: Engine<u64, Model> = Engine::new(&ctx, 4 * DEPTH as u32).unwrap();
+    let local = engine.create_qp::<RC>(&pd, caps(), TRAIN as u32).unwrap();
+    let peer = engine.create_qp::<RC>(&pd, caps(), TRAIN as u32).unwrap();
+    let e = engine.endpoint(peer, 1, None).unwrap();
+    engine.connect(local, &attr(), &e).unwrap();
+    let e = engine.endpoint(local, 1, None).unwrap();
+    engine.connect(peer, &attr(), &e).unwrap();
+    RawLibSetup {
+        model,
+        pd,
+        engine,
+        local,
+        peer,
+    }
+}
+
+/// The engine's event loop, with no reference count or `RefCell` on the way.
+fn engine_loop(rounds: usize) {
+    let RawLibSetup {
+        model,
+        pd,
+        mut engine,
+        local,
+        peer,
+    } = raw_lib_setup();
+    let mut src = pd.alloc::<u8>(SIZE).unwrap();
+    src.fill(1);
+    let src = src.freeze();
+    let mut rbuf = Some(pd.alloc::<u8>(SIZE).unwrap());
+    let mut ok = 0usize;
+    for i in 0..rounds {
+        engine.recv(peer, rbuf.take().unwrap(), i as u64).unwrap();
+        engine.send(local, src.slice(..), i as u64).unwrap();
+        model.run();
+        engine.poll(16, |_, mut c| {
+            ok += c.result.is_ok() as usize;
+            black_box(c.wr_id);
+            if let Some(buf) = c.leases.take_buf_mut() {
+                rbuf = Some(buf);
+            }
+        });
+    }
+    black_box(ok);
+}
+
+/// The owners' path, what the futures use: progress, then take by number.
+fn take(rounds: usize) {
+    let RawLibSetup {
+        model,
+        pd,
+        mut engine,
+        local,
+        peer,
+    } = raw_lib_setup();
+    let mut src = pd.alloc::<u8>(SIZE).unwrap();
+    src.fill(1);
+    let src = src.freeze();
+    let mut rbuf = pd.alloc::<u8>(SIZE).unwrap();
+    let mut ok = 0usize;
+    for i in 0..rounds {
+        let r: Seq = engine.recv(peer, rbuf, i as u64).unwrap();
+        let s: Seq = engine.send(local, src.slice(..), i as u64).unwrap();
+        model.run();
+        engine.progress();
+        let c = engine.take_send(local, s).unwrap();
+        ok += c.result.is_ok() as usize;
+        let c = engine.take_recv(peer, r).unwrap();
+        ok += c.result.is_ok() as usize;
+        rbuf = c.leases.into_buf_mut::<u8>().unwrap();
     }
     black_box(ok);
 }
@@ -653,21 +749,21 @@ fn block_on<F: Future>(f: F) -> F::Output {
 
 struct AsyncSetup {
     model: Model,
-    pd: safeverbs::Pd<Model>,
-    local: LocalQp<RC, Model>,
-    peer: LocalQp<RC, Model>,
+    pd: Pd<Model>,
+    local: AsyncQp<RC, Model>,
+    peer: AsyncQp<RC, Model>,
 }
 
 fn async_setup() -> AsyncSetup {
     let model = Model::new(7);
-    let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let worker = LocalWorker::new(&pd, 4 * DEPTH as u32).unwrap();
+    let ctx = Context::new(model.clone());
+    let pd = ctx.alloc_pd().unwrap();
+    let cq = ctx.create_async_cq(4 * DEPTH as u32).unwrap();
     let build = || {
         QueuePairBuilder::<RC, Model>::new(&pd)
-            .set_send_depth(DEPTH as u32)
-            .set_recv_depth(DEPTH as u32)
+            .set_caps(caps())
             .set_max_batch(TRAIN as u32)
-            .build_on(&worker)
+            .build_on(&cq)
             .unwrap()
     };
     let (a, b) = (build(), build());
@@ -682,12 +778,6 @@ fn async_setup() -> AsyncSetup {
     }
 }
 
-fn async_frozen(pd: &safeverbs::Pd<Model>) -> Buf<u8, Model> {
-    let mut src = pd.alloc::<u8>(SIZE).unwrap();
-    src.fill(1);
-    src.freeze()
-}
-
 /// A SEND and a receive as futures: each is ready at its first poll.
 fn async_round(rounds: usize) {
     let AsyncSetup {
@@ -696,7 +786,7 @@ fn async_round(rounds: usize) {
         local,
         peer,
     } = async_setup();
-    let src = async_frozen(&pd);
+    let src = frozen(&pd);
     let mut rbuf = Some(pd.alloc::<u8>(SIZE).unwrap());
     let mut ok = 0usize;
     block_on(async {
@@ -721,7 +811,7 @@ fn async_batch(rounds: usize) {
         local,
         peer: _peer,
     } = async_setup();
-    let src = async_frozen(&pd);
+    let src = frozen(&pd);
     let dst = pd.alloc::<u8>(SIZE).unwrap().expose().unwrap();
     let to = dst.remote();
     let mut ok = 0usize;
@@ -748,7 +838,7 @@ fn async_train(rounds: usize) {
         local,
         peer,
     } = async_setup();
-    let src = async_frozen(&pd);
+    let src = frozen(&pd);
     let mut bufs: Vec<_> = (0..TRAIN).map(|_| pd.alloc::<u8>(SIZE).unwrap()).collect();
     let mut recvs = Vec::with_capacity(TRAIN);
     let mut sends = Vec::with_capacity(TRAIN);
@@ -775,6 +865,33 @@ fn async_train(rounds: usize) {
     black_box(ok);
 }
 
+/// 16 WRITEs of one buffer through a sink, and a flush.
+fn sink(rounds: usize) {
+    let AsyncSetup {
+        model,
+        pd,
+        local,
+        peer: _peer,
+    } = async_setup();
+    let src = frozen(&pd);
+    let dst = pd.alloc::<u8>(SIZE).unwrap().expose().unwrap();
+    let to = dst.remote();
+    let mut tx = local.sink();
+    let mut ok = 0usize;
+    block_on(async {
+        for _ in 0..rounds {
+            for _ in 0..TRAIN {
+                tx.feed(WriteOp::new(src.slice(..), to)).await.unwrap();
+            }
+            tx.flush().await.unwrap();
+            model.run();
+            local.poll();
+            ok += 1;
+        }
+    });
+    black_box(ok);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let which = args.get(1).map(String::as_str).unwrap_or("none");
@@ -784,13 +901,16 @@ fn main() {
         "careful" => careful(rounds),
         "batch_careful" => batch_careful(rounds),
         "train_careful" => train_careful(rounds),
-        "take" => take(rounds),
         "eventloop" => eventloop(rounds),
+        "poll_one" => poll_one(rounds),
+        "engine" => engine_loop(rounds),
+        "take" => take(rounds),
         "batch" => batch(rounds),
         "train" => train(rounds),
         "async" => async_round(rounds),
         "async_batch" => async_batch(rounds),
         "async_train" => async_train(rounds),
+        "sink" => sink(rounds),
         other => panic!("no workload {other}"),
     }
 }

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use safeverbs_core::model::Model;
 use safeverbs_core::verbs::Verbs;
 use safeverbs_core::{
-    Access, Buf, Completed, Completion, CompletionError, ConnectAttr, Context, Nic, Pd, QpCaps,
-    QpKey, RC, Seq, Status, Worker, WrOp,
+    Access, Buf, Completed, Completion, CompletionError, ConnectAttr, Context, Engine, Nic, Pd,
+    QpCaps, QpKey, RC, Seq, Status, WrOp,
 };
 
 /// How long a request may take to complete on a real device.
@@ -31,7 +31,7 @@ fn rxe() -> Option<Context<Verbs>> {
 }
 
 /// A worker on `ctx` with two RC QPs connected to each other; the first.
-fn connected<C, N: Nic>(ctx: &Context<N>) -> (Pd<N>, Worker<C, N>, QpKey<RC>) {
+fn connected<C, N: Nic>(ctx: &Context<N>) -> (Pd<N>, Engine<C, N>, QpKey<RC>) {
     let pd = ctx.alloc_pd().unwrap();
     let caps = QpCaps {
         max_send_wr: 16,
@@ -40,9 +40,9 @@ fn connected<C, N: Nic>(ctx: &Context<N>) -> (Pd<N>, Worker<C, N>, QpKey<RC>) {
         max_recv_sge: 1,
         max_inline_data: 0,
     };
-    let mut worker = Worker::new(&pd, 64).unwrap();
-    let local = worker.create_qp::<RC>(caps, 4).unwrap();
-    let peer = worker.create_qp::<RC>(caps, 4).unwrap();
+    let mut worker = Engine::new(ctx, 64).unwrap();
+    let local = worker.create_qp::<RC>(&pd, caps, 4).unwrap();
+    let peer = worker.create_qp::<RC>(&pd, caps, 4).unwrap();
     let port = ctx.port(1).unwrap();
     let gid_index = match std::env::var("SAFEVERBS_TEST_GID_INDEX") {
         Ok(i) if port.ethernet => Some(i.parse().expect("SAFEVERBS_TEST_GID_INDEX")),
@@ -71,7 +71,7 @@ fn connected<C, N: Nic>(ctx: &Context<N>) -> (Pd<N>, Worker<C, N>, QpKey<RC>) {
 }
 
 /// Polls until request `seq` of `qp`'s send queue completes.
-fn wait_send<C, N: Nic>(worker: &mut Worker<C, N>, qp: QpKey<RC>, seq: Seq) -> Completion<C, N> {
+fn wait_send<C, N: Nic>(worker: &mut Engine<C, N>, qp: QpKey<RC>, seq: Seq) -> Completion<C, N> {
     let start = Instant::now();
     loop {
         worker.progress();
@@ -125,7 +125,7 @@ fn error_in_a_batch<N: Nic>(ctx: Context<N>, bad: usize) {
     worker.commit(local).unwrap();
 
     let done = wait_send(&mut worker, local, batch);
-    assert_eq!(done.ctx, "the batch");
+    assert_eq!(done.wr_id, "the batch");
     let Err(CompletionError::Failed {
         status, position, ..
     }) = done.result
@@ -142,7 +142,7 @@ fn error_in_a_batch<N: Nic>(ctx: Context<N>, bad: usize) {
     assert!(worker.take_send(local, batch).is_none(), "taken once");
     drop(done);
     let done = wait_send(&mut worker, local, after);
-    assert_eq!(done.ctx, "the WRITE after it");
+    assert_eq!(done.wr_id, "the WRITE after it");
     assert_eq!(
         done.result.unwrap_err().status(),
         Some(Status::WR_FLUSH_ERR)

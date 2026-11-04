@@ -63,6 +63,8 @@ pub(crate) struct Region<N: Nic> {
     ptr: NonNull<u8>,
     layout: Layout,
     lkey: u32,
+    /// The number of its protection domain ([`Pd::id`]), which every post compares.
+    pd_id: u64,
     /// Retained with the MR and allocation if revocation fails or unwinds.
     pd: ManuallyDrop<Pd<N>>,
     /// Allocation identity retained with the registration (proof only).
@@ -103,6 +105,7 @@ impl<N: Nic> Region<N> {
                     mr: ManuallyDrop::new(mr),
                     ptr,
                     layout,
+                    pd_id: pd.id(),
                     pd: ManuallyDrop::new(pd.clone()),
                     deallocation,
                 }),
@@ -227,8 +230,9 @@ impl<T, N: Nic> BufMut<T, N> {
     }
 
     /// The protection domain it is registered in.
+    #[inline]
     pub fn pd_id(&self) -> u64 {
-        self.raw.pd().id()
+        self.raw.region.pd_id
     }
 
     /// Splits into `[0, mid)` and `[mid, len)`.
@@ -327,12 +331,13 @@ impl<T, N: Nic> BufMut<T, N> {
     ///     let _ = buf.into_part();
     /// }
     /// ```
+    #[inline]
     pub fn into_part(self) -> Part<N>
     where
         T: IntoBytes,
     {
         let lkey = self.raw.region.lkey;
-        let pd = self.raw.pd().id();
+        let pd = self.raw.region.pd_id;
         Part::unique(self.raw, lkey, pd)
     }
 
@@ -408,8 +413,9 @@ impl<T, N: Nic> Iterator for Chunks<T, N> {
 
 impl<T, N: Nic> Buf<T, N> {
     /// The protection domain it is registered in.
+    #[inline]
     pub fn pd_id(&self) -> u64 {
-        self.frozen.raw.pd().id()
+        self.frozen.raw.region.pd_id
     }
 
     /// The elements `range` of it, sharing the memory.
@@ -417,6 +423,7 @@ impl<T, N: Nic> Buf<T, N> {
     /// # Panics
     ///
     /// If the range is not within it.
+    #[inline]
     pub fn slice(&self, range: impl RangeBounds<usize>) -> Buf<T, N> {
         let start = match range.start_bound() {
             Bound::Included(&s) => s,
@@ -454,6 +461,7 @@ impl<T, N: Nic> Buf<T, N> {
     ///
     /// If the byte length exceeds `u32::MAX`, the native SGE limit. Slice a larger
     /// buffer before lending it.
+    #[inline]
     pub fn into_part(self) -> Part<N>
     where
         T: IntoBytes + Immutable,
@@ -471,6 +479,7 @@ impl<T, N: Nic> Buf<T, N> {
 
     /// Lends this frozen view as one SGE, returning it unchanged if its byte
     /// length exceeds `u32::MAX`. Slice a larger view before lending it.
+    #[inline]
     pub fn try_into_part(self) -> Result<Part<N>, Self>
     where
         T: IntoBytes + Immutable,
@@ -685,8 +694,21 @@ impl<N: Nic> Leases<N> {
     /// Takes back the first unique buffer (of a receive, READ or atomic) as
     /// a `BufMut<T>`; `None` if there is none or its bytes cannot hold
     /// `[T]`.
+    #[inline]
     pub fn into_buf_mut<T: FromBytes>(self) -> Option<BufMut<T, N>> {
         match self.into_unique_raw() {
+            Some(raw) if raw.fits::<T>() => Some(BufMut::from_raw(raw)),
+            _ => None,
+        }
+    }
+}
+
+impl<N: Nic> Leases<N> {
+    /// Takes the first unique buffer out as a `BufMut<T>`, leaving the others; `None` if there is
+    /// none or its bytes cannot hold `[T]` (it is released then).
+    #[inline(always)]
+    pub fn take_buf_mut<T: FromBytes>(&mut self) -> Option<BufMut<T, N>> {
+        match self.take_unique_raw() {
             Some(raw) if raw.fits::<T>() => Some(BufMut::from_raw(raw)),
             _ => None,
         }

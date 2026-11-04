@@ -17,12 +17,12 @@
 //! - the internal `trusted` module: verbs with contracts from the NIC model;
 //! - the internal `wr_id` module: the `wr_id` of a WQE and how a completion is
 //!   routed back by it, verified;
-//! - the internal `hw` module: the hardware side of a worker (its CQ, its QPs' queues and
+//! - the internal `hw` module: the hardware side of an engine (its CQ, its QPs' queues and
 //!   rings, its share of the NIC model), verified against the trusted verbs:
 //!   every verb meets the model's precondition, the rings stay coupled to the
 //!   model's queues, and QPs are destroyed only once drained;
-//! - [`worker`]: a completion queue and the queue pairs attached to it,
-//!   driven synchronously ([`Worker`]): post requests into the rings and the
+//! - [`engine`]: a completion queue and the queue pairs attached to it,
+//!   driven synchronously and by index ([`Engine`]): post requests into the rings and the
 //!   hardware queues, commit them with one doorbell, poll the CQ, and get
 //!   each request's context, result and buffers back.
 //!
@@ -40,12 +40,13 @@
 //! shared frozen buffer (read only until every handle is gone); no reference
 //! to memory a peer may write is ever formed, only a volatile copy of it into
 //! a type that accepts any bytes. Rings never let more
-//! WQEs be in flight than the queues hold, and a worker's CQ reserves room
+//! WQEs be in flight than the queues hold, and an engine's CQ reserves room
 //! for every completion its QPs' queues may produce.
 
 #![warn(missing_docs)]
 
 pub mod buf;
+pub mod engine;
 pub mod error;
 pub(crate) mod hw;
 pub mod model;
@@ -57,10 +58,10 @@ pub mod transport;
 pub(crate) mod trusted;
 pub mod verbs;
 pub mod wc;
-pub mod worker;
 pub(crate) mod wr_id;
 
 pub use buf::{Buf, BufError, BufMut, Chunks, Exposed, Leases, Part, RingBuf};
+pub use engine::{Completion, DetachedError, Engine, PostError, QpKey, Queue, Request, Unposted};
 pub use error::{Error, Result};
 pub use nic::{
     Access, ConnectAttr, Endpoint, Gid, GidEntry, Nic, PortInfo, QpCaps, RemoteBuf, WrOp,
@@ -68,5 +69,4 @@ pub use nic::{
 pub use pd::{Context, Pd};
 pub use ring::Seq;
 pub use transport::{RC, Reliable, Transport, UC};
-pub use wc::{Completed, CompletionError, Received, Status, Wc};
-pub use worker::{Completion, DetachedError, PostError, QpKey, Queue, Request, Worker};
+pub use wc::{Completed, CompletionError, CompletionResult, Received, Status, Wc};

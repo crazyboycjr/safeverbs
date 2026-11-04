@@ -5,7 +5,7 @@
 //! `scripts/rxe.sh up`) the demos use that RDMA device; otherwise they run
 //! on SafeVerbs' simulated NIC, which needs no hardware.
 
-use safeverbs::{Context, LocalQp, Model, Nic, Pd, QueuePairBuilder, Transport, Verbs};
+use safeverbs::{AsyncQp, Context, Model, Nic, Pd, QueuePairBuilder, Transport, Verbs};
 
 /// Runs `demo` on the device `SAFEVERBS_DEVICE` names, else on the model.
 pub fn run(demo: impl Demo) -> Result<(), Box<dyn std::error::Error>> {
@@ -24,7 +24,7 @@ pub trait Demo {
 /// Two QPs of `pd` connected to each other. Across machines, each side
 /// builds one and the endpoints travel over the network (see the examples).
 #[allow(dead_code)]
-pub fn pair<T: Transport, N: Nic>(pd: &Pd<N>) -> safeverbs::Result<(LocalQp<T, N>, LocalQp<T, N>)> {
+pub fn pair<T: Transport, N: Nic>(pd: &Pd<N>) -> safeverbs::Result<(AsyncQp<T, N>, AsyncQp<T, N>)> {
     let a = QueuePairBuilder::<T, N>::new(pd).build()?;
     let b = QueuePairBuilder::<T, N>::new(pd).build()?;
     let (ea, eb) = (a.endpoint(), b.endpoint());

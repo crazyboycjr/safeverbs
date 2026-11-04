@@ -1,5 +1,5 @@
-//! Workers on the simulated NIC ([`Model`]): several QPs on one CQ, driven
-//! by the event loop ([`Worker::poll`]) through random operations, dropped
+//! Engines on the simulated NIC ([`Model`]): several QPs on one CQ, driven
+//! by the event loop ([`Engine::poll`]) through random operations, dropped
 //! (detached) requests, injected errors, flushes and refused doorbells.
 //!
 //! Throughout, every ring's invariants hold and the model's CQ is never
@@ -15,8 +15,8 @@ use std::rc::Rc;
 
 use safeverbs_core::model::Model;
 use safeverbs_core::{
-    Access, Buf, BufMut, Completed, CompletionError, ConnectAttr, Context, Pd, QpCaps, QpKey,
-    Queue, RC, Received, Status, Worker, WrOp,
+    Access, Buf, BufMut, Completed, CompletionError, ConnectAttr, Context, Engine, Pd, QpCaps,
+    QpKey, Queue, RC, Received, Status, WrOp,
 };
 
 /// A context of an owned type: it counts its drops, to check that every one
@@ -93,10 +93,13 @@ fn attr() -> ConnectAttr {
 
 /// `pairs` pairs of RC QPs on one worker, each connected to the other QP
 /// of its pair; the worker's CQ holds exactly their queues.
-fn worker(pd: &Pd<Model>, pairs: usize, depth: u32) -> (Worker<Job, Model>, Vec<QpKey<RC>>) {
-    let mut w = Worker::new(pd, (4 * pairs) as u32 * depth).unwrap();
+fn worker(pd: &Pd<Model>, pairs: usize, depth: u32) -> (Engine<Job, Model>, Vec<QpKey<RC>>) {
+    let mut w = Engine::new(pd.context(), (4 * pairs) as u32 * depth).unwrap();
     let qps: Vec<QpKey<RC>> = (0..2 * pairs)
-        .map(|_| w.create_qp::<RC>(caps(depth), depth.div_ceil(2)).unwrap())
+        .map(|_| {
+            w.create_qp::<RC>(pd, caps(depth), depth.div_ceil(2))
+                .unwrap()
+        })
         .collect();
     for pair in qps.chunks(2) {
         let (ea, eb) = (
@@ -228,7 +231,7 @@ fn event_loop_on_several_qps() {
                         // Refused: its context and buffers come back at once.
                         Err(e) => {
                             refused += 1;
-                            assert_eq!(e.ctx.id, id);
+                            assert_eq!(e.wr_id.id, id);
                             assert!(!e.leases.is_empty());
                         }
                     }
@@ -264,7 +267,7 @@ fn event_loop_on_several_qps() {
                         }
                         Err(e) => {
                             refused += 1;
-                            assert_eq!(e.ctx.id, id);
+                            assert_eq!(e.wr_id.id, id);
                             let back = e.leases.into_buf_mut::<u8>().unwrap();
                             assert_eq!(back.as_ptr() as usize, ptr);
                         }
@@ -288,7 +291,7 @@ fn event_loop_on_several_qps() {
                             );
                         }
                         Err(e) => {
-                            assert_eq!(e.ctx.id, id);
+                            assert_eq!(e.wr_id.id, id);
                             free.push(e.leases.into_buf_mut().unwrap());
                         }
                     }
@@ -324,14 +327,14 @@ fn event_loop_on_several_qps() {
                 }
                 // The event loop.
                 _ => {
-                    w.poll(|w, c| {
+                    w.poll(32, |w, c| {
                         let e = expected.remove(&(c.qp, c.queue, c.seq)).unwrap_or_else(|| {
                             panic!(
                                 "seed {seed} step {step}: an unknown or repeated completion {:?}",
                                 (c.qp, c.queue, c.seq, c.result)
                             )
                         });
-                        assert_eq!(c.ctx.id, e.job, "seed {seed}: another request's context");
+                        assert_eq!(c.wr_id.id, e.job, "seed {seed}: another request's context");
                         assert!(seen.insert(e.job), "seed {seed}: a context came back twice");
                         // In each queue's order, but for refused requests, which come at once.
                         if c.result != Err(CompletionError::Refused) {
@@ -414,11 +417,11 @@ fn event_loop_on_several_qps() {
         let mut rounds = 0;
         while !expected.is_empty() {
             model.run();
-            w.poll(|_, c| {
+            w.poll(32, |_, c| {
                 let e = expected
                     .remove(&(c.qp, c.queue, c.seq))
                     .expect("a known request");
-                assert_eq!(c.ctx.id, e.job, "seed {seed}: another request's context");
+                assert_eq!(c.wr_id.id, e.job, "seed {seed}: another request's context");
                 assert!(seen.insert(e.job), "seed {seed}: a context came back twice");
             });
             rounds += 1;
@@ -463,7 +466,7 @@ fn event_loop_on_several_qps() {
     assert!(delivered > 2000 && failed > 100 && refused > 20);
 }
 
-/// Workers and QPs removed or dropped at random moments, with work in
+/// Engines and QPs removed or dropped at random moments, with work in
 /// flight: sends signaled or not, batches, READs, receives, dropped
 /// requests, errors, flushes and refused doorbells. The model panics if a
 /// QP is destroyed with a WQE not retired by a polled completion (M's
@@ -561,7 +564,7 @@ fn removing_busy_qps_and_dropping_busy_workers() {
                     }
                 }
                 _ => {
-                    w.poll(|_, c| drop(c));
+                    w.poll(32, |_, c| drop(c));
                 }
             }
         }
@@ -629,11 +632,11 @@ fn contexts_come_back_with_their_own_requests() {
     let mut rounds = 0;
     while !want.is_empty() {
         model.run();
-        w.poll(|_, c| {
+        w.poll(32, |_, c| {
             let (qp, queue, keeper) = want
-                .remove(&c.ctx.id)
-                .unwrap_or_else(|| panic!("job {} came back twice", c.ctx.id));
-            assert_eq!((c.qp, c.queue), (qp, queue), "job {}", c.ctx.id);
+                .remove(&c.wr_id.id)
+                .unwrap_or_else(|| panic!("job {} came back twice", c.wr_id.id));
+            assert_eq!((c.qp, c.queue), (qp, queue), "job {}", c.wr_id.id);
             assert!(c.result.is_ok(), "{:?}", c.result);
             *delivered.borrow_mut() += 1;
             if let Some(keeper) = keeper {
@@ -674,7 +677,7 @@ fn a_refused_request_is_not_a_flush() {
     let c = w.take_send(a, refused).unwrap();
     assert_eq!(c.result, Err(CompletionError::Refused));
     assert_eq!(c.result.unwrap_err().status(), None);
-    assert_eq!(c.ctx.id, first_id);
+    assert_eq!(c.wr_id.id, first_id);
     drop(c);
     // The one without an owner reports the same, by its error.
     let detached = w.take_send_error(a).unwrap();

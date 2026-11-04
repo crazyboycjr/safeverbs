@@ -644,6 +644,9 @@ impl Drop for ModelMr {
 }
 
 /// A thread domain of the model (QPs of the model take no locks anyway).
+pub struct ModelTd;
+
+/// A parent domain of the model.
 pub struct ModelDomain;
 
 /// A completion queue of the model; polling it carries out work.
@@ -822,6 +825,7 @@ unsafe impl Nic for Model {
     type Mr = ModelMr;
     type Cq = ModelCq;
     type Qp = ModelQp;
+    type Td = ModelTd;
     type Domain = ModelDomain;
 
     fn name(&self) -> &str {
@@ -927,7 +931,11 @@ unsafe impl Nic for Model {
         })
     }
 
-    fn alloc_domain(&self, _pd: &ModelPd) -> Option<ModelDomain> {
+    fn alloc_td(&self) -> Option<ModelTd> {
+        Some(ModelTd)
+    }
+
+    fn alloc_domain(&self, _pd: &ModelPd, _td: &ModelTd) -> Option<ModelDomain> {
         Some(ModelDomain)
     }
 

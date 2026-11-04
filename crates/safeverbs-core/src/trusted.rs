@@ -49,7 +49,7 @@ use crate::nic::{
     ConnectAttr, DeviceCaps, Endpoint, Nic as Device, NicCq, NicQp, QpCaps, QpType, RemoteBuf, Sge,
     WrOp,
 };
-use crate::pd::Pd;
+use crate::pd::{Context, Pd};
 use crate::wc::Wc;
 
 verus! {
@@ -137,6 +137,8 @@ pub trait ExNic: Send + Sync + Sized + 'static {
     type Qp: NicQp + 'static;
 
     /// A thread domain.
+    type Td: Send + 'static;
+    /// A parent domain.
     type Domain: Send + 'static;
 }
 
@@ -435,24 +437,24 @@ pub uninterp spec fn spec_device_caps<N: Device>(pd: Pd<N>) -> DeviceCaps;
 
 /// The limits of the device of `pd`.
 #[verifier::external_body]
-pub fn device_caps<N: Device>(pd: &Pd<N>) -> (caps: DeviceCaps)
+pub fn device_caps<N: Device>(ctx: &Context<N>) -> (caps: DeviceCaps)
     ensures
-        caps == spec_device_caps(*pd),
+        caps == spec_device_caps(*ctx),
 {
-    pd.context().nic().caps()
+    ctx.nic().caps()
 }
 
-/// `ibv_create_cq_ex` (single-threaded) on the device of `pd`: a worker's CQ
+/// `ibv_create_cq_ex` (single-threaded) on the device of `ctx`: an engine's CQ
 /// of `entries` entries, and its token, with the device's limits as M has
 /// them. M's `create_cq` with a name never used, after whatever the device
 /// went through before; the worker's share is that CQ and QP names no other
 /// worker has, none used before. This is where tokens come from.
 #[verifier::external_body]
-pub fn create_cq<N: Device>(pd: &Pd<N>, entries: u32) -> (r: Result<
+pub fn create_cq<N: Device>(ctx: &Context<N>, entries: u32) -> (r: Result<
     (N::Cq, DeviceCaps, Tracked<NicToken>),
 >)
     requires
-        1 <= entries <= spec_device_caps(*pd).max_cqe,
+        1 <= entries <= spec_device_caps(*ctx).max_cqe,
     ensures
         r matches Ok((cq, caps, t)) ==> {
             let m = t@.nic();
@@ -462,25 +464,15 @@ pub fn create_cq<N: Device>(pd: &Pd<N>, entries: u32) -> (r: Result<
             &&& cq_of(cq) == sh.cq
             &&& m.cqs[sh.cq].cap == entries
             &&& m.cqs[sh.cq].reserved.len() == 0
-            &&& t@.pd() == pd_of(*pd)
-            &&& m.pds.contains(t@.pd())
-            &&& caps == spec_device_caps(*pd)
+            &&& caps == spec_device_caps(*ctx)
             &&& caps_model(m.caps, caps)
             &&& fresh_worker(t@)
         },
 {
-    let nic = pd.context().nic();
+    let nic = ctx.nic();
     let caps = nic.caps();
     let cq = nic.create_cq(entries, true)?;
     Ok((cq, caps, Tracked::assume_new()))
-}
-
-/// `ibv_alloc_td` and `ibv_alloc_parent_domain` over `pd`, where the device
-/// has them. M does not model thread domains: they change which locks the
-/// driver takes, not what the NIC does.
-#[verifier::external_body]
-pub fn alloc_domain<N: Device>(pd: &Pd<N>) -> Option<N::Domain> {
-    pd.context().nic().alloc_domain(pd.raw())
 }
 
 /// The QP number the device gave a hardware QP (no meaning in M).
@@ -669,6 +661,7 @@ pub fn pd_id_of<N: Device>(pd: &Pd<N>) -> (id: u64)
 }
 
 /// A part's range of registered memory.
+#[inline(always)]
 pub fn part_sge_of<N: Device>(part: &Part<N>) -> (sge: Sge)
     ensures
         sge == part_sge(*part),
@@ -678,6 +671,7 @@ pub fn part_sge_of<N: Device>(part: &Part<N>) -> (sge: Sge)
 }
 
 /// A part's protection domain ([`Pd::id`]).
+#[inline(always)]
 pub fn part_pd_of<N: Device>(part: &Part<N>) -> (pd: u64)
     ensures
         pd == part_pd(*part),
@@ -687,6 +681,7 @@ pub fn part_pd_of<N: Device>(part: &Part<N>) -> (pd: u64)
 }
 
 /// Whether a part is unique, so that the NIC may write it.
+#[inline(always)]
 pub fn part_writable_of<N: Device>(part: &Part<N>) -> (writable: bool)
     ensures
         writable == part_writable(*part),
@@ -701,6 +696,7 @@ pub fn part_writable_of<N: Device>(part: &Part<N>) -> (writable: bool)
 /// it moves the token's view to the present, since the region may be newer
 /// than what the worker last saw.
 #[verifier::external_body]
+#[inline(always)]
 pub fn registered<N: Device>(_part: &Part<N>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
     requires
         part_pd(*_part) == pd_id(*_pd),
@@ -720,7 +716,8 @@ pub fn registered<N: Device>(_part: &Part<N>, _pd: &Pd<N>, Tracked(token): Track
 /// [`registered`] for several parts at once: every one's region is
 /// registered in the present view.
 #[verifier::external_body]
-pub fn registered_all<N: Device>(_parts: &Vec<Part<N>>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
+#[inline(always)]
+pub fn registered_all<N: Device>(_leases: &Leases<N>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
     requires
         forall|j: int| 0 <= j < _parts@.len() ==> part_pd(#[trigger] _parts@[j]) == pd_id(*_pd),
         pd_of(*_pd) == old(token).pd(),
@@ -738,6 +735,7 @@ pub fn registered_all<N: Device>(_parts: &Vec<Part<N>>, _pd: &Pd<N>, Tracked(tok
 }
 
 /// No leases (`Leases::default`).
+#[inline(always)]
 pub fn no_leases<N: Device>() -> (r: Leases<N>)
     ensures r.inv(), r.view().len() == 0, r.loans().len() == 0, r.wqes().len() == 0,
         r.fully_recorded(),
@@ -746,6 +744,7 @@ pub fn no_leases<N: Device>() -> (r: Leases<N>)
 }
 
 /// Keeps a part's lease among `leases` (`Leases::push`).
+#[inline(always)]
 pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>, Ghost(access): Ghost<safeverbs_spec::abs::Dir>)
     requires access is In ==> part_writable(part),
     ensures
@@ -762,6 +761,7 @@ pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>, Ghost(access
 
 /// `ibv_wr_start`: queue pair `q` starts writing send WRs.
 #[verifier::external_body]
+#[inline(always)]
 pub fn start<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracked<&mut NicToken>)
     requires
         qp_of(*old(qp)) == q,
@@ -780,6 +780,7 @@ pub fn start<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
 
 /// `ibv_wr_*`: writes one send WR; it is posted at the doorbell.
 #[verifier::external_body]
+#[inline(always)]
 pub fn post<Q: NicQp>(
     qp: &mut Q,
     wr_id: u64,
@@ -809,6 +810,7 @@ pub fn post<Q: NicQp>(
 /// `ibv_wr_complete`: rings the doorbell, posting the send WRs written since
 /// the start (M's `post_send` of that list), or, on error, none of them.
 #[verifier::external_body]
+#[inline(always)]
 pub fn doorbell<Q: NicQp>(
     qp: &mut Q,
     Ghost(q): Ghost<QpId>,
@@ -865,6 +867,7 @@ pub fn abort<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
 /// `ibv_post_recv` of one WR (M's `post_recv` of a list of one), or, on
 /// error, nothing.
 #[verifier::external_body]
+#[inline(always)]
 pub fn post_recv<Q: NicQp>(
     qp: &mut Q,
     wr_id: u64,
@@ -909,13 +912,15 @@ pub fn post_recv<Q: NicQp>(
 /// `ibv_poll_cq` on the CQ of the token's share: up to `out.len()` CQEs,
 /// each popped by M's `poll_cq` and reported in `out`, in order.
 #[verifier::external_body]
-pub fn poll<C: NicCq>(cq: &mut C, out: &mut [Wc], Tracked(token): Tracked<&mut NicToken>) -> (n:
+#[inline(always)]
+pub fn poll<C: NicCq>(cq: &mut C, out: &mut [Wc], limit: usize, Tracked(token): Tracked<&mut NicToken>) -> (n:
     usize)
     requires
         cq_of(*old(cq)) == old(token).share().cq,
+        limit <= old(out)@.len(),
     ensures
         cq_of(*final(cq)) == cq_of(*old(cq)),
-        n <= old(out)@.len(),
+        n <= limit,
         final(out)@.len() == old(out)@.len(),
         final(token).same_worker(old(token)),
         final(token).same_writings(old(token)),
@@ -927,7 +932,7 @@ pub fn poll<C: NicCq>(cq: &mut C, out: &mut [Wc], Tracked(token): Tracked<&mut N
             final(out)@.take(n as int),
         ),
 {
-    cq.poll(out)
+    cq.poll(&mut out[..limit])
 }
 
 } // verus!

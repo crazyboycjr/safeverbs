@@ -7,12 +7,11 @@
 //! `verbs.h` are reimplemented here as calls through the provider's function
 //! pointers in `ibv_qp_ex` and `ibv_cq_ex`, which is all they do.
 //!
-//! A worker asks for a thread domain (`ibv_alloc_td`) and a parent domain
-//! over it ([`VerbsDomain`]), on which mlx5 drops the locks of the QPs
-//! created there and gives them a doorbell of their own, which they share;
-//! on devices without thread domains (rxe) its QPs are plain ones. CQs
-//! polled by one thread at a time are created
-//! `IBV_CREATE_CQ_ATTR_SINGLE_THREADED`.
+//! An engine asks for a thread domain (`ibv_alloc_td`, [`VerbsTd`]) and, for each protection
+//! domain of its QPs, a parent domain over both ([`VerbsDomain`]), on which mlx5 drops the locks
+//! of the QPs created there and gives them a doorbell of their own, which they share; on devices
+//! without thread domains (rxe) its QPs are plain ones. CQs polled by one thread at a time are
+//! created `IBV_CREATE_CQ_ATTR_SINGLE_THREADED`.
 
 use core::ffi::CStr;
 use core::mem::zeroed;
@@ -257,25 +256,37 @@ impl NicCq for VerbsCq {
     }
 }
 
-/// A thread domain and a parent domain over a PD (`struct ibv_td`, and
-/// the `struct ibv_pd` of `ibv_alloc_parent_domain`).
-pub struct VerbsDomain {
+/// A thread domain (`struct ibv_td`).
+pub struct VerbsTd {
     td: *mut ffi::ibv_td,
-    parent: *mut ffi::ibv_pd,
 }
 
 // SAFETY: the domain is a handle; it moves with the QPs created on it,
 // which are used by one thread at a time.
+unsafe impl Send for VerbsTd {}
+
+impl Drop for VerbsTd {
+    fn drop(&mut self) {
+        // SAFETY: the parent domains over it and the QPs on them are gone (the engine drops
+        // them first).
+        unsafe { ffi::ibv_dealloc_td(self.td) };
+    }
+}
+
+/// A parent domain over a PD and a thread domain (the `struct ibv_pd` of
+/// `ibv_alloc_parent_domain`).
+pub struct VerbsDomain {
+    parent: *mut ffi::ibv_pd,
+}
+
+// SAFETY: as for the thread domain.
 unsafe impl Send for VerbsDomain {}
 
 impl Drop for VerbsDomain {
     fn drop(&mut self) {
-        // SAFETY: the QPs created on it are gone (the worker drops them
-        // first); the parent domain goes before its thread domain.
-        unsafe {
-            ffi::ibv_dealloc_pd(self.parent);
-            ffi::ibv_dealloc_td(self.td);
-        }
+        // SAFETY: the QPs created on it are gone (the engine drops them first); it goes
+        // before its PD and its thread domain.
+        unsafe { ffi::ibv_dealloc_pd(self.parent) };
     }
 }
 
@@ -486,6 +497,7 @@ unsafe impl Nic for Verbs {
     type Mr = VerbsMr;
     type Cq = VerbsCq;
     type Qp = VerbsQp;
+    type Td = VerbsTd;
     type Domain = VerbsDomain;
 
     fn name(&self) -> &str {
@@ -609,24 +621,31 @@ unsafe impl Nic for Verbs {
         }
     }
 
-    fn alloc_domain(&self, pd: &VerbsPd) -> Option<VerbsDomain> {
-        // SAFETY: a live context and PD, and filled attributes; the thread
-        // domain is released if the parent domain fails.
-        unsafe {
-            let mut td_attr = ffi::ibv_td_init_attr { comp_mask: 0 };
-            let td = ffi::ibv_alloc_td(self.ctx, &mut td_attr);
-            if td.is_null() {
-                return None;
-            }
-            let mut pd_attr: ffi::ibv_parent_domain_init_attr = zeroed();
-            pd_attr.pd = pd.pd;
-            pd_attr.td = td;
-            let parent = ffi::ibv_alloc_parent_domain(self.ctx, &mut pd_attr);
-            if parent.is_null() {
-                ffi::ibv_dealloc_td(td);
-                return None;
-            }
-            Some(VerbsDomain { td, parent })
+    fn alloc_td(&self) -> Option<VerbsTd> {
+        // SAFETY: a live context and a filled attribute.
+        let td = unsafe {
+            let mut attr = ffi::ibv_td_init_attr { comp_mask: 0 };
+            ffi::ibv_alloc_td(self.ctx, &mut attr)
+        };
+        if td.is_null() {
+            None
+        } else {
+            Some(VerbsTd { td })
+        }
+    }
+
+    fn alloc_domain(&self, pd: &VerbsPd, td: &VerbsTd) -> Option<VerbsDomain> {
+        // SAFETY: a live context, PD and thread domain, and a filled attribute.
+        let parent = unsafe {
+            let mut attr: ffi::ibv_parent_domain_init_attr = zeroed();
+            attr.pd = pd.pd;
+            attr.td = td.td;
+            ffi::ibv_alloc_parent_domain(self.ctx, &mut attr)
+        };
+        if parent.is_null() {
+            None
+        } else {
+            Some(VerbsDomain { parent })
         }
     }
 

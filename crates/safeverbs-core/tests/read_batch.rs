@@ -2,7 +2,7 @@
 
 use safeverbs_core::model::Model;
 use safeverbs_core::{
-    Access, Completed, CompletionError, ConnectAttr, Context, QpCaps, RC, Worker, WrOp,
+    Access, Completed, CompletionError, ConnectAttr, Context, Engine, QpCaps, RC, WrOp,
 };
 
 fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
@@ -11,7 +11,7 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
     const TAIL: usize = 7;
     let model = Model::new(83);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let mut worker: Worker<(), _> = Worker::new(&pd, 32).unwrap();
+    let mut worker: Engine<(), _> = Engine::new(pd.context(), 32).unwrap();
     let caps = QpCaps {
         max_send_wr: 8,
         max_recv_wr: 8,
@@ -20,8 +20,8 @@ fn two_read_result(signal: bool) -> Result<Completed, CompletionError> {
         max_inline_data: 0,
     };
     // Two WQEs fit below depth - max_batch, so finish(false) is unsignaled.
-    let local = worker.create_qp::<RC>(caps, 2).unwrap();
-    let peer = worker.create_qp::<RC>(caps, 2).unwrap();
+    let local = worker.create_qp::<RC>(&pd, caps, 2).unwrap();
+    let peer = worker.create_qp::<RC>(&pd, caps, 2).unwrap();
     let attr = ConnectAttr {
         port: 1,
         access: Access::LOCAL_WRITE | Access::REMOTE_READ,

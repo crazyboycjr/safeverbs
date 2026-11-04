@@ -15,7 +15,7 @@ mod common;
 
 use futures::executor::block_on;
 use futures::future::try_join;
-use safeverbs::{BufMut, Context, LocalQp, Nic, Pd, RC, Received};
+use safeverbs::{AsyncQp, BufMut, Context, Nic, Pd, RC, Received};
 
 const ITERS: u32 = 1000;
 const SIZE: usize = 4096;
@@ -25,7 +25,7 @@ struct Datapath;
 /// One side: post a receive, SEND the message (stamped with the round),
 /// wait for both, check what arrived, and go again with the same buffers.
 async fn side<N: Nic>(
-    qp: &LocalQp<RC, N>,
+    qp: &AsyncQp<RC, N>,
     pd: &Pd<N>,
     me: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {

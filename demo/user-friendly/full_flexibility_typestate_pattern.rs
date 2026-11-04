@@ -6,7 +6,7 @@
 //! - `PreparedQp<T>`: the QP exists (RESET); it has an endpoint to send to
 //!   the peer, and the only way forward is `handshake` with the peer's,
 //!   which moves it through INIT and RTR to RTS.
-//! - `LocalQp<T>`: connected; the data path is here and nowhere else.
+//! - `AsyncQp<T>`: connected; the data path is here and nowhere else.
 //!
 //! The lines commented out below do not compile; each says why.
 

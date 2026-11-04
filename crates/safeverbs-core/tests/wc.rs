@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use safeverbs_core::model::Model;
 use safeverbs_core::nic::{NicCq, NicQp, QpType, Sge};
 use safeverbs_core::{
-    Access, Completed, ConnectAttr, Context, Endpoint, Nic, Pd, QpCaps, QpKey, RC, Received,
-    RemoteBuf, Wc, Worker, WrOp,
+    Access, Completed, ConnectAttr, Context, Endpoint, Engine, Nic, Pd, QpCaps, QpKey, RC,
+    Received, RemoteBuf, Wc, WrOp,
 };
 
 /// Uses a genuine zero-SGE receive; the public buffer API posts one SGE.
@@ -160,7 +160,7 @@ fn attr<N: Nic>(ctx: &Context<N>) -> ConnectAttr {
 }
 
 /// A worker on `ctx` with two RC QPs connected to each other.
-fn pair<N: Nic>(ctx: &Context<N>) -> (Pd<N>, Worker<u32, N>, QpKey<RC>, QpKey<RC>) {
+fn pair<N: Nic>(ctx: &Context<N>) -> (Pd<N>, Engine<u32, N>, QpKey<RC>, QpKey<RC>) {
     let pd = ctx.alloc_pd().unwrap();
     let caps = QpCaps {
         max_send_wr: 8,
@@ -169,9 +169,9 @@ fn pair<N: Nic>(ctx: &Context<N>) -> (Pd<N>, Worker<u32, N>, QpKey<RC>, QpKey<RC
         max_recv_sge: 1,
         max_inline_data: 0,
     };
-    let mut worker = Worker::new(&pd, 32).unwrap();
-    let a = worker.create_qp::<RC>(caps, 1).unwrap();
-    let b = worker.create_qp::<RC>(caps, 1).unwrap();
+    let mut worker = Engine::new(ctx, 32).unwrap();
+    let a = worker.create_qp::<RC>(&pd, caps, 1).unwrap();
+    let b = worker.create_qp::<RC>(&pd, caps, 1).unwrap();
     let attr = attr(ctx);
     let (ea, eb) = (
         worker.endpoint(a, 1, attr.gid_index).unwrap(),
@@ -211,7 +211,7 @@ fn every_kind_of_receive<N: Nic>(ctx: Context<N>) {
     let mut got = Vec::new();
     let start = Instant::now();
     while got.len() < 10 {
-        worker.poll(|_, c| got.push((c.ctx, c.result, c.leases)));
+        worker.poll(32, |_, c| got.push((c.wr_id, c.result, c.leases)));
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "timed out with {} completions",

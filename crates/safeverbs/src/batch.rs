@@ -1,39 +1,37 @@
 //! Batches: several SENDs and WRITEs posted as one request.
 
-use safeverbs_core::Request;
-use safeverbs_core::{Buf, Error, Leases, Nic, Part, RemoteBuf, Transport, WrOp};
+use safeverbs_core::{Buf, Error, Leases, Nic, Part, PostError, RemoteBuf, Request, Seq};
+use safeverbs_core::{Transport, WrOp};
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::Verbs;
-use crate::backlog::Posted;
 
-/// The SENDs and WRITEs of one [`LocalQp::batch`](crate::LocalQp::batch),
-/// rung with one doorbell and completed with one completion.
+/// The SENDs and WRITEs of one [`AsyncQp::batch`](crate::AsyncQp::batch) or
+/// [`LocalQp::post_batch`](crate::LocalQp::post_batch), rung with one doorbell and completed with
+/// one completion. `C` is what the request carries: the `wr_id` of a `LocalQp`.
 ///
-/// When the send queue has room they are written into it as they are
+/// When the send queue has room they go into the request as they are
 /// added; otherwise they are collected and posted, in order, once there is
 /// room. The methods return nothing: the first invalid operation (another
 /// protection domain, a WRITE longer than its destination) is skipped and
 /// later ones are ignored; what was added before it still goes out, and the
-/// batch's future yields the error.
-pub struct Batch<'a, T: Transport, N: Nic = Verbs> {
-    target: Target<'a, T, N>,
+/// batch yields the error.
+pub struct Batch<'a, T: Transport, N: Nic = Verbs, C = ()> {
+    target: Target<'a, T, N, C>,
     error: Option<Error>,
     ops: usize,
 }
 
-/// Where a batch's operations go. (A direct request keeps its held WQE
-/// inline: the batch lives on the stack only while its closure runs.)
-#[allow(clippy::large_enum_variant)]
-enum Target<'a, T: Transport, N: Nic> {
-    /// Written into the send queue as added.
-    Direct(Request<'a, T, (), N>),
+/// Where a batch's operations go.
+enum Target<'a, T: Transport, N: Nic, C> {
+    /// Into the request as added.
+    Direct(Request<'a, T, C, N>),
     /// Collected for later.
     Collect(Vec<(WrOp, Part<N>)>),
 }
 
-impl<'a, T: Transport, N: Nic> Batch<'a, T, N> {
-    pub(crate) fn direct(req: Request<'a, T, (), N>) -> Self {
+impl<'a, T: Transport, N: Nic, C> Batch<'a, T, N, C> {
+    pub(crate) fn direct(req: Request<'a, T, C, N>) -> Self {
         Batch {
             target: Target::Direct(req),
             error: None,
@@ -49,21 +47,27 @@ impl<'a, T: Transport, N: Nic> Batch<'a, T, N> {
         }
     }
 
-    /// Finishes a direct batch and rings the doorbell.
-    pub(crate) fn post(self) -> Posted<N> {
+    /// Finishes a direct batch, with `ctx` to come back with its completion, and rings the
+    /// doorbell.
+    pub(crate) fn post(self, ctx: C) -> Result<Seq, PostError<C, N>> {
         let Batch { target, error, .. } = self;
         let Target::Direct(req) = target else {
             unreachable!("a collected batch is queued, not posted")
         };
-        match error {
+        let error = match error {
             Some(error) => {
                 // What was added before the error goes out, owned by nobody.
                 let _ = req.submit_detached();
-                Err((error, Leases::default()))
+                error
             }
-            None if req.is_empty() => Err((Error::Invalid("an empty batch"), Leases::default())),
-            None => req.submit(true, ()).map_err(|e| (e.error, e.leases)),
-        }
+            None if req.is_empty() => Error::Invalid("an empty batch"),
+            None => return req.submit(true, ctx),
+        };
+        Err(PostError {
+            error,
+            wr_id: ctx,
+            leases: Leases::default(),
+        })
     }
 
     /// The operations of a collected batch.

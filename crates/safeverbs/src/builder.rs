@@ -1,18 +1,19 @@
 //! Connection setup in typestate: a [`QueuePairBuilder`] configures a QP,
-//! [`QueuePairBuilder::build_on`] creates it on a worker (or
-//! [`QueuePairBuilder::build`] on a worker of its own) as a [`PreparedQp`]
+//! [`QueuePairBuilder::build_on`] creates it on a completion queue (or
+//! [`QueuePairBuilder::build`] on one of its own) as a [`PreparedQp`]
 //! whose [`Endpoint`] goes to the peer, and [`PreparedQp::handshake`] with
-//! the peer's endpoint connects it into a [`LocalQp`]. Only connected QPs
+//! the peer's endpoint connects it into a [`LocalQp`](crate::LocalQp) or an
+//! [`AsyncQp`](crate::AsyncQp), by the kind of the CQ. Only connected QPs
 //! can post, and settings that only apply to RC exist only on RC builders.
 
 use core::marker::PhantomData;
 
 use safeverbs_core::{
-    Access, ConnectAttr, Endpoint, Error, Nic, Pd, QpCaps, QpKey, RC, Result, Transport, UC, Worker,
+    Access, ConnectAttr, Endpoint, Engine, Nic, QpCaps, QpKey, RC, Result, Transport, UC,
 };
 
-use crate::qp::QpGuard;
-use crate::{LocalQp, LocalWorker, Verbs};
+use crate::cq::{AsyncCq, Cq};
+use crate::{Pd, Verbs};
 
 /// A builder of RC QPs.
 pub type RcQueuePairBuilder<N = Verbs> = QueuePairBuilder<RC, N>;
@@ -82,6 +83,12 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
         }
     }
 
+    /// The sizes of the QP's queues.
+    pub fn set_caps(&mut self, caps: QpCaps) -> &mut Self {
+        self.caps = caps;
+        self
+    }
+
     /// WQEs in the send queue (`max_send_wr`).
     pub fn set_send_depth(&mut self, depth: u32) -> &mut Self {
         self.caps.max_send_wr = depth;
@@ -121,7 +128,7 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
     }
 
     /// The source GID index (RoCE); see `show_gids` or
-    /// [`Context::gids`](crate::Context::gids).
+    /// [`Context::gids`](safeverbs_core::Context::gids).
     pub fn set_gid_index(&mut self, gid_index: u8) -> &mut Self {
         self.gid_index = Some(Some(gid_index));
         self
@@ -158,50 +165,42 @@ impl<T: Transport, N: Nic> QueuePairBuilder<T, N> {
         self
     }
 
-    /// Creates the QP on a worker of its own, whose CQ holds exactly the
+    /// Creates the QP on a completion queue of its own for futures, which holds exactly the
     /// QP's queues, with the queues' sizes checked against the device.
-    pub fn build(&self) -> Result<PreparedQp<T, N>> {
+    pub fn build(&self) -> Result<PreparedQp<T, AsyncCq<N>>> {
         let cq_size = self.caps.max_send_wr.saturating_add(self.caps.max_recv_wr);
-        let worker = LocalWorker::new(&self.pd, cq_size)?;
-        self.build_on(&worker)
+        let cq = AsyncCq::new(self.pd.context(), cq_size)?;
+        self.build_on(&cq)
     }
 
-    /// Creates the QP on `worker`, attached to its CQ, with the queues'
-    /// sizes checked against the device. Fails with
-    /// [`Error::CqFull`](crate::Error::CqFull) if the CQ has no room left
-    /// for the QP's queues, and with
-    /// [`Error::PdMismatch`](crate::Error::PdMismatch) if the worker is of
-    /// another protection domain.
-    pub fn build_on(&self, worker: &LocalWorker<N>) -> Result<PreparedQp<T, N>> {
-        let state = worker.state();
-        let mut st = state.borrow_mut();
-        let (key, endpoint, attr) = self.build_in(&mut st.worker)?;
-        st.adopt(key);
-        drop(st);
+    /// Creates the QP on `cq`, attached to it, with the queues' sizes checked against the device.
+    /// Fails with [`Error::CqFull`](crate::Error::CqFull) if the CQ has no room left
+    /// for the QP's queues, and with [`Error::Invalid`](crate::Error::Invalid) if the CQ is of
+    /// another device.
+    pub fn build_on<C: Cq<Nic = N>>(&self, cq: &C) -> Result<PreparedQp<T, C>> {
+        let (key, endpoint, attr) = cq.with_engine(|engine| self.build_in(engine))?;
+        cq.adopt(key);
         Ok(PreparedQp {
-            guard: QpGuard::new(state.clone(), key),
+            cq: Some(cq.clone()),
+            key,
             attr,
             endpoint,
         })
     }
 
-    /// Creates the QP on a synchronous worker (the event loop's), with the
-    /// queues' sizes checked against the device; returns its key, how the
-    /// peer reaches it, and the attributes to connect it with
-    /// ([`Worker::connect`]) once the peer's endpoint is known. Fails as
+    /// Creates the QP on an engine, with the queues' sizes checked against the device; returns its
+    /// key, how the peer reaches it, and the attributes to connect it with
+    /// ([`Engine::connect`]) once the peer's endpoint is known. Fails as
     /// [`QueuePairBuilder::build_on`] does.
-    pub fn build_in<C>(&self, w: &mut Worker<C, N>) -> Result<(QpKey<T>, Endpoint, ConnectAttr)> {
+    pub fn build_in<C>(&self, w: &mut Engine<C, N>) -> Result<(QpKey<T>, Endpoint, ConnectAttr)> {
         let ctx = self.pd.context();
         let port = ctx.port(self.port)?;
         let gid_index = match self.gid_index {
             Some(g) => g,
             None => ctx.default_gid_index(self.port)?,
         };
-        if w.pd().id() != self.pd.id() {
-            return Err(Error::PdMismatch);
-        }
         let max_batch = self.max_batch.unwrap_or((self.caps.max_send_wr / 2).max(1));
-        let key = w.create_qp::<T>(self.caps, max_batch)?;
+        let key = w.create_qp::<T>(self.pd.as_raw(), self.caps, max_batch)?;
         let endpoint = match w.endpoint(key, self.port, gid_index) {
             Ok(e) => e,
             Err(e) => {
@@ -273,27 +272,38 @@ impl<N: Nic> QueuePairBuilder<RC, N> {
 /// A created QP, not connected yet: send its [`PreparedQp::endpoint`] to
 /// the peer and [`PreparedQp::handshake`] with the peer's.
 ///
-/// Dropping it removes the QP from its worker.
-pub struct PreparedQp<T: Transport, N: Nic = Verbs> {
-    guard: QpGuard<T, N>,
+/// Dropping it removes the QP from its CQ.
+pub struct PreparedQp<T: Transport, C: Cq> {
+    /// The CQ; `None` once handed on.
+    cq: Option<C>,
+    key: QpKey<T>,
     attr: ConnectAttr,
     endpoint: Endpoint,
 }
 
-impl<T: Transport, N: Nic> PreparedQp<T, N> {
+impl<T: Transport, C: Cq> Drop for PreparedQp<T, C> {
+    fn drop(&mut self) {
+        if let Some(cq) = self.cq.take() {
+            cq.remove(self.key);
+        }
+    }
+}
+
+impl<T: Transport, C: Cq> PreparedQp<T, C> {
     /// How the peer reaches this QP.
     pub fn endpoint(&self) -> Endpoint {
         self.endpoint
     }
 
-    /// Connects to the peer at `remote` (INIT, RTR, RTS).
-    pub fn handshake(self, remote: Endpoint) -> Result<LocalQp<T, N>> {
-        let key = self.guard.key;
-        self.guard
-            .state()
-            .borrow_mut()
-            .worker
-            .connect(key, &self.attr, &remote)?;
-        Ok(LocalQp::new(self.guard, self.endpoint))
+    /// Connects to the peer at `remote` (INIT, RTR, RTS), which gives the handle that posts.
+    pub fn handshake(mut self, remote: Endpoint) -> Result<C::Qp<T>> {
+        let key = self.key;
+        let attr = self.attr;
+        self.cq
+            .as_ref()
+            .expect("a QP's completion queue")
+            .with_engine(|engine| engine.connect(key, &attr, &remote))?;
+        let cq = self.cq.take().expect("a QP's completion queue");
+        Ok(cq.into_qp(key, self.endpoint))
     }
 }

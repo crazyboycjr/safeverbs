@@ -10,13 +10,15 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context as TaskContext, Poll};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures::task::noop_waker;
 use futures::{SinkExt, StreamExt};
-use safeverbs::sync::{ConnectAttr, QpCaps, QpKey, Worker, WrOp};
+use safeverbs::raw::{ConnectAttr, Engine, QpCaps, QpKey, WrOp};
 use safeverbs::{
-    Access, Buf, Completed, CompletionError, Context, Error, LocalQp, LocalWorker, Nic, Pd,
+    Access, AsyncQp, Buf, Completed, CompletionError, Context, Error, LocalCq, LocalQp, Nic, Pd,
     QueuePairBuilder, RC, Received, Status, Transport, UC, WriteOp,
 };
 
@@ -54,7 +56,7 @@ fn device() -> Option<Context> {
 }
 
 /// Two QPs of the test device connected to each other, and their PD.
-fn pair<T: Transport>(ctx: &Context, depth: u32) -> (Pd, LocalQp<T>, LocalQp<T>) {
+fn pair<T: Transport>(ctx: &Context, depth: u32) -> (Pd, AsyncQp<T>, AsyncQp<T>) {
     let pd = ctx.alloc_pd().unwrap();
     let build = || {
         let mut b = QueuePairBuilder::<T>::new(&pd);
@@ -116,7 +118,7 @@ fn uc_send_recv_and_send_with_imm() {
     send_recv::<UC>();
 }
 
-fn write_and_write_imm<T: Transport>(ctx: &Context) -> (Pd, LocalQp<T>, LocalQp<T>) {
+fn write_and_write_imm<T: Transport>(ctx: &Context) -> (Pd, AsyncQp<T>, AsyncQp<T>) {
     let (pd, a, b) = pair::<T>(ctx, 64);
     let dst = pd.alloc::<u8>(8192).unwrap().expose().unwrap();
     let src = filled(&pd, 8192, 2);
@@ -418,7 +420,7 @@ fn uc_forced_error_flushes_sends() {
 fn shared_qp_from_threads() {
     let Some(ctx) = device() else { return };
     let (pd, a, _b) = pair::<RC>(&ctx, 64);
-    let a = a.into_shared().ok().expect("alone on its worker");
+    let a = a.into_shared().ok().expect("alone on its CQ");
     let dst = pd.alloc::<u8>(4 * 64).unwrap().expose().unwrap();
     let remote = dst.remote();
     std::thread::scope(|s| {
@@ -540,25 +542,25 @@ fn refused_requests_are_not_flushed() {
         max_recv_sge: 1,
         max_inline_data: 0,
     };
-    let mut w: Worker<&str> = Worker::new(&pd, 32).unwrap();
-    let qp: QpKey<RC> = w.create_qp(caps, 2).unwrap();
+    let mut w: Engine<&str> = Engine::new(&ctx, 32).unwrap();
+    let qp: QpKey<RC> = w.create_qp(pd.as_raw(), caps, 2).unwrap();
     let src = filled(&pd, 8, 1);
     let e = w.send(qp, src.slice(..), "own doorbell").unwrap_err();
     assert_eq!(e.error, Error::NotConnected);
-    assert_eq!((e.ctx, e.leases.len()), ("own doorbell", 1));
+    assert_eq!((e.wr_id, e.leases.len()), ("own doorbell", 1));
     drop(e);
     let mut req = w.request(qp);
     req.push(WrOp::Send, src.slice(..).into_part()).unwrap();
     let staged = req.finish(true, "staged").unwrap();
     assert_eq!(w.commit(qp), Err(Error::NotConnected));
     let mut got = Vec::new();
-    w.poll(|_, c| got.push((c.seq, c.ctx, c.result)));
+    w.poll(32, |_, c| got.push((c.seq, c.wr_id, c.result)));
     assert_eq!(got, [(staged, "staged", Err(CompletionError::Refused))]);
     drop(w);
     assert!(src.try_thaw().is_ok());
 }
 
-/// What a request of [`event_loop_on_four_qps_of_one_worker`] was for: an owned value, which
+/// What a request of [`event_loop_on_four_qps_of_one_cq`] was for: an owned value, which
 /// counts its drops, so that the test sees each one come back exactly once.
 struct Job {
     kind: Kind,
@@ -581,12 +583,12 @@ impl Drop for Job {
     }
 }
 
-/// Four QPs on one worker, connected pairwise, driven by the event loop:
+/// Four QPs on one CQ, connected pairwise, driven by the event loop:
 /// SENDs into posted receives, WRITEs and READs on every QP at once, each
 /// completion handed to the loop with the context of its own request, on its
 /// own QP, and its buffers, which repost and post more.
 #[test]
-fn event_loop_on_four_qps_of_one_worker() {
+fn event_loop_on_four_qps_of_one_cq() {
     let Some(ctx) = device() else { return };
     let pd = ctx.alloc_pd().unwrap();
     let depth = 32;
@@ -597,8 +599,10 @@ fn event_loop_on_four_qps_of_one_worker() {
         max_recv_sge: 1,
         max_inline_data: 0,
     };
-    let mut w: Worker<Job> = Worker::new(&pd, 4 * 2 * depth).unwrap();
-    let qps: Vec<QpKey<RC>> = (0..4).map(|_| w.create_qp(caps, 8).unwrap()).collect();
+    let mut w: Engine<Job> = Engine::new(&ctx, 4 * 2 * depth).unwrap();
+    let qps: Vec<QpKey<RC>> = (0..4)
+        .map(|_| w.create_qp(pd.as_raw(), caps, 8).unwrap())
+        .collect();
     let attr = connect_attr(&ctx);
     let gid = gid_index(&ctx);
     for pair in qps.chunks(2) {
@@ -638,7 +642,7 @@ fn event_loop_on_four_qps_of_one_worker() {
     let mut posted = [0usize; 4];
     let mut done = [0usize; 4];
     let mut received = [0usize; 4];
-    let post = |w: &mut Worker<Job>, i: usize, posted: &mut [usize; 4]| {
+    let post = |w: &mut Engine<Job>, i: usize, posted: &mut [usize; 4]| {
         let qp = qps[i];
         let peer = i ^ 1;
         let len = 1 + posted[i] % 256;
@@ -669,10 +673,10 @@ fn event_loop_on_four_qps_of_one_worker() {
     }
     let start = Instant::now();
     while done.iter().any(|&d| d < OPS) || received.iter().any(|&r| r < OPS.div_ceil(3)) {
-        w.poll(|w, c| {
+        w.poll(32, |w, c| {
             let i = qps.iter().position(|q| q.index() == c.qp).unwrap();
-            assert_eq!(c.ctx.qp, i, "another QP's context");
-            let kind = c.ctx.kind;
+            assert_eq!(c.wr_id.qp, i, "another QP's context");
+            let kind = c.wr_id.kind;
             let result = c.result.unwrap_or_else(|e| panic!("{kind:?} failed: {e}"));
             match (kind, result) {
                 (Kind::Inbox, Completed::Received(Received::Message { len, imm: None })) => {
@@ -719,20 +723,20 @@ fn event_loop_on_four_qps_of_one_worker() {
     }
 }
 
-/// Four QPs on one worker, connected pairwise, with futures: every
+/// Four QPs on one CQ, connected pairwise, with futures: every
 /// future's poll drives the shared CQ for all of them.
 #[test]
-fn futures_on_four_qps_of_one_worker() {
+fn futures_on_four_qps_of_one_cq() {
     let Some(ctx) = device() else { return };
     let pd = ctx.alloc_pd().unwrap();
-    let worker = LocalWorker::new(&pd, 4 * 2 * 64).unwrap();
+    let cq = ctx.create_async_cq(4 * 2 * 64).unwrap();
     let build = || {
         let mut b = QueuePairBuilder::<RC>::new(&pd);
         b.set_send_depth(64).set_recv_depth(64);
         if let Some(i) = gid_index(&ctx) {
             b.set_gid_index(i);
         }
-        b.build_on(&worker).unwrap()
+        b.build_on(&cq).unwrap()
     };
     let mut qps = Vec::new();
     for _ in 0..2 {
@@ -805,7 +809,7 @@ fn futures_on_four_qps_of_one_worker() {
     }
 }
 
-/// Removing QPs and dropping a worker with work in flight drains each QP
+/// Removing QPs and dropping an engine with work in flight drains each QP
 /// before destroying it: receives that never match, WRITEs whose last WQE
 /// is unsignaled (it succeeds with no completion of its own, so only the
 /// drain WQE retires it), and READs the peer answers. Every removal
@@ -825,10 +829,12 @@ fn removing_and_dropping_busy_qps_drains_them() {
     };
     let src = filled(&pd, 4096, 3);
     let dst = pd.alloc::<u8>(4096).unwrap().expose().unwrap();
-    for drop_worker in [false, true] {
-        let mut w: Worker<()> = Worker::new(&pd, 4 * 2 * depth).unwrap();
+    for drop_engine in [false, true] {
+        let mut w: Engine<()> = Engine::new(&ctx, 4 * 2 * depth).unwrap();
         // Requests of one WQE, so that up to `depth - 1` may go unsignaled.
-        let qps: Vec<QpKey<RC>> = (0..4).map(|_| w.create_qp(caps, 1).unwrap()).collect();
+        let qps: Vec<QpKey<RC>> = (0..4)
+            .map(|_| w.create_qp(pd.as_raw(), caps, 1).unwrap())
+            .collect();
         let attr = connect_attr(&ctx);
         let gid = gid_index(&ctx);
         for pair in qps.chunks(2) {
@@ -868,7 +874,7 @@ fn removing_and_dropping_busy_qps_drains_them() {
             qps.iter().all(|&qp| w.send_ring(qp).in_flight_wqes() > 0),
             "unsignaled WQEs wait for a later completion"
         );
-        if drop_worker {
+        if drop_engine {
             drop(w);
         } else {
             for &qp in &qps {
@@ -879,4 +885,251 @@ fn removing_and_dropping_busy_qps_drains_them() {
         }
     }
     assert!(src.try_thaw().is_ok(), "every request released the buffer");
+}
+
+/// `2 * pairs` connected QPs of one device on one [`LocalCq`] of exactly their queues.
+fn local_qps<W>(ctx: &Context, pairs: usize, depth: u32) -> (Pd, LocalCq<W>, Vec<LocalQp<RC, W>>) {
+    let pd = ctx.alloc_pd().unwrap();
+    let cq = ctx.create_local_cq(pairs as u32 * 4 * depth).unwrap();
+    let build = || {
+        let mut b = QueuePairBuilder::<RC>::new(&pd);
+        b.set_send_depth(depth).set_recv_depth(depth);
+        if let Some(i) = gid_index(ctx) {
+            b.set_gid_index(i);
+        }
+        b.build_on(&cq).unwrap()
+    };
+    let mut qps = Vec::new();
+    for _ in 0..pairs {
+        let (a, b) = (build(), build());
+        let (ea, eb) = (a.endpoint(), b.endpoint());
+        qps.push(a.handshake(eb).unwrap());
+        qps.push(b.handshake(ea).unwrap());
+    }
+    (pd, cq, qps)
+}
+
+/// Polls until `n` requests were handed to `f`.
+fn poll_until<W>(cq: &LocalCq<W>, n: usize, mut f: impl FnMut(safeverbs::Wc<W>)) {
+    let start = Instant::now();
+    let mut handed = 0;
+    while handed < n {
+        handed += cq.poll(32, &mut f);
+        assert!(start.elapsed() < DEADLINE, "timed out");
+    }
+}
+
+/// Every operation of the event loop's handles, each `wr_id` coming back with its result and
+/// buffer.
+#[test]
+fn local_cq_every_operation() {
+    let Some(ctx) = device() else { return };
+    let (pd, cq, qps) = local_qps::<&str>(&ctx, 1, 16);
+    let (a, b) = (&qps[0], &qps[1]);
+    let dst = pd.alloc::<u8>(256).unwrap().expose().unwrap();
+    let src = filled(&pd, 256, 5);
+
+    a.post_write(src.clone(), dst.remote(), "write").unwrap();
+    poll_until(&cq, 1, |wc| {
+        assert_eq!((wc.wr_id, wc.qp_num()), ("write", a.qp_num()));
+        assert_eq!(wc.result, Ok(Completed::Sent));
+    });
+    let mut read = None;
+    a.post_read(pd.alloc::<u8>(256).unwrap(), dst.remote(), "read")
+        .unwrap();
+    poll_until(&cq, 1, |mut wc| {
+        assert_eq!(wc.wr_id, "read");
+        wc.result.unwrap();
+        read = wc.buf_mut::<u8>();
+    });
+    assert_eq!(&read.unwrap()[..], &src[..]);
+
+    let mut got = Vec::new();
+    b.post_recv(pd.alloc::<u8>(256).unwrap(), "recv").unwrap();
+    a.post_send_imm(src.clone(), 9, "send").unwrap();
+    poll_until(&cq, 2, |wc| got.push(wc));
+    got.sort_by_key(|wc| wc.wr_id);
+    assert_eq!(got[0].result.map(|_| got[0].qp_num()), Ok(b.qp_num()));
+    let mut recv = got.remove(0);
+    assert_eq!(
+        recv.result,
+        Ok(Completed::Received(Received::Message {
+            len: 256,
+            imm: Some(9)
+        }))
+    );
+    assert_eq!(&recv.buf_mut::<u8>().unwrap()[..], &src[..]);
+    assert_eq!(got[0].wr_id, "send");
+    drop(got);
+
+    let mut word = pd.alloc::<u64>(1).unwrap();
+    word[0] = 40;
+    let word = word.expose().unwrap();
+    a.post_fetch_add(pd.alloc::<u64>(1).unwrap(), word.remote(), 2, "add")
+        .unwrap();
+    let mut old = None;
+    poll_until(&cq, 1, |mut wc| {
+        wc.result.unwrap();
+        old = wc.buf_mut::<u64>();
+    });
+    assert_eq!(old.unwrap()[0], 40);
+    assert_eq!(word.reclaim()[0], 42);
+}
+
+/// Pings and pongs on four QPs of one CQ of exactly their queues, the closure posting on the QP
+/// the completion came from, in `poll` and in `poll_one`.
+#[test]
+fn local_cq_event_loop_on_four_qps() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Job {
+        Inbox(usize),
+        Message,
+    }
+    const ROUNDS: u32 = 2000;
+    let Some(ctx) = device() else { return };
+    let depth = 16;
+    let (pd, cq, qps) = local_qps::<Job>(&ctx, 2, depth);
+    for (i, qp) in qps.iter().enumerate() {
+        for _ in 0..depth {
+            qp.post_recv(pd.alloc::<u8>(64).unwrap(), Job::Inbox(i))
+                .unwrap();
+        }
+    }
+    let msg = filled(&pd, 64, 3);
+    // The first of each pair starts; each message received is answered, until the rounds are up.
+    let mut owed = [0u32; 4];
+    owed[0] = 8;
+    owed[2] = 8;
+    let mut received = 0;
+    let start = Instant::now();
+    while received < ROUNDS {
+        let by_one = received % 3 == 0;
+        let mut handle = |mut wc: safeverbs::Wc<Job>| {
+            wc.result.expect("no failures");
+            if let Job::Inbox(i) = wc.wr_id {
+                received += 1;
+                assert_eq!(wc.qp_num(), qps[i].qp_num(), "another QP's wr_id");
+                owed[i ^ 1] += 1;
+                let buf = wc.buf_mut::<u8>().expect("a receive's buffer");
+                assert_eq!(&buf[..], &msg[..]);
+                // A receive's slot just came free.
+                qps[i].post_recv(buf, Job::Inbox(i)).unwrap();
+            }
+        };
+        if by_one {
+            while let Some(wc) = cq.poll_one() {
+                handle(wc);
+            }
+        } else {
+            cq.poll(4, &mut handle);
+        }
+        for (i, qp) in qps.iter().enumerate() {
+            while owed[i] > 0 && qp.can_post() {
+                qp.post_send(msg.clone(), Job::Message).unwrap();
+                owed[i] -= 1;
+            }
+        }
+        assert!(start.elapsed() < DEADLINE, "timed out");
+    }
+    drop(qps);
+    assert!(msg.try_thaw().is_ok(), "released, drained");
+}
+
+/// Unsignaled requests come back with the next signaled one, one doorbell for all; a full queue
+/// is an error; a batch is one request.
+#[test]
+fn local_cq_stage_ring_and_batch() {
+    let Some(ctx) = device() else { return };
+    let depth = 8;
+    let (pd, cq, qps) = local_qps::<u32>(&ctx, 1, depth);
+    let a = &qps[0];
+    let dst = pd.alloc::<u8>(64).unwrap().expose().unwrap();
+    let src = filled(&pd, 64, 1);
+    for i in 0..3 {
+        a.stage(WrOp::Write(dst.remote()), src.clone().into_part(), i, false)
+            .unwrap();
+    }
+    a.stage(WrOp::Write(dst.remote()), src.clone().into_part(), 3, true)
+        .unwrap();
+    a.ring().unwrap();
+    let mut got = Vec::new();
+    poll_until(&cq, 4, |wc| {
+        wc.result.unwrap();
+        got.push(wc.wr_id);
+    });
+    assert_eq!(got, [0, 1, 2, 3]);
+
+    let mut posted = 0;
+    let e = loop {
+        match a.post_write(src.clone(), dst.remote(), 100 + posted) {
+            Ok(()) => posted += 1,
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(e.error, Error::QueueFull);
+    assert_eq!((e.wr_id, e.leases.len()), (100 + posted, 1));
+    drop(e);
+    poll_until(&cq, posted as usize, |wc| {
+        wc.result.unwrap();
+    });
+
+    a.post_batch(7, |batch| {
+        for i in 0..5 {
+            batch.write(src.slice(..8), dst.remote().offset(8 * i));
+        }
+    })
+    .unwrap();
+    poll_until(&cq, 1, |wc| {
+        assert_eq!((wc.wr_id, wc.result.is_ok()), (7, true))
+    });
+    assert_eq!(a.in_flight(), 0);
+}
+
+/// Dropping a QP with work in flight drains it first, from the closure too, and the other QPs'
+/// completions are still handed out.
+#[test]
+fn local_cq_dropping_qps_with_work_in_flight() {
+    let Some(ctx) = device() else { return };
+    let drops = Rc::new(Cell::new(0));
+    #[allow(dead_code)]
+    struct Counted(Rc<Cell<u32>>);
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let (pd, cq, mut qps) = local_qps::<Counted>(&ctx, 2, 16);
+    let dst = pd.alloc::<u8>(64).unwrap().expose().unwrap();
+    let src = filled(&pd, 64, 1);
+    for qp in &qps {
+        for _ in 0..8 {
+            qp.post_write(src.clone(), dst.remote(), Counted(drops.clone()))
+                .unwrap();
+        }
+        qp.post_recv(pd.alloc::<u8>(8).unwrap(), Counted(drops.clone()))
+            .unwrap();
+    }
+    let first = RefCell::new(Some(qps.remove(0)));
+    let mut others = 0;
+    let start = Instant::now();
+    while others < 8 {
+        cq.poll(32, |wc| {
+            if first
+                .borrow()
+                .as_ref()
+                .is_some_and(|q| q.qp_num() == wc.qp_num())
+            {
+                // A request of the first QP: it goes, with the others it has.
+                drop(first.borrow_mut().take());
+            } else {
+                others += 1;
+            }
+        });
+        assert!(start.elapsed() < DEADLINE, "timed out");
+    }
+    assert!(first.borrow().is_none());
+    drop(qps);
+    drop(cq);
+    assert_eq!(drops.get(), 4 * 9, "every wr_id exactly once");
+    assert!(src.try_thaw().is_ok(), "drained, then released");
 }

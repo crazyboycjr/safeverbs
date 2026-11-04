@@ -31,6 +31,7 @@ pub const INDEX_SHIFT: u64 = 48;
 
 /// How far after the oldest WQE in flight a completion's WQE may lie and
 /// still be recovered by [`wqe_of`].
+#[allow(dead_code)]
 pub const WQE_SPAN: u64 = 0x8000_0000_0000;
 
 /// The `wr_id` of WQE `wqe` of QP `index`'s receive queue if `recv`, else
@@ -125,41 +126,16 @@ pub fn is_recv(wr_id: u64) -> (recv: bool)
 /// The ring's number of the WQE a completion names, from its low bits and
 /// the oldest WQE in flight (`retired`): the one at or after `retired`, less
 /// than [`WQE_SPAN`] after it, with those low bits. (A WQE before `retired`
-/// maps far ahead, where the ring ignores it.)
-#[inline]
+/// maps far ahead, where the ring ignores it.) How far after `retired` it lies is the difference
+/// of the low bits, modulo 2^47, and a subtraction of the whole words has those low bits.
+#[inline(always)]
 pub fn wqe_of(wr_id: u64, retired: u64) -> (wqe: u64)
     ensures
         forall|w: u64|
             retired <= w && w - retired < WQE_SPAN && w & WQE_MASK == wr_id & WQE_MASK ==> wqe
                 == w,
 {
-    let low = wr_id & WQE_MASK;
-    let base = retired & WQE_MASK;
-    assert(low <= 0x7fff_ffff_ffffu64 && base <= 0x7fff_ffff_ffffu64) by (bit_vector)
-        requires
-            low == wr_id & 0x7fff_ffff_ffffu64,
-            base == retired & 0x7fff_ffff_ffffu64,
-    ;
-    // How far after `retired` the WQE lies: the difference of the low bits,
-    // modulo 2^47.
-    let ahead = if low >= base {
-        low - base
-    } else {
-        low + WQE_SPAN - base
-    };
-    let wqe = retired.wrapping_add(ahead);
-    proof {
-        assert forall|w: u64|
-            retired <= w && w - retired < WQE_SPAN && w & WQE_MASK == wr_id
-                & WQE_MASK implies wqe == w by {
-            assert(retired <= w && sub(w, retired) < 0x8000_0000_0000u64 && w & 0x7fff_ffff_ffffu64
-                == low && base == retired & 0x7fff_ffff_ffffu64 ==> (low >= base ==> sub(low, base)
-                == sub(w, retired)) && (low < base ==> sub(add(low, 0x8000_0000_0000u64), base)
-                == sub(w, retired))) by (bit_vector);
-            assert(ahead == w - retired);
-        }
-    }
-    wqe
+    retired.wrapping_add(wr_id.wrapping_sub(retired) & WQE_MASK)
 }
 
 } // verus!

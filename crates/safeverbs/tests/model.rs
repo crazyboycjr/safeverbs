@@ -13,11 +13,11 @@ use futures::executor::block_on;
 use futures::task::noop_waker;
 use futures::{SinkExt, StreamExt};
 use safeverbs::{
-    Buf, BufMut, CompletionError, Context, Error, LocalQp, LocalWorker, Model, Pd,
-    QueuePairBuilder, RC, Received, Status, Transport, UC, WriteOp,
+    AsyncCq, AsyncQp, Buf, BufMut, CompletionError, Context, Error, Model, Pd, QueuePairBuilder,
+    RC, Received, Status, Transport, UC, WriteOp,
 };
 
-type Qp<T> = LocalQp<T, Model>;
+type Qp<T> = AsyncQp<T, Model>;
 
 /// Two QPs of one model connected to each other.
 fn pair<T: Transport>(seed: u64, depth: u32) -> (Model, Pd<Model>, Qp<T>, Qp<T>) {
@@ -571,7 +571,7 @@ fn uc_drops_messages_without_a_receive() {
 #[test]
 fn shared_qp_across_threads() {
     let (_m, pd, a, b) = pair::<RC>(14, 64);
-    let a = a.into_shared().ok().expect("alone on its worker");
+    let a = a.into_shared().ok().expect("alone on its CQ");
     let dst = pd.alloc::<u8>(4 * 64).unwrap().expose().unwrap();
     let remote = dst.remote();
     std::thread::scope(|s| {
@@ -808,23 +808,24 @@ fn random_operations_return_every_buffer_once() {
     }
 }
 
-/// `pairs` pairs of RC QPs on one worker, each connected to the other QP of
-/// its pair; the worker's CQ holds exactly their queues.
-fn pairs_on_worker(
+/// `pairs` pairs of RC QPs on one CQ, each connected to the other QP of
+/// its pair; the CQ holds exactly their queues.
+fn pairs_on_cq(
     seed: u64,
     pairs: usize,
     depth: u32,
-) -> (Model, Pd<Model>, LocalWorker<Model>, Vec<Qp<RC>>) {
+) -> (Model, Pd<Model>, AsyncCq<Model>, Vec<Qp<RC>>) {
     let model = Model::new(seed);
-    let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let worker = LocalWorker::new(&pd, 4 * pairs as u32 * depth).unwrap();
+    let ctx = Context::new(model.clone());
+    let pd = ctx.alloc_pd().unwrap();
+    let cq = ctx.create_async_cq(4 * pairs as u32 * depth).unwrap();
     let mut qps = Vec::new();
     for _ in 0..pairs {
         let build = || {
             QueuePairBuilder::<RC, Model>::new(&pd)
                 .set_send_depth(depth)
                 .set_recv_depth(depth)
-                .build_on(&worker)
+                .build_on(&cq)
                 .unwrap()
         };
         let (a, b) = (build(), build());
@@ -836,18 +837,18 @@ fn pairs_on_worker(
     let e = QueuePairBuilder::<RC, Model>::new(&pd)
         .set_send_depth(1)
         .set_recv_depth(1)
-        .build_on(&worker)
+        .build_on(&cq)
         .err();
     assert_eq!(e, Some(Error::CqFull { need: 2, free: 0 }));
-    (model, pd, worker, qps)
+    (model, pd, cq, qps)
 }
 
 #[test]
-fn qps_of_one_worker_share_its_cq() {
-    let (_m, pd, worker, qps) = pairs_on_worker(21, 2, 16);
+fn qps_of_one_cq_share_it() {
+    let (_m, pd, cq, qps) = pairs_on_cq(21, 2, 16);
     assert!(
         qps.iter()
-            .all(|q| q.worker().with(|w| w.cq_size()) == 4 * 2 * 16)
+            .all(|q| q.cq().with(|w| w.cq_size()) == 4 * 2 * 16)
     );
     block_on(async {
         // Receives on every QP, sends on every QP: one CQ retires them all.
@@ -875,7 +876,7 @@ fn qps_of_one_worker_share_its_cq() {
     // Dropped QPs leave the others working, and their share of the CQ.
     let mut qps = qps;
     qps.truncate(2);
-    assert_eq!(worker.with(|w| w.reserved()), 2 * 2 * 16);
+    assert_eq!(cq.with(|w| w.reserved()), 2 * 2 * 16);
     let recv = qps[1].recv(pd.alloc::<u8>(8).unwrap());
     block_on(qps[0].send(filled(&pd, 8, 1))).unwrap();
     assert_eq!(
@@ -883,17 +884,17 @@ fn qps_of_one_worker_share_its_cq() {
         Received::Message { len: 8, imm: None }
     );
     drop(qps);
-    assert_eq!(worker.with(|w| w.reserved()), 0);
+    assert_eq!(cq.with(|w| w.reserved()), 0);
 }
 
 #[test]
-fn shared_qp_needs_a_worker_of_its_own() {
-    let (_m, _pd, _worker, mut qps) = pairs_on_worker(22, 1, 8);
+fn shared_qp_needs_a_cq_of_its_own() {
+    let (_m, _pd, _cq, mut qps) = pairs_on_cq(22, 1, 8);
     let q = qps.pop().unwrap();
-    assert!(q.into_shared().is_err(), "its worker has another QP");
+    assert!(q.into_shared().is_err(), "its CQ has another QP");
 }
 
-/// Random operations on several QPs of one worker: futures (some dropped),
+/// Random operations on several QPs of one CQ: futures (some dropped),
 /// polls with random delays, injected errors, forced flushes and refused
 /// doorbells. Throughout, the rings' invariants hold and the CQ, exactly as
 /// large as the QPs reserve, is never overrun (the model would panic); each
@@ -901,10 +902,10 @@ fn shared_qp_needs_a_worker_of_its_own() {
 /// back is never one already in hand; at the end every frozen buffer thaws
 /// and nothing stays registered.
 #[test]
-fn random_operations_on_qps_of_one_worker() {
+fn random_operations_on_qps_of_one_cq() {
     for seed in 1..60u64 {
         let pairs = 1 + (seed % 3) as usize;
-        let (m, pd, worker, qps) = pairs_on_worker(100 + seed, pairs, 2 + seed as u32 % 9);
+        let (m, pd, cq, qps) = pairs_on_cq(100 + seed, pairs, 2 + seed as u32 % 9);
         m.set_pace((seed * 37 % 500) as u32, 1 + (seed % 5) as u32);
         let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
         let dst = pd.alloc::<u8>(1024).unwrap().expose().unwrap();
@@ -990,7 +991,7 @@ fn random_operations_on_qps_of_one_worker() {
                     _ => {}
                 },
                 8 => {
-                    worker.poll();
+                    cq.poll();
                 }
                 _ => {
                     // Poll every future once.
@@ -1052,9 +1053,9 @@ fn random_operations_on_qps_of_one_worker() {
             }
         }
         m.run();
-        worker.poll();
+        cq.poll();
         assert_eq!(free.len() + lost, total, "seed {seed}");
-        drop((free, dst, qps, worker));
+        drop((free, dst, qps, cq));
         for f in frozen {
             assert!(
                 f.try_thaw().is_ok(),

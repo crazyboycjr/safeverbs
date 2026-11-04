@@ -48,6 +48,11 @@ impl<N: Nic> Context<N> {
         &self.nic
     }
 
+    /// Whether `other` is a handle to the same open device.
+    pub fn same_device(&self, other: &Context<N>) -> bool {
+        Arc::ptr_eq(&self.nic, &other.nic)
+    }
+
     /// The device's name.
     pub fn name(&self) -> &str {
         self.nic.name()
@@ -136,6 +141,7 @@ impl<N: Nic> Pd<N> {
 
     /// A number unique to this PD in the process, which buffers and QPs
     /// compare to check they belong together.
+    #[inline]
     pub fn id(&self) -> u64 {
         self.inner.id
     }

@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 use safeverbs_core::model::Model;
 use safeverbs_core::{
-    Access, CompletionError, ConnectAttr, Context, Pd, QpCaps, QpKey, RC, Received, Status, Worker,
+    Access, CompletionError, ConnectAttr, Context, Engine, Pd, QpCaps, QpKey, RC, Received, Status,
     WrOp,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -32,13 +32,13 @@ fn waker(calls: &Arc<AtomicUsize>, panic: Option<&'static str>) -> Waker {
 }
 
 /// A model, its protection domain, and a worker with two QPs connected to each other.
-type Pair = (Model, Pd<Model>, Worker<(), Model>, QpKey<RC>, QpKey<RC>);
+type Pair = (Model, Pd<Model>, Engine<(), Model>, QpKey<RC>, QpKey<RC>);
 
 fn pair(seed: u64) -> Pair {
     let model = Model::new(seed);
     model.set_pace(0, 64);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let mut worker = Worker::new(&pd, 32).unwrap();
+    let mut worker = Engine::new(pd.context(), 32).unwrap();
     let caps = QpCaps {
         max_send_wr: 8,
         max_recv_wr: 8,
@@ -46,8 +46,8 @@ fn pair(seed: u64) -> Pair {
         max_recv_sge: 1,
         max_inline_data: 0,
     };
-    let local = worker.create_qp::<RC>(caps, 2).unwrap();
-    let peer = worker.create_qp::<RC>(caps, 2).unwrap();
+    let local = worker.create_qp::<RC>(&pd, caps, 2).unwrap();
+    let peer = worker.create_qp::<RC>(&pd, caps, 2).unwrap();
     let attr = ConnectAttr {
         port: 1,
         access: Access::LOCAL_WRITE | Access::REMOTE_WRITE,

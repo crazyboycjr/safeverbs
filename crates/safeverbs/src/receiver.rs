@@ -5,14 +5,14 @@ use core::task::{Context, Poll};
 use std::collections::VecDeque;
 
 use futures_core::Stream;
-use safeverbs_core::{BufError, BufMut, CompletionError, Error, Received, Seq};
+use safeverbs_core::{BufError, BufMut, CompletionError, Error, Queue, Received, Seq};
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::op::{Side, received};
+use crate::op::received;
 use crate::qp::QueueAccess;
 
 /// A [`Stream`] of receives on a QP, from
-/// [`LocalQp::receiver`](crate::LocalQp::receiver): each item is what a
+/// [`AsyncQp::receiver`](crate::AsyncQp::receiver): each item is what a
 /// receive got, or why not, and its buffer, in completion order.
 ///
 /// Items with an error (flush errors after the QP failed) hand their buffers
@@ -57,7 +57,7 @@ impl<'q, Q: QueueAccess, U: FromBytes + IntoBytes> Receiver<'q, Q, U> {
         q.with_state(|s| {
             s.unclog();
             let qp = s.key();
-            let w = s.worker();
+            let w = s.engine();
             if w.recv_ring(qp).failed() {
                 return Err(BufError {
                     error: Error::QpFailed,
@@ -100,7 +100,7 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
         let next = q.with_state(|s| {
             s.unclog();
             let qp = s.key();
-            let w = s.worker();
+            let w = s.engine();
             while !this.spare.is_empty() && w.recv_ring(qp).can_post() && !w.recv_ring(qp).failed()
             {
                 let buf = this.spare.pop().expect("a spare buffer");
@@ -119,14 +119,14 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
             w.progress();
             let failed = w.recv_ring(qp).failed();
             match this.posted.front() {
-                Some(&seq) => match s.take_request(Side::Recv, seq) {
+                Some(&seq) => match s.take_request(Queue::Recv, seq) {
                     Some((result, leases)) => {
                         this.posted.pop_front();
                         let buf = leases.into_buf_mut().expect("a receive holds its buffer");
                         Poll::Ready(Some((result.map(received), buf)))
                     }
                     None => {
-                        s.set_waker(Side::Recv, seq, cx.waker());
+                        s.set_waker(Queue::Recv, seq, cx.waker());
                         Poll::Pending
                     }
                 },
@@ -146,7 +146,7 @@ impl<Q: QueueAccess, U> Drop for Receiver<'_, Q, U> {
         let posted = &self.posted;
         self.q.with_state(|s| {
             for &seq in posted {
-                s.detach(Side::Recv, seq);
+                s.detach(Queue::Recv, seq);
             }
         });
     }

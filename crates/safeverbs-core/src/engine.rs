@@ -1,39 +1,41 @@
-//! A worker: one completion queue and the queue pairs attached to it, the
-//! unit of thread affinity, driven synchronously.
+//! An engine: one completion queue and the queue pairs attached to it, the
+//! unit of thread affinity, driven synchronously and by index.
 //!
-//! Everything of a worker that the NIC model M sees (its CQ, its QPs'
+//! Applications use the handles of the `safeverbs` crate, `LocalCq` and `LocalQp`, or its
+//! futures: thin, safe wrappers over this type. It stays public as an escape hatch for anyone
+//! who wants neither a reference count nor a `RefCell` on the way.
+//!
+//! Everything of an engine that the NIC model M sees (its CQ, its QPs'
 //! hardware queues and rings, its share of M) lives in the internal `Hw`,
 //! which is verified: every call into the NIC meets M's precondition, the
 //! rings stay coupled to M's queues, completions are routed to the WQEs they
 //! name, and QPs are destroyed only drained. This module is the unverified
-//! shell around it: keys, the event loop's bookkeeping and the drain's
-//! timing.
+//! shell around it: keys, thread domains and the drain's timing.
 //!
 //! The efficient way to use RDMA is one CQ per thread, shared by all of that
 //! thread's QPs, and a loop that polls it, dispatches each completion and
-//! posts new work. A [`Worker`] is that CQ with its QPs, as one value: `Send`
+//! posts new work. An [`Engine`] is that CQ with its QPs, as one value: `Send`
 //! but not `Sync`, so it moves between threads as a whole and is used by one
 //! thread at a time. Its CQ is created `IBV_CREATE_CQ_ATTR_SINGLE_THREADED`,
 //! and, where the device has thread domains, its QPs are created on one
-//! thread domain of the worker's: mlx5 then takes no QP locks and gives the
-//! worker's QPs a doorbell of their own, which they share. Elsewhere (rxe)
+//! thread domain of the engine's: mlx5 then takes no QP locks and gives the
+//! engine's QPs a doorbell of their own, which they share. Elsewhere (rxe)
 //! they are plain QPs.
 //!
 //! # QPs and their keys
 //!
-//! [`Worker::create_qp`] creates a QP attached to the worker's CQ and returns
-//! its [`QpKey`], a typed index: every per-QP method takes one. A QP reserves
-//! CQ capacity for every completion it may produce, its send and receive
-//! depths, and creating one that does not fit is an error ([`Error::CqFull`]),
-//! never a possible overrun: each WQE in flight produces at most one
-//! completion, and each QP's rings never let more WQEs be in flight than its
-//! queues hold. This is the rule of the NIC model M (`create_qp` reserves
-//! the depths on the CQ).
+//! [`Engine::create_qp`] creates a QP attached to the engine's CQ, in a protection domain of
+//! the same device, and returns its [`QpKey`], a typed index: every per-QP method takes one. A
+//! QP reserves CQ capacity for every completion it may produce, its send and receive depths, and
+//! creating one that does not fit is an error ([`Error::CqFull`]), never a possible overrun: each
+//! WQE in flight produces at most one completion, and each QP's rings never let more WQEs be in
+//! flight than its queues hold. This is the rule of the NIC model M (`create_qp` reserves the
+//! depths on the CQ).
 //!
 //! # Completions
 //!
 //! Every completion is routed to its QP and queue by its `wr_id`, which
-//! holds the QP's index in the worker (16 bits), the queue (1 bit) and the
+//! holds the QP's index in the engine (16 bits), the queue (1 bit) and the
 //! low 47 bits of the WQE's number in that queue's ring. The ring's number
 //! is recovered from the WQEs in flight, which span at most the queue's
 //! depth, so the 47 bits never wrap ambiguously. Routing therefore costs a
@@ -41,38 +43,39 @@
 //! is needed in any case, since a failed completion's opcode is undefined.
 //! The QP's ring then retires its requests in order, as before.
 //!
-//! There are two ways to drive a worker:
+//! There are two ways to drive an engine:
 //!
-//! - **The event loop** ([`Worker::poll`]): poll the CQ, and get every
-//!   request that retired (with an owner) as a [`Completion`]: its context,
-//!   result and buffers, with its QP, queue and sequence number, handed to a
-//!   callback that may post new work. Nothing is allocated.
-//! - **Owners that take their results** ([`Worker::progress`] and
-//!   [`Worker::take_send`]): polling retires requests into their rings and
-//!   wakes their wakers; each owner takes its request's result by sequence
-//!   number. The futures of `safeverbs` work this way.
+//! - **The event loop** ([`Engine::poll`]): reads the CQEs, updates the CQ's consumer index and
+//!   then, in one pass over them, routes each one, walks its ring up to it and hands every
+//!   request that completes (with an owner) as a [`Completion`] (its context, result and buffers,
+//!   with its QP, queue and sequence number) to a callback that may post new work on any QP. Nothing
+//!   is allocated.
+//! - **Owners that take their results** ([`Engine::progress`] and [`Engine::take_send`]): polling
+//!   retires requests into their rings, where their results wait, and wakes their wakers; each
+//!   owner takes its request's result by sequence number. The futures of `safeverbs` work this
+//!   way.
 //!
-//! A worker driven one way should not be driven the other: `poll` hands out
-//! the results owners would wait for.
+//! An engine driven one way should not be driven the other: `poll` hands out the results owners
+//! would wait for.
 //!
 //! # Contexts
 //!
-//! A `Worker<C>` keeps a value of the type `C` with each request that has an
+//! An `Engine<C>` keeps a value of the type `C` with each request that has an
 //! owner: whatever tells the program which request just finished. It lives in
 //! the request's ring slot and comes back exactly once, with its result and
 //! its buffers:
 //!
 //! ```no_run
-//! # use safeverbs_core::{Buf, Completed, CompletionError, Pd, QpKey, RC, Worker};
+//! # use safeverbs_core::{Buf, Completed, CompletionError, Context, Engine, QpKey, RC};
 //! enum Job {
 //!     Reply { client: u32 },
 //!     Log,
 //! }
 //!
-//! # fn f(pd: Pd, qp: QpKey<RC>, buf: Buf<u8>) -> safeverbs_core::Result<()> {
-//! let mut w: Worker<Job> = Worker::new(&pd, 4096)?;
+//! # fn f(ctx: Context, qp: QpKey<RC>, buf: Buf<u8>) -> safeverbs_core::Result<()> {
+//! let mut w: Engine<Job> = Engine::new(&ctx, 4096)?;
 //! w.send(qp, buf.slice(..), Job::Reply { client: 7 })?;
-//! w.poll(|w, c| match (c.ctx, c.result) {
+//! w.poll(32, |w, c| match (c.wr_id, c.result) {
 //!     (Job::Reply { client }, Ok(_)) => println!("replied to {client}"),
 //!     (Job::Log, Ok(_)) => {}
 //!     (job, Err(e)) => {
@@ -84,13 +87,13 @@
 //! # Ok(()) }
 //! ```
 //!
-//! C programs would use a `u64`, which is `Worker<u64>`. The default, `()`,
+//! C programs would use a `u64`, which is `Engine<u64>`. The default, `()`,
 //! costs nothing; the futures of `safeverbs` use it, being their own identity.
 //! A batch is one request, with one context ([`Request::submit`]). Requests
 //! without an owner hold none.
 //!
-//! Giving up a request hands its context back ([`Worker::detach_send`]).
-//! Removing a QP or dropping the worker gives up every request: the contexts
+//! Giving up a request hands its context back ([`Engine::detach_send`]).
+//! Removing a QP or dropping the engine gives up every request: the contexts
 //! of the requests not delivered yet are dropped then, and their buffers
 //! released once the NIC is done with them. A context's destructor is never run
 //! by a poll.
@@ -100,7 +103,7 @@
 //! The NIC may read and write the buffers of every WQE posted and not yet
 //! retired, and M (`destroy_qp`) allows destroying a QP only when its queues
 //! are empty. So a QP is never destroyed with work in flight: removing it
-//! ([`Worker::remove_qp`], and dropping the worker, for each of its QPs)
+//! ([`Engine::remove_qp`], and dropping the engine, for each of its QPs)
 //! first moves it to the error state, where the NIC completes every WQE
 //! left with a flush error, then posts a signaled *drain* WQE on its send
 //! queue (a SEND of nothing, which the error state flushes too: it retires
@@ -108,13 +111,13 @@
 //! a completion of their own) and polls the CQ until both rings have
 //! nothing in flight. Only then is the QP destroyed, and only after that
 //! are its buffers released. The other QPs' completions polled meanwhile
-//! go to their rings as [`Worker::progress`] sends them.
+//! go to their rings as [`Engine::progress`] sends them.
 //!
 //! A device that never flushes is a fatal error, and no buffer is ever
 //! freed while the NIC may access it: if no completion arrives for
 //! [`DRAIN_TIMEOUT`], the QP is kept as it is, with its buffers, its index
-//! and its share of the CQ, and [`Worker::remove_qp`] fails with
-//! [`Error::NotFlushed`]. Dropping the worker tries once more; a QP still
+//! and its share of the CQ, and [`Engine::remove_qp`] fails with
+//! [`Error::NotFlushed`]. Dropping the engine tries once more; a QP still
 //! not drained then is leaked with its buffers, and so are the CQ and the
 //! thread domain it is attached to.
 
@@ -127,16 +130,17 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::buf::{Buf, BufError, BufMut, Leases, Part};
 use crate::error::{Error, Result};
-use crate::hw::Hw;
+pub use crate::hw::Unposted;
+use crate::hw::{Hw, Refusal};
 use crate::nic::{ConnectAttr, Endpoint, Nic, QpCaps, RemoteBuf, WrOp};
-use crate::pd::Pd;
+use crate::pd::{Context, Pd};
 use crate::ring::{Payload, Ring, Seq};
 use crate::transport::{Reliable, Transport};
 use crate::verbs::Verbs;
 #[cfg(doc)]
 use crate::wc::CompletionError;
 
-pub use crate::hw::{Completion, DetachedError, MAX_QPS, MAX_SGES, Side as Queue};
+pub use crate::hw::{Completion, DetachedError, MAX_QPS, MAX_SGES, POLL_MAX, Side as Queue};
 
 /// How long removing a QP waits for a completion while the device flushes
 /// its work, before it gives up: then the QP and its buffers are kept, never
@@ -146,12 +150,12 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Empty polls of the CQ between two looks at the clock while draining.
 const DRAIN_SPINS: u32 = 1024;
 
-/// A QP of a worker: its index there, typed by its transport. Cheap to copy.
+/// A QP of an engine: its index there, typed by its transport. Cheap to copy.
 ///
-/// A key names a QP of the worker that created it, until the QP is removed;
-/// using it with another worker, or after the removal, names another QP or
+/// A key names a QP of the engine that created it, until the QP is removed;
+/// using it with another engine, or after the removal, names another QP or
 /// none (and the methods panic). That is a logic error, not a memory-safety
-/// one: the worker checks what each WQE may do against the QP it is posted
+/// one: the engine checks what each WQE may do against the QP it is posted
 /// on.
 pub struct QpKey<T: Transport> {
     index: u16,
@@ -159,7 +163,8 @@ pub struct QpKey<T: Transport> {
 }
 
 impl<T: Transport> QpKey<T> {
-    /// The QP's index in its worker, as [`Completion::qp`] reports it.
+    /// The QP's index in its engine, as [`Completion::qp`] reports it.
+    #[inline(always)]
     pub fn index(self) -> usize {
         self.index as usize
     }
@@ -191,10 +196,41 @@ impl<T: Transport> core::fmt::Debug for QpKey<T> {
 pub struct PostError<C = (), N: Nic = Verbs> {
     /// What went wrong.
     pub error: Error,
-    /// The context it was given.
-    pub ctx: C,
+    /// The value it was given (its context).
+    pub wr_id: C,
     /// Its buffers.
     pub leases: Leases<N>,
+}
+
+impl<C, N: Nic> PostError<C, N> {
+    /// Takes back its unique buffer (of a receive, READ or atomic) as a `BufMut<T>`.
+    pub fn buf_mut<T: FromBytes>(&mut self) -> Option<BufMut<T, N>> {
+        self.leases.take_buf_mut()
+    }
+}
+
+impl<C, N: Nic> Completion<C, N> {
+    /// The number of the QP it was posted on.
+    #[inline(always)]
+    pub fn qp_num(&self) -> u32 {
+        self.qp_num
+    }
+
+    /// Takes back its unique buffer (of a receive, READ or atomic) as a `BufMut<T>`; `None` if it
+    /// has none or its bytes cannot hold `[T]`.
+    #[inline(always)]
+    pub fn buf_mut<T: FromBytes>(&mut self) -> Option<BufMut<T, N>> {
+        self.leases.take_buf_mut()
+    }
+}
+
+impl<C, N: Nic> core::fmt::Debug for Completion<C, N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Completion")
+            .field("result", &self.result)
+            .field("qp_num", &self.qp_num)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<C, N: Nic> core::fmt::Debug for PostError<C, N> {
@@ -225,41 +261,62 @@ impl<C, N: Nic> From<PostError<C, N>> for std::io::Error {
     }
 }
 
+/// A refusal of a request given a context, with that context.
+#[cold]
+#[inline(never)]
+fn owned<C, N: Nic>(refused: Refusal<C, N>) -> PostError<C, N> {
+    PostError {
+        error: refused.error,
+        wr_id: refused.ctx.expect("the context it was given"),
+        leases: refused.leases,
+    }
+}
+
+/// A parent domain over a protection domain and the engine's thread domain.
+struct Domain<N: Nic> {
+    /// Dropped before its protection domain.
+    domain: N::Domain,
+    pd: Pd<N>,
+}
+
 /// A completion queue and the QPs attached to it (the synchronous layer), with
 /// a context of type `C` kept with each request (see the module documentation).
 ///
-/// Dropping it drains its QPs (as [`Worker::remove_qp`] does, all at once),
+/// Dropping it drains its QPs (as [`Engine::remove_qp`] does, all at once),
 /// drops the contexts of the requests not delivered, destroys the QPs, releases
 /// the buffers their requests held, then destroys the CQ and the thread domain.
 /// A QP the device never flushes is leaked with its buffers, and so are the CQ
 /// and the domain.
-pub struct Worker<C = (), N: Nic = Verbs> {
+pub struct Engine<C = (), N: Nic = Verbs> {
     /// The verified hardware side; dropped by hand, in `drop`.
     hw: ManuallyDrop<Hw<C, N>>,
-    /// The next request of each queue of each QP [`Worker::poll`] hands
-    /// out, by index.
-    cursors: Vec<(Seq, Seq)>,
+    /// The parent domains its QPs are created on, one per protection domain; dropped by hand.
+    domains: ManuallyDrop<Vec<Domain<N>>>,
+    /// The thread domain of its QPs, where the device has them; dropped by hand, last.
+    td: ManuallyDrop<Option<N::Td>>,
 }
 
-impl<C, N: Nic> Worker<C, N> {
-    /// A worker of `pd` with a CQ of `cq_size` entries, on a thread domain
-    /// of its own where the device has them.
-    pub fn new(pd: &Pd<N>, cq_size: u32) -> Result<Worker<C, N>> {
-        Ok(Worker {
-            hw: ManuallyDrop::new(Hw::new(pd.clone(), cq_size)?),
-            cursors: Vec::new(),
+impl<C, N: Nic> Engine<C, N> {
+    /// An engine on the device of `ctx` with a CQ of `cq_size` entries, on a thread domain of
+    /// its own where the device has them.
+    pub fn new(ctx: &Context<N>, cq_size: u32) -> Result<Engine<C, N>> {
+        let hw = Hw::new(ctx.clone(), cq_size)?;
+        Ok(Engine {
+            hw: ManuallyDrop::new(hw),
+            domains: ManuallyDrop::new(Vec::new()),
+            td: ManuallyDrop::new(ctx.nic().alloc_td()),
         })
     }
 
-    /// The protection domain of its QPs.
-    pub fn pd(&self) -> &Pd<N> {
-        self.hw.pd()
+    /// The device of its QPs.
+    pub fn context(&self) -> &Context<N> {
+        self.hw.context()
     }
 
     /// Whether its QPs are created on a thread domain (so the driver takes
     /// no locks for them); not every device has thread domains.
     pub fn is_lock_free(&self) -> bool {
-        self.hw.is_lock_free()
+        self.td.is_some()
     }
 
     /// The entries of its CQ.
@@ -272,30 +329,51 @@ impl<C, N: Nic> Worker<C, N> {
         self.hw.reserved()
     }
 
-    /// Panics unless `index` names a QP of the worker.
+    /// Panics unless `index` names a QP of the engine.
     fn check(&self, index: usize) {
-        assert!(self.hw.is_qp(index), "no QP {index} in this worker");
+        assert!(self.hw.is_qp(index), "no QP {index} in this engine");
     }
 
-    /// Creates a QP (in the RESET state) with queues of `caps` and requests
-    /// of at most `max_batch` WQEs, attached to the worker's CQ.
+    /// The parent domain to create a QP of `pd` on: the engine's for that protection domain,
+    /// made the first time; `None` where the device has no thread domains.
+    fn domain_index(&mut self, pd: &Pd<N>) -> Option<usize> {
+        let td = (*self.td).as_ref()?;
+        if let Some(i) = self.domains.iter().position(|d| d.pd.id() == pd.id()) {
+            return Some(i);
+        }
+        let domain = pd.context().nic().alloc_domain(pd.raw(), td)?;
+        self.domains.push(Domain {
+            domain,
+            pd: pd.clone(),
+        });
+        Some(self.domains.len() - 1)
+    }
+
+    /// Creates a QP (in the RESET state) in `pd` with queues of `caps` and requests of at most
+    /// `max_batch` WQEs, attached to the engine's CQ.
     ///
-    /// The sizes are checked against what the device supports, and the
-    /// QP's depths must fit in what the CQ has not reserved yet. M has one
-    /// limit of scatter/gather elements per QP: every WQE is held to the
-    /// smaller of `max_send_sge` and `max_recv_sge`.
-    pub fn create_qp<T: Transport>(&mut self, caps: QpCaps, max_batch: u32) -> Result<QpKey<T>> {
+    /// `pd` must be of the engine's device. The sizes are checked against what the device
+    /// supports, and the QP's depths must fit in what the CQ has not reserved yet. M has one
+    /// limit of scatter/gather elements per QP: every WQE is held to the smaller of
+    /// `max_send_sge` and `max_recv_sge`.
+    pub fn create_qp<T: Transport>(
+        &mut self,
+        pd: &Pd<N>,
+        caps: QpCaps,
+        max_batch: u32,
+    ) -> Result<QpKey<T>> {
         const {
             assert!(
                 T::IN_ORDER_COMPLETION,
                 "only in-order transports are supported"
             );
         }
-        let index = self.hw.create_qp(T::QP_TYPE, caps, max_batch)?;
-        if self.cursors.len() <= index {
-            self.cursors.resize(index + 1, (0, 0));
+        if !self.context().same_device(pd.context()) {
+            return Err(Error::Invalid("a protection domain of another device"));
         }
-        self.cursors[index] = (0, 0);
+        let domain = self.domain_index(pd);
+        let domain = domain.map(|i| &self.domains[i].domain);
+        let index = self.hw.create_qp(pd, domain, T::QP_TYPE, caps, max_batch)?;
         Ok(QpKey {
             index: index as u16,
             _t: PhantomData,
@@ -310,13 +388,13 @@ impl<C, N: Nic> Worker<C, N> {
     /// drained first (see the module documentation): moved to the error
     /// state, given a signaled drain WQE, and the CQ polled until nothing of
     /// it is in flight, the other QPs' completions going to their rings as
-    /// [`Worker::progress`] sends them. No completion of the QP is left in
+    /// [`Engine::progress`] sends them. No completion of the QP is left in
     /// the CQ then, so another QP may take its index and its share at once.
     ///
     /// If the device does not flush (no completion for [`DRAIN_TIMEOUT`]),
     /// the QP is kept with its buffers, index and share, never destroyed or
     /// freed, and this fails with [`Error::NotFlushed`]; dropping the
-    /// worker tries again. Either way the key names no QP afterwards.
+    /// engine tries again. Either way the key names no QP afterwards.
     pub fn remove_qp<T: Transport>(&mut self, qp: QpKey<T>) -> Result<()> {
         let index = qp.index();
         if !self.hw.is_qp(index) {
@@ -336,7 +414,7 @@ impl<C, N: Nic> Worker<C, N> {
     fn drain(&mut self, only: Option<usize>) -> bool {
         let (from, to) = match only {
             Some(index) => (index, index + 1),
-            None => (0, self.cursors.len()),
+            None => (0, self.hw.qp_slots()),
         };
         let mut deadline = Instant::now() + DRAIN_TIMEOUT;
         let mut idle = 0u32;
@@ -372,98 +450,55 @@ impl<C, N: Nic> Worker<C, N> {
     /// Polls the CQ once, retiring what completed in the rings of its QPs
     /// (and waking the wakers registered there); returns the number of
     /// completions. Owners take their results by sequence number
-    /// ([`Worker::take_send`], [`Worker::take_recv`]).
+    /// ([`Engine::take_send`], [`Engine::take_recv`]).
     ///
     /// If a registered waker panics, every CQE already polled is still
     /// recorded and every registered notification is attempted before the
     /// panic resumes. Catching that panic does not lose those results.
+    #[inline]
     pub fn progress(&mut self) -> usize {
         self.hw.progress()
     }
 
-    /// The event loop's poll: polls the CQ once and hands every request
-    /// that retired with an owner (and was not taken otherwise) to `f`, with
-    /// the worker, in each queue's order, and every request refused with its
-    /// doorbell at once; returns the number of completions polled. `f` may
-    /// post new work, take or detach requests, even remove QPs. Nothing is
-    /// allocated.
+    /// The event loop's poll: reads at most `n` CQEs ([`POLL_MAX`] at most), updates the CQ's
+    /// consumer index, and then hands every request they complete with an owner (and that was not
+    /// taken otherwise) to `f`, with the engine, in each queue's order, and every request refused
+    /// with its doorbell at once; returns the number of requests handed out. `f` may post new work
+    /// on any QP, take or detach requests, even poll or remove QPs. Nothing is allocated.
     ///
     /// Requests without an owner (detached) release their buffers when they
-    /// retire; their first error is reported by [`Worker::take_send_error`].
+    /// retire; their first error is reported by [`Engine::take_send_error`].
     /// An unsignaled request retires with the next signaled one of its
     /// queue: a loop that posts unsignaled requests also posts signaled
     /// ones.
-    pub fn poll<F: FnMut(&mut Worker<C, N>, Completion<C, N>)>(&mut self, mut f: F) -> usize {
-        let n = self.progress();
-        while let Some(next) = self.hw.pop_dirty() {
-            let Some((index, refused)) = next else {
-                continue;
-            };
-            self.deliver(index, Queue::Send, &mut f);
-            self.deliver(index, Queue::Recv, &mut f);
-            if refused {
-                self.deliver_refused(index, &mut f);
-            }
+    #[inline]
+    pub fn poll<F: FnMut(&mut Engine<C, N>, Completion<C, N>)>(
+        &mut self,
+        n: usize,
+        mut f: F,
+    ) -> usize {
+        self.hw.read_completions(n);
+        let mut handed = 0;
+        while let Some(done) = self.hw.next_completion() {
+            f(self, done);
+            handed += 1;
         }
-        n
+        handed
     }
 
-    /// Hands the refused requests among the ones in flight of QP `index`'s
-    /// send queue to `f` (refusals are rare: the scan is too).
-    fn deliver_refused<F: FnMut(&mut Worker<C, N>, Completion<C, N>)>(
-        &mut self,
-        index: usize,
-        f: &mut F,
-    ) {
-        let Some(ring) = self.hw.ring(index, Queue::Send) else {
-            return;
-        };
-        let (from, to) = (ring.retired(), ring.committed());
-        let mut seq = from;
-        while seq < to {
-            let refused = match self.hw.ring(index, Queue::Send) {
-                Some(ring) => ring.state(seq) == crate::ring::State::Refused,
-                None => return,
-            };
-            if refused && let Some(done) = self.hw.take(index, Queue::Send, seq) {
-                f(self, done);
-            }
-            seq += 1;
-        }
+    /// The first half of [`Engine::poll`], for a caller who cannot lend the engine to a callback:
+    /// reads at most `n` CQEs and updates the CQ's consumer index, unless some read before are not
+    /// routed yet. Returns how many it read.
+    #[inline(always)]
+    pub fn read_completions(&mut self, n: usize) -> usize {
+        self.hw.read_completions(n)
     }
 
-    /// Hands the retired requests of one queue to `f`, in order.
-    fn deliver<F: FnMut(&mut Worker<C, N>, Completion<C, N>)>(
-        &mut self,
-        index: usize,
-        queue: Queue,
-        f: &mut F,
-    ) {
-        loop {
-            let Some(ring) = self.hw.ring(index, queue) else {
-                return;
-            };
-            let (head, retired) = (ring.head(), ring.retired());
-            let Some(cursors) = self.cursors.get_mut(index) else {
-                return;
-            };
-            let cursor = match queue {
-                Queue::Send => &mut cursors.0,
-                Queue::Recv => &mut cursors.1,
-            };
-            // Requests before the head were taken or freed already.
-            if *cursor < head {
-                *cursor = head;
-            }
-            if *cursor >= retired {
-                return;
-            }
-            let seq = *cursor;
-            *cursor += 1;
-            if let Some(done) = self.hw.take(index, queue, seq) {
-                f(self, done);
-            }
-        }
+    /// The second half of [`Engine::poll`]: the next request that completed with an owner, `None`
+    /// when nothing is left of what was read.
+    #[inline(always)]
+    pub fn next_completion(&mut self) -> Option<Completion<C, N>> {
+        self.hw.next_completion()
     }
 
     // -------------------------------------------------------------------------
@@ -475,32 +510,40 @@ impl<C, N: Nic> Worker<C, N> {
         self.hw.qp_num(qp.index()).map_or(0, |(num, _)| num)
     }
 
+    /// The protection domain of the QP.
+    pub fn pd<T: Transport>(&self, qp: QpKey<T>) -> &Pd<N> {
+        self.check(qp.index());
+        self.hw.qp_pd(qp.index()).expect("a QP of this engine")
+    }
+
     /// The queues' sizes.
     pub fn caps<T: Transport>(&self, qp: QpKey<T>) -> QpCaps {
         self.check(qp.index());
-        self.hw.qp_caps(qp.index()).expect("a QP of this worker")
+        self.hw.qp_caps(qp.index()).expect("a QP of this engine")
     }
 
     /// Whether the QP was created without the driver's locks (on the
-    /// worker's thread domain).
+    /// engine's thread domain).
     pub fn qp_is_lock_free<T: Transport>(&self, qp: QpKey<T>) -> bool {
         self.check(qp.index());
         self.hw.qp_num(qp.index()).is_some_and(|(_, free)| free)
     }
 
     /// The send queue's ring.
+    #[inline]
     pub fn send_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Payload<C, N>> {
         match self.hw.ring(qp.index(), Queue::Send) {
             Some(ring) => ring,
-            None => panic!("no QP {} in this worker", qp.index()),
+            None => panic!("no QP {} in this engine", qp.index()),
         }
     }
 
     /// The receive queue's ring.
+    #[inline]
     pub fn recv_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Payload<C, N>> {
         match self.hw.ring(qp.index(), Queue::Recv) {
             Some(ring) => ring,
-            None => panic!("no QP {} in this worker", qp.index()),
+            None => panic!("no QP {} in this engine", qp.index()),
         }
     }
 
@@ -511,7 +554,7 @@ impl<C, N: Nic> Worker<C, N> {
         port: u8,
         gid_index: Option<u8>,
     ) -> Result<Endpoint> {
-        let ctx = self.pd().context();
+        let ctx = self.context();
         let info = ctx.port(port)?;
         let gid = match gid_index {
             Some(index) => {
@@ -557,7 +600,9 @@ impl<C, N: Nic> Worker<C, N> {
 
     /// Starts a request on the QP's send queue: add its WQEs, then give it its
     /// context when it is finished ([`Request::submit`], [`Request::finish`]).
-    /// Its WQEs go out at the next [`Worker::commit`] of the QP.
+    /// Nothing reaches the hardware until then; its WQEs go out at the next
+    /// [`Engine::commit`] of the QP.
+    #[inline]
     pub fn request<T: Transport>(&mut self, qp: QpKey<T>) -> Request<'_, T, C, N> {
         Request {
             w: self,
@@ -566,7 +611,9 @@ impl<C, N: Nic> Worker<C, N> {
         }
     }
 
-    /// One WQE as a request of its own, signaled, and the doorbell.
+    /// One WQE as a request of its own, signaled, and the doorbell; if the queue is full it waits
+    /// for room, polling the CQ.
+    #[inline(always)]
     fn post_one<T: Transport>(
         &mut self,
         qp: QpKey<T>,
@@ -574,19 +621,90 @@ impl<C, N: Nic> Worker<C, N> {
         part: Part<N>,
         ctx: C,
     ) -> Result<Seq, PostError<C, N>> {
-        let mut req = self.request(qp);
-        if let Err(e) = req.push(op, part) {
-            return Err(PostError {
-                error: e.error,
-                ctx,
-                leases: Leases::from(e.buf),
-            });
+        match self
+            .hw
+            .post_one(qp.index(), op, part, Some(ctx), true, true)
+        {
+            Ok(Ok(seq)) => Ok(seq),
+            Ok(Err(refused)) => Err(owned(refused)),
+            Err(unposted) => self.post_slow(qp.index(), unposted, true, true),
         }
-        req.submit(true, ctx)
+    }
+
+    /// [`Engine::post_one`] out of the common.
+    #[cold]
+    #[inline(never)]
+    fn post_slow(
+        &mut self,
+        index: usize,
+        unposted: Unposted<C, N>,
+        signal: bool,
+        ring: bool,
+    ) -> Result<Seq, PostError<C, N>> {
+        self.hw
+            .post_one_slow(index, unposted, signal, ring)
+            .map_err(owned)
+    }
+
+    /// One WQE doing `op` on `part` as a signaled request of its own, and the doorbell, if nothing
+    /// is out of the common: the QP takes work, nothing is being gathered, there is room and the
+    /// checks pass. Otherwise everything comes back untouched, for
+    /// [`Engine::post_unposted`] or for later.
+    #[inline(always)]
+    pub fn try_post<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        ctx: C,
+    ) -> Result<Result<Seq, PostError<C, N>>, Unposted<C, N>> {
+        match self
+            .hw
+            .post_one(qp.index(), op, part, Some(ctx), true, true)
+        {
+            Ok(Ok(seq)) => Ok(Ok(seq)),
+            Ok(Err(refused)) => Ok(Err(owned(refused))),
+            Err(unposted) => Err(unposted),
+        }
+    }
+
+    /// [`Engine::try_post`] without the doorbell, as [`Engine::stage`] writes it: signaled if
+    /// `signal`, else only if the ring needs it.
+    #[inline(always)]
+    pub fn try_stage<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        ctx: C,
+        signal: bool,
+    ) -> Result<Result<Seq, PostError<C, N>>, Unposted<C, N>> {
+        match self
+            .hw
+            .post_one(qp.index(), op, part, Some(ctx), signal, false)
+        {
+            Ok(Ok(seq)) => Ok(Ok(seq)),
+            Ok(Err(refused)) => Ok(Err(owned(refused))),
+            Err(unposted) => Err(unposted),
+        }
+    }
+
+    /// What [`Engine::try_post`] or [`Engine::try_stage`] handed back, as a request of the general
+    /// kind, signaled if `signal`, and the doorbell if `ring`: it waits for room if it must,
+    /// polling the CQ.
+    pub fn post_unposted<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        unposted: Unposted<C, N>,
+        signal: bool,
+        ring: bool,
+    ) -> Result<Seq, PostError<C, N>> {
+        self.post_slow(qp.index(), unposted, signal, ring)
     }
 
     /// SENDs `buf` into the peer's next receive, as a signaled request of its
     /// own, and rings the doorbell. `ctx` comes back with its completion.
+    #[inline]
     pub fn send<T: Transport, U: IntoBytes + Immutable>(
         &mut self,
         qp: QpKey<T>,
@@ -596,7 +714,8 @@ impl<C, N: Nic> Worker<C, N> {
         self.post_one(qp, WrOp::Send, buf.into_part(), ctx)
     }
 
-    /// [`Worker::send`] with immediate data `imm`.
+    /// [`Engine::send`] with immediate data `imm`.
+    #[inline]
     pub fn send_imm<T: Transport, U: IntoBytes + Immutable>(
         &mut self,
         qp: QpKey<T>,
@@ -609,6 +728,7 @@ impl<C, N: Nic> Worker<C, N> {
 
     /// RDMA WRITEs `buf` to `dst` in the peer's memory, as a signaled request
     /// of its own, and rings the doorbell. `ctx` comes back with its completion.
+    #[inline]
     pub fn write<T: Transport, U: IntoBytes + Immutable>(
         &mut self,
         qp: QpKey<T>,
@@ -619,8 +739,9 @@ impl<C, N: Nic> Worker<C, N> {
         self.post_one(qp, WrOp::Write(dst), buf.into_part(), ctx)
     }
 
-    /// [`Worker::write`] with immediate data `imm`, which also consumes one of
+    /// [`Engine::write`] with immediate data `imm`, which also consumes one of
     /// the peer's receives.
+    #[inline]
     pub fn write_imm<T: Transport, U: IntoBytes + Immutable>(
         &mut self,
         qp: QpKey<T>,
@@ -635,6 +756,7 @@ impl<C, N: Nic> Worker<C, N> {
     /// RDMA READs `src` from the peer's memory into `buf`, as a signaled
     /// request of its own, and rings the doorbell. `ctx` comes back with its
     /// completion and the buffer.
+    #[inline]
     pub fn read<T: Reliable, U: FromBytes + IntoBytes>(
         &mut self,
         qp: QpKey<T>,
@@ -647,6 +769,7 @@ impl<C, N: Nic> Worker<C, N> {
 
     /// Posts a receive into `buf`. `ctx` comes back with its completion and the
     /// buffer.
+    #[inline(always)]
     pub fn recv<T: Transport, U: FromBytes + IntoBytes>(
         &mut self,
         qp: QpKey<T>,
@@ -656,18 +779,73 @@ impl<C, N: Nic> Worker<C, N> {
         self.post_recv(qp, buf.into_part(), ctx)
     }
 
+    /// Writes one WQE doing `op` on `part` as a request of its own, with `ctx` to come back with
+    /// its completion, signaled if `signal` (else only if the ring needs it). Its WQE goes out at
+    /// the next [`Engine::commit`], with those written before it.
+    #[inline]
+    pub fn stage<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        ctx: C,
+        signal: bool,
+    ) -> Result<Seq, PostError<C, N>> {
+        match self
+            .hw
+            .post_one(qp.index(), op, part, Some(ctx), signal, false)
+        {
+            Ok(Ok(seq)) => Ok(seq),
+            Ok(Err(refused)) => Err(owned(refused)),
+            Err(unposted) => self.post_slow(qp.index(), unposted, signal, false),
+        }
+    }
+
+    /// [`Engine::stage`] of a request without an owner: nobody will take it back, its buffers are
+    /// released when it retires, and its first error is reported by
+    /// [`Engine::take_send_error`].
+    #[inline]
+    pub fn stage_detached<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        op: WrOp,
+        part: Part<N>,
+        signal: bool,
+    ) -> Result<Seq, BufError<Leases<N>>> {
+        let done = match self.hw.post_one(qp.index(), op, part, None, signal, false) {
+            Ok(done) => done,
+            Err(unposted) => self.hw.post_one_slow(qp.index(), unposted, signal, false),
+        };
+        done.map_err(|refused| BufError {
+            error: refused.error,
+            buf: refused.leases,
+        })
+    }
+
     /// Rings the QP's doorbell for every request written since the last
     /// one. If the device refuses, none of them is posted: each one with an
     /// owner retires at once as [`CompletionError::Refused`], which its owner
-    /// takes with its context and buffers ([`Worker::take_send`], or
-    /// [`Worker::poll`]); each one without an owner releases its buffers and is
-    /// reported by [`Worker::take_send_error`]. Sequence numbers are never
+    /// takes with its context and buffers ([`Engine::take_send`], or
+    /// [`Engine::poll`]); each one without an owner releases its buffers and is
+    /// reported by [`Engine::take_send_error`]. Sequence numbers are never
     /// reused. [`Request::submit`] hands the context and buffers of its own
     /// request back with the error instead.
     /// A waker panic during refusal propagates only after all staged
     /// requests have their refusal result and notifications are attempted.
+    #[inline]
     pub fn commit<T: Transport>(&mut self, qp: QpKey<T>) -> Result<()> {
         self.hw.commit(qp.index(), None).map_err(|(e, _)| e)
+    }
+
+    /// Takes the context, result and buffers of retired (or refused) request `seq` of `queue`.
+    #[inline(always)]
+    pub fn take<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        queue: Queue,
+        seq: Seq,
+    ) -> Option<Completion<C, N>> {
+        self.hw.take(qp.index(), queue, seq)
     }
 
     /// Takes the context, result and buffers of retired (or refused) send
@@ -721,19 +899,17 @@ impl<C, N: Nic> Worker<C, N> {
     /// Posts a receive into `part`, a unique buffer, on the QP, with `ctx` for
     /// its owner. Refused, with `part` and `ctx`, when the receive queue is
     /// full or the QP takes no work.
+    #[inline(always)]
     pub fn post_recv<T: Transport>(
         &mut self,
         qp: QpKey<T>,
         part: Part<N>,
         ctx: C,
     ) -> Result<Seq, PostError<C, N>> {
-        self.hw
-            .post_recv(qp.index(), part, Some(ctx))
-            .map_err(|(e, ctx)| PostError {
-                error: e.error,
-                ctx: ctx.expect("the context it was given"),
-                leases: Leases::from(e.buf),
-            })
+        match self.hw.post_recv(qp.index(), part, Some(ctx)) {
+            Ok(seq) => Ok(seq),
+            Err(refused) => Err(owned(refused)),
+        }
     }
 
     /// Posts a receive into `part` that nobody will take back by its sequence
@@ -743,51 +919,63 @@ impl<C, N: Nic> Worker<C, N> {
         &mut self,
         qp: QpKey<T>,
         part: Part<N>,
-    ) -> Result<Seq, BufError<Part<N>>> {
+    ) -> Result<Seq, BufError<Leases<N>>> {
         self.hw
             .post_recv(qp.index(), part, None)
-            .map_err(|(e, _)| e)
+            .map_err(|refused| BufError {
+                error: refused.error,
+                buf: refused.leases,
+            })
     }
 }
 
-impl<C, N: Nic> Drop for Worker<C, N> {
+impl<C, N: Nic> Drop for Engine<C, N> {
     /// Drops the contexts of the requests not delivered and drains every QP
-    /// (all at once, as [`Worker::remove_qp`] does one), destroys the drained
+    /// (all at once, as [`Engine::remove_qp`] does one), destroys the drained
     /// ones and releases their buffers, then destroys the CQ and the thread
     /// domain. If the device does not flush some QP,
     /// that QP is leaked with its buffers, and so are the CQ and the domain
     /// (destroying them would need the QP gone).
     fn drop(&mut self) {
-        for index in 0..self.cursors.len() {
+        let slots = self.hw.qp_slots();
+        for index in 0..slots {
             self.hw.start_drain(index);
         }
         self.drain(None);
-        for index in 0..self.cursors.len() {
+        for index in 0..slots {
             if !self.hw.draining(index) {
                 self.hw.destroy(index);
             }
         }
-        // SAFETY: taken once, here; the field is not used again.
-        let hw = unsafe { ManuallyDrop::take(&mut self.hw) };
-        if let Err(hw) = hw.finish() {
+        // SAFETY: taken once, here; the fields are not used again.
+        let (hw, domains, td) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.hw),
+                ManuallyDrop::take(&mut self.domains),
+                ManuallyDrop::take(&mut self.td),
+            )
+        };
+        match hw.finish() {
+            Ok(()) => {
+                drop(domains);
+                drop(td);
+            }
             // A QP the NIC may still use: nothing of it is ever freed.
-            core::mem::forget(hw);
+            Err(hw) => core::mem::forget((hw, domains, td)),
         }
     }
 }
 
-/// A request being written on a QP of a worker: one or more WQEs that
+/// A request being written on a QP of an engine: one or more WQEs that
 /// retire together.
 ///
-/// Each WQE is held back until the next one arrives (or the request is
-/// finished), so that the last can be written signaled. A request longer
-/// than the QP's `max_batch` WQEs, or than the room in the send queue, is
-/// split: the part so far goes out as a request of its own (signaled,
-/// without an owner) and the rest continues once there is room. Dropping
-/// an unfinished request finishes it without an owner. The WQEs and their
-/// buffers are kept by the worker's verified hardware side.
+/// Nothing reaches the hardware until it is finished, when its signaling is known. A request
+/// longer than the QP's `max_batch` WQEs, or than the room in the send queue, is split: the part
+/// so far goes out as a request of its own (signaled, without an owner) and the rest continues
+/// once there is room. Dropping an unfinished request finishes it without an owner. The WQEs and
+/// their buffers are kept by the engine's verified hardware side.
 pub struct Request<'w, T: Transport, C = (), N: Nic = Verbs> {
-    w: &'w mut Worker<C, N>,
+    w: &'w mut Engine<C, N>,
     index: usize,
     _t: PhantomData<fn() -> T>,
 }
@@ -795,15 +983,9 @@ pub struct Request<'w, T: Transport, C = (), N: Nic = Verbs> {
 impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
     /// Adds a WQE doing `op` on `part`; on error nothing is added and the
     /// part is handed back.
+    #[inline]
     pub fn push(&mut self, op: WrOp, part: Part<N>) -> Result<(), BufError<Part<N>>> {
-        self.w.hw.gather(self.index, part)?;
-        self.w
-            .hw
-            .push(self.index, op)
-            .map_err(|(error, back)| BufError {
-                error,
-                buf: back.expect("the part of a WQE of one part"),
-            })
+        self.w.hw.push(self.index, op, part)
     }
 
     /// Adds a WQE doing `op` on the concatenation of `parts` (a gather
@@ -824,7 +1006,7 @@ impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
                 return Err(Error::TooManySges { got: n, max });
             }
         }
-        self.w.hw.push(self.index, op).map_err(|(error, _)| error)
+        self.w.hw.push_gathered(self.index, op)
     }
 
     /// Whether no WQE was added.
@@ -836,7 +1018,8 @@ impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
     /// it), with `ctx` to come back with its completion. Returns its sequence
     /// number, or `ctx` if it has no WQE. It goes out at the next commit; if the
     /// device refuses that doorbell, it retires as
-    /// [`CompletionError::Refused`] (see [`Worker::commit`]).
+    /// [`CompletionError::Refused`] (see [`Engine::commit`]).
+    #[inline]
     pub fn finish(self, signal: bool, ctx: C) -> core::result::Result<Seq, C> {
         self.w
             .hw
@@ -854,27 +1037,21 @@ impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
     /// Finishes the request with `ctx`, as [`Request::finish`], and rings the
     /// doorbell. If the device refuses, or it has no WQE, its context and
     /// buffers come back with the error.
+    #[inline]
     pub fn submit(self, signal: bool, ctx: C) -> Result<Seq, PostError<C, N>> {
         let seq = match self.w.hw.close(self.index, signal, Some(ctx)) {
             Ok(seq) => seq,
             Err(ctx) => {
                 return Err(PostError {
                     error: Error::Invalid("a request without a WQE"),
-                    ctx: ctx.expect("the context it was given"),
+                    wr_id: ctx.expect("the context it was given"),
                     leases: Leases::default(),
                 });
             }
         };
-        match self.w.hw.commit(self.index, Some(seq)) {
-            Ok(()) => Ok(seq),
-            Err((error, kept)) => {
-                let kept = kept.expect("the request just staged");
-                Err(PostError {
-                    error,
-                    ctx: kept.ctx.expect("a request with an owner has its context"),
-                    leases: kept.leases,
-                })
-            }
+        match self.w.hw.commit_own(self.index, seq) {
+            Ok(seq) => Ok(seq),
+            Err(refused) => Err(owned(refused)),
         }
     }
 
@@ -994,25 +1171,30 @@ mod tests {
     #[test]
     fn qps_reserve_the_cq() {
         let pd = Context::new(Model::new(3)).alloc_pd().unwrap();
-        let mut w: Worker<(), _> = Worker::new(&pd, 64).unwrap();
-        let a = w.create_qp::<RC>(caps(16), 4).unwrap();
-        let b = w.create_qp::<RC>(caps(16), 4).unwrap();
+        let mut w: Engine<(), _> = Engine::new(pd.context(), 64).unwrap();
+        let a = w.create_qp::<RC>(&pd, caps(16), 4).unwrap();
+        let b = w.create_qp::<RC>(&pd, caps(16), 4).unwrap();
         assert_eq!(w.reserved(), 64);
         assert_eq!(
-            w.create_qp::<RC>(caps(1), 1).err(),
+            w.create_qp::<RC>(&pd, caps(1), 1).err(),
             Some(Error::CqFull { need: 2, free: 0 })
         );
         w.remove_qp(a).unwrap();
         assert_eq!(w.reserved(), 32);
-        let c = w.create_qp::<RC>(caps(16), 4).unwrap();
+        let c = w.create_qp::<RC>(&pd, caps(16), 4).unwrap();
         assert_eq!(c.index(), a.index(), "the index is reused");
         assert_ne!(w.qp_num(c), w.qp_num(b));
     }
 
     /// Two RC QPs of one worker connected to each other.
-    fn connected_pair(w: &mut Worker<(), Model>, depth: u32, batch: u32) -> (QpKey<RC>, QpKey<RC>) {
-        let a = w.create_qp::<RC>(caps(depth), batch).unwrap();
-        let b = w.create_qp::<RC>(caps(depth), batch).unwrap();
+    fn connected_pair(
+        w: &mut Engine<(), Model>,
+        pd: &Pd<Model>,
+        depth: u32,
+        batch: u32,
+    ) -> (QpKey<RC>, QpKey<RC>) {
+        let a = w.create_qp::<RC>(pd, caps(depth), batch).unwrap();
+        let b = w.create_qp::<RC>(pd, caps(depth), batch).unwrap();
         let attr = ConnectAttr {
             port: 1,
             access: crate::nic::Access::LOCAL_WRITE,
@@ -1046,8 +1228,8 @@ mod tests {
     fn remove_qp_drains_work_in_flight() {
         let model = Model::new(11);
         let pd = Context::new(model.clone()).alloc_pd().unwrap();
-        let mut w = Worker::new(&pd, 64).unwrap();
-        let (a, b) = connected_pair(&mut w, 8, 1);
+        let mut w = Engine::new(pd.context(), 64).unwrap();
+        let (a, b) = connected_pair(&mut w, &pd, 8, 1);
         let frozen = pd.alloc::<u8>(64).unwrap().freeze();
         // Receives on both sides; the sends of `a` take two of `b`'s.
         for qp in [a, a, b, b, b] {
@@ -1082,8 +1264,8 @@ mod tests {
         let model = Model::new(13);
         model.set_pace(900, 1);
         let pd = Context::new(model.clone()).alloc_pd().unwrap();
-        let mut w = Worker::new(&pd, 64).unwrap();
-        let (a, b) = connected_pair(&mut w, 8, 6);
+        let mut w = Engine::new(pd.context(), 64).unwrap();
+        let (a, b) = connected_pair(&mut w, &pd, 8, 6);
         let frozen = pd.alloc::<u8>(64).unwrap().freeze();
         for _ in 0..4 {
             let buf = pd.alloc::<u8>(64).unwrap();
@@ -1109,15 +1291,15 @@ mod tests {
         for recovers in [true, false] {
             let model = Model::new(17);
             let pd = Context::new(model.clone()).alloc_pd().unwrap();
-            let mut w = Worker::new(&pd, 64).unwrap();
-            let (a, b) = connected_pair(&mut w, 8, 1);
+            let mut w = Engine::new(pd.context(), 64).unwrap();
+            let (a, b) = connected_pair(&mut w, &pd, 8, 1);
             let buf = pd.alloc::<u8>(64).unwrap();
             let ptr = buf.as_ptr() as usize;
             w.post_recv(a, buf.into_part(), ()).unwrap();
             model.halt(true);
             assert_eq!(w.remove_qp(a), Err(Error::NotFlushed));
             assert_eq!(w.reserved(), 32, "its share of the CQ stays taken");
-            let c = w.create_qp::<RC>(caps(8), 8).unwrap();
+            let c = w.create_qp::<RC>(&pd, caps(8), 8).unwrap();
             assert_ne!(c.index(), a.index(), "its index stays taken");
             assert_eq!(model.registered(), 1, "its buffer stays registered");
             let _ = (b, ptr);
@@ -1136,9 +1318,9 @@ mod tests {
     #[test]
     fn refused_doorbell_retires_staged_requests() {
         let pd = Context::new(Model::new(7)).alloc_pd().unwrap();
-        let mut w: Worker<u32, _> = Worker::new(&pd, 64).unwrap();
+        let mut w: Engine<u32, _> = Engine::new(pd.context(), 64).unwrap();
         // Not connected: the worker refuses the doorbell, as a device would.
-        let qp = w.create_qp::<RC>(caps(8), 4).unwrap();
+        let qp = w.create_qp::<RC>(&pd, caps(8), 4).unwrap();
         let buf = pd.alloc::<u8>(64).unwrap().freeze();
         let mut req = w.request(qp);
         req.push(WrOp::Send, buf.clone().into_part()).unwrap();
@@ -1150,7 +1332,7 @@ mod tests {
         req.push(WrOp::Send, buf.into_part()).unwrap();
         let refused = req.submit(true, 22).unwrap_err();
         assert_eq!(refused.error, Error::NotConnected);
-        assert_eq!(refused.ctx, 22);
+        assert_eq!(refused.wr_id, 22);
         assert_eq!(refused.leases.len(), 1);
         assert_eq!(w.send_ring(qp).posted(), 3);
         assert_eq!(w.send_ring(qp).in_flight_wqes(), 0);
@@ -1164,7 +1346,9 @@ mod tests {
         );
         assert!(w.take_send_error(qp).is_none());
         let mut got = Vec::new();
-        w.poll(|_, c| got.push((c.qp, c.queue, c.seq, c.ctx, c.result, c.leases.len())));
+        w.poll(32, |_, c| {
+            got.push((c.qp, c.queue, c.seq, c.wr_id, c.result, c.leases.len()))
+        });
         assert_eq!(
             got,
             [(

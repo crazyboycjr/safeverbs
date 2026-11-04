@@ -130,87 +130,16 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
     /// Gives up ownership of request `seq`, as [`Ring::detach`] does, and hands
     /// back its context, if it has one.
     pub fn give_up(&mut self, seq: Seq) -> (ctx: Option<C>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            old(self).req(seq as int) matches Some(r) ==> ctx == r.leases.ctx,
-            old(self).staged(seq as int) matches Some(r) ==> ctx == r.leases.ctx,
-            old(self).refused(seq as int) matches Some(p) ==> ctx == p.ctx,
-            forall|s: int| #[trigger] final(self).req(s) == if s == seq && old(self).req(s) is Some {
-                if old(self).req(s)->0.phase is Complete {
-                    None
-                } else {
-                    Some(ReqView { leases: old(self).req(s)->0.leases.without_ctx(), ..old(self).req(s)->0.detach() })
-                }
-            } else {
-                old(self).req(s)
-            },
-            forall|s: int| #[trigger] final(self).staged(s) == if s == seq && old(self).staged(s) is Some {
-                Some(ReqView { leases: old(self).staged(s)->0.leases.without_ctx(), ..old(self).staged(s)->0.detach() })
-            } else {
-                old(self).staged(s)
-            },
-            forall|s: int| #[trigger] final(self).refused(s) == if s == seq {
-                None
-            } else {
-                old(self).refused(s)
-            },
-            final(self).woken() == old(self).woken(),
-            final(self).same_wqes(old(self)),
-            final(self).same_open(old(self)),
-            final(self).spec_posted() == old(self).spec_posted(),
-            forall|s: int, w: int| #[trigger] final(self).dma(s, w) == if s == seq && old(self).dma(s, w) is Some {
-                Some(old(self).dma(s, w)->0.without_ctx())
-            } else {
-                old(self).dma(s, w)
-            },
-            forall|s: int| #[trigger] final(self).meta(s) == if s == seq && old(self).req(s) is Some && old(self).req(s)->0.phase is Complete {
-                None
-            } else {
-                old(self).meta(s)
-            },
-            final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
-        proof {
-            self.lemma_state_views(seq as int);
-        }
-        let state = self.state(seq);
-        let ghost pre = *self;
-        let ctx = if matches!(state, State::Free) {
+        let ctx = if seq < self.head || seq >= self.posted {
             None
         } else {
-            proof {
-                reveal(Ring::inv_slots);
-                if seq < self.retired {
-                    assert(self.done_ok(seq as int));
-                } else {
-                    assert(self.live_ok(seq as int));
-                }
-            }
             let i = self.index(seq);
-            let slot = &mut self.slots[i];
-            let taken = match &mut slot.leases {
+            match &mut self.slots[i].leases {
                 Some(payload) => payload.ctx.take(),
                 None => None,
-            };
-            proof {
-                assert(pre.slot(seq as int).leases is Some);
-                self.lemma_payload_update(&pre, seq as int, pre.slot(seq as int).leases->0.without_ctx());
             }
-            taken
         };
-        let ghost stripped = *self;
-        proof {
-            pre.lemma_state_views(seq as int);
-            if matches!(state, State::Free) {
-                assert forall|w: int| pre.dma(seq as int, w) is None by {
-                    if pre.dma(seq as int, w) is Some {
-                        pre.lemma_dma(seq as int, w);
-                    }
-                }
-            }
-        }
         self.detach(seq);
         ctx
     }

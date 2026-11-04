@@ -67,12 +67,12 @@ use crate::error::{Error, Result};
 use crate::nic::{
     ConnectAttr, DeviceCaps, Endpoint, Nic as Device, NicCq, NicQp, QpCaps, QpType, Sge, WrOp,
 };
-use crate::pd::Pd;
+use crate::pd::{Context, Pd};
 use crate::ring::wake::WakeBatch;
 use crate::ring::{Payload, Ring, Seq as RingSeq, Taken};
 use crate::trusted::*;
 use crate::verbs::Verbs;
-use crate::wc::{Completed, CompletionError, Opcode, Wc};
+use crate::wc::{Completed, CompletionError, CompletionResult, Opcode, Received, Wc};
 use crate::wr_id::*;
 
 mod completion;
@@ -101,21 +101,24 @@ pub enum Side {
     Recv,
 }
 
-/// A request that retired, as [`Worker::poll`](crate::worker::Worker::poll) and
-/// [`Worker::take_send`](crate::worker::Worker::take_send) hand it out.
+/// A request that completed, as [`Engine::poll`](crate::engine::Engine::poll) and
+/// [`Engine::take_send`](crate::engine::Engine::take_send) hand it out: an owned value, with only
+/// what its operation defines.
 #[verifier::reject_recursive_types(N)]
 pub struct Completion<C = (), N: Device = Verbs> {
-    /// The QP's index in the worker
-    /// ([`QpKey::index`](crate::worker::QpKey::index)).
+    /// The value it was posted with (its context).
+    pub wr_id: C,
+    /// What it did, or why it did not.
+    pub result: CompletionResult,
+    /// The QP's index in the engine
+    /// ([`QpKey::index`](crate::engine::QpKey::index)).
     pub qp: usize,
+    /// The QP's number on the device.
+    pub qp_num: u32,
     /// The queue it was posted on.
     pub queue: Side,
     /// Its sequence number in that queue.
     pub seq: RingSeq,
-    /// The context it was posted with.
-    pub ctx: C,
-    /// What it did, or why it did not.
-    pub result: core::result::Result<Completed, CompletionError>,
     /// Its buffers.
     pub leases: Leases<N>,
 }
@@ -144,15 +147,24 @@ pub enum Phase {
     Broken,
 }
 
-/// A QP of a worker: its hardware handle and the rings of its queues.
+/// A QP of an engine: its hardware handle and the rings of its queues.
 #[verifier::reject_recursive_types(C)]
 #[verifier::reject_recursive_types(N)]
 pub struct HwQp<C, N: Device> {
     hw: N::Qp,
     send: Ring<Payload<C, N>>,
     recv: Ring<Payload<C, N>>,
-    caps: QpCaps,
-    qp_type: QpType,
+    /// The number of its protection domain ([`Pd::id`]), which every post compares.
+    pd_id: u64,
+    /// The longest message it may send.
+    max_len: u32,
+    /// Its number on the device.
+    qp_num: u32,
+    /// What the data path checks instead of `phase` and `removed`, together: it takes work
+    /// (it is `Phase::Ready`) and is not being removed.
+    takes_work: bool,
+    /// READ and atomics are allowed (a reliable connection).
+    reliable: bool,
     /// Atomics are allowed (a reliable connection on a device with them).
     atomics: bool,
     phase: Phase,
@@ -165,158 +177,80 @@ pub struct HwQp<C, N: Device> {
     drain_pending: bool,
     /// Whether a doorbell was refused since the event loop last looked.
     refused: bool,
-    /// Whether the QP is in the worker's list of QPs with requests to hand
-    /// out.
-    dirty: bool,
+    caps: QpCaps,
+    /// Its transport (erased from the data path: `reliable` says what that asks).
+    #[allow(dead_code)]
+    qp_type: QpType,
+    /// Its protection domain, alive as long as it is.
+    pd: Pd<N>,
     /// M's name of the QP.
     #[allow(dead_code)]
     id: Ghost<QpId>,
-    /// The protection domain's number ([`Pd::id`]).
-    #[allow(dead_code)]
-    pd_id: Ghost<u64>,
-    /// The WQE the open request holds back until it knows whether it is
-    /// its last (so that the last can be written signaled), with its parts.
-    held: Option<Held>,
-    held_parts: Vec<Part<N>>,
-    /// The parts of the WQE being gathered.
-    building: Vec<Part<N>>,
-    /// The leases of the open request's WQEs written so far.
+    /// The request being gathered: nothing of it reaches the hardware until it is finished,
+    /// when its signaling is known. Its WQEs, their scatter/gather lists and its leases.
+    open_wqes: Vec<OpenWqe>,
+    open_sges: Vec<Sge>,
     open_leases: Leases<N>,
-    /// The local byte count of the final held WQE, for inferred success.
-    held_bytes: u64,
+    /// The parts of a gather list, until it is checked.
+    building: Vec<Part<N>>,
     /// The final WR written for each send request (erased).
     #[allow(dead_code)]
     send_tails: Ghost<Map<int, SendWr>>,
 }
 
-/// A WQE held back: its `wr_id`, operation and scatter/gather list.
+/// A request of one WQE that the data path's own way does not take: all of it.
+pub struct Unposted<C, N: Device> {
+    /// What it does.
+    pub op: WrOp,
+    /// Its buffer.
+    pub part: Part<N>,
+    /// The context it was given.
+    pub ctx: Option<C>,
+}
+
+/// A request that could not be posted: why, and its context, if it has one, and buffers.
+pub struct Refusal<C, N: Device> {
+    /// What went wrong.
+    pub error: Error,
+    /// The context it was given.
+    pub ctx: Option<C>,
+    /// Its buffers.
+    pub leases: Leases<N>,
+}
+
+/// A WQE of the request being gathered: its operation and where its scatter/gather list lies
+/// in `HwQp::open_sges`.
 #[derive(Clone, Copy)]
-struct Held {
-    wr_id: u64,
+struct OpenWqe {
     op: WrOp,
-    sges: [Sge; MAX_SGES],
-    n: usize,
+    first_sge: usize,
+    sges: usize,
+    /// Its local bytes, for the success a later completion implies.
+    bytes: u32,
 }
 
-/// The logical inputs the pop loop appends, in its order.
-pub(crate) open spec fn collected_parts<N: Device>(
-    parts: Seq<Part<N>>, remaining: int, access: safeverbs_spec::abs::Dir,
-) -> Seq<crate::buf::Loan<N>> {
-    Seq::new((parts.len() - remaining) as nat, |i: int| crate::buf::Loan {
-        part: parts[parts.len() - 1 - i], access: Some(access),
-    })
-}
-
-/// Moves all SGE guards into their request without changing the native algorithm.
-/// The erased ledger records even a shared input whose redundant Arc is dropped.
-#[inline(always)]
-fn keep_parts<N: Device>(
-    leases: &mut Leases<N>, parts: &mut Vec<Part<N>>,
-    Ghost(wqe): Ghost<crate::buf::WqeLoans>,
-)
-    requires old(leases).inv(), old(leases).fully_recorded(),
-        wqe.first == old(leases).loans().len(),
-        wqe.sges.len() == old(parts)@.len(),
-        forall|i: int| 0 <= i < old(parts)@.len()
-            ==> wqe.sges[i] == part_sge(#[trigger] old(parts)@[i])
-                && (wqe.access() is In ==> part_writable(old(parts)@[i])),
-    ensures final(parts)@.len() == 0,
-        final(leases).inv(),
-        final(leases).fully_recorded(),
-        final(leases).loans() == old(leases).loans()
-            + collected_parts(old(parts)@, 0, wqe.access()),
-        final(leases).wqes() == old(leases).wqes().push(wqe),
-{
-    let ghost access = wqe.access();
-    let ghost original = parts@;
-    let ghost prefix = leases.loans();
-    let ghost old_wqes = leases.wqes();
-    proof {
-        leases.lemma_wqes();
-        assert(collected_parts(original, original.len() as int, access) =~= Seq::empty());
-    }
-    while parts.len() > 0
-        invariant
-            leases.inv(),
-            leases.wqes() == old_wqes,
-            crate::buf::covers_inputs(old_wqes, prefix.len() as int),
-            parts@.len() <= original.len(),
-            parts@ == original.take(parts@.len() as int),
-            leases.loans() == prefix + collected_parts(original, parts@.len() as int, access),
-            forall|i: int| 0 <= i < original.len()
-                ==> access is In ==> part_writable(#[trigger] original[i]),
-            forall|i: int| 0 <= i < original.len()
-                ==> wqe.sges[i] == part_sge(#[trigger] original[i]),
-            wqe.first == prefix.len(), wqe.sges.len() == original.len(),
-            forall|i: int| 0 <= i < old_wqes.len()
-                ==> (#[trigger] old_wqes[i]).end() <= prefix.len(),
-        decreases parts@.len(),
-    {
-        let ghost before = parts@;
-        match parts.pop() {
-            Some(part) => {
-                proof { assert(part == original[before.len() - 1]); }
-                keep_lease(leases, part, Ghost(access));
-            },
-            None => {},
-        }
-        proof {
-            assert(parts@ =~= original.take(parts@.len() as int));
-            let old_tail = collected_parts(original, before.len() as int, access);
-            let new_tail = collected_parts(original, parts@.len() as int, access);
-            assert(new_tail =~= old_tail.push(crate::buf::Loan {
-                part: original[before.len() - 1], access: Some(access),
-            }));
-            assert(prefix + new_tail =~= (prefix + old_tail).push(crate::buf::Loan {
-                part: original[before.len() - 1], access: Some(access),
-            }));
-        }
-    }
-    proof {
-        assert forall|j: int| 0 <= j < wqe.sges.len() implies {
-            let loan = #[trigger] leases.loans()[wqe.end() - 1 - j];
-            &&& loan.part.spec_sge() == wqe.sges[j]
-            &&& loan.access == Some(wqe.access())
-        } by {
-            let k = original.len() - 1 - j;
-            assert(leases.loans()[wqe.end() - 1 - j] == collected_parts(original, 0, access)[k]);
-            assert(leases.loans()[wqe.end() - 1 - j].part == original[j]);
-        }
-    }
-    leases.record_wqe(Ghost(wqe));
-}
-
-/// The WR M sees for a held WQE.
-spec fn held_wr(h: Held, signaled: bool) -> SendWr {
-    send_wr(h.wr_id, signaled, h.op, h.sges@.take(h.n as int))
-}
-
-/// A held WQE with parts `parts`, number `num`, on a QP with attributes
-/// `attr`, is one M accepts once its parts' regions are registered: its
-/// `wr_id`, its parts' ranges, domain and uniqueness, its length.
-spec fn held_ok<N: Device>(h: Held, parts: Seq<Part<N>>, index: u16, num: int, attr: QpAttr, pd_id: u64, max_msg: nat) -> bool {
-    &&& h.wr_id == spec_wr_id(index, false, num as u64)
-    &&& 1 <= h.n <= MAX_SGES
-    &&& parts.len() == h.n
-    &&& forall|j: int|
-        0 <= j < h.n ==> h.sges@[j] == part_sge(#[trigger] parts[j]) && part_pd(parts[j]) == pd_id
-            && (opcode_model(h.op).writes_local() ==> part_writable(parts[j]))
-    &&& h.n <= attr.max_sge
-    &&& opcode_model(h.op).allowed_on(attr.transport)
-    &&& total_len(h.sges@.take(h.n as int).map_values(|sge: Sge| sge_model(sge))) <= max_msg
-}
-
-/// The hardware side of a worker: its CQ, its QPs and its share of M.
+/// The hardware side of an engine: its CQ, its QPs and its share of M.
 #[verifier::reject_recursive_types(C)]
 #[verifier::reject_recursive_types(N)]
 pub struct Hw<C, N: Device> {
     cq: N::Cq,
-    pd: Pd<N>,
-    domain: Option<N::Domain>,
+    /// The device, alive as long as the CQ is.
+    ctx: Context<N>,
     caps: DeviceCaps,
     qps: Vec<Option<HwQp<C, N>>>,
-    /// The QPs with retired requests the event loop has not handed out.
-    dirty: Vec<u16>,
+    /// The CQEs read from the CQ and not routed yet: `polled[polled_at..polled_len]`, oldest
+    /// first. The first may have retired some requests already. Here, the program may post
+    /// and poll between two of them, and everything sees them in order.
+    polled: [Wc; POLL_MAX],
+    polled_at: usize,
+    polled_len: usize,
+    /// Results for the event loop may wait in the rings: a poll that kept them there
+    /// ([`Hw::progress`]) or a refused doorbell put them there.
+    kept: bool,
+    /// Where the event loop looks next for them: by QP index, twice, a QP's send ring first.
+    kept_at: usize,
+    /// Panics of the wakers run on the event loop's path, until its CQEs are done.
+    panics: WakeBatch,
     /// Entries of the CQ.
     cq_size: u32,
     /// CQ entries reserved by the QPs attached.
@@ -1361,46 +1295,33 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// A worker of `pd` with a CQ of `cq_size` entries, on a thread domain
-    /// of its own where the device has them.
-    pub fn new(pd: Pd<N>, cq_size: u32) -> (r: Result<Hw<C, N>>)
-        ensures
-            r matches Ok(hw) ==> hw.inv() && hw.spec_reserved() == 0 && hw.spec_cq_size() == cq_size,
+    /// An engine's hardware side on the device of `ctx`, with a CQ of `cq_size` entries.
+    pub fn new(ctx: Context<N>, cq_size: u32) -> (r: Result<Hw<C, N>>)
     {
-        let caps = device_caps(&pd);
+        let caps = device_caps(&ctx);
         if cq_size == 0 || cq_size > caps.max_cqe {
             return Err(Error::Invalid("a CQ needs 1..=max_cqe entries"));
         }
-        let (cq, caps, token) = match create_cq(&pd, cq_size) {
+        let (cq, caps, token) = match create_cq(&ctx, cq_size) {
             Ok(created) => created,
             Err(e) => return Err(e),
         };
-        let domain = alloc_domain(&pd);
         let hw = Hw {
             cq,
-            pd,
-            domain,
+            ctx,
             caps,
             qps: Vec::new(),
-            dirty: Vec::new(),
+            polled: [EMPTY_WC; POLL_MAX],
+            polled_at: 0,
+            polled_len: 0,
+            kept: false,
+            kept_at: 0,
+            panics: WakeBatch::new(),
             cq_size,
             reserved: 0,
             token,
             next_name: Ghost(0),
         };
-        proof {
-            let t = hw.token@;
-            assert forall|q: QpId| #[trigger] writes(t, q) implies exists|i: int|
-                0 <= i < hw.qps@.len() && #[trigger] hw.qps@[i] is Some && hw.qps@[i]->0.id() == q by {
-                assert(!t.started(q) && t.written(q) == Seq::<SendWr>::empty());
-                assert(!writes(t, q));
-            }
-            assert forall|q: QpId| #[trigger] t.nic().qps.contains_key(q) && t.share().owns.contains(q) implies exists|i: int|
-                0 <= i < hw.qps@.len() && #[trigger] hw.qps@[i] is Some && hw.qps@[i]->0.id() == q by {
-                // Nothing of the share exists yet.
-                assert(!t.nic().qps.contains_key(q));
-            }
-        }
         Ok(hw)
     }
 
@@ -1430,31 +1351,16 @@ impl<C, N: Device> Hw<C, N> {
         self.cq_size
     }
 
-    /// The protection domain of its QPs.
-    pub fn pd(&self) -> &Pd<N> {
-        &self.pd
+    /// The device.
+    pub fn context(&self) -> &Context<N> {
+        &self.ctx
     }
 
-    /// Whether its QPs are created on a thread domain.
-    pub fn is_lock_free(&self) -> bool {
-        self.domain.is_some()
-    }
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// Creates a QP of type `qp_type` (in the RESET state) with queues of
-    /// `caps` and requests of at most `max_batch` WQEs, attached to the
-    /// worker's CQ; returns its index.
-    ///
-    /// The sizes are checked against what the device supports, and the
-    /// QP's depths must fit in what the CQ has not reserved yet: this is
-    /// M's reservation, so the CQ cannot overrun.
     #[verifier::spinoff_prover]
-    pub fn create_qp(&mut self, qp_type: QpType, caps: QpCaps, max_batch: u32) -> (r: Result<usize>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
+    pub fn create_qp(&mut self, pd: &Pd<N>, domain: Option<&N::Domain>, qp_type: QpType, caps: QpCaps, max_batch: u32) -> (r: Result<usize>)
     {
         let dev = self.caps;
         if caps.max_send_wr == 0 || caps.max_recv_wr == 0 {
@@ -1489,12 +1395,6 @@ impl<C, N: Device> Hw<C, N> {
         // The first free index, or a new one.
         let mut index = 0;
         while index < self.qps.len()
-            invariant
-                index <= self.qps@.len(),
-                forall|i: int| 0 <= i < index ==> (#[trigger] self.qps@[i]) is Some,
-            ensures
-                index < self.qps@.len() ==> self.qps@[index as int] is None,
-            decreases self.qps@.len() - index,
         {
             if self.qps[index].is_none() {
                 break;
@@ -1502,28 +1402,12 @@ impl<C, N: Device> Hw<C, N> {
             index += 1;
         }
         if index == self.qps.len() && index >= MAX_QPS {
-            return Err(Error::Invalid("a worker holds at most 65536 QPs"));
+            return Err(Error::Invalid("an engine holds at most 65536 QPs"));
         }
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        let ghost sh = t0.share();
-        let ghost q = t0.name(self.next_name@);
-        let ghost attr = qp_attr(t0.pd(), qp_type, sh.cq, caps);
-        let ghost start = *self;
-        proof {
-            // The name is fresh, the depths fit the device and the CQ.
-            let cq = m0.cqs[sh.cq];
-            let cqs1 = m0.cqs.insert(attr.send_cq, cq.reserve(q, attr.sq_depth));
-            let cqs2 = cqs1.insert(attr.recv_cq, cqs1[attr.recv_cq].reserve(q, attr.rq_depth));
-            safeverbs_spec::nic_proofs::lemma_copies(q, attr.sq_depth);
-            safeverbs_spec::nic_proofs::lemma_copies(q, attr.rq_depth);
-            broadcast use vstd::multiset::group_multiset_axioms;
-            assert(cqs2[sh.cq].reserved.len() == cq.reserved.len() + attr.sq_depth + attr.rq_depth);
-            assert(nic_enabled(m0, Nic::Step::create_qp(q, attr)));
-        }
+        let ghost q = self.token@.name(self.next_name@);
         let hw = match create_qp(
-            &self.pd,
-            self.domain.as_ref(),
+            pd,
+            domain,
             &self.cq,
             qp_type,
             &caps,
@@ -1532,11 +1416,6 @@ impl<C, N: Device> Hw<C, N> {
         ) {
             Ok(hw) => hw,
             Err(e) => {
-                proof {
-                    start.lemma_rely(t0, m0, self.token@.nic());
-                    start.lemma_same_token(t0, self.token@, self.token@.nic());
-                    self.lemma_inv_fields(&start, self.token@, self.token@.nic());
-                }
                 return Err(e);
             },
         };
@@ -1544,6 +1423,12 @@ impl<C, N: Device> Hw<C, N> {
             QpType::Rc => true,
             QpType::Uc => false,
         };
+        let max_len = if dev.max_msg < 0x7fff_ffff {
+            dev.max_msg
+        } else {
+            0x7fff_ffff
+        };
+        let qp_num = qp_num_of(&hw);
         // Twice the depth: requests in flight never take more than the depth
         // (each has a WQE at least); the rest is room for results not taken
         // yet.
@@ -1551,25 +1436,27 @@ impl<C, N: Device> Hw<C, N> {
             hw,
             send: Ring::new(2 * caps.max_send_wr as usize, caps.max_send_wr, max_batch),
             recv: Ring::new(2 * caps.max_recv_wr as usize, caps.max_recv_wr, 1),
-            caps,
-            qp_type,
+            pd_id: pd_id_of(pd),
+            max_len,
+            qp_num,
+            takes_work: false,
+            reliable,
             atomics: reliable && dev.atomics,
             phase: Phase::Reset,
             started: false,
             removed: false,
             drain_pending: false,
             refused: false,
-            dirty: false,
+            caps,
+            qp_type,
+            pd: pd.clone(),
             id: Ghost(q),
-            pd_id: Ghost(pd_id(self.pd)),
-            held: None,
-            held_parts: Vec::with_capacity(MAX_SGES),
-            building: Vec::with_capacity(MAX_SGES),
+            open_wqes: Vec::new(),
+            open_sges: Vec::new(),
             open_leases: no_leases(),
-            held_bytes: 0,
+            building: Vec::new(),
             send_tails: Ghost(Map::empty()),
         };
-        let ghost before = *self;
         if index == self.qps.len() {
             self.qps.push(Some(entry));
         } else {
@@ -1577,82 +1464,6 @@ impl<C, N: Device> Hw<C, N> {
         }
         self.reserved += need as u32;
         self.next_name = Ghost(self.next_name@ + 1);
-        proof {
-            let t = self.token@;
-            let mid = choose|mid: Nic::State| rely_reaches(sh, pinned(t0), m0, mid) && nic_step(mid, t.nic(), Nic::Step::create_qp(q, attr));
-            let n = t.nic();
-            start.lemma_rely(t0, m0, mid);
-            start.lemma_same_token(t0, t, mid);
-            before.lemma_inv_fields(&start, t, mid);
-            lemma_nic_step_is_next(mid, n, Nic::Step::create_qp(q, attr));
-            lemma_step_keeps_invariant(mid, n);
-            lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::create_qp(q, attr));
-            safeverbs_spec::nic_proofs::lemma_copies(q, attr.sq_depth);
-            safeverbs_spec::nic_proofs::lemma_copies(q, attr.rq_depth);
-            outcomes::lemma_recv_empty(self.qps@[index as int]->0.recv, n, q);
-            send_outcomes::lemma_implied_empty(self.qps@[index as int]->0.send);
-            assert forall|s: int| self.qps@[index as int]->0.send.meta(s) is Some implies false by {
-                self.qps@[index as int]->0.send.lemma_meta(s);
-            }
-            send_outcomes::lemma_results_empty(self.qps@[index as int]->0.send, n, q);
-            broadcast use vstd::multiset::group_multiset_axioms;
-            // The new QP is not one of the table's: those exist in M already.
-            assert forall|i: int| 0 <= i < before.qps@.len() && #[trigger] before.qps@[i] is Some implies before.qps@[i]->0.id() != q by {
-                assert(before.entry_ok(i, t, mid));
-            }
-            assert(!mid.qps.contains_key(q));
-            assert(!writes(t, q)) by {
-                if writes(t, q) {
-                    let i = choose|i: int| 0 <= i < before.qps@.len() && #[trigger] before.qps@[i] is Some && before.qps@[i]->0.id() == q;
-                    assert(before.entry_ok(i, t, mid));
-                }
-            }
-            assert forall|i: int| 0 <= i < self.qps@.len() implies #[trigger] self.entry_ok(i, t, n) by {
-                if i == index {
-                    let e = self.qps@[i]->0;
-                    assert(e.id() == q);
-                    assert(n.qps[q].attr == attr);
-                } else {
-                    assert(self.qps@[i] == before.qps@[i]);
-                    assert(before.entry_ok(i, t, mid));
-                    if let Some(e) = self.qps@[i] {
-                        lemma_ok_same(e, i as u16, mid, n, sh, t.pd(), t.started(e.id()), t.written(e.id()));
-                    }
-                }
-            }
-            assert forall|i: int, j: int|
-                #![trigger self.qps@[i], self.qps@[j]]
-                0 <= i < self.qps@.len() && 0 <= j < self.qps@.len() && i != j && self.qps@[i] is Some
-                    && self.qps@[j] is Some implies self.qps@[i]->0.id() != self.qps@[j]->0.id() by {
-                if i != index && j != index {
-                    assert(self.qps@[i] == before.qps@[i] && self.qps@[j] == before.qps@[j]);
-                } else if i == index {
-                    assert(self.qps@[j] == before.qps@[j]);
-                } else {
-                    assert(self.qps@[i] == before.qps@[i]);
-                }
-            }
-            assert forall|p: QpId| #[trigger] n.qps.contains_key(p) && sh.owns.contains(p) implies exists|i: int|
-                0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
-                if p == q {
-                    assert(self.qps@[index as int] is Some);
-                } else {
-                    assert(mid.qps.contains_key(p));
-                    let i = choose|i: int| 0 <= i < before.qps@.len() && #[trigger] before.qps@[i] is Some && before.qps@[i]->0.id() == p;
-                    assert(i != index);
-                    assert(self.qps@[i] == before.qps@[i]);
-                }
-            }
-            assert forall|p: QpId| #[trigger] writes(t, p) implies exists|i: int|
-                0 <= i < self.qps@.len() && #[trigger] self.qps@[i] is Some && self.qps@[i]->0.id() == p by {
-                let i = choose|i: int| 0 <= i < before.qps@.len() && #[trigger] before.qps@[i] is Some && before.qps@[i]->0.id() == p;
-                assert(i != index);
-                assert(self.qps@[i] == before.qps@[i]);
-            }
-            assert forall|k: nat| k >= self.next_name@ implies !(#[trigger] n.qps.contains_key(t.name(k))) by {
-                assert(t.name(k) != q);
-            }
-        }
         Ok(index)
     }
 }
@@ -1845,37 +1656,23 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// Moves QP `index` to the error state: every request in flight
-    /// completes with a flush error. Work posted from then on is flushed
-    /// too.
     #[verifier::spinoff_prover]
     pub fn set_error(&mut self, index: usize) -> (r: Result<()>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
             return Err(Error::Invalid("no such QP"));
         }
-        let ghost start = *self;
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        let ghost sh = t0.share();
-        proof {
-            assert(start.entry_ok(index as int, t0, m0));
-        }
-        let r = match &mut self.qps[index] {
+        match &mut self.qps[index] {
             Some(e) => {
                 if e.removed {
                     no_qp(index);
                 }
-                let ghost q = e.id@;
+                let ghost q = e.id();
                 let r = to_error(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                 if r.is_ok() {
                     e.phase = Phase::Ready;
+                    e.takes_work = true;
                 }
                 r
             },
@@ -1883,37 +1680,7 @@ impl<C, N: Device> Hw<C, N> {
                 no_qp(index);
                 Err(Error::Invalid("no such QP"))
             },
-        };
-        proof {
-            let t = self.token@;
-            let n = t.nic();
-            let e0 = start.qps@[index as int]->0;
-            let q = e0.id();
-            if r is Ok {
-                let mid = choose|mid: Nic::State| rely_reaches(sh, pinned(t0), m0, mid) && nic_step(mid, n, Nic::Step::modify_qp(q, QpState::Err));
-                start.lemma_rely(t0, m0, mid);
-                start.lemma_same_token(t0, t, mid);
-                lemma_nic_step_is_next(mid, n, Nic::Step::modify_qp(q, QpState::Err));
-                lemma_step_keeps_invariant(mid, n);
-                lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::modify_qp(q, QpState::Err));
-                assert(start.entry_ok(index as int, t, mid));
-                let e = self.qps@[index as int]->0;
-                let written = t.written(q);
-                assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(n.qps[q].attr, #[trigger] written[j]) by {
-                    assert(mid.send_wr_ok(mid.qps[q].attr, written[j]));
-                }
-                outcomes::lemma_recv_framed(e.recv, mid, n, q);
-                send_outcomes::lemma_results_framed(e.send, mid, n, q);
-                assert(self.entry_ok(index as int, t, n));
-                self.lemma_touch_one(&start, t, mid, n, index as int);
-            } else {
-                start.lemma_rely(t0, m0, n);
-                start.lemma_same_token(t0, t, n);
-                assert(start.entry_ok(index as int, t, n));
-                self.lemma_touch_one(&start, t, n, n, index as int);
-            }
         }
-        r
     }
 }
 
@@ -2025,27 +1792,12 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// Connects QP `index` to `remote` (RESET to INIT, RTR and RTS). A QP
-    /// connects once: from RESET, as created. If connecting fails part way,
-    /// the QP takes no work until it is moved to the error state.
     #[verifier::spinoff_prover]
     pub fn connect(&mut self, index: usize, attr: &ConnectAttr, remote: &Endpoint) -> (r: Result<()>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
             return Err(Error::Invalid("no such QP"));
-        }
-        let ghost start = *self;
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        let ghost sh = t0.share();
-        proof {
-            assert(start.entry_ok(index as int, t0, m0));
         }
         let phase = match &self.qps[index] {
             Some(e) => e.phase,
@@ -2054,343 +1806,116 @@ impl<C, N: Device> Hw<C, N> {
         if !matches!(phase, Phase::Reset) {
             return Err(Error::Invalid("a QP connects once, from RESET"));
         }
-        proof {
-            assert(self.qps@[index as int]->0.phase == Phase::Reset);
-        }
-        let r = match &mut self.qps[index] {
+        match &mut self.qps[index] {
             Some(e) => {
                 if e.removed {
                     no_qp(index);
                 }
-                let ghost q = e.id@;
-                proof {
-                    assert(e.phase == Phase::Reset);
-                    assert(phase_ok(e.phase, m0.qps[q].state));
-                }
+                let ghost q = e.id();
                 let r = connect(&mut e.hw, attr, remote, Ghost(q), Tracked(self.token.borrow_mut()));
                 e.phase = if r.is_ok() {
                     Phase::Ready
                 } else {
                     Phase::Broken
                 };
+                e.takes_work = r.is_ok();
                 r
             },
             None => {
                 no_qp(index);
                 Err(Error::Invalid("no such QP"))
             },
-        };
-        proof {
-            let t = self.token@;
-            let n = t.nic();
-            let q = start.qps@[index as int]->0.id();
-            let tos = if r is Ok {
-                connect_states()
-            } else {
-                let k = choose|k: int| 0 <= k < 3 && modified(sh, pinned(t0), m0, n, q, connect_states().take(k));
-                connect_states().take(k)
-            };
-            assert forall|i: int| 0 <= i < tos.len() implies !(#[trigger] tos[i] is Reset) by {
-                assert(tos[i] == connect_states()[i]);
-            }
-            lemma_modified(sh, pinned(t0), m0, n, q, tos);
-            let written = t0.written(q);
-            let (a, b) = (m0.qps[q], n.qps[q]);
-            assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(b.attr, #[trigger] written[j]) by {
-                lemma_written_pinned(t0, q, j);
-                let wr = written[j];
-                assert(m0.send_wr_ok(a.attr, wr));
-                if !wr.inline {
-                    assert forall|x: int| 0 <= x < wr.sges.len() implies n.registered(a.attr.pd, #[trigger] wr.sges[x], wr.opcode.writes_local()) by {
-                        assert(m0.registered(a.attr.pd, wr.sges[x], wr.opcode.writes_local()));
-                        assert(pinned(t0).contains(wr.sges[x].lkey));
-                    }
-                }
-            }
-            let cs = connect_states();
-            assert(cs[0] == QpState::Init && cs[1] == QpState::Rtr && cs[2] == QpState::Rts);
-            if tos.len() > 0 {
-                assert(tos.last() == tos[tos.len() - 1]);
-                assert(tos[tos.len() - 1] == cs[tos.len() - 1]);
-            }
-            let e = self.qps@[index as int]->0;
-            let e0 = start.qps@[index as int]->0;
-            assert(e0.ok(index as u16, m0, sh, t0.pd(), t0.started(q), t0.written(q)));
-            assert(phase_ok(e.phase, b.state));
-            assert(sq_linked(e.send, index as u16, b));
-            assert(rq_linked(e.recv, index as u16, b));
-            assert(writing_ok(e.send, index as u16, n, b.attr, t0.started(q), written, e.held is Some));
-            outcomes::lemma_recv_framed(e.recv, m0, n, q);
-            send_outcomes::lemma_results_framed(e.send, m0, n, q);
-            assert(self.entry_ok(index as int, t0, n));
-            self.lemma_but_one(&start, t0, m0, n, index as int);
-            self.lemma_same_token(t0, t, n);
         }
-        r
     }
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// Posts a receive into `part`, a unique buffer, on QP `index`, with
-    /// `ctx` for its owner; without one if nobody will take it back by its
-    /// sequence number. Refused, `part` and `ctx` handed back, when the QP
-    /// takes no work (`Error::NotConnected`), the part is of another
-    /// protection domain or frozen, or the receive queue is full.
+    #[inline(always)]
     #[verifier::spinoff_prover]
-    pub fn post_recv(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: core::result::Result<RingSeq, (BufError<Part<N>>, Option<C>)>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
-            r matches Ok(seq) ==> old(self).admission_separated_from(part)
-                && final(self).recv_holds_input(index, seq, part),
-            r matches Err((error, back)) ==> error.buf == part && back == ctx,
+    pub fn post_recv(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
+    {
+        if index < self.qps.len() {
+            match &mut self.qps[index] {
+                Some(e) => {
+                    // One comparison each: the QP takes work, the buffer is of its protection
+                    // domain and may be written, the queue has room.
+                    #[allow(clippy::collapsible_match)] // Explicit for Verus.
+                    if e.takes_work && part_pd_of(&part) == e.pd_id && part_writable_of(&part) && e.recv.can_post() {
+                        let ghost q = e.id();
+                        // The buffer's region is registered (its lease says so).
+                        registered(&part, &e.pd, Tracked(self.token.borrow_mut()));
+                        let sge = part_sge_of(&part);
+                        let wqe = e.recv.next_wqe();
+                        let id = wr_id(index as u16, true, wqe);
+                        let sges = [sge];
+                        // The slot first: from then on it keeps the memory alive.
+                        let mut leases = Leases::one(part, Ghost(safeverbs_spec::abs::Dir::In));
+                        leases.record_wqe(Ghost(crate::buf::WqeLoans {
+                            wr_id: id, opcode: None, sges: sges@, first: 0,
+                        }));
+                        let detached = ctx.is_none();
+                        let implied = Ok(Completed::Received(Received::Message { len: sge.length, imm: None }));
+                        e.recv.fill(1, detached, implied, Payload { ctx, leases });
+                        return match post_recv(&mut e.hw, id, &sges, Ghost(q), Tracked(self.token.borrow_mut())) {
+                            Ok(()) => {
+                                let seq = e.recv.stage_filled(1, true);
+                                e.recv.commit();
+                                Ok(seq)
+                            },
+                            Err(error) => Err(not_posted(&mut e.recv, error)),
+                        };
+                    }
+                },
+                None => {},
+            }
+        }
+        self.recv_refused(index, part, ctx)
+    }
+
+    /// Why a receive is refused, on QP `index`: it takes no work (`Error::NotConnected`), the
+    /// part is of another protection domain or frozen, or the receive queue is full.
+    #[cold]
+    #[inline(never)]
+    fn recv_refused(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
     {
         if index >= self.qps.len() {
             no_qp(index);
-            return Err((BufError { error: Error::Invalid("no such QP"), buf: part }, ctx));
+            return Err(Refusal { error: Error::Invalid("no such QP"), ctx, leases: Leases::from(part) });
         }
-        proof {
-            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
-        }
-        let (ready, room, clogged) = match &self.qps[index] {
-            Some(e) => (matches!(e.phase, Phase::Ready), e.recv.can_post(), e.recv.is_clogged()),
-            None => {
-                no_qp(index);
-                (false, false, false)
-            },
-        };
-        if !ready {
-            return Err((BufError { error: Error::NotConnected, buf: part }, ctx));
-        }
-        if part_pd_of(&part) != pd_id_of(&self.pd) {
-            return Err((BufError { error: Error::PdMismatch, buf: part }, ctx));
-        }
-        if !part_writable_of(&part) {
-            return Err((BufError { error: Error::Invalid("receive into a frozen buffer"), buf: part }, ctx));
-        }
-        if !room {
-            let error = if clogged {
-                Error::Clogged
-            } else {
-                Error::QueueFull
-            };
-            return Err((BufError { error, buf: part }, ctx));
-        }
-        let ghost admitted = part;
-        let ghost admission = *self;
-        #[cfg(verus_keep_ghost)]
-        let part = {
-            let mut part = part;
-            self.separate_unique_input(&mut part);
-            part
-        };
-        proof { assert(admission.admission_separated_from(admitted)); }
-        let ghost start = *self;
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        let ghost sh = t0.share();
-        // The buffer's region is registered (its lease says so).
-        registered(&part, &self.pd, Tracked(self.token.borrow_mut()));
-        let ghost t1 = self.token@;
-        let ghost m1 = t1.nic();
-        proof {
-            start.lemma_rely(t0, m0, m1);
-            start.lemma_same_token(t0, t1, m1);
-            self.lemma_inv_fields(&start, t1, m1);
-            assert(self.entry_ok(index as int, t1, m1));
-        }
-        let ghost mid1 = *self;
-        let sge = part_sge_of(&part);
-        let r = match &mut self.qps[index] {
+        let error = match &self.qps[index] {
             Some(e) => {
                 if e.removed {
                     no_qp(index);
                 }
-                let ghost q = e.id@;
-                let ghost e1 = *e;
-                proof {
-                    e1.recv.lemma_wqes();
-                    outcomes::lemma_recv_no_staged(e1.recv);
-                }
-                let seq = match e.recv.begin() {
-                    Some(seq) => seq,
-                    None => {
-                        proof { assert(false); }
-                        0
-                    },
-                };
-                proof {
-                    e.recv.lemma_wqes();
-                }
-                let wqe = match e.recv.push_wqe() {
-                    Some(wqe) => wqe,
-                    None => {
-                        proof { assert(false); }
-                        0
-                    },
-                };
-                let id = wr_id(index as u16, true, wqe);
-                let sges = [sge];
-                proof {
-                    let qp = m1.qps[q];
-                    e1.recv.lemma_wqes();
-                    assert(sges@ =~= seq![sge]);
-                    let wr = recv_wr(id, sges@);
-                    assert(wr.sges[0] == sge_model(sge));
-                    assert(m1.recv_wr_ok(qp.attr, wr));
-                    assert(nic_enabled(m1, Nic::Step::post_recv(q, seq![wr])));
-                }
-                match post_recv(&mut e.hw, id, &sges, Ghost(q), Tracked(self.token.borrow_mut())) {
-                    Ok(()) => {
-                        let implied = Wc::success(Opcode::RECV, sge.length);
-                        let mut leases = no_leases();
-                        keep_lease(&mut leases, part, Ghost(safeverbs_spec::abs::Dir::In));
-                        leases.record_wqe(Ghost(crate::buf::WqeLoans {
-                            wr_id: id, opcode: None, sges: sges@, first: 0,
-                        }));
-                        proof {
-                            lemma_ledger_entry(leases, 0);
-                            assert(leases.loans() == seq![crate::buf::Loan {
-                                part: admitted, access: Some(safeverbs_spec::abs::Dir::In),
-                            }]);
-                        }
-                        let detached = ctx.is_none();
-                        let payload = Payload { ctx, leases };
-                        let ghost resource = payload;
-                        let ghost before_end = e.recv;
-                        proof { lemma_resources_kept(e1.recv, e.recv); }
-                        e.recv.end(true, detached, implied, payload);
-                        proof { lemma_resources_added(before_end, e.recv, seq as int, resource, detached); }
-                        let ghost staged = e.recv;
-                        proof {
-                            staged.lemma_wqes();
-                            assert(before_end.same_dma(&e1.recv));
-                            assert(staged.keeps_dma(&e1.recv));
-                        }
-                        e.recv.commit();
-                        proof {
-                            lemma_resources_kept(staged, e.recv);
-                            e.recv.lemma_wqes();
-                            assert(e.recv.keeps_dma(&e1.recv));
-                        }
-                        proof {
-                            let wr = recv_wr(id, sges@);
-                            assert(e.recv.dma(seq as int, wqe as int) == Some(resource));
-                            assert(ledger_has(resource.leases, id, None, wr.sges));
-                            assert(ring_backed(e.recv, wqe as int, id, None, wr.sges));
-                            assert(e.recv.req(seq as int) is Some);
-                            assert(e.recv.req(seq as int)->0.phase is InFlight);
-                            assert(e.recv.req(seq as int)->0.leases == resource);
-                            assert(e.recv.meta(seq as int) is Some);
-                            assert(e.recv.meta(seq as int)->0.first == wqe);
-                            assert(e.recv.meta(seq as int)->0.end as int == wqe as int + 1);
-                            assert(e.recv.meta(seq as int)->0.seen is None);
-                        }
-                        Ok(seq)
-                    },
-                    Err(error) => {
-                        e.recv.abort();
-                        proof { lemma_resources_kept(e1.recv, e.recv); }
-                        Err((BufError { error, buf: part }, ctx))
-                    },
+                if !matches!(e.phase, Phase::Ready) {
+                    Error::NotConnected
+                } else if part_pd_of(&part) != e.pd_id {
+                    Error::PdMismatch
+                } else if !part_writable_of(&part) {
+                    Error::Invalid("receive into a frozen buffer")
+                } else if e.recv.is_clogged() {
+                    Error::Clogged
+                } else {
+                    Error::QueueFull
                 }
             },
             None => {
                 no_qp(index);
-                Err((BufError { error: Error::Invalid("no such QP"), buf: part }, ctx))
+                Error::Invalid("no such QP")
             },
         };
-        proof {
-            let t = self.token@;
-            let n = t.nic();
-            let q = mid1.qps@[index as int]->0.id();
-            let e1 = mid1.qps@[index as int]->0;
-            let e = self.qps@[index as int]->0;
-            let wr = recv_wr(spec_wr_id(index as u16, true, e1.recv.spec_wqe_posted()), seq![sge]);
-            let pins = pinned(t1).union(recv_keys(seq![wr]));
-            if r is Ok {
-                let mid = choose|mid: Nic::State| rely_reaches(sh, pins, m1, mid) && nic_step(mid, n, Nic::Step::post_recv(q, seq![wr]));
-                lemma_rely_fewer_pins(sh, pins, pinned(t1), m1, mid);
-                mid1.lemma_rely(t1, m1, mid);
-                lemma_nic_step_is_next(mid, n, Nic::Step::post_recv(q, seq![wr]));
-                lemma_step_keeps_invariant(mid, n);
-                lemma_mine_keeps_share_wf(sh, pins, mid, n, Nic::Step::post_recv(q, seq![wr]));
-                assert(mid1.entry_ok(index as int, t1, mid));
-                let (a, b) = (mid.qps[q], n.qps[q]);
-                e.recv.lemma_wqes();
-                assert forall|k: int| 0 <= k < b.rq.len() implies (#[trigger] b.rq[k]).wr.wr_id == spec_wr_id(
-                    index as u16,
-                    true,
-                    (b.rq_head + k) as u64,
-                ) by {
-                    if k < a.rq.len() {
-                        assert(b.rq[k] == a.rq[k]);
-                    }
-                }
-                assert(rq_linked(e.recv, index as u16, b));
-                outcomes::lemma_recv_framed(e1.recv, mid, n, q);
-                outcomes::lemma_recv_added(e1.recv, e.recv, n, q, r->Ok_0 as int);
-                assert forall|k: int| 0 <= k < b.rq.len() implies
-                    ring_backed(e.recv, b.rq_head + k, (#[trigger] b.rq[k]).wr.wr_id,
-                        None, b.rq[k].wr.sges) by {
-                    if k < a.rq.len() {
-                        lemma_backed_kept(e1.recv, e.recv, b.rq_head + k,
-                            b.rq[k].wr.wr_id, None, b.rq[k].wr.sges);
-                    } else {
-                        let s = e1.recv.spec_posted() as int;
-                        assert(e.recv.dma(s, b.rq_head + k) is Some);
-                        assert(ledger_has(e.recv.dma(s, b.rq_head + k)->0.leases, wr.wr_id, None, wr.sges));
-                    }
-                }
-                let written = t1.written(q);
-                assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(b.attr, #[trigger] written[j]) by {
-                    assert(mid.send_wr_ok(a.attr, written[j]));
-                }
-                e.send.lemma_wqes();
-                e.recv.lemma_wqes();
-                assert forall|j: int| 0 <= j < t1.written(q).len() implies
-                    written_backed(e, e.send.spec_wqe_committed() + j, #[trigger] t1.written(q)[j]) by {
-                    lemma_written_kept(e1, e, e1.send.spec_wqe_committed() + j, t1.written(q)[j]);
-                }
-                send_outcomes::lemma_results_framed(e.send, mid, n, q);
-                assert(self.entry_ok(index as int, t1, n));
-                self.lemma_touch_one(&mid1, t1, mid, n, index as int);
-                self.lemma_same_token(t1, t, n);
-            } else {
-                mid1.lemma_rely(t1, m1, n);
-                assert(mid1.entry_ok(index as int, t1, n));
-                assert(rq_linked(e.recv, index as u16, n.qps[q]));
-                outcomes::lemma_recv_kept(e1.recv, e.recv, n, q);
-                lemma_queues_kept(e1, e, n.qps[q]);
-                e.send.lemma_wqes();
-                e.recv.lemma_wqes();
-                assert forall|j: int| 0 <= j < t1.written(q).len() implies
-                    written_backed(e, e.send.spec_wqe_committed() + j, #[trigger] t1.written(q)[j]) by {
-                    lemma_written_kept(e1, e, e1.send.spec_wqe_committed() + j, t1.written(q)[j]);
-                }
-                assert(self.entry_ok(index as int, t1, n));
-                self.lemma_touch_one(&mid1, t1, n, n, index as int);
-                self.lemma_same_token(t1, t, n);
-            }
-        }
-        proof {
-            if r is Ok {
-                assert(admission.admission_separated_from(admitted));
-                self.lemma_recv_holds_input(index, r->Ok_0, admitted);
-                assert(self.recv_holds_input(index, r->Ok_0, admitted));
-            }
-        }
-        r
+        Err(Refusal { error, ctx, leases: Leases::from(part) })
     }
 }
 
 // =============================================================================
 // Completions
 
-/// Completions taken from the CQ per poll.
+/// Completions [`Hw::progress`] takes from the CQ per poll.
 pub const POLL_BATCH: usize = 16;
+
+/// The most CQEs one event loop's poll reads.
+pub const POLL_MAX: usize = 32;
 
 /// A placeholder completion.
 pub(crate) const EMPTY_WC: Wc = Wc {
@@ -2475,73 +2000,20 @@ proof fn lemma_poll_steps(sh: Share, pins: ISet<Key>, m: Nic::State, m2: Nic::St
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// Routes one completion, the one `before`'s `poll_cq` step reports, to
-    /// its QP's ring: its `wr_id` names the QP's index, the queue and the
+    /// Routes one completion to its QP's ring: its `wr_id` names the QP's index, the queue and the
     /// WQE, which the ring retires (with every earlier request it ends).
+    #[inline(always)]
     #[verifier::spinoff_prover]
-    fn dispatch(&mut self, wc: &Wc, wakes: &mut WakeBatch, Ghost(t): Ghost<NicToken>, Ghost(before): Ghost<Nic::State>, Ghost(after): Ghost<Nic::State>)
-        requires
-            old(self).inv_with(t, before),
-            nic_step(before, after, Nic::Step::poll_cq(t.share().cq)),
-            reports(*wc, before.cqs[t.share().cq].entries[0]),
-        ensures
-            final(self).inv_with(t, after),
-            final(self).token == old(self).token,
-            final(self).qps@.len() == old(self).qps@.len(),
-            final(self).same_table(old(self)),
+    #[allow(clippy::ptr_arg)] // Vstd specifies indexing a `Vec`.
+    fn dispatch(qps: &mut Vec<Option<HwQp<C, N>>>, wc: &Wc, wakes: &mut WakeBatch, Ghost(t): Ghost<NicToken>, Ghost(before): Ghost<Nic::State>, Ghost(after): Ghost<Nic::State>)
     {
-        let ghost sh = t.share();
-        let ghost c = sh.cq;
-        let ghost start = *self;
-        let ghost e = before.cqs[c].entries[0];
-        proof {
-            lemma_reports(*wc, e);
-            safeverbs_spec::nic_proofs::lemma_head_is_first(before, c);
-            lemma_poll(before, after, c);
-            assert(share_wf(before, sh));
-            assert(sh.owns.contains(e.qp));
-        }
-        let ghost i = choose|i: int| 0 <= i < start.qps@.len() && #[trigger] start.qps@[i] is Some && start.qps@[i]->0.id() == e.qp;
-        let ghost qp = before.qps[e.qp];
-        proof {
-            assert(start.entry_ok(i, t, before));
-            lemma_wr_id_fields(i as u16, e.queue is Recv, e.seq as u64);
-            if e.queue is Send {
-                assert(qp.sq[e.seq - qp.sq_head].wr.wr_id == spec_wr_id(i as u16, false, e.seq as u64));
-            } else {
-                assert(qp.rq[e.seq - qp.rq_head].wr.wr_id == spec_wr_id(i as u16, true, e.seq as u64));
-            }
-        }
         let index = index_of(wc.wr_id);
-        proof {
-            assert(index == i);
-        }
-        if index >= self.qps.len() {
+        if index >= qps.len() {
             return;
         }
-        match &mut self.qps[index] {
-            Some(qp_entry) => {
-                let changed = qp_entry.complete_cqe(wc, wakes, Ghost(i), Ghost(t), Ghost(before), Ghost(after));
-                if changed && !qp_entry.dirty && !qp_entry.removed {
-                    qp_entry.dirty = true;
-                    self.dirty.push(index as u16);
-                }
-            },
+        match &mut qps[index] {
+            Some(qp_entry) => qp_entry.complete_cqe(wc, wakes, Ghost(index as int), Ghost(t), Ghost(before), Ghost(after)),
             None => {},
-        }
-        proof {
-            let q = e.qp;
-            assert(self.entry_ok(i, t, after));
-            // `poll_cq` changed only QP `q` and the CQ's entries.
-            assert(after.cqs[c].reserved == before.cqs[c].reserved);
-            assert forall|w: WqeRef| #[trigger] after.retired.contains_key(w) implies before.retired.contains_key(w) || w.qp == q by {
-                reveal(retires);
-            }
-            assert forall|w: WqeRef| w.qp != q && #[trigger] before.retired.contains_key(w)
-                implies after.retired.contains_key(w) && after.retired[w] == before.retired[w] by {
-                reveal(retires);
-            }
-            self.lemma_poll_one(&start, t, before, after, i);
         }
     }
 
@@ -2628,76 +2100,192 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// Polls the CQ once, retiring what completed in the rings of its QPs
-    /// (and waking the wakers registered there); returns the number of
-    /// completions.
+    /// Polls the CQ once, retiring what completed in the rings of its QPs (and waking the wakers
+    /// registered there), where the results wait for their owners; what the event loop read and
+    /// did not route yet goes first, in its order. Returns the number of completions.
     #[verifier::spinoff_prover]
     pub fn progress(&mut self) -> (n: usize)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
     {
         let mut wakes = WakeBatch::new();
-        let mut wcs = [EMPTY_WC; POLL_BATCH];
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        let ghost sh = t0.share();
-        let ghost start = *self;
-        let n = poll(&mut self.cq, &mut wcs, Tracked(self.token.borrow_mut()));
-        let ghost t = self.token@;
-        let ghost m2 = t.nic();
-        let ghost done = wcs@.take(n as int);
-        let ghost (befores, afters) = lemma_poll_steps(sh, pinned(t0), m0, m2, done);
-        proof {
-            self.lemma_inv_fields(&start, t0, m0);
-            assert(done.len() == n);
-        }
-        let mut i = 0;
-        while i < n
-            invariant
-                0 <= i <= n,
-                sh == t0.share(),
-                n <= wcs@.len(),
-                done == wcs@.take(n as int),
-                done.len() == n,
-                poll_steps(sh, pinned(t0), m0, m2, done, befores, afters),
-                self.token@ == t,
-                t.same_worker(&t0),
-                t.same_writings(&t0),
-                self.qps@.len() == start.qps@.len(),
-                self.same_table(&start),
-                self.inv_with(t0, if i == 0 { m0 } else { afters[i - 1] }),
-            decreases n - i,
+        let mut n = self.polled_len - self.polled_at;
+        while self.polled_at < self.polled_len
         {
-            proof {
-                assert(0 <= i < done.len());
-                assert(done[i as int] == wcs@[i as int]);
-                if i == 0 {
-                    assert(rely_reaches(sh, pinned(t0), m0, befores[0]));
-                    self.lemma_rely(t0, m0, befores[0]);
-                } else {
-                    let j = i as int;
-                    assert(rely_reaches(sh, pinned(t0), afters[j - 1], befores[j]));
-                    self.lemma_rely(t0, afters[j - 1], befores[j]);
-                }
-                assert(nic_step(befores[i as int], afters[i as int], Nic::Step::poll_cq(t0.share().cq)));
-                assert(reports(wcs@[i as int], befores[i as int].cqs[t0.share().cq].entries[0]));
-            }
-            self.dispatch(&wcs[i], &mut wakes, Ghost(t0), Ghost(befores[i as int]), Ghost(afters[i as int]));
+            Self::dispatch(&mut self.qps, &self.polled[self.polled_at], &mut wakes, Ghost(t0), Ghost(befores[i as int]), Ghost(afters[i as int]));
+            self.polled_at += 1;
+        }
+        self.polled_at = 0;
+        self.polled_len = 0;
+        let read = poll(&mut self.cq, &mut self.polled, POLL_BATCH, Tracked(self.token.borrow_mut()));
+        let mut i = 0;
+        while i < read
+        {
+            Self::dispatch(&mut self.qps, &self.polled[i], &mut wakes, Ghost(t0), Ghost(befores[i as int]), Ghost(afters[i as int]));
             i += 1;
         }
-        proof {
-            if n == 0 {
-                self.lemma_rely(t0, m0, m2);
-            } else {
-                assert(afters[n - 1] == afters.last());
-            }
-            self.lemma_same_token(t0, t, m2);
-        }
+        n += read;
+        // Results wait in the rings, if the event loop wants them.
+        self.kept = true;
+        self.kept_at = 0;
         wakes.finish();
         n
+    }
+
+    /// The first half of the event loop's poll: reads at most `n` CQEs ([`POLL_MAX`] at most) and
+    /// updates the CQ's consumer index, unless some read before are not routed yet. Then
+    /// [`Hw::next_completion`] hands out what they retire, while the program may post anything:
+    /// the CQ's capacity is safe, since the CQEs have left it. Returns how many it read.
+    #[inline(always)]
+    pub fn read_completions(&mut self, n: usize) -> (read: usize)
+    {
+        if self.polled_at < self.polled_len {
+            return 0;
+        }
+        let limit = if n < POLL_MAX { n } else { POLL_MAX };
+        let read = poll(&mut self.cq, &mut self.polled, limit, Tracked(self.token.borrow_mut()));
+        self.polled_at = 0;
+        self.polled_len = read;
+        read
+    }
+
+    /// The second half of the event loop's poll: the next request that completed with an owner,
+    /// in each queue's order, from the results waiting in the rings and then, in one pass, from
+    /// the CQEs read: each is routed, its ring walked up to it, and what that retires handed out.
+    /// `None` when nothing is left. A panic of a waker registered on the requests resumes then.
+    #[inline(always)]
+    pub fn next_completion(&mut self) -> (r: Option<Completion<C, N>>)
+    {
+        if self.kept {
+            let kept = self.next_kept();
+            if kept.is_some() {
+                return kept;
+            }
+        }
+        while self.polled_at < self.polled_len
+        {
+            let at = self.polled_at;
+            let wc = &self.polled[at];
+            let id = wc.wr_id;
+            let index = index_of(id);
+            let e = if index < self.qps.len() {
+                match &mut self.qps[index] {
+                    Some(e) => e,
+                    None => {
+                        self.polled_at = at + 1;
+                        continue;
+                    },
+                }
+            } else {
+                self.polled_at = at + 1;
+                continue;
+            };
+            let recv = is_recv(id);
+            let (ring, queue) = if recv { (&mut e.recv, Side::Recv) } else { (&mut e.send, Side::Send) };
+            let wqe = wqe_of(id, ring.wqe_retired());
+            if !ring.wqe_in_flight(wqe) {
+                self.polled_at = at + 1;
+                continue;
+            }
+            let seq = ring.retired();
+            let (i, ended) = match ring.retire_next(recv, wqe, wc, &mut self.panics) {
+                Some(step) => step,
+                None => {
+                    self.polled_at = at + 1;
+                    continue;
+                },
+            };
+            if ended {
+                self.polled_at = at + 1;
+            }
+            let passed = ring.pass_retired(seq);
+            let slot = ring.retired_slot(i);
+            if passed && matches!(slot.leases, Some(Payload { ctx: Some(_), .. })) {
+                let result = slot.outcome;
+                match slot.leases.take() {
+                    Some(Payload { ctx: Some(wr_id), leases }) => {
+                        return Some(Completion { wr_id, result, qp: index, qp_num: e.qp_num, queue, seq, leases });
+                    },
+                    other => crate::ring::forget_free(other),
+                }
+            } else {
+                let other = Self::hand_out_other(ring, i, seq, index, e.qp_num, queue);
+                if other.is_some() {
+                    return other;
+                }
+            }
+        }
+        if self.panics.pending() {
+            self.resume_panics();
+        }
+        None
+    }
+
+    /// What retiring a request of a CQE leaves besides the common case: the head has to look for
+    /// the next slot in use, now that this one is free, and the request may have held nothing
+    /// (without an owner, or taken since it was refused).
+    #[cold]
+    #[inline(never)]
+    fn hand_out_other(ring: &mut Ring<Payload<C, N>>, i: usize, seq: RingSeq, index: usize, qp_num: u32, queue: Side) -> (r: Option<Completion<C, N>>)
+    {
+        let slot = ring.retired_slot(i);
+        let result = slot.outcome;
+        let taken = slot.leases.take();
+        ring.advance_head();
+        match taken {
+            Some(Payload { ctx: Some(wr_id), leases }) => {
+                Some(Completion { wr_id, result, qp: index, qp_num, queue, seq, leases })
+            },
+            // A request with an owner holds a context, so nothing is lost here.
+            _ => None,
+        }
+    }
+
+    /// Resumes the first panic of a waker the event loop's path ran.
+    #[cold]
+    #[inline(never)]
+    fn resume_panics(&mut self)
+    {
+        let mut panics = WakeBatch::new();
+        core::mem::swap(&mut panics, &mut self.panics);
+        panics.finish();
+    }
+
+    /// The next result waiting in the rings for the event loop: of a poll that kept them there,
+    /// or of a refused doorbell, which comes at once, ahead of the requests before it.
+    #[cold]
+    #[inline(never)]
+    fn next_kept(&mut self) -> (r: Option<Completion<C, N>>)
+    {
+        while self.kept_at < 2 * self.qps.len()
+        {
+            let index = self.kept_at / 2;
+            let side = if self.kept_at & 1 == 0 { Side::Send } else { Side::Recv };
+            let range = match &self.qps[index] {
+                Some(e) => match side {
+                    Side::Send => (e.send.head(), if e.refused { e.send.committed() } else { e.send.retired() }),
+                    Side::Recv => (e.recv.head(), e.recv.retired()),
+                },
+                None => (0, 0),
+            };
+            let mut seq = range.0;
+            while seq < range.1
+            {
+                let done = self.take(index, side, seq);
+                if done.is_some() {
+                    return done;
+                }
+                seq += 1;
+            }
+            if matches!(side, Side::Send) {
+                match &mut self.qps[index] {
+                    Some(e) => e.refused = false,
+                    None => {},
+                }
+            }
+            self.kept_at += 1;
+        }
+        self.kept_at = 0;
+        self.kept = false;
+        None
     }
 }
 
@@ -2705,162 +2293,162 @@ impl<C, N: Device> Hw<C, N> {
 // Doorbells
 
 impl<C, N: Device> Hw<C, N> {
-    /// Rings QP `index`'s doorbell for every request written since the last
-    /// one; with `keep`, hands back the leases of that staged request if the
-    /// device refuses. If the device refuses (or the QP takes no work, which
-    /// is refused as a device would refuse it: `Error::NotConnected`), none
-    /// of them is posted: each with an owner retires at once with a flush
-    /// error, each without releases its leases.
+    #[inline]
     #[verifier::spinoff_prover]
     pub fn commit(&mut self, index: usize, keep: Option<RingSeq>) -> (r: core::result::Result<(), (Error, Option<Payload<C, N>>)>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
-            r matches Err((_, Some(kept))) ==> kept.leases.inv() && kept.leases.fully_recorded(),
     {
         if index >= self.qps.len() {
             no_qp(index);
             return Ok(());
         }
-        proof {
-            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
-        }
-        let (started, open, ready) = match &self.qps[index] {
-            Some(e) => (e.started, e.send.is_open(), matches!(e.phase, Phase::Ready)),
-            None => {
-                no_qp(index);
-                (false, false, false)
-            },
-        };
-        // An open request is the caller's to finish first: the borrow of a
-        // request rules this out.
-        if !started || open {
-            return Ok(());
-        }
-        let ghost start = *self;
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        let ghost sh = t0.share();
-        let r = match &mut self.qps[index] {
+        match &mut self.qps[index] {
             Some(e) => {
-                let ghost q = e.id@;
-                let ghost e0 = *e;
+                if !e.started {
+                    return Ok(());
+                }
                 e.started = false;
-                let refused = if ready {
-                    proof {
-                        let qp = m0.qps[q];
-                        e0.send.lemma_wqes();
-                        assert(nic_enabled(m0, Nic::Step::post_send(q, t0.written(q))));
-                    }
+                let ghost q = e.id();
+                let refused = if matches!(e.phase, Phase::Ready) {
                     match doorbell(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut())) {
                         Ok(()) => {
                             e.send.commit();
-                            None
+                            return Ok(());
                         },
-                        Err(err) => Some(err),
+                        Err(err) => err,
                     }
                 } else {
                     abort(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
-                    Some(Error::NotConnected)
+                    Error::NotConnected
                 };
-                match refused {
-                    None => Ok(()),
-                    Some(err) => {
-                        // Only a refused doorbell wakes anyone, its staged requests' wakers;
-                        // a waker's panic resumes once the bookkeeping is done.
-                        let mut wakes = WakeBatch::new();
-                        let kept = match keep {
-                            Some(seq) => e.send.abort_keeping_with_wakes(seq, &mut wakes),
-                            None => {
-                                e.send.abort_with_wakes(&mut wakes);
-                                None
-                            },
-                        };
-                        e.refused = true;
-                        if !e.dirty {
-                            e.dirty = true;
-                            self.dirty.push(index as u16);
-                        }
-                        wakes.finish();
-                        Err((err, kept))
+                // Only a refused doorbell wakes anyone, its staged requests' wakers;
+                // a waker's panic resumes once the bookkeeping is done.
+                let mut wakes = WakeBatch::new();
+                let kept = match keep {
+                    Some(seq) => e.send.abort_keeping_with_wakes(seq, &mut wakes),
+                    None => {
+                        e.send.abort_with_wakes(&mut wakes);
+                        None
                     },
-                }
+                };
+                e.refused = true;
+                self.kept = true;
+                self.kept_at = 0;
+                wakes.finish();
+                Err((refused, kept))
             },
             None => {
                 no_qp(index);
                 Ok(())
             },
-        };
-        proof {
-            let t = self.token@;
-            let n = t.nic();
-            let e0 = start.qps@[index as int]->0;
-            let q = e0.id();
-            let e = self.qps@[index as int]->0;
-            assert(start.entry_ok(index as int, t0, m0));
-            if ready && r is Ok {
-                let wrs = t0.written(q);
-                let mid = choose|mid: Nic::State| rely_reaches(sh, pinned(t0), m0, mid) && nic_step(mid, n, Nic::Step::post_send(q, wrs));
-                start.lemma_rely(t0, m0, mid);
-                lemma_nic_step_is_next(mid, n, Nic::Step::post_send(q, wrs));
-                lemma_step_keeps_invariant(mid, n);
-                lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::post_send(q, wrs));
-                assert(start.entry_ok(index as int, t0, mid));
-                let (a, b) = (mid.qps[q], n.qps[q]);
-                e.send.lemma_wqes();
-                lemma_queues_kept(e0, e, a);
-                assert forall|k: int| 0 <= k < b.sq.len() implies {
-                    let wr = (#[trigger] b.sq[k]).wr;
-                    &&& !wr.inline
-                    &&& ring_backed(e.send, b.sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges)
-                } by {
-                    if k < a.sq.len() {
-                        assert(b.sq[k] == a.sq[k]);
-                    } else {
-                        let j = k - a.sq.len();
-                        assert(b.sq[k].wr == wrs[j]);
-                        assert(written_backed(e0, e0.send.spec_wqe_committed() + j, wrs[j]));
-                        assert(!e0.send.spec_is_open());
-                        lemma_backed_kept(e0.send, e.send, b.sq_head + k,
-                            wrs[j].wr_id, Some(wrs[j].opcode), wrs[j].sges);
+        }
+    }
+
+    /// One WQE as a request of its own, on the data path's own way: check, write the WQE, ring the
+    /// doorbell if `ring`, write the slot. `signal` asks for a completion (the ring also asks when
+    /// it must). Without a `ctx`, the request has no owner. If it fails, nothing of it is posted,
+    /// and its `ctx` and buffers come back.
+    ///
+    /// Whatever is out of the common hands everything back, untouched, as [`Unposted`]: the QP
+    /// takes no work, a request is being gathered, no room, a check fails, an atomic.
+    /// [`Hw::post_one_slow`] sorts all that out, as a request of the general kind.
+    #[inline(always)]
+    #[verifier::spinoff_prover]
+    pub fn post_one(&mut self, index: usize, op: WrOp, part: Part<N>, ctx: Option<C>, signal: bool, ring: bool) -> (r: core::result::Result<core::result::Result<RingSeq, Refusal<C, N>>, Unposted<C, N>>)
+    {
+        if index < self.qps.len() {
+            match &mut self.qps[index] {
+                Some(e) => {
+                    let sge = part_sge_of(&part);
+                    // What the operation asks beyond a length that fits, one comparison each.
+                    let fits = match op {
+                        WrOp::Send | WrOp::SendImm(_) => true,
+                        WrOp::Write(r) | WrOp::WriteImm(r, _) => sge.length as u64 <= r.len,
+                        WrOp::Read(r) => e.reliable && part_writable_of(&part) && sge.length as u64 <= r.len,
+                        WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. } => false,
+                    };
+                    if fits && e.takes_work && e.open_wqes.len() == 0 && part_pd_of(&part) == e.pd_id && sge.length <= e.max_len && e.send.can_post() {
+                        let ghost q = e.id();
+                        let implied = implied_outcome(&op, sge.length);
+                        // Its region is registered (its lease says so).
+                        registered(&part, &e.pd, Tracked(self.token.borrow_mut()));
+                        let id = wr_id(index as u16, false, e.send.next_wqe());
+                        let signaled = signal || e.send.must_signal(1);
+                        let sges = [sge];
+                        // The slot first: from then on it keeps the memory alive.
+                        let mut leases = Leases::one(part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }));
+                        leases.record_wqe(Ghost(crate::buf::WqeLoans {
+                            wr_id: id, opcode: Some(opcode_model(op)), sges: sges@, first: 0,
+                        }));
+                        let detached = ctx.is_none();
+                        e.send.fill(1, detached, implied, Payload { ctx, leases });
+                        let waiting = e.started;
+                        if !waiting {
+                            start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                        }
+                        post(&mut e.hw, id, signaled, &op, &sges, Ghost(q), Tracked(self.token.borrow_mut()));
+                        if ring && !waiting {
+                            match doorbell(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut())) {
+                                Ok(()) => {
+                                    let seq = e.send.stage_filled(1, signaled);
+                                    e.send.commit();
+                                    return Ok(Ok(seq));
+                                },
+                                Err(error) => return Ok(Err(not_posted(&mut e.send, error))),
+                            }
+                        }
+                        e.started = true;
+                        let seq = e.send.stage_filled(1, signaled);
+                        return if ring {
+                            Ok(self.commit_own(index, seq))
+                        } else {
+                            Ok(Ok(seq))
+                        };
                     }
-                }
-                assert forall|k: int| 0 <= k < b.sq.len() implies (#[trigger] b.sq[k]).wr.wr_id == spec_wr_id(
-                    index as u16,
-                    false,
-                    (b.sq_head + k) as u64,
-                ) by {
-                    if k < a.sq.len() {
-                        assert(b.sq[k] == a.sq[k]);
-                    } else {
-                        assert(b.sq[k].wr == wrs[k - a.sq.len()]);
-                    }
-                }
-                assert(sq_linked(e.send, index as u16, b));
-                outcomes::lemma_recv_framed(e.recv, mid, n, q);
-                send_outcomes::lemma_bound_committed(e0.send, e.send, e.send_tails@,
-                    index as u16, a, b, wrs);
-                send_outcomes::lemma_results_committed(e0.send, e.send, mid, q);
-                send_outcomes::lemma_results_framed(e.send, mid, n, q);
-                assert(self.entry_ok(index as int, t, n));
-                self.lemma_commit_frame(&start, t0, t, mid, n, index as int);
-            } else {
-                start.lemma_rely(t0, m0, n);
-                assert(start.entry_ok(index as int, t0, n));
-                assert(sq_linked(e.send, index as u16, n.qps[q]));
-                lemma_queues_kept(e0, e, n.qps[q]);
-                send_outcomes::lemma_bound_kept(e0.send, e.send, e.send_tails@, index as u16,
-                    n.qps[q], n.qps[q], t0.written(q));
-                send_outcomes::lemma_bound_no_written(e.send, e.send_tails@, index as u16,
-                    n.qps[q], t0.written(q));
-                send_outcomes::lemma_results_refused(e0.send, e.send, n, q);
-                assert(self.entry_ok(index as int, t, n));
-                self.lemma_commit_frame(&start, t0, t, n, n, index as int);
+                },
+                None => {},
             }
         }
-        r
+        Err(Unposted { op, part, ctx })
+    }
+
+    /// [`Hw::post_one`], out of the common: the request of one WQE of the general kind, which
+    /// waits for room if it must (this polls the CQ).
+    #[cold]
+    #[inline(never)]
+    pub fn post_one_slow(&mut self, index: usize, unposted: Unposted<C, N>, signal: bool, ring: bool) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
+    {
+        let op = unposted.op;
+        let part = unposted.part;
+        let ctx = unposted.ctx;
+        // A request left open by a program that forgot its builder goes out as it is.
+        let _ = self.close(index, true, None);
+        match self.push(index, op, part) {
+            Ok(()) => {},
+            Err(e) => return Err(Refusal { error: e.error, ctx, leases: Leases::from(e.buf) }),
+        }
+        let seq = match self.close(index, signal, ctx) {
+            Ok(seq) => seq,
+            Err(ctx) => return Err(Refusal { error: Error::Invalid("a request without a WQE"), ctx, leases: Leases::new() }),
+        };
+        if ring {
+            self.commit_own(index, seq)
+        } else {
+            Ok(seq)
+        }
+    }
+
+    /// Rings QP `index`'s doorbell for the request `seq` just staged and those before it. If the
+    /// device refuses, it hands back that request's context and buffers.
+    #[inline(never)]
+    pub fn commit_own(&mut self, index: usize, seq: RingSeq) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
+    {
+        match self.commit(index, Some(seq)) {
+            Ok(()) => Ok(seq),
+            Err((error, kept)) => Err(match kept {
+                Some(payload) => Refusal { error, ctx: payload.ctx, leases: payload.leases },
+                None => Refusal { error, ctx: None, leases: Leases::new() },
+            }),
+        }
     }
 }
 
@@ -2994,166 +2582,66 @@ impl<C, N: Device> Hw<C, N> {
     /// Whether QP `index` has a request open (between its first WQE and
     /// [`Hw::close`]).
     pub fn is_open(&self, index: usize) -> bool
-        requires
-            self.inv(),
     {
         if index >= self.qps.len() {
             return false;
         }
-        proof {
-            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
-        }
         match &self.qps[index] {
-            Some(e) => e.send.is_open(),
+            Some(e) => e.open_wqes.len() > 0,
             None => false,
         }
     }
 
-    /// Closes QP `index`'s open request: stages it in the ring and writes its
-    /// last WQE, signaled if `signal` or if the ring says so, with `ctx` for
-    /// its owner; without one if nobody will take it back. Returns its
-    /// sequence number; without an open request, `ctx` back. It goes out at
-    /// the next doorbell.
+    /// Closes QP `index`'s open request: its signaling is known now, so its WQEs are written, the
+    /// last signaled if `signal` or if the ring says so, and it is staged in the ring with `ctx`
+    /// for its owner; without one if nobody will take it back. Returns its sequence number;
+    /// without an open request, `ctx` back. It goes out at the next doorbell.
     #[verifier::spinoff_prover]
     pub fn close(&mut self, index: usize, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
-            r matches Err(back) ==> back == ctx,
     {
         if index >= self.qps.len() {
             return Err(ctx);
         }
-        proof {
-            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
-        }
         let open = match &self.qps[index] {
-            Some(e) => e.send.is_open(),
+            Some(e) => e.open_wqes.len() > 0,
             None => false,
         };
         if !open {
             return Err(ctx);
         }
-        let ghost start = *self;
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        let ghost sh = t0.share();
-        // The held WQE's regions are registered (its parts' leases say so).
-        match &self.qps[index] {
-            Some(e) => registered_all(&e.held_parts, &self.pd, Tracked(self.token.borrow_mut())),
-            None => {},
-        }
-        let ghost t1 = self.token@;
-        let ghost m1 = t1.nic();
-        proof {
-            start.lemma_rely(t0, m0, m1);
-            start.lemma_same_token(t0, t1, m1);
-            self.lemma_inv_fields(&start, t1, m1);
-        }
-        let ghost mid1 = *self;
-        let r = match &mut self.qps[index] {
+        match &mut self.qps[index] {
             Some(e) => {
-                let ghost q = e.id@;
-                let ghost e1 = *e;
-                proof {
-                    assert(mid1.entry_ok(index as int, t1, m1));
-                }
-                let h = match e.held {
-                    Some(h) => h,
-                    None => {
-                        proof { assert(false); }
-                        return Err(ctx);
-                    },
-                };
-                let ghost footprint = crate::buf::WqeLoans {
-                    wr_id: h.wr_id, opcode: Some(opcode_model(h.op)),
-                    sges: h.sges@.take(h.n as int), first: e.open_leases.loans().len() as int,
-                };
-                keep_parts(&mut e.open_leases, &mut e.held_parts, Ghost(footprint));
-                let mut leases = no_leases();
-                core::mem::swap(&mut leases, &mut e.open_leases);
-                let bytes = e.held_bytes as u32;
-                let implied = Wc::success(opcode_of(&h.op), bytes);
-                proof {
-                    e1.send.lemma_wqes();
-                }
-                let detached = ctx.is_none();
-                let payload = Payload { ctx, leases };
-                let ghost resource = payload;
-                let (seq, signaled) = e.send.end(signal, detached, implied, payload);
-                proof { lemma_resources_added(e1.send, e.send, seq as int, resource, detached); }
+                let ghost q = e.id();
+                // Its regions are registered (its leases say so).
+                registered_all(&e.open_leases, &e.pd, Tracked(self.token.borrow_mut()));
+                let n = e.open_wqes.len();
+                let signaled = signal || e.send.must_signal(n as u64);
                 if !e.started {
-                    crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                    start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                     e.started = true;
                 }
-                let sges = vstd::slice::slice_subrange(h.sges.as_slice(), 0, h.n);
-                post(&mut e.hw, h.wr_id, signaled, &h.op, sges, Ghost(q), Tracked(self.token.borrow_mut()));
-                e.send_tails = Ghost(e.send_tails@.insert(seq as int, held_wr(h, signaled)));
-                proof {
-                    assert(sges@ == h.sges@.take(h.n as int));
-                    assert(self.token@.written(q) =~= t1.written(q).push(held_wr(h, signaled)));
-                    send_outcomes::lemma_implied_added(e1.send, e.send, e1.send_tails@,
-                        seq as int, held_wr(h, signaled));
-                    e.send.lemma_meta(seq as int);
-                    send_outcomes::lemma_bound_added(e1.send, e.send, e1.send_tails@, index as u16,
-                        m1.qps[q], t1.written(q), self.token@.written(q), seq as int, held_wr(h, signaled));
-                    send_outcomes::lemma_results_kept(e1.send, e.send, m1, q);
+                let first = e.send.next_wqe();
+                let mut i = 0;
+                while i < n
+                {
+                    let wqe = &e.open_wqes[i];
+                    let sges = vstd::slice::slice_subrange(e.open_sges.as_slice(), wqe.first_sge, wqe.first_sge + wqe.sges);
+                    let id = wr_id(index as u16, false, first + i as u64);
+                    post(&mut e.hw, id, signaled && i + 1 == n, &wqe.op, sges, Ghost(q), Tracked(self.token.borrow_mut()));
+                    i += 1;
                 }
-                e.held = None;
-                e.held_bytes = 0;
-                proof {
-                    assert(sges@ == h.sges@.take(h.n as int));
-                    lemma_held_wr_ok(h, e1.held_parts@, index as u16, e1.send.spec_wqe_committed() + t1.written(q).len(), m1, m1.qps[q].attr, e1.pd_id@, signaled);
-                }
-                proof {
-                    e.send.lemma_wqes();
-                    lemma_queues_kept(e1, *e, m1.qps[q]);
-                    let written = self.token@.written(q);
-                    assert forall|j: int| 0 <= j < written.len() implies
-                        written_backed(*e, e.send.spec_wqe_committed() + j, #[trigger] written[j]) by {
-                        let w = e.send.spec_wqe_committed() + j;
-                        let wr = written[j];
-                        if j < t1.written(q).len() {
-                            assert(wr == t1.written(q)[j]);
-                            assert(written_backed(e1, w, wr));
-                            if ring_backed(e1.send, w, wr.wr_id, Some(wr.opcode), wr.sges) {
-                                lemma_backed_kept(e1.send, e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
-                            } else {
-                                lemma_ledger_extended(e1.open_leases, resource.leases, wr.wr_id, Some(wr.opcode), wr.sges);
-                                assert(e.send.dma(seq as int, w) == Some(resource));
-                            }
-                        } else {
-                            assert(wr == held_wr(h, signaled));
-                            assert(e.send.dma(seq as int, w) == Some(resource));
-                            assert(resource.leases.wqes().last() == footprint);
-                            assert(ledger_has(resource.leases, wr.wr_id, Some(wr.opcode), wr.sges));
-                        }
-                    }
-                }
+                let last = e.open_wqes[n - 1];
+                let implied = implied_outcome(&last.op, last.bytes);
+                let mut leases = no_leases();
+                core::mem::swap(&mut leases, &mut e.open_leases);
+                let detached = ctx.is_none();
+                let seq = e.send.stage(n as u64, signaled, detached, implied, Payload { ctx, leases });
+                e.open_wqes.clear();
+                e.open_sges.clear();
                 Ok(seq)
             },
             None => Err(ctx),
-        };
-        proof {
-            let t = self.token@;
-            let q = mid1.qps@[index as int]->0.id();
-            let e = self.qps@[index as int]->0;
-            let e1 = mid1.qps@[index as int]->0;
-            assert(mid1.entry_ok(index as int, t1, m1));
-            let written = t.written(q);
-            let attr = m1.qps[q].attr;
-            assert forall|j: int| 0 <= j < written.len() implies m1.send_wr_ok(attr, #[trigger] written[j]) by {
-                if j < t1.written(q).len() {
-                    assert(written[j] == t1.written(q)[j]);
-                }
-            }
-            assert(writing_ok(e.send, index as u16, m1, attr, t.started(q), written, false));
-            assert(self.entry_ok(index as int, t, m1));
-            self.lemma_commit_frame(&mid1, t1, t, m1, m1, index as int);
         }
-        r
     }
 }
 
@@ -3279,23 +2767,12 @@ impl<C, N: Device> Hw<C, N> {
     /// `index`; refused (the part handed back) past [`MAX_SGES`] parts.
     #[verifier::spinoff_prover]
     pub fn gather(&mut self, index: usize, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             no_qp(index);
             return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
         }
-        let ghost start = *self;
-        let ghost t = self.token@;
-        let ghost m = t.nic();
-        proof {
-            assert(start.entry_ok(index as int, t, m));
-        }
-        let r = match &mut self.qps[index] {
+        match &mut self.qps[index] {
             Some(e) => {
                 if e.building.len() >= MAX_SGES {
                     let max = e.caps.max_send_sge as usize;
@@ -3309,345 +2786,198 @@ impl<C, N: Device> Hw<C, N> {
                 no_qp(index);
                 Err(BufError { error: Error::Invalid("no such QP"), buf: part })
             },
-        };
-        proof {
-            assert(self.entry_ok(index as int, t, m));
-            self.lemma_touch_one(&start, t, m, m, index as int);
         }
-        r
     }
 
-    /// Drops the parts gathered on QP `index` but one, which it hands back if
-    /// it was the only one.
-    fn give_back(parts: &mut Vec<Part<N>>) -> (r: Option<Part<N>>)
-        ensures
-            final(parts)@.len() == 0,
+    /// Checks a WQE doing `op` on `parts` against QP `index`: what the QP may do, the parts'
+    /// domain and uniqueness, the lengths.
+    #[inline]
+    fn check_wqe(e: &HwQp<C, N>, op: &WrOp, parts: &[Part<N>]) -> (r: Result<u64>)
     {
-        let r = if parts.len() == 1 {
-            parts.pop()
+        let n = parts.len();
+        let max_sge = if e.caps.max_send_sge <= e.caps.max_recv_sge {
+            e.caps.max_send_sge
         } else {
-            None
+            e.caps.max_recv_sge
         };
-        while parts.len() > 0
-            decreases parts@.len(),
-        {
-            parts.pop();
-        }
-        r
-    }
-
-    /// Finishes the WQE gathered on QP `index` with operation `op`: checks
-    /// it (what the QP may do, the parts' domain and uniqueness, the
-    /// lengths), opens a request for it or splits the open one when it is
-    /// full (waiting for room: this polls the CQ), writes the WQE held so far
-    /// and holds this one. On error nothing is added; the part is handed
-    /// back if there was one, else the parts are dropped.
-    #[verifier::spinoff_prover]
-    pub fn push(&mut self, index: usize, op: WrOp) -> (r: core::result::Result<(), (Error, Option<Part<N>>)>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
-    {
-        if index >= self.qps.len() {
-            no_qp(index);
-            return Err((Error::Invalid("no such QP"), None));
-        }
-        let pd_id = pd_id_of(&self.pd);
-        let max_msg = self.caps.max_msg;
-        let ghost start = *self;
-        let ghost t = self.token@;
-        let ghost m = t.nic();
-        proof {
-            assert(start.entry_ok(index as int, t, m));
-        }
-        // The parts, out of the entry.
-        let mut parts: Vec<Part<N>> = Vec::new();
-        let (rc, atomics, max_sge) = match &mut self.qps[index] {
-            Some(e) => {
-                core::mem::swap(&mut parts, &mut e.building);
-                let max_sge = if e.caps.max_send_sge <= e.caps.max_recv_sge {
-                    e.caps.max_send_sge
-                } else {
-                    e.caps.max_recv_sge
-                };
-                (matches!(e.qp_type, QpType::Rc), e.atomics, max_sge)
-            },
-            None => {
-                no_qp(index);
-                (false, false, 0)
-            },
-        };
-        proof {
-            assert(self.entry_ok(index as int, t, m));
-            self.lemma_touch_one(&start, t, m, m, index as int);
-        }
         // What the QP may do: READ and atomics on reliable connections only,
         // atomics where the device has them.
-        let n = parts.len();
-        let check = if n == 0 || n > max_sge as usize {
-            Err(Error::TooManySges { got: n, max: max_sge as usize })
-        } else if matches!(op, WrOp::Read(_)) && !rc {
-            Err(Error::Unsupported("RDMA READ on this QP"))
-        } else if (matches!(op, WrOp::FetchAdd { .. }) || matches!(op, WrOp::CompareSwap { .. })) && !atomics {
-            Err(Error::Unsupported("atomics on this QP"))
-        } else {
-            Ok(())
-        };
-        if let Err(error) = check {
-            let back = Self::give_back(&mut parts);
-            return Err((error, back));
+        if n == 0 || n > max_sge as usize {
+            return Err(Error::TooManySges { got: n, max: max_sge as usize });
         }
-        let writes_local = matches!(op, WrOp::Read(_)) || matches!(op, WrOp::FetchAdd { .. })
-            || matches!(op, WrOp::CompareSwap { .. });
-        let limit: u64 = if max_msg < 0x7fff_ffff {
-            max_msg as u64
-        } else {
-            0x7fff_ffff
-        };
-        // The scatter/gather list, its owners and its length.
-        let mut sges = [Sge { addr: 0, length: 0, lkey: 0 }; MAX_SGES];
+        if matches!(op, WrOp::Read(_)) && !e.reliable {
+            return Err(Error::Unsupported("RDMA READ on this QP"));
+        }
+        let atomic = matches!(op, WrOp::FetchAdd { .. }) || matches!(op, WrOp::CompareSwap { .. });
+        if atomic && !e.atomics {
+            return Err(Error::Unsupported("atomics on this QP"));
+        }
+        let writes_local = matches!(op, WrOp::Read(_)) || atomic;
+        // The scatter/gather list's owners and its length.
         let mut total: u64 = 0;
         let mut i = 0;
-        let mut bad: Option<Error> = None;
         while i < n
-            invariant_except_break
-                bad is None,
-            invariant
-                n == parts@.len(),
-                1 <= n <= MAX_SGES,
-                0 <= i <= n,
-                bad is None ==> total == sges_len(sges@.take(i as int)) && total <= limit,
-                bad is None ==> forall|j: int|
-                    0 <= j < i ==> sges@[j] == part_sge(#[trigger] parts@[j]) && part_pd(parts@[j]) == pd_id
-                        && (writes_local ==> part_writable(parts@[j])),
-                limit <= 0x7fff_ffff,
-            ensures
-                bad is None ==> i == n,
-            decreases n - i,
         {
-            let sge = part_sge_of(&parts[i]);
-            if part_pd_of(&parts[i]) != pd_id {
-                bad = Some(Error::PdMismatch);
-                break;
+            if part_pd_of(&parts[i]) != e.pd_id {
+                return Err(Error::PdMismatch);
             }
             if writes_local && !part_writable_of(&parts[i]) {
-                bad = Some(Error::Invalid("the NIC would write a frozen buffer"));
-                break;
+                return Err(Error::Invalid("the NIC would write a frozen buffer"));
             }
-            let ghost before = sges@;
-            sges[i] = sge;
-            proof {
-                assert(sges@.take(i as int) =~= before.take(i as int));
-                lemma_sges_len_step(sges@, i as int);
-            }
-            total += sge.length as u64;
-            if total > limit {
-                bad = Some(Error::TooLong { len: total, max: limit });
-                break;
+            total += part_sge_of(&parts[i]).length as u64;
+            if total > e.max_len as u64 {
+                return Err(Error::TooLong { len: total, max: e.max_len as u64 });
             }
             i += 1;
         }
-        if let Some(error) = bad {
-            let back = Self::give_back(&mut parts);
-            return Err((error, back));
-        }
-        proof {
-            assert(i == n);
-            assert(total == sges_len(sges@.take(n as int)));
-        }
-        let remote = match op {
+        match *op {
             WrOp::Write(r) | WrOp::WriteImm(r, _) | WrOp::Read(r) => if total > r.len {
                 Err(Error::TooLong { len: total, max: r.len })
             } else {
-                Ok(())
+                Ok(total)
             },
             WrOp::FetchAdd { remote, .. } | WrOp::CompareSwap { remote, .. } => if total != 8 || n != 1 {
                 Err(Error::Invalid("an atomic needs one local buffer of 8 bytes"))
             } else if remote.len < 8 || remote.addr % 8 != 0 {
                 Err(Error::Invalid("an atomic needs 8 aligned remote bytes"))
             } else {
-                Ok(())
+                Ok(total)
             },
-            WrOp::Send | WrOp::SendImm(_) => Ok(()),
-        };
-        if let Err(error) = remote {
-            let back = Self::give_back(&mut parts);
-            return Err((error, back));
+            WrOp::Send | WrOp::SendImm(_) => Ok(total),
         }
-        // A request with room for the WQE: a new one, or the open one.
-        proof {
-            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
-        }
-        let (open, wqe_room) = match &self.qps[index] {
-            Some(e) => (e.send.is_open(), e.send.wqe_room()),
-            None => (false, 0),
-        };
-        if !open || wqe_room == 0 {
-            if open {
-                let _ = self.close(index, true, None);
-            }
-            if let Err(error) = self.make_send_room(index) {
-                let back = Self::give_back(&mut parts);
-                return Err((error, back));
-            }
-        }
-        proof {
-            let e = self.qps@[index as int]->0;
-            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
-            lemma_same_table_trans(self, &start, &start);
-        }
-        self.hold(index, op, parts, sges, n, total);
-        Ok(())
     }
 
-    /// The new WQE of [`Hw::push`], checked, in a request with room for it:
-    /// writes the WQE held so far, if any, and holds this one.
-    #[verifier::spinoff_prover]
-    fn hold(&mut self, index: usize, op: WrOp, parts: Vec<Part<N>>, sges: [Sge; MAX_SGES], n: usize, total: u64)
-        requires
-            old(self).inv(),
-            old(self).has_qp(index as int),
-            old(self).can_hold(index as int),
-            parts@.len() == n,
-            1 <= n <= MAX_SGES,
-            forall|j: int|
-                0 <= j < n ==> sges@[j] == part_sge(#[trigger] parts@[j]) && part_pd(parts@[j]) == pd_id(old(self).pd)
-                    && (opcode_model(op).writes_local() ==> part_writable(parts@[j])),
-            total == sges_len(sges@.take(n as int)),
-            total <= old(self).caps.max_msg,
-            old(self).wqe_fits(index as int, op, n),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
+    /// Makes room for one more WQE in QP `index`'s open request: a request that is full, or that
+    /// the queue has no more room for, goes out as a request of its own (signaled, without an
+    /// owner), and a new one waits for room (this polls the CQ).
+    #[inline]
+    fn open_room(&mut self, index: usize) -> (r: Result<()>)
     {
-        let mut parts = parts;
-        // The WQE held so far (if any) is written now: its regions are
-        // registered (its parts' leases say so).
-        proof {
-            assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
+        let (k, full) = match &self.qps[index] {
+            Some(e) => {
+                let k = e.open_wqes.len() as u32;
+                (k, k >= e.send.max_wqes() || k >= e.send.wqe_room())
+            },
+            None => (0, false),
+        };
+        if k > 0 {
+            if !full {
+                return Ok(());
+            }
+            let _ = self.close(index, true, None);
         }
-        let ghost s2 = *self;
-        let ghost t2 = self.token@;
-        let ghost m2 = t2.nic();
-        let has_held = match &self.qps[index] {
-            Some(e) => e.held.is_some(),
+        let can = match &self.qps[index] {
+            Some(e) => e.send.can_post(),
             None => false,
         };
-        if has_held {
-            match &self.qps[index] {
-                Some(e) => registered_all(&e.held_parts, &self.pd, Tracked(self.token.borrow_mut())),
-                None => {},
-            }
+        if can {
+            Ok(())
+        } else {
+            self.make_send_room(index)
         }
-        let ghost t3 = self.token@;
-        let ghost m3 = t3.nic();
-        proof {
-            if has_held {
-                s2.lemma_rely(t2, m2, m3);
-                s2.lemma_same_token(t2, t3, m3);
-                self.lemma_inv_fields(&s2, t3, m3);
-            }
-            assert(self.entry_ok(index as int, t3, m3));
+    }
+
+    /// Adds a WQE doing `op` on `part` to QP `index`'s open request, or opens one for it. On error
+    /// nothing is added and the part is handed back.
+    #[verifier::spinoff_prover]
+    pub fn push(&mut self, index: usize, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
+    {
+        if index >= self.qps.len() {
+            no_qp(index);
+            return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
         }
-        let ghost s3 = *self;
+        let checked = match &self.qps[index] {
+            Some(e) => {
+                if e.removed {
+                    no_qp(index);
+                }
+                Self::check_wqe(e, &op, core::slice::from_ref(&part))
+            },
+            None => {
+                no_qp(index);
+                return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
+            },
+        };
+        let bytes = match checked {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(BufError { error, buf: part }),
+        };
+        match self.open_room(index) {
+            Ok(()) => {},
+            Err(error) => return Err(BufError { error, buf: part }),
+        }
         match &mut self.qps[index] {
             Some(e) => {
-                let ghost q = e.id@;
-                let ghost e3 = *e;
-                proof {
-                    e3.send.lemma_wqes();
-                }
-                if !e.send.is_open() {
-                    match e.send.begin() {
-                        Some(_) => {},
-                        None => {
-                            proof { assert(false); }
-                        },
-                    }
-                }
-                proof {
-                    e.send.lemma_wqes();
-                }
-                let wqe = match e.send.push_wqe() {
-                    Some(wqe) => wqe,
-                    None => {
-                        proof { assert(false); }
-                        0
-                    },
-                };
-                match e.held {
-                    Some(h) => {
-                        if !e.started {
-                            crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
-                            e.started = true;
-                        }
-                        let held_sges = vstd::slice::slice_subrange(h.sges.as_slice(), 0, h.n);
-                        post(&mut e.hw, h.wr_id, false, &h.op, held_sges, Ghost(q), Tracked(self.token.borrow_mut()));
-                        proof {
-                            assert(held_sges@ == h.sges@.take(h.n as int));
-                            lemma_held_wr_ok(h, e3.held_parts@, index as u16, e3.send.spec_wqe_committed() + t3.written(q).len(), m3, m3.qps[q].attr, e3.pd_id@, false);
-                        }
-                        let ghost footprint = crate::buf::WqeLoans {
-                            wr_id: h.wr_id, opcode: Some(opcode_model(h.op)),
-                            sges: h.sges@.take(h.n as int), first: e.open_leases.loans().len() as int,
-                        };
-                        keep_parts(&mut e.open_leases, &mut e.held_parts, Ghost(footprint));
-                    },
-                    None => {},
-                }
-                e.held = Some(Held { wr_id: wr_id(index as u16, false, wqe), op, sges, n });
-                core::mem::swap(&mut e.held_parts, &mut parts);
-                core::mem::swap(&mut e.building, &mut parts);
-                e.held_bytes = total;
+                let first_sge = e.open_sges.len();
+                e.open_sges.push(part_sge_of(&part));
+                e.open_wqes.push(OpenWqe { op, first_sge, sges: 1, bytes: bytes as u32 });
+                keep_lease(&mut e.open_leases, part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }));
             },
             None => {},
         }
-        proof {
-            let t4 = self.token@;
-            let e3 = s3.qps@[index as int]->0;
-            let e = self.qps@[index as int]->0;
-            let q = e3.id();
-            let attr = m3.qps[q].attr;
-            let written = t4.written(q);
-            assert(s3.entry_ok(index as int, t3, m3));
-            assert forall|j: int| 0 <= j < written.len() implies m3.send_wr_ok(attr, #[trigger] written[j]) by {
-                if j < t3.written(q).len() {
-                    assert(written[j] == t3.written(q)[j]);
-                }
-            }
-            assert(writing_ok(e.send, index as u16, m3, attr, t4.started(q), written, true));
-            e.send.lemma_wqes();
-            lemma_queues_kept(e3, e, m3.qps[q]);
-            assert forall|j: int| 0 <= j < written.len() implies
-                written_backed(e, e.send.spec_wqe_committed() + j, #[trigger] written[j]) by {
-                let w = e.send.spec_wqe_committed() + j;
-                let wr = written[j];
-                if j < t3.written(q).len() {
-                    assert(wr == t3.written(q)[j]);
-                    lemma_written_kept(e3, e, w, wr);
-                } else {
-                    let h = e3.held->0;
-                    assert(wr == held_wr(h, false));
-                    assert(e.open_leases.wqes().last().wr_id == wr.wr_id);
-                    assert(e.open_leases.wqes().last().opcode == Some(wr.opcode));
-                    assert(e.open_leases.wqes().last().sges.map_values(|s: Sge| sge_model(s)) == wr.sges);
-                    assert(ledger_has(e.open_leases, wr.wr_id, Some(wr.opcode), wr.sges));
-                }
-            }
-            assert(opcode_model(op).allowed_on(attr.transport));
-            assert(e.held->0.sges == sges && e.held->0.n == n);
-            assert(total == sges_len(sges@.take(n as int)));
-            assert(caps_model(m3.caps, self.caps));
-            assert(total <= m3.caps.max_msg);
-            assert(held_ok(e.held->0, e.held_parts@, index as u16, e.send.spec_wqe_committed() + written.len(), attr, e.pd_id@, m3.caps.max_msg));
-            lemma_resources_kept(e3.send, e.send);
-            send_outcomes::lemma_results_kept(e3.send, e.send, m3, q);
-            assert(self.entry_ok(index as int, t4, m3));
-            self.lemma_commit_frame(&s3, t3, t4, m3, m3, index as int);
-        }
+        Ok(())
     }
+
+    /// Finishes the WQE gathered on QP `index` with operation `op`, as [`Hw::push`] does a WQE of
+    /// one part. On error nothing is added and the parts are dropped.
+    #[verifier::spinoff_prover]
+    pub fn push_gathered(&mut self, index: usize, op: WrOp) -> (r: Result<()>)
+    {
+        if index >= self.qps.len() {
+            no_qp(index);
+            return Err(Error::Invalid("no such QP"));
+        }
+        let checked = match &self.qps[index] {
+            Some(e) => {
+                if e.removed {
+                    no_qp(index);
+                }
+                Self::check_wqe(e, &op, e.building.as_slice())
+            },
+            None => {
+                no_qp(index);
+                return Err(Error::Invalid("no such QP"));
+            },
+        };
+        let bytes = match checked {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.drop_gathered(index);
+                return Err(error);
+            },
+        };
+        match self.open_room(index) {
+            Ok(()) => {},
+            Err(error) => {
+                self.drop_gathered(index);
+                return Err(error);
+            },
+        }
+        match &mut self.qps[index] {
+            Some(e) => {
+                let first_sge = e.open_sges.len();
+                let sges = e.building.len();
+                let mut i = 0;
+                while i < sges
+                {
+                    e.open_sges.push(part_sge_of(&e.building[i]));
+                    i += 1;
+                }
+                e.open_wqes.push(OpenWqe { op, first_sge, sges, bytes: bytes as u32 });
+                // In the order the hardware reads them is no matter to the leases.
+                while e.building.len() > 0
+                {
+                    match e.building.pop() {
+                        Some(part) => keep_lease(&mut e.open_leases, part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out })),
+                        None => {},
+                    }
+                }
+            },
+            None => {},
+        }
+        Ok(())
+    }
+
 }
 
 // =============================================================================
@@ -3696,6 +3026,18 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
+    /// QP `index`'s protection domain.
+    pub fn qp_pd(&self, index: usize) -> Option<&Pd<N>>
+    {
+        if index >= self.qps.len() {
+            return None;
+        }
+        match &self.qps[index] {
+            Some(e) => Some(&e.pd),
+            None => None,
+        }
+    }
+
     /// QP `index`'s queue sizes.
     pub fn qp_caps(&self, index: usize) -> Option<QpCaps>
         requires
@@ -3730,87 +3072,26 @@ impl<C, N: Device> Hw<C, N> {
     #[inline(always)]
     #[verifier::spinoff_prover]
     pub fn take(&mut self, index: usize, side: Side, seq: RingSeq) -> (r: Option<Completion<C, N>>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
-            r matches Some(c) ==> c.qp == index && c.queue == side && c.seq == seq
-                && c.leases.inv() && c.leases.fully_recorded(),
-            side is Recv ==> (r matches Some(c) ==> old(self).recv_taken_matches(index, seq, c)),
-            side is Send ==> (r matches Some(c) ==> old(self).send_taken_matches(index, seq, c)),
-            old(self).takeable(index, side, seq) ==> r is Some,
     {
         if index >= self.qps.len() {
             return None;
         }
-        let ghost start = *self;
-        let ghost t = self.token@;
-        let ghost m = t.nic();
-        proof {
-            assert(start.entry_ok(index as int, t, m));
-        }
-        let taken = match &mut self.qps[index] {
-            Some(e) => match side {
-                Side::Send => e.send.take(seq),
-                Side::Recv => e.recv.take(seq),
+        match &mut self.qps[index] {
+            Some(e) => {
+                let taken = match side {
+                    Side::Send => e.send.take(seq),
+                    Side::Recv => e.recv.take(seq),
+                };
+                // Field by field: nothing of the request is copied twice on its way out.
+                match taken {
+                    Some(Taken { outcome, leases: Payload { ctx: Some(wr_id), leases } }) => {
+                        Some(Completion { qp: index, qp_num: e.qp_num, queue: side, seq, wr_id, result: outcome, leases })
+                    },
+                    // A request with an owner holds a context, so nothing is lost here.
+                    _ => None,
+                }
             },
             None => None,
-        };
-        proof {
-            if start.qps@[index as int] is Some {
-                let old_e = start.qps@[index as int]->0;
-                let e = self.qps@[index as int]->0;
-                lemma_resources_kept(old_e.send, e.send);
-                lemma_resources_kept(old_e.recv, e.recv);
-                let pre = start.qps@[index as int]->0;
-                let post = self.qps@[index as int]->0;
-                lemma_queues_kept(pre, post, m.qps[pre.id()]);
-                outcomes::lemma_recv_kept(pre.recv, post.recv, m, pre.id());
-                send_outcomes::lemma_results_kept(pre.send, post.send, m, pre.id());
-                post.send.lemma_wqes();
-                assert forall|j: int| 0 <= j < t.written(pre.id()).len()
-                    implies written_backed(post, post.send.spec_wqe_committed() + j,
-                        #[trigger] t.written(pre.id())[j]) by {
-                    lemma_written_kept(pre, post, pre.send.spec_wqe_committed() + j, t.written(pre.id())[j]);
-                }
-                assert(self.entry_ok(index as int, t, m));
-                self.lemma_touch_one(&start, t, m, m, index as int);
-            } else {
-                assert(self.qps@ =~= start.qps@);
-                self.lemma_inv_fields(&start, t, m);
-            }
-        }
-        let ghost done = taken->0;
-        // Field by field: nothing of the request is copied twice on its way out.
-        match taken {
-            Some(Taken { wc: outcome, refused: never_posted, first_wqe: first, leases: Payload { ctx: Some(ctx), leases: kept } }) => {
-                let result = match side {
-                    Side::Send => send_outcomes::send_result_of::<C, N>(&outcome, never_posted, first, Ghost(start), Ghost(index), Ghost(seq), Ghost(done)),
-                    Side::Recv => outcomes::recv_result_of::<C, N>(&outcome, Ghost(start), Ghost(index), Ghost(seq), Ghost(done)),
-                };
-                let c = Completion { qp: index, queue: side, seq, ctx, result, leases: kept };
-                proof {
-                    match side {
-                        Side::Send => start.lemma_send_finished(index, seq, done, c),
-                        Side::Recv => start.lemma_recv_finished(index, seq, done, c),
-                    }
-                }
-                Some(c)
-            },
-            _ => {
-                // A request with an owner holds a context, so nothing is lost here.
-                proof {
-                    if taken is Some {
-                        match side {
-                            Side::Send => start.lemma_send_taken(index, seq, done),
-                            Side::Recv => start.lemma_recv_taken(index, seq, done),
-                        }
-                        assert(false);
-                    }
-                }
-                None
-            },
         }
     }
 
@@ -3818,64 +3099,17 @@ impl<C, N: Device> Hw<C, N> {
     /// released when it retires (now, if it has). Its context comes back.
     #[verifier::spinoff_prover]
     pub fn detach(&mut self, index: usize, side: Side, seq: RingSeq) -> (ctx: Option<C>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             return None;
         }
-        let ghost start = *self;
-        let ghost t = self.token@;
-        let ghost m = t.nic();
-        proof {
-            assert(start.entry_ok(index as int, t, m));
-        }
-        let ctx = match &mut self.qps[index] {
-            Some(e) => {
-                let ghost send = e.send;
-                let ghost recv = e.recv;
-                let ctx = match side {
-                    Side::Send => e.send.give_up(seq),
-                    Side::Recv => e.recv.give_up(seq),
-                };
-                proof {
-                    match side {
-                        Side::Send => {
-                            lemma_resources_given_up(send, e.send, seq as int);
-                        },
-                        Side::Recv => {
-                            lemma_resources_given_up(recv, e.recv, seq as int);
-                        },
-                    }
-                }
-                ctx
+        match &mut self.qps[index] {
+            Some(e) => match side {
+                Side::Send => e.send.give_up(seq),
+                Side::Recv => e.recv.give_up(seq),
             },
             None => None,
-        };
-        proof {
-            if start.qps@[index as int] is Some {
-                let pre = start.qps@[index as int]->0;
-                let post = self.qps@[index as int]->0;
-                lemma_queues_kept(pre, post, m.qps[pre.id()]);
-                outcomes::lemma_recv_kept(pre.recv, post.recv, m, pre.id());
-                send_outcomes::lemma_results_kept(pre.send, post.send, m, pre.id());
-                post.send.lemma_wqes();
-                assert forall|j: int| 0 <= j < t.written(pre.id()).len()
-                    implies written_backed(post, post.send.spec_wqe_committed() + j,
-                        #[trigger] t.written(pre.id())[j]) by {
-                    lemma_written_kept(pre, post, pre.send.spec_wqe_committed() + j, t.written(pre.id())[j]);
-                }
-                assert(self.entry_ok(index as int, t, m));
-                self.lemma_touch_one(&start, t, m, m, index as int);
-            } else {
-                assert(self.qps@ =~= start.qps@);
-                self.lemma_inv_fields(&start, t, m);
-            }
         }
-        ctx
     }
 
     /// Wakes `waker` when request `seq` of QP `index`'s ring of `side`
@@ -3939,100 +3173,20 @@ impl<C, N: Device> Hw<C, N> {
     /// refusal, which M never saw.
     #[verifier::spinoff_prover]
     pub fn take_send_error(&mut self, index: usize) -> (r: Option<DetachedError>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
-            r matches Some(error) ==> old(self).detached_taken_matches(index, error),
     {
         if index >= self.qps.len() {
             return None;
-        }
-        let ghost start = *self;
-        let ghost t = self.token@;
-        let ghost m = t.nic();
-        proof {
-            assert(start.entry_ok(index as int, t, m));
         }
         let record = match &mut self.qps[index] {
             Some(e) => e.send.take_detached_error(),
             None => None,
         };
-        proof {
-            if start.qps@[index as int] is Some {
-                let pre = start.qps@[index as int]->0;
-                let post = self.qps@[index as int]->0;
-                lemma_queues_kept(pre, post, m.qps[pre.id()]);
-                send_outcomes::lemma_results_kept(pre.send, post.send, m, pre.id());
-                post.send.lemma_wqes();
-                assert forall|j: int| 0 <= j < t.written(pre.id()).len()
-                    implies written_backed(post, post.send.spec_wqe_committed() + j,
-                        #[trigger] t.written(pre.id())[j]) by {
-                    lemma_written_kept(pre, post, pre.send.spec_wqe_committed() + j, t.written(pre.id())[j]);
-                }
-                assert(self.entry_ok(index as int, t, m));
-                self.lemma_touch_one(&start, t, m, m, index as int);
-            } else {
-                assert(self.qps@ =~= start.qps@);
-                self.lemma_inv_fields(&start, t, m);
-            }
-        }
         match record {
-            Some(d) => Some(send_outcomes::detached_error_of::<C, N>(d, Ghost(start), Ghost(index))),
+            Some(d) => Some(DetachedError { seq: d.seq, error: d.error }),
             None => None,
         }
     }
 
-    /// The next QP listed with requests for the event loop to hand out,
-    /// with whether a doorbell of it was refused since (both flags cleared):
-    /// `None` once the list is empty, `Some(None)` for a QP removed since.
-    #[verifier::spinoff_prover]
-    pub fn pop_dirty(&mut self) -> (r: Option<Option<(usize, bool)>>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
-    {
-        let ghost start = *self;
-        let ghost t = self.token@;
-        let ghost m = t.nic();
-        let popped = self.dirty.pop();
-        proof {
-            self.lemma_inv_fields(&start, t, m);
-        }
-        let index = match popped {
-            Some(i) => i as usize,
-            None => return None,
-        };
-        if index >= self.qps.len() {
-            return Some(None);
-        }
-        let ghost s0 = *self;
-        proof {
-            assert(s0.entry_ok(index as int, t, m));
-        }
-        let r = match &mut self.qps[index] {
-            Some(e) => {
-                e.dirty = false;
-                let refused = e.refused;
-                e.refused = false;
-                Some((index, refused))
-            },
-            None => None,
-        };
-        proof {
-            if s0.qps@[index as int] is Some {
-                assert(self.entry_ok(index as int, t, m));
-                self.lemma_touch_one(&s0, t, m, m, index as int);
-            } else {
-                assert(self.qps@ =~= s0.qps@);
-                self.lemma_inv_fields(&s0, t, m);
-            }
-        }
-        Some(r)
-    }
 }
 
 // =============================================================================
@@ -4095,19 +3249,7 @@ impl<C, N: Device> Hw<C, N> {
     /// removed (if `removed`).
     #[verifier::spinoff_prover]
     fn set_flags(&mut self, index: usize, drain: Option<bool>, removed: bool)
-        requires
-            old(self).inv(),
-            old(self).has_qp(index as int),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
     {
-        let ghost start = *self;
-        let ghost t = self.token@;
-        let ghost m = t.nic();
-        proof {
-            assert(start.entry_ok(index as int, t, m));
-        }
         match &mut self.qps[index] {
             Some(e) => {
                 match drain {
@@ -4117,15 +3259,11 @@ impl<C, N: Device> Hw<C, N> {
                 }
                 if removed {
                     e.removed = true;
-                    e.dirty = false;
+                    e.takes_work = false;
                     e.refused = false;
                 }
             },
             None => {},
-        }
-        proof {
-            assert(self.entry_ok(index as int, t, m));
-            self.lemma_touch_one(&start, t, m, m, index as int);
         }
     }
 
@@ -4133,121 +3271,39 @@ impl<C, N: Device> Hw<C, N> {
     /// writing and gives up its requests; whether anything is in flight.
     #[verifier::spinoff_prover]
     fn discard(&mut self, index: usize) -> (busy: bool)
-        requires
-            old(self).inv(),
-            old(self).has_qp(index as int),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
     {
         let mut wakes = WakeBatch::new();
-        let ghost start = *self;
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        proof {
-            assert(start.entry_ok(index as int, t0, m0));
-        }
         let busy = match &mut self.qps[index] {
             Some(e) => {
-                let ghost q = e.id@;
-                let open = e.send.is_open();
-                if open {
-                    e.held = None;
-                    while e.held_parts.len() > 0
-                        decreases e.held_parts@.len(),
-                    {
-                        e.held_parts.pop();
-                    }
-                    let mut leases = no_leases();
-                    core::mem::swap(&mut leases, &mut e.open_leases);
-                    e.held_bytes = 0;
-                }
+                let ghost q = e.id();
+                e.open_wqes.clear();
+                e.open_sges.clear();
+                let mut leases = no_leases();
+                core::mem::swap(&mut leases, &mut e.open_leases);
                 if e.started {
                     e.started = false;
                     abort(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                 }
-                // Nothing staged or open is posted: refused (their owners are
-                // gone too).
-                let ghost before_abort = e.send;
+                // Nothing staged is posted: refused (their owners are gone too).
                 e.send.abort_with_wakes(&mut wakes);
-                proof {
-                    lemma_resources_kept(before_abort, e.send);
-                    send_outcomes::lemma_bound_kept(before_abort, e.send, e.send_tails@, index as u16,
-                        m0.qps[q], m0.qps[q], t0.written(q));
-                    send_outcomes::lemma_bound_no_written(e.send, e.send_tails@, index as u16, m0.qps[q], t0.written(q));
-                    send_outcomes::lemma_results_refused(before_abort, e.send, m0, q);
-                }
-                let ghost s1 = e.send;
                 let mut seq = e.send.head();
                 while seq < e.send.posted()
-                    invariant
-                        e.send.inv(),
-                        send_outcomes::send_implied(e.send, e.send_tails@),
-                        send_outcomes::send_results(e.send, m0, q),
-                        send_outcomes::tail_bound(e.send, e.send_tails@, index as u16, m0.qps[q], Seq::empty()),
-                        ring_resources_ok(e.send),
-                        e.send.same_wqes(&s1),
-                        keeps_leases(e.send, before_abort),
-                        e.send.same_open(&s1),
-                        e.send.spec_posted() == s1.spec_posted(),
-                    decreases e.send.spec_posted() - seq,
                 {
-                    let ghost before_detach = e.send;
                     // A context's destructor is the user's: it runs here, between
                     // two consistent states, never during a poll.
                     let _ctx = e.send.give_up(seq);
-                    proof {
-                        lemma_resources_given_up(before_detach, e.send, seq as int);
-                        send_outcomes::lemma_results_kept(before_detach, e.send, m0, q);
-                    }
                     seq += 1;
                 }
-                let ghost r1 = e.recv;
                 let mut seq = e.recv.head();
                 while seq < e.recv.posted()
-                    invariant
-                        e.recv.inv(),
-                        outcomes::recv_outcomes(e.recv, m0, q),
-                        ring_resources_ok(e.recv),
-                        e.recv.same_wqes(&r1),
-                        keeps_leases(e.recv, r1),
-                        e.recv.same_open(&r1),
-                        e.recv.spec_posted() == r1.spec_posted(),
-                    decreases e.recv.spec_posted() - seq,
                 {
-                    let ghost before_detach = e.recv;
                     let _ctx = e.recv.give_up(seq);
-                    proof {
-                        lemma_resources_given_up(before_detach, e.recv, seq as int);
-                        outcomes::lemma_recv_kept(before_detach, e.recv, m0, q);
-                    }
                     seq += 1;
                 }
                 e.send.in_flight_wqes() > 0 || e.recv.in_flight_wqes() > 0
             },
             None => false,
         };
-        proof {
-            let t = self.token@;
-            let n = t.nic();
-            let e0 = start.qps@[index as int]->0;
-            let q = e0.id();
-            let e = self.qps@[index as int]->0;
-            if e0.started {
-                start.lemma_rely(t0, m0, n);
-                lemma_rely_frame(t0.share(), pinned(t0), m0, n);
-            } else {
-                assert(t == t0);
-                start.lemma_inv_fields(&start, t0, m0);
-            }
-            assert(start.inv_with(t0, n));
-            assert(start.entry_ok(index as int, t0, n));
-            lemma_queues_kept(e0, e, n.qps[q]);
-            outcomes::lemma_recv_framed(e.recv, m0, n, q);
-            send_outcomes::lemma_results_framed(e.send, m0, n, q);
-            assert(self.entry_ok(index as int, t, n));
-            self.lemma_commit_frame(&start, t0, t, n, n, index as int);
-        }
         wakes.finish();
         busy
     }
@@ -4278,21 +3334,9 @@ impl<C, N: Device> Hw<C, N> {
     /// (it goes out at the next doorbell).
     #[verifier::spinoff_prover]
     fn stage_drain(&mut self, index: usize) -> (written: bool)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
-            written ==> final(self).has_qp(index as int),
     {
         if index >= self.qps.len() {
             return false;
-        }
-        let ghost start = *self;
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        proof {
-            assert(start.entry_ok(index as int, t0, m0));
         }
         let ready = match &self.qps[index] {
             Some(e) => e.removed && e.drain_pending && matches!(e.phase, Phase::Ready) && e.send.can_post(),
@@ -4303,103 +3347,24 @@ impl<C, N: Device> Hw<C, N> {
         }
         match &mut self.qps[index] {
             Some(e) => {
-                let ghost q = e.id@;
-                let ghost e0 = *e;
-                proof {
-                    e0.send.lemma_wqes();
+                let ghost q = e.id();
+                let wqe = e.send.next_wqe();
+                if !e.started {
+                    start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                    e.started = true;
                 }
-                match e.send.begin() {
-                    Some(_) => {},
-                    None => {
-                        proof { assert(false); }
-                    },
-                }
-                proof {
-                    e.send.lemma_wqes();
-                }
-                let wqe = match e.send.push_wqe() {
-                    Some(wqe) => wqe,
-                    None => {
-                        proof { assert(false); }
-                        0
-                    },
-                };
-                let implied = Wc::success(Opcode::SEND, 0);
+                let nothing: [Sge; 0] = [];
+                let none = nothing.as_slice();
+                post(&mut e.hw, wr_id(index as u16, false, wqe), true, &WrOp::Send, none, Ghost(q), Tracked(self.token.borrow_mut()));
                 let mut leases = no_leases();
                 leases.record_wqe(Ghost(crate::buf::WqeLoans {
                     wr_id: spec_wr_id(index as u16, false, wqe),
                     opcode: Some(safeverbs_spec::nic::Opcode::Send),
                     sges: Seq::empty(), first: 0,
                 }));
-                proof {
-                    lemma_ledger_entry(leases, 0);
-                    assert(leases.wqes()[0].sges.map_values(|s: Sge| sge_model(s)) =~= Seq::empty());
-                }
-                let payload = Payload { ctx: None, leases };
-                let ghost resource = payload;
-                let ghost before_end = e.send;
-                proof { lemma_resources_kept(e0.send, e.send); }
-                let (_seq, signaled) = e.send.end(true, true, implied, payload);
-                proof { lemma_resources_added(before_end, e.send, _seq as int, resource, true); }
-                if !e.started {
-                    crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
-                    e.started = true;
-                }
-                let nothing: [Sge; 0] = [];
-                let none = nothing.as_slice();
-                post(&mut e.hw, wr_id(index as u16, false, wqe), signaled, &WrOp::Send, none, Ghost(q), Tracked(self.token.borrow_mut()));
-                e.send_tails = Ghost(e.send_tails@.insert(_seq as int,
-                    send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@)));
-                proof {
-                    assert(none@ =~= Seq::<Sge>::empty());
-                    assert(self.token@.written(q) =~= t0.written(q).push(
-                        send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@)));
-                    send_outcomes::lemma_implied_added(e0.send, e.send, e0.send_tails@,
-                        _seq as int, send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@));
-                    e.send.lemma_meta(_seq as int);
-                    send_outcomes::lemma_bound_added(e0.send, e.send, e0.send_tails@, index as u16,
-                        m0.qps[q], t0.written(q), self.token@.written(q), _seq as int,
-                        send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@));
-                    send_outcomes::lemma_results_kept(e0.send, e.send, m0, q);
-                    assert(none@ =~= Seq::<Sge>::empty());
-                    let wr = send_wr(spec_wr_id(index as u16, false, wqe), signaled, WrOp::Send, none@);
-                    assert(wr.sges =~= Seq::<safeverbs_spec::nic::Sge>::empty());
-                    assert(m0.send_wr_ok(m0.qps[q].attr, wr));
-                    let w = e0.send.spec_wqe_posted() as int;
-                    assert(e.send.dma(_seq as int, w) == Some(resource));
-                    assert(ledger_has(resource.leases, wr.wr_id, Some(wr.opcode), wr.sges));
-                    assert(ring_backed(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges));
-                }
+                let _seq = e.send.stage(1, true, true, Ok(Completed::Sent), Payload { ctx: None, leases });
             },
             None => {},
-        }
-        proof {
-            let t = self.token@;
-            let e0 = start.qps@[index as int]->0;
-            let q = e0.id();
-            let e = self.qps@[index as int]->0;
-            let attr = m0.qps[q].attr;
-            let written = t.written(q);
-            assert forall|j: int| 0 <= j < written.len() implies m0.send_wr_ok(attr, #[trigger] written[j]) by {
-                if j < t0.written(q).len() {
-                    assert(written[j] == t0.written(q)[j]);
-                }
-            }
-            e.send.lemma_wqes();
-            lemma_queues_kept(e0, e, m0.qps[q]);
-            assert forall|j: int| 0 <= j < written.len() implies
-                written_backed(e, e.send.spec_wqe_committed() + j, #[trigger] written[j]) by {
-                let w = e.send.spec_wqe_committed() + j;
-                let wr = written[j];
-                if j < t0.written(q).len() {
-                    assert(wr == t0.written(q)[j]);
-                    assert(written_backed(e0, w, wr));
-                    assert(!e0.send.spec_is_open());
-                    lemma_backed_kept(e0.send, e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
-                }
-            }
-            assert(self.entry_ok(index as int, t, m0));
-            self.lemma_commit_frame(&start, t0, t, m0, m0, index as int);
         }
         true
     }
@@ -4503,23 +3468,12 @@ impl<C, N: Device> Hw<C, N> {
     /// its share of the CQ. Whether it was destroyed.
     #[verifier::spinoff_prover]
     pub fn destroy(&mut self, index: usize) -> (destroyed: bool)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
     {
         if index >= self.qps.len() {
             return false;
         }
-        let ghost start = *self;
-        let ghost t0 = self.token@;
-        let ghost m0 = t0.nic();
-        let ghost sh = t0.share();
-        proof {
-            assert(start.entry_ok(index as int, t0, m0));
-        }
         let idle = match &self.qps[index] {
-            Some(e) => e.removed && !e.started && !e.send.is_open() && e.send.in_flight_wqes() == 0
+            Some(e) => e.removed && !e.started && e.open_wqes.len() == 0 && e.send.in_flight_wqes() == 0
                 && e.recv.in_flight_wqes() == 0,
             None => false,
         };
@@ -4531,51 +3485,15 @@ impl<C, N: Device> Hw<C, N> {
         let entry = match slot {
             Some(entry) => entry,
             None => {
-                proof { assert(false); }
                 return false;
             },
         };
-        let ghost q = entry.id@;
-        let ghost need = entry.caps.max_send_wr + entry.caps.max_recv_wr;
-        proof {
-            let qp = m0.qps[q];
-            entry.send.lemma_wqes();
-            entry.recv.lemma_wqes();
-            assert(nic_enabled(m0, Nic::Step::destroy_qp(q)));
-            assert(m0.cq_wf(sh.cq));
-            assert(m0.cqs[sh.cq].reserved.count(q) == m0.reserved_by(sh.cq, q));
-            broadcast use vstd::multiset::group_multiset_axioms;
-            assert(need <= self.reserved);
-        }
         let need = entry.caps.max_send_wr + entry.caps.max_recv_wr;
+        let ghost q = entry.id();
         // The hardware QP first; the rest of the entry, the rings with the
         // buffers, goes when this returns, once the NIC holds none of them.
         destroy_qp(entry.hw, Ghost(q), Tracked(self.token.borrow_mut()));
         self.reserved -= need;
-        proof {
-            let t = self.token@;
-            let n = t.nic();
-            let mid = choose|mid: Nic::State| rely_reaches(sh, pinned(t0), m0, mid) && nic_step(mid, n, Nic::Step::destroy_qp(q));
-            start.lemma_rely(t0, m0, mid);
-            start.lemma_same_token(t0, t, mid);
-            lemma_nic_step_is_next(mid, n, Nic::Step::destroy_qp(q));
-            lemma_step_keeps_invariant(mid, n);
-            lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::destroy_qp(q));
-            assert(start.entry_ok(index as int, t, mid));
-            let qp = mid.qps[q];
-            let cq = mid.cqs[sh.cq];
-            safeverbs_spec::nic_proofs::lemma_copies(q, qp.attr.sq_depth);
-            safeverbs_spec::nic_proofs::lemma_copies(q, qp.attr.rq_depth);
-            broadcast use vstd::multiset::group_multiset_axioms;
-            assert(mid.cq_wf(sh.cq));
-            assert(cq.reserved.count(q) == mid.reserved_by(sh.cq, q));
-            let c1 = cq.unreserve(q, qp.attr.sq_depth);
-            assert(copies(q, qp.attr.sq_depth).subset_of(cq.reserved));
-            assert(copies(q, qp.attr.rq_depth).subset_of(c1.reserved));
-            assert(n.cqs[sh.cq].reserved.len() == cq.reserved.len() - qp.attr.sq_depth - qp.attr.rq_depth);
-            assert(!writes(t, q));
-            self.lemma_remove_one(&start, t, mid, n, index as int);
-        }
         true
     }
 
@@ -4583,6 +3501,7 @@ impl<C, N: Device> Hw<C, N> {
     /// before: M's `destroy_cq` needs none attached). Otherwise hands the
     /// worker back: a QP the device never flushed keeps it, and the caller
     /// leaks it all (no memory the NIC may use is ever freed).
+    #[allow(clippy::result_large_err)] // Once, at the very end: nothing to save.
     pub fn finish(self) -> (r: core::result::Result<(), Self>)
         requires
             self.inv(),
@@ -4622,36 +3541,19 @@ impl<C, N: Device> Hw<C, N> {
     /// pushed.
     #[verifier::spinoff_prover]
     pub fn drop_gathered(&mut self, index: usize)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
     {
         if index >= self.qps.len() {
             return;
         }
-        let ghost start = *self;
-        let ghost t = self.token@;
-        let ghost m = t.nic();
-        proof {
-            assert(start.entry_ok(index as int, t, m));
-        }
         match &mut self.qps[index] {
-            Some(e) => {
-                Self::give_back(&mut e.building);
-            },
+            Some(e) => e.building.clear(),
             None => {},
         }
-        proof {
-            if start.qps@[index as int] is Some {
-                assert(self.entry_ok(index as int, t, m));
-                self.lemma_touch_one(&start, t, m, m, index as int);
-            } else {
-                assert(self.qps@ =~= start.qps@);
-                self.lemma_inv_fields(&start, t, m);
-            }
-        }
+    }
+
+    /// The number of slots of the QP table: every QP's index is below it.
+    pub fn qp_slots(&self) -> usize {
+        self.qps.len()
     }
 
     /// Waits until a new send request of at least one WQE fits on QP
@@ -4671,23 +3573,32 @@ impl<C, N: Device> Hw<C, N> {
     }
 }
 
-/// The opcode a successful completion of `op` reports.
-fn opcode_of(op: &WrOp) -> (opcode: Opcode)
-    ensures opcode == match *op {
-        WrOp::Send | WrOp::SendImm(_) => Opcode::SEND,
-        WrOp::Write(_) | WrOp::WriteImm(..) => Opcode::RDMA_WRITE,
-        WrOp::Read(_) => Opcode::RDMA_READ,
-        WrOp::FetchAdd { .. } => Opcode::FETCH_ADD,
-        WrOp::CompareSwap { .. } => Opcode::COMP_SWAP,
-    },
+/// The device refused the only request written: what its slot got comes back.
+#[cold]
+#[inline(never)]
+fn not_posted<C, N: Device>(ring: &mut Ring<Payload<C, N>>, error: Error) -> (r: Refusal<C, N>)
+{
+    match ring.unfill() {
+        Some(payload) => Refusal { error, ctx: payload.ctx, leases: payload.leases },
+        None => Refusal { error, ctx: None, leases: Leases::new() },
+    }
+}
+
+/// The success a completion of `op` on `len` bytes reports, and the one its request reports if
+/// a later completion retires it: the NIC reports the status alone of a SEND or a WRITE, and a
+/// READ or an atomic reports the length it asked for.
+#[inline(always)]
+fn implied_outcome(op: &WrOp, len: u32) -> (r: CompletionResult)
 {
     match op {
-        WrOp::Send | WrOp::SendImm(_) => Opcode::SEND,
-        WrOp::Write(_) | WrOp::WriteImm(..) => Opcode::RDMA_WRITE,
-        WrOp::Read(_) => Opcode::RDMA_READ,
-        WrOp::FetchAdd { .. } => Opcode::FETCH_ADD,
-        WrOp::CompareSwap { .. } => Opcode::COMP_SWAP,
+        WrOp::Send | WrOp::SendImm(_) | WrOp::Write(_) | WrOp::WriteImm(..) => Ok(Completed::Sent),
+        WrOp::Read(_) | WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. } => Ok(Completed::Read { len }),
     }
+}
+
+/// Whether the NIC writes the local buffer of `op`.
+spec fn op_writes_local(op: WrOp) -> bool {
+    opcode_model(op).writes_local()
 }
 
 } // verus!

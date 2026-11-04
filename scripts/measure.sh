@@ -82,11 +82,14 @@ fi
 workloads='raw - 0
 careful - 0
 eventloop careful 1
+poll_one careful 1
+engine careful 1
 take careful 1
 async careful 1
 batch_careful - 0
 batch batch_careful 1
 async_batch batch_careful 1
+sink batch_careful 1
 train_careful - 0
 train train_careful 1
 async_train careful 16'

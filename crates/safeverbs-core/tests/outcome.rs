@@ -3,14 +3,14 @@
 use safeverbs_core::model::Model;
 use safeverbs_core::ring::State;
 use safeverbs_core::{
-    Access, CompletionError, ConnectAttr, Context, QpCaps, RC, Status, Worker, WrOp,
+    Access, CompletionError, ConnectAttr, Context, Engine, QpCaps, RC, Status, WrOp,
 };
 
 fn adjacent_errors(first_wqes: usize, signal_first: bool) {
     let model = Model::new(97);
     model.set_pace(0, 1);
     let pd = Context::new(model.clone()).alloc_pd().unwrap();
-    let mut worker: Worker<(), _> = Worker::new(&pd, 32).unwrap();
+    let mut worker: Engine<(), _> = Engine::new(pd.context(), 32).unwrap();
     let caps = QpCaps {
         max_send_wr: 8,
         max_recv_wr: 8,
@@ -18,8 +18,8 @@ fn adjacent_errors(first_wqes: usize, signal_first: bool) {
         max_recv_sge: 1,
         max_inline_data: 0,
     };
-    let local = worker.create_qp::<RC>(caps, 2).unwrap();
-    let peer = worker.create_qp::<RC>(caps, 2).unwrap();
+    let local = worker.create_qp::<RC>(&pd, caps, 2).unwrap();
+    let peer = worker.create_qp::<RC>(&pd, caps, 2).unwrap();
     let attr = ConnectAttr {
         port: 1,
         access: Access::LOCAL_WRITE | Access::REMOTE_WRITE,

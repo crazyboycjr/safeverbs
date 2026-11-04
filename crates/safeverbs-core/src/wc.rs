@@ -250,6 +250,9 @@ impl Completed {
     }
 }
 
+/// What a request reports: what it did, or why it did not.
+pub type CompletionResult = Result<Completed, CompletionError>;
+
 /// Why a request did not complete successfully. Its context and buffers come
 /// back with the error all the same.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -350,6 +353,7 @@ impl Wc {
     }
 
     /// Whether the work request succeeded.
+    #[inline(always)]
     pub(crate) const fn is_ok(&self) -> (ok: bool)
         ensures
             ok == self.spec_ok(),
@@ -360,6 +364,7 @@ impl Wc {
     /// What a successful completion reports, as M's outcome says. A
     /// notification carries its immediate data by M's rule for receives
     /// (`RecvWr::allows_outcome`); without it, the proof says nothing.
+    #[inline(always)]
     pub(crate) const fn completed(&self) -> (done: Completed)
         requires
             self.spec_ok(),
@@ -383,8 +388,28 @@ impl Wc {
         }
     }
 
+    /// What a successful completion of a receive reports: `completed`, for the receive queue, where
+    /// M allows nothing but a message or a notification.
+    #[inline(always)]
+    pub(crate) const fn received(&self) -> (done: Received)
+        requires
+            self.spec_ok(),
+    {
+        let len = self.byte_len;
+        if self.opcode.0 == 129 {
+            let imm = match self.imm {
+                Some(imm) => imm,
+                None => 0,
+            };
+            Received::WriteNotification { imm, len }
+        } else {
+            Received::Message { len, imm: self.imm }
+        }
+    }
+
     /// The error of a failed completion, of the WQE at `position` in its
     /// request.
+    #[inline(always)]
     pub(crate) const fn failure(&self, position: u32) -> (error: CompletionError)
         ensures
             error matches CompletionError::Failed { status, position: at, .. }

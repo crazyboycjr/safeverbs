@@ -6,17 +6,14 @@
 
 use std::collections::VecDeque;
 
-use safeverbs_core::worker::MAX_SGES;
-use safeverbs_core::{Error, Leases, Nic, Part, QpKey, Seq, Transport, Worker, WrOp};
+use safeverbs_core::{Engine, Error, Leases, Nic, Part, QpKey, Seq, Transport, WrOp};
 
-/// Work for one request. (A gather list is kept inline, which makes the
-/// enum large; it only lives in the backlog while a queue is full.)
-#[allow(clippy::large_enum_variant)]
+/// Work for one request, while it waits or takes the general path.
 pub(crate) enum Work<N: Nic> {
     /// One send-queue WQE.
     One(WrOp, Part<N>),
     /// One send-queue WQE with a gather list.
-    Gather(WrOp, [Option<Part<N>>; MAX_SGES]),
+    Gather(WrOp, Vec<Part<N>>),
     /// A batch of send-queue WQEs.
     Batch(Vec<(WrOp, Part<N>)>),
     /// A receive.
@@ -51,6 +48,11 @@ impl<N: Nic> Backlog<N> {
         }
     }
 
+    /// The entries it holds.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Whether no work waits (new work may be posted at once).
     pub(crate) fn is_idle(&self) -> bool {
         let mut i = 0;
@@ -75,7 +77,7 @@ impl<N: Nic> Backlog<N> {
     }
 
     /// Posts waiting work in order while it fits.
-    pub(crate) fn drain<T: Transport>(&mut self, w: &mut Worker<(), N>, qp: QpKey<T>) {
+    pub(crate) fn drain<T: Transport>(&mut self, w: &mut Engine<(), N>, qp: QpKey<T>) {
         let mut i = 0;
         while i < self.entries.len() {
             if self.entries[i].work.is_some() {
@@ -138,7 +140,7 @@ impl<N: Nic> Backlog<N> {
 /// room in the queue and for a free slot: when every slot holds a result
 /// that its future has not taken yet, it waits for those futures to be
 /// polled.
-pub(crate) fn fits<T: Transport, N: Nic>(w: &Worker<(), N>, qp: QpKey<T>, work: &Work<N>) -> bool {
+pub(crate) fn fits<T: Transport, N: Nic>(w: &Engine<(), N>, qp: QpKey<T>, work: &Work<N>) -> bool {
     match work {
         Work::One(..) | Work::Gather(..) => w.send_ring(qp).can_post(),
         Work::Batch(ops) => {
@@ -152,7 +154,7 @@ pub(crate) fn fits<T: Transport, N: Nic>(w: &Worker<(), N>, qp: QpKey<T>, work: 
 
 /// Posts `work` now on QP `qp` of `w` (and rings the doorbell).
 pub(crate) fn post<T: Transport, N: Nic>(
-    w: &mut Worker<(), N>,
+    w: &mut Engine<(), N>,
     qp: QpKey<T>,
     work: Work<N>,
 ) -> Posted<N> {
@@ -166,7 +168,7 @@ pub(crate) fn post<T: Transport, N: Nic>(
         }
         Work::Gather(op, parts) => {
             let mut req = w.request(qp);
-            if let Err(e) = req.push_gather(op, parts.into_iter().flatten()) {
+            if let Err(e) = req.push_gather(op, parts) {
                 return Err((e, Leases::default()));
             }
             req.submit(true, ()).map_err(|e| (e.error, e.leases))

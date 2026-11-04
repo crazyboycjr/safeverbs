@@ -156,32 +156,6 @@ pub(super) proof fn lemma_recv_completed<L>(
     }
 }
 
-/// What a receive the ring handed back reports: the outcome M retired for its one WQE.
-#[inline(always)]
-pub(super) fn recv_result_of<C, N: Device>(
-    wc: &Wc, Ghost(hw): Ghost<Hw<C, N>>, Ghost(index): Ghost<usize>, Ghost(seq): Ghost<RingSeq>,
-    Ghost(t): Ghost<Taken<Payload<C, N>>>,
-) -> (result: core::result::Result<Completed, CompletionError>)
-    requires
-        hw.inv(),
-        hw.has_qp(index as int),
-        hw.recv_taken_from(index, seq, t),
-        t.wc == *wc,
-    ensures
-        hw.recv_result_from(t, result),
-{
-    proof {
-        wc.lemma_outcome_ok();
-        wc.lemma_spec_status();
-    }
-    if wc.is_ok() {
-        Ok(wc.completed())
-    } else {
-        // A receive is a request of one WQE: its error is at position 0.
-        Err(wc.failure(0))
-    }
-}
-
 impl<C, N: Device> Hw<C, N> {
     /// A completed receive request's observed result, before it is taken.
     pub closed spec fn recv_result(&self, index: usize, seq: RingSeq) -> Option<safeverbs_spec::types::Outcome> {

@@ -40,7 +40,7 @@ impl<U, N: Nic> WriteOp<U, N> {
 }
 
 /// A [`Sink`] of RDMA WRITEs on a QP, from
-/// [`LocalQp::sink`](crate::LocalQp::sink).
+/// [`AsyncQp::sink`](crate::AsyncQp::sink).
 ///
 /// - `poll_ready` waits for room in the send queue;
 /// - `start_send` writes the WQE (unsignaled unless the ring needs a
@@ -88,20 +88,17 @@ impl<'q, Q: QueueAccess, U: IntoBytes + Immutable> WriteSink<'q, Q, U> {
         };
         let item = self.items;
         self.items += 1;
-        let seq = self.q.with_qp(|w, qp| {
-            let mut req = w.request(qp);
-            req.push(wr, op.buf.into_part()).map_err(|e| e.error)?;
-            Ok::<_, Error>(req.finish_detached(signal))
-        })?;
-        if let Some(seq) = seq {
-            self.last = Some(seq);
-            let follows = self
-                .runs
-                .last()
-                .is_some_and(|&(first, of)| seq - first == item - of);
-            if !follows {
-                self.runs.push((seq, item));
-            }
+        let seq = self
+            .q
+            .with_qp(|w, qp| w.stage_detached(qp, wr, op.buf.into_part(), signal))
+            .map_err(|e| e.error)?;
+        self.last = Some(seq);
+        let follows = self
+            .runs
+            .last()
+            .is_some_and(|&(first, of)| seq - first == item - of);
+        if !follows {
+            self.runs.push((seq, item));
         }
         Ok(())
     }
@@ -149,7 +146,7 @@ impl<Q: QueueAccess, U: IntoBytes + Immutable> Sink<WriteOp<U, Q::N>> for WriteS
             s.drain();
             let idle = s.sends_idle();
             let qp = s.key();
-            let w = s.worker();
+            let w = s.engine();
             w.progress();
             if idle && w.send_ring(qp).can_post() {
                 return Ok::<bool, Error>(true);
@@ -186,9 +183,8 @@ impl<Q: QueueAccess, U: IntoBytes + Immutable> Sink<WriteOp<U, Q::N>> for WriteS
         let done = match this.last {
             Some(last) => this.q.with_qp(|w, qp| {
                 w.progress();
-                // Retired (and freed, it has no owner); or refused by the
-                // device with its doorbell (the ring then records a flush
-                // error for it).
+                // Completed (and freed, it has no owner); or refused by the device with its
+                // doorbell (the ring then records it as refused).
                 matches!(w.send_ring(qp).state(last), State::Free)
             }),
             None => true,

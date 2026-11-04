@@ -46,12 +46,19 @@ impl WakeBatch {
     }
 
     /// Attempt every notification even if an earlier user waker panicked.
+    #[inline(never)]
     pub(crate) fn wake(&mut self, waker: Waker) {
         if let Some(panic) = try_wake(waker) {
             let mut panics = self.panics.take().unwrap_or_default();
             panics.push(panic);
             self.panics = Some(panics);
         }
+    }
+
+    /// Whether a waker panicked.
+    #[inline(always)]
+    pub(crate) fn pending(&self) -> bool {
+        self.panics.is_some()
     }
 
     /// Propagate the first wake panic only after the caller is consistent. Without one,

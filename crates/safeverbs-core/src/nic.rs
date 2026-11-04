@@ -341,9 +341,10 @@ pub unsafe trait Nic: Send + Sync + Sized + 'static {
     type Cq: NicCq + 'static;
     /// A queue pair.
     type Qp: NicQp + 'static;
-    /// A thread domain with a parent domain over a PD: QPs created on it
-    /// are used by one thread at a time, so the driver may skip their locks
-    /// (and give them a doorbell of their own, shared among them).
+    /// A thread domain: the QPs created on it are used by one thread at a time, so the
+    /// driver may skip their locks and give them a doorbell of their own, shared among them.
+    type Td: Send + 'static;
+    /// A parent domain over a PD and a thread domain, on which QPs of that PD are created.
     type Domain: Send + 'static;
 
     /// The device's name.
@@ -402,10 +403,13 @@ pub unsafe trait Nic: Send + Sync + Sized + 'static {
     /// one thread at a time when `single_threaded`.
     fn create_cq(&self, entries: u32, single_threaded: bool) -> Result<Self::Cq>;
 
-    /// Allocates a thread domain and a parent domain over `pd` (with them,
-    /// mlx5 drops the locks of the QPs created there); `None` where the
-    /// device has none (rxe).
-    fn alloc_domain(&self, pd: &Self::Pd) -> Option<Self::Domain>;
+    /// Allocates a thread domain; `None` where the device has none (rxe).
+    fn alloc_td(&self) -> Option<Self::Td>;
+
+    /// Allocates a parent domain over `pd` and `td` (with it, mlx5 drops the locks of the QPs
+    /// created there); `None` if the device refuses. It must be dropped before `pd` and `td`,
+    /// and after the QPs created on it.
+    fn alloc_domain(&self, pd: &Self::Pd, td: &Self::Td) -> Option<Self::Domain>;
 
     /// Creates a QP in `pd` with its queues on the two CQs (they may be the
     /// same). On `domain`, which must be over `pd`, the driver may skip its

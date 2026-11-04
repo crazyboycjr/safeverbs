@@ -81,7 +81,7 @@ fn recv<T: DeserializeOwned>(stream: &mut TcpStream) -> anyhow::Result<T> {
 fn connect(
     args: &Args,
     stream: &mut TcpStream,
-) -> anyhow::Result<(safeverbs::Pd, safeverbs::LocalQp<safeverbs::UC>)> {
+) -> anyhow::Result<(safeverbs::Pd, safeverbs::AsyncQp<safeverbs::UC>)> {
     let ctx = Context::open(args.device.as_deref())?;
     let pd = ctx.alloc_pd()?;
     let mut b = UcQueuePairBuilder::new(&pd);

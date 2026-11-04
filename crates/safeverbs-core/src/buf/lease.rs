@@ -345,16 +345,26 @@ impl<N: Nic> Part<N> {
     { matches!(self.lease, Lease::Unique(_)) }
 }
 
-/// The resources of one request. The first stays inline; repeated consecutive
+/// The resources of one request: one, as most requests hold, inline. Repeated consecutive
 /// references to the same frozen allocation are retained once.
 #[verifier::reject_recursive_types(N)]
 pub struct Leases<N: Nic = Verbs> {
-    first: Option<Lease<N>>,
-    rest: Vec<Lease<N>>,
+    held: Held<N>,
     #[allow(dead_code)]
     loans: Ghost<Seq<Loan<N>>>,
     #[allow(dead_code)]
     wqes: Ghost<Seq<WqeLoans>>,
+}
+
+/// What a request's [`Leases`] hold.
+#[verifier::reject_recursive_types(N)]
+enum Held<N: Nic> {
+    /// Nothing.
+    Nothing,
+    /// One resource.
+    One(Lease<N>),
+    /// Several, in their order.
+    Many(Vec<Lease<N>>),
 }
 
 impl<N: Nic> Leases<N> {
@@ -632,10 +642,21 @@ impl<N: Nic> Leases<N> {
     }
 
     /// No leases, with no allocation.
+    #[inline(always)]
     pub fn new() -> (r: Self)
-        ensures r.inv(), r.view() == Seq::<Resource<N>>::empty(), r.loans().len() == 0,
-            r.wqes().len() == 0, r.fully_recorded(),
-    { Leases { first: None, rest: Vec::new(), loans: Ghost(Seq::empty()), wqes: Ghost(Seq::empty()) } }
+        ensures r.view().len() == 0, r.loans().len() == 0, r.wqes().len() == 0, r.fully_recorded(),
+    { Leases { held: Held::Nothing, loans: Ghost(Seq::empty()), wqes: Ghost(Seq::empty()) } }
+
+    /// The lease of one input part, as a request of one WQE holds it, with no allocation.
+    #[inline(always)]
+    pub(crate) fn one(part: Part<N>, Ghost(access): Ghost<Dir>) -> (r: Self)
+    {
+        Leases {
+            held: Held::One(part.lease),
+            loans: Ghost(seq![Loan { part, access: Some(access) }]),
+            wqes: Ghost(Seq::empty()),
+        }
+    }
 
     /// Adds provenance only after the checked collection loop established its footprint.
     #[inline]
@@ -711,32 +732,40 @@ impl<N: Nic> Leases<N> {
 
     /// Retains an incoming resource or drops only a redundant shared reference.
     #[allow(clippy::collapsible_if)] // Keep the pattern and pointer primitive explicit for Verus.
-    #[inline]
+    #[inline(always)]
     fn push_resource(&mut self, lease: Lease<N>)
-        ensures
-            final(self).loans() == old(self).loans(),
-            final(self).wqes() == old(self).wqes(),
-            old(self).repr_inv() ==> final(self).repr_inv(),
-            old(self).repr_inv() ==> (
-                final(self).view() == old(self).view().push(lease.observation())
-                || (old(self).view().len() > 0
-                    && old(self).view().last().same_frozen(lease.observation())
-                    && final(self).view() == old(self).view())
-            ),
     {
-        let last = match self.rest.last() {
-            Some(l) => Some(l),
-            None => self.first.as_ref(),
+        let last = match &self.held {
+            Held::Nothing => None,
+            Held::One(first) => Some(first),
+            Held::Many(rest) => rest.last(),
         };
         if let (Some(Lease::Shared(a)), Lease::Shared(b)) = (last, &lease) {
             if same_frozen_arc(a, b) {
                 return;
             }
         }
-        if self.first.is_none() {
-            self.first = Some(lease);
+        if matches!(self.held, Held::Nothing) {
+            self.held = Held::One(lease);
         } else {
-            self.rest.push(lease);
+            self.push_rest(lease);
+        }
+    }
+
+    /// Retains a resource after the first one.
+    #[inline(never)]
+    fn push_rest(&mut self, lease: Lease<N>)
+    {
+        match &mut self.held {
+            Held::Many(rest) => rest.push(lease),
+            held => {
+                let mut rest = Vec::new();
+                if let Held::One(first) = core::mem::replace(held, Held::Nothing) {
+                    rest.push(first);
+                }
+                rest.push(lease);
+                *held = Held::Many(rest);
+            },
         }
     }
 
@@ -749,7 +778,7 @@ impl<N: Nic> Leases<N> {
     { self.push_loan(part, Ghost(None)); }
 
     /// Record the operation's access without storing it at run time.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn push_access(&mut self, part: Part<N>, Ghost(access): Ghost<Dir>)
         requires access is In ==> part.spec_writable(),
         ensures old(self).inv() ==> final(self).inv(),
@@ -757,7 +786,7 @@ impl<N: Nic> Leases<N> {
             final(self).wqes() == old(self).wqes(),
     { self.push_loan(part, Ghost(Some(access))); }
 
-    #[inline]
+    #[inline(always)]
     fn push_loan(&mut self, part: Part<N>, Ghost(access): Ghost<Option<Dir>>)
         requires access == Some(Dir::In) ==> part.spec_writable(),
         ensures
@@ -837,71 +866,62 @@ impl<N: Nic> Leases<N> {
 
     /// The number of retained resources.
     pub fn len(&self) -> (len: usize)
-        requires self.view().len() <= usize::MAX,
-        ensures len == self.view().len(),
     {
-        self.first.is_some() as usize + self.rest.len()
+        match &self.held {
+            Held::Nothing => 0,
+            Held::One(_) => 1,
+            Held::Many(rest) => rest.len(),
+        }
     }
 
     /// Whether it holds no lease.
     pub fn is_empty(&self) -> (empty: bool)
         ensures self.inv() ==> (empty <==> self.view().len() == 0),
-    { self.first.is_none() }
+    { matches!(self.held, Held::Nothing) }
 
     /// Selects the first unique resource and drops all remaining resources.
     /// Type interpretation is handled by the buffer wrapper after this move.
+    #[inline(always)]
     pub(super) fn into_unique_raw(self) -> (r: Option<RawMut<N>>)
-        ensures
-            r is Some ==> exists|i: int| 0 <= i < self.raw_view().len()
-                && self.raw_view()[i] == Lease::Unique(r->0)
-                && forall|j: int| 0 <= j < i ==> !(self.raw_view()[j] is Unique),
-            r is None ==> forall|i: int| 0 <= i < self.raw_view().len()
-                ==> !(self.raw_view()[i] is Unique),
     {
-        let ghost original = self.raw_view();
         let mut remaining = self;
-        if matches!(&remaining.first, Some(Lease::Unique(_))) {
-            return match remaining.first.take() {
-                Some(Lease::Unique(raw)) => {
-                    proof { assert(original[0] == Lease::Unique(raw)); }
-                    Some(raw)
-                },
-                _ => None,
-            };
+        remaining.take_unique_raw()
+    }
+
+    /// Takes the first unique resource out, leaving the others.
+    /// Type interpretation is handled by the buffer wrapper after this move.
+    #[inline(always)]
+    pub(super) fn take_unique_raw(&mut self) -> (r: Option<RawMut<N>>)
+    {
+        match &self.held {
+            Held::Nothing => return None,
+            Held::One(Lease::Shared(_)) => return None,
+            Held::One(Lease::Unique(_)) => {},
+            Held::Many(_) => return self.take_unique_raw_from_many(),
         }
+        match core::mem::replace(&mut self.held, Held::Nothing) {
+            Held::One(Lease::Unique(raw)) => Some(raw),
+            other => {
+                core::mem::forget(other);
+                None
+            },
+        }
+    }
+
+    /// [`Leases::take_unique_raw`], among several resources.
+    #[inline(never)]
+    fn take_unique_raw_from_many(&mut self) -> (r: Option<RawMut<N>>)
+    {
+        let rest = match &mut self.held {
+            Held::Many(rest) => rest,
+            _ => return None,
+        };
         let mut i = 0;
-        while i < remaining.rest.len()
-            invariant
-                original == self.raw_view(),
-                remaining.raw_view() == original,
-                !(remaining.first is Some && remaining.first->0 is Unique),
-                i <= remaining.rest@.len(),
-                forall|j: int| 0 <= j < i ==> !(remaining.rest@[j] is Unique),
-            decreases remaining.rest@.len() - i,
+        while i < rest.len()
         {
-            if matches!(&remaining.rest[i], Lease::Unique(_)) {
-                let ghost position = i as int + if remaining.first is Some { 1int } else { 0int };
-                proof {
-                    assert(0 <= position < original.len());
-                    assert(original[position] == remaining.rest@[i as int]);
-                    assert forall|j: int| 0 <= j < position implies !(original[j] is Unique) by {
-                        if remaining.first is Some {
-                            if j > 0 { assert(original[j] == remaining.rest@[j - 1]); }
-                        } else {
-                            assert(original[j] == remaining.rest@[j]);
-                        }
-                    }
-                }
-                return match remaining.rest.remove(i) {
-                    Lease::Unique(raw) => {
-                        proof {
-                            assert(original[position] == Lease::Unique(raw));
-                            assert(exists|k: int| 0 <= k < original.len()
-                                && original[k] == Lease::Unique(raw)
-                                && forall|j: int| 0 <= j < k ==> !(original[j] is Unique));
-                        }
-                        Some(raw)
-                    },
+            if matches!(&rest[i], Lease::Unique(_)) {
+                return match rest.remove(i) {
+                    Lease::Unique(raw) => Some(raw),
                     _ => None,
                 };
             }
@@ -923,8 +943,7 @@ mod tests {
     fn ghost_ledgers_add_no_native_size_or_alignment() {
         #[allow(dead_code)]
         struct NativeShape {
-            first: Option<Lease<Model>>,
-            rest: Vec<Lease<Model>>,
+            held: Held<Model>,
         }
         assert_eq!(size_of::<Leases<Model>>(), size_of::<NativeShape>());
         assert_eq!(align_of::<Leases<Model>>(), align_of::<NativeShape>());
