@@ -227,7 +227,7 @@ pub(crate) fn same_frozen_arc<N: Nic>(a: &Arc<Frozen<N>>, b: &Arc<Frozen<N>>) ->
 }
 
 /// Releases what it is given.
-#[inline(never)]
+#[inline]
 fn release<T>(_value: T) {
 }
 
