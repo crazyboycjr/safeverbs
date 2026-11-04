@@ -1,17 +1,17 @@
 # Reading the code
 
-Start with an application, follow one request through the synchronous core, then read
-the asynchronous wrapper and the proofs. The large verified modules contain both
-executable Rust and ghost code; on a first pass, follow the executable methods and
-return to their contracts afterward.
+Start with an application, follow one request through the engine, then read the handles
+over it and the proofs. The large verified modules contain both executable Rust and ghost
+code; on a first pass, follow the executable methods and return to their contracts
+afterward.
 
 ## 1. Start at a shared-CQ application
 
-Read [`examples/event_loop/src/main.rs`](../examples/event_loop/src/main.rs): `main`
-creates two workers, attaches several QPs to each, connects them, and posts receives.
-`serve` and `ping_pong` show the steady-state loop: poll one CQ, dispatch each result by its
-context (a small `Job` enum, the example's own), repost buffers, stage work, and commit each
-active QP once per turn.
+Read [`examples/event_loop/src/main.rs`](../examples/event_loop/src/main.rs): each of two
+threads creates a `LocalCq`, attaches several QPs to it, connects them, and posts receives.
+`serve` and `ping_pong` show the steady-state loop: poll the CQ, dispatch each result by its
+`wr_id` (a small `Job` enum, the example's own), repost buffers, stage work, and ring each
+active QP's doorbell once per turn.
 
 For a smaller asynchronous application, read the
 [greeter client](../examples/greeter/src/client.rs) and
@@ -20,36 +20,42 @@ For a smaller asynchronous application, read the
 Keep three units distinct:
 
 - A **WQE** is one hardware work item.
-- A **request** may own several WQEs, but has one sequence number, context and result, and
-  holds several leases. A batch completes only after its entire WQE interval retires.
-- A **worker** owns one shared CQ and several QPs. Each QP still has its own send and
-  receive rings; sharing the CQ does not merge their completion accounting.
+- A **request** may own several WQEs, but has one sequence number, `wr_id` and result, and
+  holds several leases. A batch completes only after its entire WQE interval completes.
+- An **engine** owns one shared CQ and several QPs; `LocalCq` and `AsyncCq` are handles to
+  one. Each QP still has its own send and receive rings; sharing the CQ does not merge their
+  completion accounting.
 
-## 2. Follow one synchronous request
+Inside the core, a request that has completed is said to *retire* from its ring: that is the
+ring's word for the step, and what M calls it too. Public docs say it completes.
+
+## 2. Follow one request through the engine
 
 Read these files in order:
 
 | File | What to follow |
 | --- | --- |
-| [`worker.rs`](../crates/safeverbs-core/src/worker.rs) | `Worker::request`, `Request::push`, `Request::finish`, `Worker::commit`, then `Worker::poll` or `Worker::progress` |
-| [`hw.rs`](../crates/safeverbs-core/src/hw.rs) | `Hw::gather`, `push`, `close`, `commit`, `progress`: per-QP state, hardware calls, CQ routing and ring updates |
-| [`ring.rs`](../crates/safeverbs-core/src/ring.rs) | `begin`, `push_wqe`, `end`, `commit`, `complete`, `take`, `detach`: the request lifecycle independently of FFI |
-| [`ring/payload.rs`](../crates/safeverbs-core/src/ring/payload.rs) | what a slot of a worker's rings holds: the buffers and the context, one generic value to the ring |
-| [`wr_id.rs`](../crates/safeverbs-core/src/wr_id.rs) | how a CQE identifies its QP, queue and WQE number (internal: users have contexts) |
+| [`local.rs`](../crates/safeverbs/src/local.rs) | `LocalQp::post_send`, `LocalQp::post_recv` and `LocalCq::poll`: thin handles over the engine, which keep no state of their own |
+| [`engine.rs`](../crates/safeverbs-core/src/engine.rs) | `Engine::try_post`, `Engine::poll`, `Engine::read_completions`, `Engine::next_completion`, then the general path, `Engine::request`, `Request::push`, `Request::finish`, `Engine::commit` |
+| [`hw.rs`](../crates/safeverbs-core/src/hw.rs) | `Hw::post_one`, `Hw::post_recv`, `read_completions`, `next_completion`, `progress`, then `push`, `close`, `commit`: per-QP state, hardware calls, CQ routing and ring updates |
+| [`ring.rs`](../crates/safeverbs-core/src/ring.rs) | `fill`, `stage_filled`, `commit`, `retire_oldest`, `retire_next`, `complete_with_wakes`, `take`, `detach`: the request lifecycle independently of FFI |
+| [`ring/payload.rs`](../crates/safeverbs-core/src/ring/payload.rs) | what a slot of an engine's rings holds: the buffers and the `wr_id`, one generic value to the ring |
+| [`wr_id.rs`](../crates/safeverbs-core/src/wr_id.rs) | how a CQE identifies its QP, queue and WQE number (internal: users have their own `wr_id`s, kept in the slots) |
 | [`nic.rs`](../crates/safeverbs-core/src/nic.rs) | the unsafe backend contract the core relies on |
 | [`verbs.rs`](../crates/safeverbs-core/src/verbs.rs) | the concrete libibverbs implementation; read after understanding the core |
 
-There are two useful traces:
+There are three useful traces:
 
 ```text
-request -> gather/push -> close (with its context) -> staged in ring -> commit -> doorbell
-CQ poll -> decode wr_id -> ring.complete -> take context, typed result and leases
+post_send -> checks, one comparison each -> slot -> WQE -> doorbell -> slot staged and committed
+poll -> read the CQEs, update the consumer index -> for each: decode wr_id, retire in the ring, hand out
+batch -> collect its WQEs -> close (signaling now known) -> slot -> WQEs -> doorbell at commit
 ```
 
-`finish` stages a request; `commit` posts it. Neither means it has completed. A CQE
-can retire earlier unsignaled WQEs too. `Worker::poll` delivers owned results to its
-callback, while `progress` leaves them for their owners to take. Mixing those result
-consumers on one worker can consume results a future is waiting for.
+A CQE can retire earlier unsignaled WQEs too, and then hands out those requests first.
+`Engine::poll` delivers owned results to its callback, while `progress` leaves them in the rings
+for their owners to take: that is what futures do. What `progress` leaves is found by a cold scan
+if a poll comes next, so a CQ driven both ways loses nothing, but the handles do not allow it.
 
 ## 3. Follow the memory separately
 
@@ -70,7 +76,7 @@ views. Continue with
 
 `Leases::view` describes physical keepers. Its ghost `loans` and `wqes` describe every
 logical SGE and its operation, even when multiple inputs share one physical Arc. Follow
-`keep_parts` in `hw.rs`, then `ring_resources_ok` and `take` to see how a request's
+`post_one` and `close` in `hw.rs`, then `ring_resources_ok` and `take` to see how a request's
 metadata travels through the rings with it.
 
 For remote access, `Exposed::try_reclaim` revokes the remote registration before returning
@@ -90,19 +96,19 @@ receive buffer, and an error names the WQE that failed.
 
 ## 4. Add the asynchronous layer
 
-Read [`worker.rs`](../crates/safeverbs/src/worker.rs) in the application crate first:
-`LocalWorker` shares one synchronous worker through `Rc<RefCell<_>>`. Then read
+Read [`cq.rs`](../crates/safeverbs/src/cq.rs) in the application crate first: `AsyncCq` shares
+one engine through `Rc<RefCell<_>>`, as `LocalCq` does in `local.rs`. Then read
 [`qp.rs`](../crates/safeverbs/src/qp.rs),
 [`op.rs`](../crates/safeverbs/src/op.rs) and
 [`backlog.rs`](../crates/safeverbs/src/backlog.rs).
 
-`Op` tracks a queued ticket or posted sequence number. Polling it progresses the
-worker's shared CQ and takes its own result, which the operation's `Outcome` turns into its
-output: `()` for sends and writes, the buffer for a READ, a `Received` and the buffer for a
-receive. Dropping queued work releases it; dropping a posted future detaches its owner,
-retaining the buffers until the NIC is done. The future is the request's identity, so the
-worker's context is `()` here. Finally read `batch.rs`, `sink.rs` (which maps a failed request
-back to its item) and `receiver.rs` for amortized operation APIs.
+`Op` tracks a queued ticket or posted sequence number. Polling it polls the shared CQ and takes
+its own result, which the operation's `Outcome` turns into its output: `()` for sends and writes,
+the buffer for a READ, a `Received` and the buffer for a receive. Dropping queued work releases
+it; dropping a posted future detaches its owner, retaining the buffers until the NIC is done. The
+future is the request's identity, so the requests carry no `wr_id` here. Finally read `batch.rs`,
+`sink.rs` (which maps a failed request back to its item) and `receiver.rs` for amortized operation
+APIs.
 
 ## 5. Read the proof claim before its mechanics
 
@@ -120,10 +126,12 @@ Start with [verification.md](verification.md), then:
 5. [`examples.rs`](../crates/safeverbs-spec/src/examples.rs): concrete checked traces.
 6. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the ring-to-A adapters;
    return to `Hw::inv` and [`trusted.rs`](../crates/safeverbs-core/src/trusted.rs)
-   for the hardware-facing contracts. `share.rs` provides the hardware worker framing
+   for the hardware-facing contracts. `share.rs` provides the hardware side's framing
    rules. [`hw/send_outcomes.rs`](../crates/safeverbs-core/src/hw/send_outcomes.rs) and
    [`hw/outcomes.rs`](../crates/safeverbs-core/src/hw/outcomes.rs) tie requests' results
    to the WQEs M retired.
 
 The executable test backend [`model.rs`](../crates/safeverbs-core/src/model.rs) is not
-the formal model M: tests use it to move real bytes and inject failures.
+the formal model M: tests use it to move real bytes and inject failures, and
+[`scripts/measure.sh`](../scripts/measure.sh) to count what each public path costs against
+code written by hand ([`measure.rs`](../crates/safeverbs/examples/measure.rs)).

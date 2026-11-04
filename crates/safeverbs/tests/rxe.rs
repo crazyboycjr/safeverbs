@@ -1112,7 +1112,7 @@ fn local_cq_dropping_qps_with_work_in_flight() {
     let first = RefCell::new(Some(qps.remove(0)));
     let mut others = 0;
     let start = Instant::now();
-    while others < 8 {
+    while others < 8 || first.borrow().is_some() {
         cq.poll(32, |wc| {
             if first
                 .borrow()
@@ -1127,7 +1127,6 @@ fn local_cq_dropping_qps_with_work_in_flight() {
         });
         assert!(start.elapsed() < DEADLINE, "timed out");
     }
-    assert!(first.borrow().is_none());
     drop(qps);
     drop(cq);
     assert_eq!(drops.get(), 4 * 9, "every wr_id exactly once");

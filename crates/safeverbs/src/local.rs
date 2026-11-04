@@ -221,10 +221,16 @@ fn not_common<T: Transport, W, N: Nic>(
 
 impl<T: Transport, W, N: Nic> LocalQp<T, W, N> {
     /// A signaled request of one WQE, and the doorbell. Unlike the engine's general path it never
-    /// waits for room.
+    /// waits for room. The caller borrowed the engine first and made `part` after, so that no
+    /// `Part` crosses the borrow's panic: that would keep it in memory.
     #[inline(always)]
-    fn post(&self, op: WrOp, part: Part<N>, wr_id: W) -> Posted<W, N> {
-        let mut engine = self.cq.engine.borrow_mut();
+    fn post(
+        &self,
+        mut engine: RefMut<'_, Engine<W, N>>,
+        op: WrOp,
+        part: Part<N>,
+        wr_id: W,
+    ) -> Posted<W, N> {
         match engine.try_post(self.key, op, part, wr_id) {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e),
@@ -232,39 +238,48 @@ impl<T: Transport, W, N: Nic> LocalQp<T, W, N> {
         }
     }
 
+    /// The engine under the CQ.
+    #[inline(always)]
+    fn engine(&self) -> RefMut<'_, Engine<W, N>> {
+        self.cq.engine.borrow_mut()
+    }
+
     /// SENDs `buf` into the peer's next receive and rings the doorbell. `wr_id` comes back with
     /// its completion.
-    #[inline]
+    #[inline(always)]
     pub fn post_send<U: IntoBytes + Immutable>(&self, buf: Buf<U, N>, wr_id: W) -> Posted<W, N> {
-        self.post(WrOp::Send, buf.into_part(), wr_id)
+        let engine = self.engine();
+        self.post(engine, WrOp::Send, buf.into_part(), wr_id)
     }
 
     /// [`LocalQp::post_send`] with immediate data `imm`.
-    #[inline]
+    #[inline(always)]
     pub fn post_send_imm<U: IntoBytes + Immutable>(
         &self,
         buf: Buf<U, N>,
         imm: u32,
         wr_id: W,
     ) -> Posted<W, N> {
-        self.post(WrOp::SendImm(imm), buf.into_part(), wr_id)
+        let engine = self.engine();
+        self.post(engine, WrOp::SendImm(imm), buf.into_part(), wr_id)
     }
 
     /// RDMA WRITEs `buf` to `dst` in the peer's memory and rings the doorbell. `wr_id` comes back
     /// with its completion.
-    #[inline]
+    #[inline(always)]
     pub fn post_write<U: IntoBytes + Immutable>(
         &self,
         buf: Buf<U, N>,
         dst: RemoteBuf,
         wr_id: W,
     ) -> Posted<W, N> {
-        self.post(WrOp::Write(dst), buf.into_part(), wr_id)
+        let engine = self.engine();
+        self.post(engine, WrOp::Write(dst), buf.into_part(), wr_id)
     }
 
     /// [`LocalQp::post_write`] with immediate data `imm`, which also consumes one of the peer's
     /// receives.
-    #[inline]
+    #[inline(always)]
     pub fn post_write_imm<U: IntoBytes + Immutable>(
         &self,
         buf: Buf<U, N>,
@@ -272,20 +287,18 @@ impl<T: Transport, W, N: Nic> LocalQp<T, W, N> {
         imm: u32,
         wr_id: W,
     ) -> Posted<W, N> {
-        self.post(WrOp::WriteImm(dst, imm), buf.into_part(), wr_id)
+        let engine = self.engine();
+        self.post(engine, WrOp::WriteImm(dst, imm), buf.into_part(), wr_id)
     }
 
     /// Posts a receive into `buf`. `wr_id` comes back with its completion and the buffer.
-    #[inline]
+    #[inline(always)]
     pub fn post_recv<U: FromBytes + IntoBytes>(&self, buf: BufMut<U, N>, wr_id: W) -> Posted<W, N> {
-        let posted = self
-            .cq
-            .engine
-            .borrow_mut()
-            .post_recv(self.key, buf.into_part(), wr_id);
-        match posted {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
+        let mut engine = self.engine();
+        match engine.try_post_recv(self.key, buf.into_part(), wr_id) {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err((part, wr_id)) => Err(engine.recv_error(self.key, part, wr_id)),
         }
     }
 
@@ -408,14 +421,15 @@ impl<T: Transport, W, N: Nic> LocalQp<T, W, N> {
 impl<T: Reliable, W, N: Nic> LocalQp<T, W, N> {
     /// RDMA READs `src` from the peer's memory into `buf` and rings the doorbell. `wr_id` comes back
     /// with its completion and the buffer.
-    #[inline]
+    #[inline(always)]
     pub fn post_read<U: FromBytes + IntoBytes>(
         &self,
         buf: BufMut<U, N>,
         src: RemoteBuf,
         wr_id: W,
     ) -> Posted<W, N> {
-        self.post(WrOp::Read(src), buf.into_part(), wr_id)
+        let engine = self.engine();
+        self.post(engine, WrOp::Read(src), buf.into_part(), wr_id)
     }
 
     /// Atomically adds `add` to the 8 bytes at `dst` in the peer's memory; their old value lands
@@ -427,7 +441,13 @@ impl<T: Reliable, W, N: Nic> LocalQp<T, W, N> {
         add: u64,
         wr_id: W,
     ) -> Posted<W, N> {
-        self.post(WrOp::FetchAdd { remote: dst, add }, old.into_part(), wr_id)
+        let engine = self.engine();
+        self.post(
+            engine,
+            WrOp::FetchAdd { remote: dst, add },
+            old.into_part(),
+            wr_id,
+        )
     }
 
     /// Atomically replaces the 8 bytes at `dst` in the peer's memory with `swap` if they equal
@@ -445,6 +465,7 @@ impl<T: Reliable, W, N: Nic> LocalQp<T, W, N> {
             compare,
             swap,
         };
-        self.post(op, old.into_part(), wr_id)
+        let engine = self.engine();
+        self.post(engine, op, old.into_part(), wr_id)
     }
 }

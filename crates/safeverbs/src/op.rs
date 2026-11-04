@@ -4,6 +4,7 @@
 
 use core::future::Future;
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -24,8 +25,11 @@ pub(crate) type TakenResult = CompletionResult;
 pub trait Outcome<N: Nic> {
     /// The future's output.
     type Output;
-    /// The request completed with `result`.
-    fn done(result: Result<Completed, CompletionError>, leases: Leases<N>) -> Self::Output;
+    /// The queue its requests are on.
+    const QUEUE: Queue;
+    /// The request completed with `result`, and these are its buffers; what it leaves of them is
+    /// released.
+    fn done(result: Result<Completed, CompletionError>, leases: &mut Leases<N>) -> Self::Output;
     /// The request could not be posted; `back` holds its buffers.
     fn failed(error: Error, back: Leases<N>) -> Self::Output;
 }
@@ -37,8 +41,9 @@ pub struct Sent;
 
 impl<N: Nic> Outcome<N> for Sent {
     type Output = Result<(), Error>;
+    const QUEUE: Queue = Queue::Send;
     #[inline(always)]
-    fn done(result: TakenResult, _leases: Leases<N>) -> Self::Output {
+    fn done(result: TakenResult, _leases: &mut Leases<N>) -> Self::Output {
         match result {
             Ok(_) => Ok(()),
             Err(error) => Err(Error::Completion(error)),
@@ -55,9 +60,10 @@ pub struct Read<T>(PhantomData<T>);
 
 impl<T: FromBytes, N: Nic> Outcome<N> for Read<T> {
     type Output = Result<BufMut<T, N>, BufError<BufMut<T, N>>>;
+    const QUEUE: Queue = Queue::Send;
     #[inline(always)]
-    fn done(result: TakenResult, leases: Leases<N>) -> Self::Output {
-        let buf = leases.into_buf_mut().expect("a READ holds its buffer");
+    fn done(result: TakenResult, leases: &mut Leases<N>) -> Self::Output {
+        let buf = leases.take_buf_mut().expect("a READ holds its buffer");
         match result {
             Ok(_) => Ok(buf),
             Err(error) => Err(BufError {
@@ -90,9 +96,10 @@ pub struct Recv<T>(PhantomData<T>);
 
 impl<T: FromBytes, N: Nic> Outcome<N> for Recv<T> {
     type Output = Result<(Received, BufMut<T, N>), BufError<BufMut<T, N>>>;
+    const QUEUE: Queue = Queue::Recv;
     #[inline(always)]
-    fn done(result: TakenResult, leases: Leases<N>) -> Self::Output {
-        let buf = leases.into_buf_mut().expect("a receive holds its buffer");
+    fn done(result: TakenResult, leases: &mut Leases<N>) -> Self::Output {
+        let buf = leases.take_buf_mut().expect("a receive holds its buffer");
         match result {
             Ok(done) => Ok((received(done), buf)),
             Err(error) => Err(BufError {
@@ -124,7 +131,6 @@ impl<T: FromBytes, N: Nic> Outcome<N> for Recv<T> {
 #[must_use = "an operation is posted when created (or when there is room); await it for its outcome"]
 pub struct Op<'q, Q: QueueAccess, K: Outcome<Q::N>> {
     q: &'q Q,
-    side: Queue,
     state: OpState<Q::N>,
     _k: PhantomData<fn() -> K>,
 }
@@ -160,30 +166,36 @@ impl<N: Nic> OpState<N> {
 
 impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
     #[inline(always)]
-    pub(crate) fn new(q: &'q Q, side: Queue, state: OpState<Q::N>) -> Self {
+    pub(crate) fn new(q: &'q Q, state: OpState<Q::N>) -> Self {
         Op {
             q,
-            side,
             state,
             _k: PhantomData,
         }
     }
 
     /// Posts a send request of one WQE now if it fits and nothing waits before it, else queues it.
+    /// Its buffer, in `part`, becomes a `Part` only with the state in hand: nothing with a
+    /// destructor crosses the state's panic, where it would have to stay in memory.
     #[inline(always)]
-    pub(crate) fn post(q: &'q Q, op: WrOp, part: Part<Q::N>) -> Self {
-        Self::new(q, Queue::Send, q.with_state(|s| s.post_send(op, part)))
+    pub(crate) fn post(q: &'q Q, op: WrOp, part: impl FnOnce() -> Part<Q::N>) -> Self {
+        let part = ManuallyDrop::new(part);
+        let state = q.with_state(|s| s.post_send(op, ManuallyDrop::into_inner(part)()));
+        Self::new(q, state)
     }
 
-    /// Posts a receive now if it fits and nothing waits before it, else queues it.
+    /// Posts a receive now if it fits and nothing waits before it, else queues it. See
+    /// [`Op::post`] for `part`.
     #[inline(always)]
-    pub(crate) fn post_recv(q: &'q Q, part: Part<Q::N>) -> Self {
-        Self::new(q, Queue::Recv, q.with_state(|s| s.post_recv(part)))
+    pub(crate) fn post_recv(q: &'q Q, part: impl FnOnce() -> Part<Q::N>) -> Self {
+        let part = ManuallyDrop::new(part);
+        let state = q.with_state(|s| s.post_recv(ManuallyDrop::into_inner(part)()));
+        Self::new(q, state)
     }
 
     /// Posts send work of any kind now if it fits and nothing waits before it, else queues it.
     pub(crate) fn post_work(q: &'q Q, work: Work<Q::N>) -> Self {
-        Self::new(q, Queue::Send, q.with_state(|s| s.post_work(work)))
+        Self::new(q, q.with_state(|s| s.post_work(work)))
     }
 
     /// The request's sequence number in its queue, once posted.
@@ -198,7 +210,6 @@ impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
     #[cold]
     #[inline(never)]
     fn poll_other(&mut self, cx: &Context<'_>) -> Poll<K::Output> {
-        let side = self.side;
         match core::mem::replace(&mut self.state, OpState::Done) {
             OpState::Failed(failed) => {
                 let (error, back) = *failed;
@@ -207,7 +218,7 @@ impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
             OpState::Queued(ticket) => {
                 let posted = self.q.with_state(|s| {
                     s.drain();
-                    s.take_ticket(side, ticket)
+                    s.take_ticket(K::QUEUE, ticket)
                 });
                 match posted {
                     Some(Ok(seq)) => {
@@ -227,27 +238,32 @@ impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
     }
 
     /// A poll of a posted request: its result if it is there, else after a poll of the CQ; else
-    /// the waker is registered and the future asks to be polled again.
+    /// the waker is registered and the future asks to be polled again. The output is made with
+    /// the state still in hand, from the buffers where the state put them: one move less of them.
     #[inline(always)]
     fn poll_posted(&mut self, seq: Seq, cx: &Context<'_>) -> Poll<K::Output> {
-        let side = self.side;
-        let taken = self.q.with_state(|s| {
+        let output = self.q.with_state(|s| {
             s.drain();
-            if let Some(done) = s.take_request(side, seq) {
-                return Some(done);
+            if s.completed(K::QUEUE, seq) {
+                return match s.take_request(K::QUEUE, seq) {
+                    Some((result, mut leases)) => Some(K::done(result, &mut leases)),
+                    None => None,
+                };
             }
-            // One poll of the CQ retires the requests of all its QPs.
+            // One poll of the CQ completes the requests of all its QPs.
             s.engine().progress();
-            let done = s.take_request(side, seq);
-            if done.is_none() {
-                s.set_waker(side, seq, cx.waker());
+            match s.take_request(K::QUEUE, seq) {
+                Some((result, mut leases)) => Some(K::done(result, &mut leases)),
+                None => {
+                    s.set_waker(K::QUEUE, seq, cx.waker());
+                    None
+                }
             }
-            done
         });
-        match taken {
-            Some((result, leases)) => {
+        match output {
+            Some(output) => {
                 self.state = OpState::Done;
-                Poll::Ready(K::done(result, leases))
+                Poll::Ready(output)
             }
             None => {
                 cx.waker().wake_by_ref();
@@ -287,12 +303,11 @@ impl<Q: QueueAccess, K: Outcome<Q::N>> Op<'_, Q, K> {
     #[cold]
     #[inline(never)]
     fn give_up(&mut self) {
-        let side = self.side;
         match self.state {
-            OpState::Posted(seq) => self.q.with_state(|s| s.detach(side, seq)),
+            OpState::Posted(seq) => self.q.with_state(|s| s.detach(K::QUEUE, seq)),
             OpState::Queued(ticket) => self.q.with_state(|s| {
-                if let Some(seq) = s.cancel(side, ticket) {
-                    s.detach(side, seq);
+                if let Some(seq) = s.cancel(K::QUEUE, ticket) {
+                    s.detach(K::QUEUE, seq);
                 }
             }),
             OpState::Failed(_) | OpState::Done => {}

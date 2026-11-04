@@ -238,7 +238,12 @@ impl<N: Nic> Part<N> {
         proof { use_type_invariant(&raw); raw.lemma_domain(); }
         let length = match checked_sge_len(raw.len()) {
             Some(length) => length,
-            None => panic!("a single SGE exceeds u32::MAX bytes"),
+            None => {
+                // Released first, so that no buffer stays alive across the panic: the `Part` is
+                // then built in place.
+                drop(raw);
+                panic!("a single SGE exceeds u32::MAX bytes")
+            },
         };
         Part { sge: Sge { addr: raw.ptr().addr() as u64, length, lkey }, pd, lease: Lease::Unique(raw) }
     }

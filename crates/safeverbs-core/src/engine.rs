@@ -261,6 +261,9 @@ impl<C, N: Nic> From<PostError<C, N>> for std::io::Error {
     }
 }
 
+/// A receive [`Engine::try_post_recv`] hands back: its buffer and its context.
+pub type ReceiveBack<C, N> = (Part<N>, C);
+
 /// A refusal of a request given a context, with that context.
 #[cold]
 #[inline(never)]
@@ -906,26 +909,57 @@ impl<C, N: Nic> Engine<C, N> {
         part: Part<N>,
         ctx: C,
     ) -> Result<Seq, PostError<C, N>> {
-        match self.hw.post_recv(qp.index(), part, Some(ctx)) {
-            Ok(seq) => Ok(seq),
-            Err(refused) => Err(owned(refused)),
+        match self.try_post_recv(qp, part, ctx) {
+            Ok(posted) => posted,
+            Err((part, ctx)) => Err(self.recv_error(qp, part, ctx)),
         }
     }
 
-    /// Posts a receive into `part` that nobody will take back by its sequence
-    /// number: its buffer is released when it retires. Refused, with `part`,
-    /// when the receive queue is full or the QP takes no work.
+    /// [`Engine::post_recv`] if nothing is out of the common: the QP takes work, the checks pass
+    /// and there is room. Otherwise the buffer and `ctx` come back untouched, for
+    /// [`Engine::recv_error`] to say why.
+    #[inline(always)]
+    pub fn try_post_recv<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        part: Part<N>,
+        ctx: C,
+    ) -> Result<Result<Seq, PostError<C, N>>, ReceiveBack<C, N>> {
+        match self.hw.post_recv(qp.index(), part, Some(ctx)) {
+            Ok(Ok(seq)) => Ok(Ok(seq)),
+            Ok(Err(refused)) => Ok(Err(owned(refused))),
+            Err((part, ctx)) => Err((part, ctx.expect("the context it was given"))),
+        }
+    }
+
+    /// Why [`Engine::try_post_recv`] handed a receive back.
+    #[cold]
+    #[inline(never)]
+    pub fn recv_error<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        part: Part<N>,
+        ctx: C,
+    ) -> PostError<C, N> {
+        owned(self.hw.recv_refused(qp.index(), part, Some(ctx)))
+    }
+
+    /// [`Engine::post_recv`] of a receive without an owner: its buffer is released when it
+    /// retires, and its first error goes with the detached send errors' own.
     pub fn post_recv_detached<T: Transport>(
         &mut self,
         qp: QpKey<T>,
         part: Part<N>,
     ) -> Result<Seq, BufError<Leases<N>>> {
-        self.hw
-            .post_recv(qp.index(), part, None)
-            .map_err(|refused| BufError {
-                error: refused.error,
-                buf: refused.leases,
-            })
+        let refused = match self.hw.post_recv(qp.index(), part, None) {
+            Ok(Ok(seq)) => return Ok(seq),
+            Ok(Err(refused)) => refused,
+            Err((part, ctx)) => self.hw.recv_refused(qp.index(), part, ctx),
+        };
+        Err(BufError {
+            error: refused.error,
+            buf: refused.leases,
+        })
     }
 }
 

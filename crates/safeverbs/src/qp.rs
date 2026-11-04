@@ -215,6 +215,17 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
         })
     }
 
+    /// Whether request `seq`, posted, has completed; a refused one may not say so yet.
+    #[inline(always)]
+    pub(crate) fn completed(&self, side: Queue, seq: Seq) -> bool {
+        let engine = &self.state.engine;
+        let ring = match side {
+            Queue::Send => engine.send_ring(self.key),
+            Queue::Recv => engine.recv_ring(self.key),
+        };
+        seq < ring.retired()
+    }
+
     /// Wakes `waker` when request `seq` retires.
     pub(crate) fn set_waker(&mut self, side: Queue, seq: Seq, waker: &core::task::Waker) {
         let w = &mut self.state.engine;
@@ -266,10 +277,11 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
     /// order.
     #[inline(always)]
     pub(crate) fn post_recv(&mut self, part: Part<N>) -> OpState<N> {
-        if self.state.pending == 0 && self.state.engine.recv_ring(self.key).can_post() {
-            match self.state.engine.post_recv(self.key, part, ()) {
-                Ok(seq) => OpState::Posted(seq),
-                Err(e) => OpState::failed(e.error, e.leases),
+        if self.state.pending == 0 {
+            match self.state.engine.try_post_recv(self.key, part, ()) {
+                Ok(Ok(seq)) => OpState::Posted(seq),
+                Ok(Err(e)) => OpState::failed(e.error, e.leases),
+                Err((part, ())) => self.recv_slow(part),
             }
         } else {
             self.recv_slow(part)
@@ -574,9 +586,9 @@ macro_rules! qp_api {
             }
 
             /// SENDs `buf` into the peer's next receive.
-            #[inline]
+            #[inline(always)]
             pub fn send<U: IntoBytes + Immutable>(&self, buf: Buf<U, N>) -> Op<'_, Self, Sent> {
-                Op::post(self, WrOp::Send, buf.into_part())
+                Op::post(self, WrOp::Send, || buf.into_part())
             }
 
             /// SENDs `buf` with immediate data `imm`.
@@ -586,7 +598,7 @@ macro_rules! qp_api {
                 buf: Buf<U, N>,
                 imm: u32,
             ) -> Op<'_, Self, Sent> {
-                Op::post(self, WrOp::SendImm(imm), buf.into_part())
+                Op::post(self, WrOp::SendImm(imm), || buf.into_part())
             }
 
             /// SENDs the concatenation of `bufs` as one message (a gather
@@ -602,11 +614,7 @@ macro_rules! qp_api {
                             got: i + 1,
                             max: MAX_SGES,
                         };
-                        return Op::new(
-                            self,
-                            Queue::Send,
-                            OpState::failed(error, Leases::default()),
-                        );
+                        return Op::new(self, OpState::failed(error, Leases::default()));
                     }
                     parts.push(buf.into_part());
                 }
@@ -620,7 +628,7 @@ macro_rules! qp_api {
                 buf: Buf<U, N>,
                 dst: RemoteBuf,
             ) -> Op<'_, Self, Sent> {
-                Op::post(self, WrOp::Write(dst), buf.into_part())
+                Op::post(self, WrOp::Write(dst), || buf.into_part())
             }
 
             /// RDMA WRITEs `buf` to `dst` with immediate data `imm`, which
@@ -631,17 +639,17 @@ macro_rules! qp_api {
                 dst: RemoteBuf,
                 imm: u32,
             ) -> Op<'_, Self, Sent> {
-                Op::post(self, WrOp::WriteImm(dst, imm), buf.into_part())
+                Op::post(self, WrOp::WriteImm(dst, imm), || buf.into_part())
             }
 
             /// Posts a receive into `buf`; yields what it got (a message or the
             /// notification of a peer's WRITE) and the buffer.
-            #[inline]
+            #[inline(always)]
             pub fn recv<U: FromBytes + IntoBytes>(
                 &self,
                 buf: BufMut<U, N>,
             ) -> Op<'_, Self, Recv<U>> {
-                Op::post_recv(self, buf.into_part())
+                Op::post_recv(self, || buf.into_part())
             }
 
             /// Posts the SENDs and WRITEs `f` adds as one request: one
@@ -651,7 +659,7 @@ macro_rules! qp_api {
             /// borrowed: it must not use another QP of the same CQ.
             pub fn batch(&self, f: impl FnOnce(&mut Batch<'_, T, N>)) -> Op<'_, Self, Sent> {
                 let state = self.with_state(|s| s.post_batch(f));
-                Op::new(self, Queue::Send, state)
+                Op::new(self, state)
             }
 
             /// A [`futures_sink::Sink`] of RDMA WRITEs: `poll_ready` waits
@@ -712,7 +720,7 @@ macro_rules! qp_api {
                 buf: BufMut<U, N>,
                 src: RemoteBuf,
             ) -> Op<'_, Self, Read<U>> {
-                Op::post(self, WrOp::Read(src), buf.into_part())
+                Op::post(self, WrOp::Read(src), || buf.into_part())
             }
 
             /// Atomically adds `add` to the 8 bytes at `dst` in the peer's
@@ -724,7 +732,9 @@ macro_rules! qp_api {
                 dst: RemoteBuf,
                 add: u64,
             ) -> Op<'_, Self, Read<u64>> {
-                Op::post(self, WrOp::FetchAdd { remote: dst, add }, old.into_part())
+                Op::post(self, WrOp::FetchAdd { remote: dst, add }, || {
+                    old.into_part()
+                })
             }
 
             /// Atomically replaces the 8 bytes at `dst` in the peer's memory
@@ -742,7 +752,7 @@ macro_rules! qp_api {
                     compare,
                     swap,
                 };
-                Op::post(self, op, old.into_part())
+                Op::post(self, op, || old.into_part())
             }
         }
     };

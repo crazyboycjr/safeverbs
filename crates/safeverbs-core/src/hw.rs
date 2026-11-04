@@ -94,6 +94,7 @@ pub const MAX_SGES: usize = 16;
 
 /// One of a QP's two work queues.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u32)] // No padding in a `Completion`, which moving one would copy.
 pub enum Side {
     /// The send queue: SENDs, WRITEs, READs, atomics.
     Send,
@@ -197,6 +198,9 @@ pub struct HwQp<C, N: Device> {
     #[allow(dead_code)]
     send_tails: Ghost<Map<int, SendWr>>,
 }
+
+/// A receive that the data path's own way does not take: its buffer and its context.
+pub type UnpostedRecv<C, N> = (Part<N>, Option<C>);
 
 /// A request of one WQE that the data path's own way does not take: all of it.
 pub struct Unposted<C, N: Device> {
@@ -1832,7 +1836,7 @@ impl<C, N: Device> Hw<C, N> {
 impl<C, N: Device> Hw<C, N> {
     #[inline(always)]
     #[verifier::spinoff_prover]
-    pub fn post_recv(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
+    pub fn post_recv(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: core::result::Result<core::result::Result<RingSeq, Refusal<C, N>>, UnpostedRecv<C, N>>)
     {
         if index < self.qps.len() {
             match &mut self.qps[index] {
@@ -1860,27 +1864,27 @@ impl<C, N: Device> Hw<C, N> {
                             Ok(()) => {
                                 let seq = e.recv.stage_filled(1, true);
                                 e.recv.commit();
-                                Ok(seq)
+                                Ok(Ok(seq))
                             },
-                            Err(error) => Err(not_posted(&mut e.recv, error)),
+                            Err(error) => Ok(Err(not_posted(&mut e.recv, error))),
                         };
                     }
                 },
                 None => {},
             }
         }
-        self.recv_refused(index, part, ctx)
+        Err((part, ctx))
     }
 
     /// Why a receive is refused, on QP `index`: it takes no work (`Error::NotConnected`), the
     /// part is of another protection domain or frozen, or the receive queue is full.
     #[cold]
     #[inline(never)]
-    fn recv_refused(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
+    pub fn recv_refused(&mut self, index: usize, part: Part<N>, ctx: Option<C>) -> (r: Refusal<C, N>)
     {
         if index >= self.qps.len() {
             no_qp(index);
-            return Err(Refusal { error: Error::Invalid("no such QP"), ctx, leases: Leases::from(part) });
+            return Refusal { error: Error::Invalid("no such QP"), ctx, leases: Leases::from(part) };
         }
         let error = match &self.qps[index] {
             Some(e) => {
@@ -1904,7 +1908,7 @@ impl<C, N: Device> Hw<C, N> {
                 Error::Invalid("no such QP")
             },
         };
-        Err(Refusal { error, ctx, leases: Leases::from(part) })
+        Refusal { error, ctx, leases: Leases::from(part) }
     }
 }
 
@@ -2137,7 +2141,7 @@ impl<C, N: Device> Hw<C, N> {
     #[inline(always)]
     pub fn read_completions(&mut self, n: usize) -> (read: usize)
     {
-        if self.polled_at < self.polled_len {
+        if self.polled_at < self.polled_len || self.kept {
             return 0;
         }
         let limit = if n < POLL_MAX { n } else { POLL_MAX };
@@ -2154,12 +2158,6 @@ impl<C, N: Device> Hw<C, N> {
     #[inline(always)]
     pub fn next_completion(&mut self) -> (r: Option<Completion<C, N>>)
     {
-        if self.kept {
-            let kept = self.next_kept();
-            if kept.is_some() {
-                return kept;
-            }
-        }
         while self.polled_at < self.polled_len
         {
             let at = self.polled_at;
@@ -2179,44 +2177,88 @@ impl<C, N: Device> Hw<C, N> {
                 continue;
             };
             let recv = is_recv(id);
-            let (ring, queue) = if recv { (&mut e.recv, Side::Recv) } else { (&mut e.send, Side::Send) };
+            let ring = if recv { &mut e.recv } else { &mut e.send };
             let wqe = wqe_of(id, ring.wqe_retired());
             if !ring.wqe_in_flight(wqe) {
                 self.polled_at = at + 1;
                 continue;
             }
             let seq = ring.retired();
-            let (i, ended) = match ring.retire_next(recv, wqe, wc, &mut self.panics) {
-                Some(step) => step,
-                None => {
-                    self.polled_at = at + 1;
-                    continue;
+            let qp_num = e.qp_num;
+            match ring.retire_oldest(recv, wqe, wc) {
+                Some(slot) => {
+                    if slot.end_is(wqe + 1) {
+                        self.polled_at = at + 1;
+                    }
+                    let result = slot.outcome;
+                    match slot.leases.take() {
+                        Some(Payload { ctx: Some(wr_id), leases }) => {
+                            let queue = if recv { Side::Recv } else { Side::Send };
+                            return Some(Completion { wr_id, result, qp: index, qp_num, queue, seq, leases });
+                        },
+                        // A request with an owner holds a context, so nothing is lost here.
+                        other => crate::ring::forget_free(other),
+                    }
                 },
-            };
-            if ended {
-                self.polled_at = at + 1;
+                None => {
+                    let other = self.next_general(at, index, recv, wqe);
+                    if other.is_some() {
+                        return other;
+                    }
+                },
             }
-            let passed = ring.pass_retired(seq);
-            let slot = ring.retired_slot(i);
-            if passed && matches!(slot.leases, Some(Payload { ctx: Some(_), .. })) {
-                let result = slot.outcome;
-                match slot.leases.take() {
-                    Some(Payload { ctx: Some(wr_id), leases }) => {
-                        return Some(Completion { wr_id, result, qp: index, qp_num: e.qp_num, queue, seq, leases });
-                    },
-                    other => crate::ring::forget_free(other),
-                }
-            } else {
-                let other = Self::hand_out_other(ring, i, seq, index, e.qp_num, queue);
-                if other.is_some() {
-                    return other;
-                }
+        }
+        if self.kept {
+            let kept = self.next_kept();
+            if kept.is_some() {
+                return kept;
             }
         }
         if self.panics.pending() {
             self.resume_panics();
         }
         None
+    }
+
+    /// What [`Hw::next_completion`] does with a CQE out of the common: one step of its walk, on the
+    /// oldest request of its queue, which retires it if it ends at or before the CQE's WQE, and
+    /// hands it out if it has an owner. A CQE that ends inside it is spent.
+    #[inline(never)]
+    fn next_general(&mut self, at: usize, index: usize, recv: bool, wqe: u64) -> (r: Option<Completion<C, N>>)
+    {
+        let wc = &self.polled[at];
+        let e = match &mut self.qps[index] {
+            Some(e) => e,
+            None => return None,
+        };
+        let (ring, queue) = if recv { (&mut e.recv, Side::Recv) } else { (&mut e.send, Side::Send) };
+        let seq = ring.retired();
+        let (i, ended) = match ring.retire_next(recv, wqe, wc, &mut self.panics) {
+            Some(step) => step,
+            None => {
+                self.polled_at = at + 1;
+                return None;
+            },
+        };
+        if ended {
+            self.polled_at = at + 1;
+        }
+        let passed = ring.pass_retired(seq);
+        let slot = ring.retired_slot(i);
+        if passed && matches!(slot.leases, Some(Payload { ctx: Some(_), .. })) {
+            let result = slot.outcome;
+            match slot.leases.take() {
+                Some(Payload { ctx: Some(wr_id), leases }) => {
+                    Some(Completion { wr_id, result, qp: index, qp_num: e.qp_num, queue, seq, leases })
+                },
+                other => {
+                    crate::ring::forget_free(other);
+                    None
+                },
+            }
+        } else {
+            Self::hand_out_other(ring, i, seq, index, e.qp_num, queue)
+        }
     }
 
     /// What retiring a request of a CQE leaves besides the common case: the head has to look for
@@ -2366,7 +2408,7 @@ impl<C, N: Device> Hw<C, N> {
                         WrOp::Read(r) => e.reliable && part_writable_of(&part) && sge.length as u64 <= r.len,
                         WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. } => false,
                     };
-                    if fits && e.takes_work && e.open_wqes.len() == 0 && part_pd_of(&part) == e.pd_id && sge.length <= e.max_len && e.send.can_post() {
+                    if fits && e.takes_work && e.open_wqes.len() == 0 && !(ring && e.started) && part_pd_of(&part) == e.pd_id && sge.length <= e.max_len && e.send.can_post() {
                         let ghost q = e.id();
                         let implied = implied_outcome(&op, sge.length);
                         // Its region is registered (its lease says so).
@@ -2381,12 +2423,11 @@ impl<C, N: Device> Hw<C, N> {
                         }));
                         let detached = ctx.is_none();
                         e.send.fill(1, detached, implied, Payload { ctx, leases });
-                        let waiting = e.started;
-                        if !waiting {
+                        if ring || !e.started {
                             start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                         }
                         post(&mut e.hw, id, signaled, &op, &sges, Ghost(q), Tracked(self.token.borrow_mut()));
-                        if ring && !waiting {
+                        if ring {
                             match doorbell(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut())) {
                                 Ok(()) => {
                                     let seq = e.send.stage_filled(1, signaled);
@@ -2397,12 +2438,7 @@ impl<C, N: Device> Hw<C, N> {
                             }
                         }
                         e.started = true;
-                        let seq = e.send.stage_filled(1, signaled);
-                        return if ring {
-                            Ok(self.commit_own(index, seq))
-                        } else {
-                            Ok(Ok(seq))
-                        };
+                        return Ok(Ok(e.send.stage_filled(1, signaled)));
                     }
                 },
                 None => {},
@@ -2881,6 +2917,39 @@ impl<C, N: Device> Hw<C, N> {
     /// nothing is added and the part is handed back.
     #[verifier::spinoff_prover]
     pub fn push(&mut self, index: usize, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
+    {
+        if index < self.qps.len() {
+            match &mut self.qps[index] {
+                Some(e) => {
+                    let sge = part_sge_of(&part);
+                    // One comparison each, as for a request of one WQE; a QP that takes no work
+                    // collects its WQEs too, and its doorbell is refused.
+                    let fits = match op {
+                        WrOp::Send | WrOp::SendImm(_) => true,
+                        WrOp::Write(r) | WrOp::WriteImm(r, _) => sge.length as u64 <= r.len,
+                        WrOp::Read(_) | WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. } => false,
+                    };
+                    let k = e.open_wqes.len() as u32;
+                    if fits && k > 0 && k < e.send.max_wqes() && k < e.send.wqe_room()
+                        && part_pd_of(&part) == e.pd_id && sge.length <= e.max_len
+                    {
+                        let first_sge = e.open_sges.len();
+                        e.open_sges.push(sge);
+                        e.open_wqes.push(OpenWqe { op, first_sge, sges: 1, bytes: sge.length });
+                        keep_lease(&mut e.open_leases, part, Ghost(safeverbs_spec::abs::Dir::Out));
+                        return Ok(());
+                    }
+                },
+                None => {},
+            }
+        }
+        self.push_other(index, op, part)
+    }
+
+    /// [`Hw::push`] out of the common: the request's first WQE, an operation with more to check,
+    /// no room, or a check that fails.
+    #[inline(never)]
+    fn push_other(&mut self, index: usize, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
     {
         if index >= self.qps.len() {
             no_qp(index);

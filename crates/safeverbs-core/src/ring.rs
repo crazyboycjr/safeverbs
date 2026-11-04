@@ -111,8 +111,7 @@
 //!    request (and not retired) number at most `depth - max_wqes`.
 //!
 //! No counter overflows: [`Ring::has_free_slot`] refuses a new request once
-//! the WQE or request numbers could not hold `max_wqes` more (after 2^64
-//! of them, which no NIC reaches). The proofs also rely on a few facts about wakers that
+//! the WQE or request numbers reach [`COUNTERS_END`], which no NIC does. The proofs also rely on a few facts about wakers that
 //! Verus takes on trust: [`core::task::Waker`] is opaque to them, and waking,
 //! comparing and cloning one are the standard library's (see the TCB in
 //! `docs/verification.md`). User wake panics are retained until the ring operation
@@ -158,6 +157,22 @@ fn will_wake(a: &Waker, b: &Waker) -> (same: bool)
         same ==> waker_id(*a) == waker_id(*b),
 {
     a.will_wake(b)
+}
+
+/// The WQE and request numbers a ring refuses to go past: far from overflowing with one request
+/// more of any size.
+pub const COUNTERS_END: u64 = 1 << 62;
+
+/// Slot `i` of `slots`, for an `i` from [`Ring::index`], with no bounds check: the data path holds
+/// a request's buffers at this point, and a panic edge would keep them in memory.
+#[inline(always)]
+fn slot_in<L>(slots: &mut Vec<Slot<L>>, i: usize) -> (slot: &mut Slot<L>)
+    requires
+        i < old(slots)@.len(),
+{
+    // SAFETY: `i` is a sequence number masked with one less than the number of slots, a power of
+    // two that never changes.
+    unsafe { slots.as_mut_slice().get_unchecked_mut(i) }
 }
 
 /// Forgets a value that holds nothing: its destructor has nothing to do.
@@ -297,6 +312,12 @@ pub(crate) struct Slot<L> {
 }
 
 impl<L> Slot<L> {
+    /// Whether its request ends just before WQE number `end`.
+    #[inline(always)]
+    pub(crate) fn end_is(&self, end: u64) -> bool {
+        self.end_wqe == end
+    }
+
     /// Holds nothing: no outcome, no leases, no waker.
     spec fn is_empty(&self) -> bool {
         &&& self.state == State::Free
@@ -391,6 +412,9 @@ pub struct Ring<L> {
     committed_sig_end: u64,
     /// Whether an error completion has retired a request.
     failed: bool,
+    /// Whether refused requests may be left among the committed ones, so that retiring has more
+    /// to look at.
+    refused: bool,
     /// The first error of a detached request, until someone takes it.
     detached_error: Option<DetachedRecord>,
     /// Who to wake when each slot's request retires: by slot, empty until a waker is first
@@ -1045,6 +1069,7 @@ impl<L> Ring<L> {
             sig_end: 0,
             committed_sig_end: 0,
             failed: false,
+            refused: false,
             detached_error: None,
             wakers: Vec::new(),
             woken: Ghost(vstd::seq::Seq::empty()),
@@ -1213,14 +1238,13 @@ impl<L> Ring<L> {
     /// Whether a slot is free for the next request.
     ///
     /// It also refuses once the WQE or request sequence numbers are nearly
-    /// exhausted (after 2^64 - `max_wqes` of them, centuries at any rate a
+    /// exhausted (after [`COUNTERS_END`] of them, centuries at any rate a
     /// NIC can reach), so that no counter can overflow. One comparison
     /// covers both: neither number exceeds their bitwise or.
     #[inline(always)]
     pub fn has_free_slot(&self) -> (free: bool)
     {
-        self.posted - self.head <= self.mask && (self.wqe_posted | self.posted)
-            <= u64::MAX - self.max_wqes
+        self.posted - self.head <= self.mask && (self.wqe_posted | self.posted) < COUNTERS_END
     }
 
     /// [`Ring::has_free_slot`], as a specification.
@@ -1420,7 +1444,7 @@ impl<L> Ring<L> {
     {
         let first_wqe = self.wqe_posted;
         let i = self.index(self.posted);
-        let slot = &mut self.slots[i];
+        let slot = slot_in(&mut self.slots, i);
         slot.end_wqe = first_wqe + wqes;
         slot.first_wqe = Ghost(first_wqe);
         slot.outcome = implied;
@@ -1830,6 +1854,7 @@ impl<L> Ring<L> {
             }
             seq += 1;
         }
+        self.refused = self.committed != self.posted || self.refused;
         self.committed = self.posted;
         self.wqe_posted = self.wqe_committed;
         self.sig_end = self.committed_sig_end;
@@ -2197,7 +2222,7 @@ impl<L> Ring<L> {
     /// there is to it, and [`Ring::advance_head`] has to look once the request's slot is free.
     #[inline(always)]
     pub(crate) fn pass_retired(&mut self, seq: Seq) -> (passed: bool) {
-        if self.head == seq && self.retired == seq + 1 {
+        if self.head == seq && !self.refused {
             self.head = seq + 1;
             true
         } else {
@@ -2280,7 +2305,7 @@ impl<L> Ring<L> {
         let seq = self.retired;
         let i = self.index(seq);
         let first = self.wqe_retired;
-        let slot = &mut self.slots[i];
+        let slot = slot_in(&mut self.slots, i);
         let end = slot.end_wqe;
         let last = wqe + 1;
         if end > last {
@@ -2292,7 +2317,8 @@ impl<L> Ring<L> {
         let ended = end == last;
         if ended {
             if wc.is_ok() {
-                if recv && slot.outcome.is_ok() {
+                // A receive has one WQE, so nothing was recorded on it before.
+                if recv {
                     slot.outcome = Ok(Completed::Received(wc.received()));
                 }
             } else if slot.outcome.is_ok() {
@@ -2311,16 +2337,44 @@ impl<L> Ring<L> {
             }
         }
         // Refused requests after the last WQE in flight: no completion would retire them.
-        if end == self.wqe_committed && self.retired != self.committed {
+        if self.refused && end == self.wqe_committed {
             self.skip_refused();
         }
         Some((i, ended))
     }
 
+    /// The common case of [`Ring::retire_next`] for the event loop's path, all in one test: a
+    /// success on the oldest request, which ends at or before WQE `wqe`, has an owner nobody waits
+    /// on, and frees the oldest slot in use, with no refused request around. Otherwise this
+    /// changes nothing and the general path takes it. Returns the request's slot, for the caller
+    /// to empty.
+    #[inline(always)]
+    pub(crate) fn retire_oldest(&mut self, recv: bool, wqe: u64, wc: &Wc) -> (r: Option<&mut Slot<L>>)
+    {
+        let seq = self.retired;
+        let i = self.index(seq);
+        let slot = slot_in(&mut self.slots, i);
+        let end = slot.end_wqe;
+        let last = wqe + 1;
+        if end <= last && wc.is_ok() && !slot.detached && slot.outcome.is_ok()
+            && self.head == seq && !self.refused && self.wakers.is_empty()
+        {
+            if recv && end == last {
+                slot.outcome = Ok(Completed::Received(wc.received()));
+            }
+            self.retired = seq + 1;
+            self.head = seq + 1;
+            self.wqe_retired = end;
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
     /// The slot of a request [`Ring::retire_next`] just retired, for what it holds.
     #[inline(always)]
     pub(crate) fn retired_slot(&mut self, i: usize) -> &mut Slot<L> {
-        &mut self.slots[i]
+        slot_in(&mut self.slots, i)
     }
 
     /// What retiring request `seq`, in `slot`, with first WQE `first`, takes beyond the common
@@ -2484,6 +2538,9 @@ impl<L> Ring<L> {
         {
             self.head += 1;
         }
+        if self.head == self.committed {
+            self.refused = false;
+        }
     }
 
     /// Moving `head` past a free slot changes nothing A sees.
@@ -2575,7 +2632,7 @@ impl<L> Ring<L> {
             return None;
         }
         let i = self.index(seq);
-        let slot = &mut self.slots[i];
+        let slot = slot_in(&mut self.slots, i);
         if seq >= self.retired && !matches!(slot.outcome, Err(CompletionError::Refused)) {
             return None;
         }
