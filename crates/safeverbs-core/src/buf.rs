@@ -41,13 +41,13 @@ use memory::OwnedRange;
 pub(crate) use memory::{Frozen, RawMut};
 pub use view::Buf;
 mod lease;
-pub(crate) use lease::Lease;
 #[allow(unused_imports)] // Named only by contracts erased from plain cargo builds.
 pub(crate) use lease::Loan;
 #[allow(unused_imports)] // Erased WQE provenance used by the verified engine.
 pub(crate) use lease::WqeLoans;
 #[cfg(verus_keep_ghost)]
 pub(crate) use lease::covers_inputs;
+pub(crate) use lease::{Lease, same_frozen_arc};
 pub use lease::{Leases, Part};
 
 /// Linux's `ENOMEM`.
@@ -439,6 +439,34 @@ impl<T, N: Nic> Buf<T, N> {
             .unwrap_or_else(|| panic!("range {start}..{end} of a buffer of {}", self.len()))
     }
 
+    /// A part of it by reference, for a batch: what [`Buf::slice`] gives, with no reference to
+    /// count, and so nothing to do for the posts of a request after the first.
+    ///
+    /// # Panics
+    ///
+    /// As [`Buf::slice`].
+    pub fn view(&self, range: impl RangeBounds<usize>) -> BufView<'_, T, N> {
+        let start = match range.start_bound() {
+            Bound::Included(&s) => s,
+            Bound::Excluded(&s) => s.checked_add(1).expect("range start overflow"),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&e) => e.checked_add(1).expect("range end overflow"),
+            Bound::Excluded(&e) => e,
+            Bound::Unbounded => self.len(),
+        };
+        let view = self
+            .view
+            .slice(start, end, size_of::<T>())
+            .unwrap_or_else(|| panic!("range {start}..{end} of a buffer of {}", self.len()));
+        BufView {
+            frozen: &self.frozen,
+            view,
+            _t: PhantomData,
+        }
+    }
+
     /// Whether no other `Buf` and no request holds the frozen buffer.
     pub fn is_unique(&self) -> bool {
         Arc::strong_count(&self.frozen) == 1
@@ -506,6 +534,95 @@ impl<T, N: Nic> Buf<T, N> {
         U: TryFromBytes + KnownLayout + Immutable,
     {
         U::try_ref_from_bytes(self.as_bytes()).ok()
+    }
+}
+
+/// A part of a [`Buf`] by reference ([`Buf::view`]).
+pub struct BufView<'a, T, N: Nic = Verbs> {
+    frozen: &'a Arc<Frozen<N>>,
+    view: range::ElementRange,
+    _t: PhantomData<&'a [T]>,
+}
+
+/// What a request's WQE can send from: a [`Buf`], by value or by reference, or a [`BufView`]. A
+/// request keeps one reference to the frozen allocation its consecutive WQEs come from, so by
+/// reference they touch no reference count after the first.
+pub trait Lend<N: Nic> {
+    /// Its bytes, and what they belong to, with nothing touched.
+    #[doc(hidden)]
+    fn peek(&self) -> Peek<'_, N>;
+    /// One scatter/gather element, keeping its allocation alive.
+    #[doc(hidden)]
+    fn lend(self) -> Part<N>;
+}
+
+/// The bytes of what can be lent ([`Lend::peek`]).
+#[doc(hidden)]
+pub struct Peek<'a, N: Nic> {
+    pub(crate) frozen: &'a Arc<Frozen<N>>,
+    pub(crate) offset: usize,
+    pub(crate) bytes: usize,
+}
+
+impl<N: Nic> Peek<'_, N> {
+    /// Its scatter/gather element, for a length that fits one.
+    #[inline(always)]
+    pub(crate) fn sge(&self) -> crate::nic::Sge {
+        crate::nic::Sge {
+            addr: (self.frozen.raw.ptr().addr() + self.offset) as u64,
+            length: self.bytes as u32,
+            lkey: self.frozen.raw.region.lkey,
+        }
+    }
+}
+
+impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for Buf<U, N> {
+    #[inline(always)]
+    fn peek(&self) -> Peek<'_, N> {
+        Peek {
+            frozen: &self.frozen,
+            offset: self.view.offset(),
+            bytes: self.view.byte_len(size_of::<U>()),
+        }
+    }
+    #[inline(always)]
+    fn lend(self) -> Part<N> {
+        self.into_part()
+    }
+}
+
+impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for &Buf<U, N> {
+    #[inline(always)]
+    fn peek(&self) -> Peek<'_, N> {
+        Peek {
+            frozen: &self.frozen,
+            offset: self.view.offset(),
+            bytes: self.view.byte_len(size_of::<U>()),
+        }
+    }
+    #[inline(always)]
+    fn lend(self) -> Part<N> {
+        self.clone().into_part()
+    }
+}
+
+impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for BufView<'_, U, N> {
+    #[inline(always)]
+    fn peek(&self) -> Peek<'_, N> {
+        Peek {
+            frozen: self.frozen,
+            offset: self.view.offset(),
+            bytes: self.view.byte_len(size_of::<U>()),
+        }
+    }
+    #[inline(always)]
+    fn lend(self) -> Part<N> {
+        Buf::<U, N> {
+            frozen: self.frozen.clone(),
+            view: self.view,
+            _t: PhantomData,
+        }
+        .into_part()
     }
 }
 

@@ -744,8 +744,9 @@ pub fn no_leases<N: Device>() -> (r: Leases<N>)
 }
 
 /// Keeps a part's lease among `leases` (`Leases::push`).
+#[allow(dead_code)] // The proofs' way in, until they are back: `OpenRequest` keeps leases now.
 #[inline(always)]
-pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>, Ghost(access): Ghost<safeverbs_spec::abs::Dir>)
+pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>, Ghost(access): Ghost<safeverbs_spec::abs::Dir>, spare: &mut Vec<crate::buf::Lease<N>>)
     requires access is In ==> part_writable(part),
     ensures
         old(leases).inv() ==> final(leases).inv(),
@@ -753,7 +754,7 @@ pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>, Ghost(access
         final(leases).wqes() == old(leases).wqes(),
 {
     proof { part.lemma_fields(); }
-    leases.push_access(part, Ghost(access))
+    leases.push_access(part, Ghost(access), spare)
 }
 
 // =============================================================================

@@ -79,7 +79,8 @@ impl<N: Nic> Cq for AsyncCq<N> {
     }
 
     fn remove<T: Transport>(&self, key: QpKey<T>) {
-        self.state.borrow_mut().remove_qp(key);
+        let left_behind = self.state.borrow_mut().remove_qp(key);
+        drop(left_behind);
     }
 
     fn into_qp<T: Transport>(self, key: QpKey<T>, endpoint: Endpoint) -> AsyncQp<T, N> {

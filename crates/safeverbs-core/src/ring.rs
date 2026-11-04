@@ -310,6 +310,9 @@ pub(crate) struct Slot<L> {
     pub(crate) outcome: CompletionResult,
     /// No owner: release the leases at retirement.
     detached: bool,
+    /// Its retirement takes the general path: it has no owner, or holds more than the common case
+    /// does ([`Ring::take_general_path`]).
+    general: bool,
     /// What keeps its memory alive while the NIC uses it.
     pub(crate) leases: Option<L>,
 }
@@ -349,6 +352,7 @@ impl<L> Slot<L> {
             first_wqe: Ghost(0),
             outcome: Ok(Completed::Sent),
             detached: false,
+            general: false,
             leases: None,
         }
     }
@@ -1495,7 +1499,16 @@ impl<L> Ring<L> {
         slot.first_wqe = Ghost(first_wqe);
         slot.outcome = implied;
         slot.detached = detached;
+        slot.general = detached;
         forget_free(slot.leases.replace(leases));
+    }
+
+    /// Request `seq`, just staged, takes the general path when it retires.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn take_general_path(&mut self, seq: Seq) {
+        let i = self.index(seq);
+        self.slots[i].general = true;
     }
 
     /// The second half of [`Ring::stage`]: the request of the slot just filled is staged.
@@ -2550,7 +2563,7 @@ impl<L> Ring<L> {
         let slot = slot_in(&mut self.slots, i);
         let end = slot.end_wqe;
         let last = wqe + 1;
-        if end <= last && wc.is_ok() && !slot.detached && slot.outcome.is_ok()
+        if end <= last && wc.is_ok() && !slot.general && slot.outcome.is_ok()
             && self.head == seq && !self.refused && self.wakers.is_empty()
         {
             if recv && end == last {
@@ -3052,7 +3065,7 @@ impl<L> Ring<L> {
     /// Gives up ownership of request `seq`: a retired or refused request is
     /// freed and its leases released now, a staged or in-flight one when it
     /// retires.
-    pub fn detach(&mut self, seq: Seq)
+    pub fn detach(&mut self, seq: Seq) -> (waker: Option<Waker>)
         requires
             old(self).inv(),
         ensures
@@ -3090,7 +3103,7 @@ impl<L> Ring<L> {
             final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
         if seq < self.head || seq >= self.posted {
-            return;
+            return None;
         }
         let i = self.index(seq);
         let waker = self.take_waker(i);
@@ -3102,9 +3115,10 @@ impl<L> Ring<L> {
             self.advance_head();
         } else {
             slot.detached = true;
+            slot.general = true;
         }
-        // The future it would wake is gone.
-        drop(waker);
+        // The future it would wake is gone. Its destructor is the program's, so the caller runs it.
+        waker
     }
 
     /// A request reported `Staged` or `InFlight` is not retired, and its
@@ -3227,7 +3241,7 @@ impl<L> Ring<L> {
     /// Registers `waker` to be woken when request `seq` retires (a staged or
     /// in-flight request with an owner); replaces the one before unless it
     /// would wake the same task.
-    pub fn set_waker(&mut self, seq: Seq, waker: &Waker)
+    pub fn set_waker(&mut self, seq: Seq, waker: &Waker) -> (replaced: Option<Waker>)
         requires
             old(self).inv(),
         ensures
@@ -3255,11 +3269,11 @@ impl<L> Ring<L> {
     {
         let state = self.state(seq);
         if !matches!(state, State::Staged) && !matches!(state, State::InFlight) {
-            return;
+            return None;
         }
         let i = self.index(seq);
         if self.slots[i].detached {
-            return;
+            return None;
         }
         if self.wakers.is_empty() {
             let mut wakers = Vec::with_capacity(self.slots.len());
@@ -3275,8 +3289,11 @@ impl<L> Ring<L> {
             Some(old) => will_wake(old, waker),
             None => false,
         };
-        if !same {
-            self.wakers[i] = Some(clone_waker(waker));
+        if same {
+            None
+        } else {
+            // Its destructor is the program's, so the caller runs it.
+            self.wakers[i].replace(clone_waker(waker))
         }
     }
     // -------------------------------------------------------------------------

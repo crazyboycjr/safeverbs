@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 
+use safeverbs_core::engine::OpenRequest;
 use safeverbs_core::{Engine, Error, Leases, Nic, Part, QpKey, Seq, Transport, WrOp};
 
 /// Work for one request, while it waits or takes the general path.
@@ -14,8 +15,8 @@ pub(crate) enum Work<N: Nic> {
     One(WrOp, Part<N>),
     /// One send-queue WQE with a gather list.
     Gather(WrOp, Vec<Part<N>>),
-    /// A batch of send-queue WQEs.
-    Batch(Vec<(WrOp, Part<N>)>),
+    /// A batch of send-queue WQEs, collected.
+    Open(OpenRequest<N>),
     /// A receive.
     Recv(Part<N>),
 }
@@ -143,11 +144,7 @@ impl<N: Nic> Backlog<N> {
 pub(crate) fn fits<T: Transport, N: Nic>(w: &Engine<(), N>, qp: QpKey<T>, work: &Work<N>) -> bool {
     match work {
         Work::One(..) | Work::Gather(..) => w.send_ring(qp).can_post(),
-        Work::Batch(ops) => {
-            let ring = w.send_ring(qp);
-            let want = ops.len().min(ring.max_wqes() as usize) as u32;
-            ring.can_post() && ring.depth() - ring.in_flight_wqes() >= want
-        }
+        Work::Open(open) => w.open_fits(qp, open),
         Work::Recv(_) => w.recv_ring(qp).can_post(),
     }
 }
@@ -173,29 +170,9 @@ pub(crate) fn post<T: Transport, N: Nic>(
             }
             req.submit(true, ()).map_err(|e| (e.error, e.leases))
         }
-        Work::Batch(ops) => {
-            let mut req = w.request(qp);
-            let mut error = None;
-            for (op, part) in ops {
-                if error.is_none()
-                    && let Err(e) = req.push(op, part)
-                {
-                    error = Some(e.error);
-                }
-            }
-            match error {
-                Some(error) => {
-                    // What was added before the error goes out, owned by
-                    // nobody.
-                    let _ = req.submit_detached();
-                    Err((error, Leases::default()))
-                }
-                None if req.is_empty() => {
-                    Err((Error::Invalid("an empty batch"), Leases::default()))
-                }
-                None => req.submit(true, ()).map_err(|e| (e.error, e.leases)),
-            }
-        }
+        Work::Open(mut open) => w
+            .submit_open(qp, &mut open, true, ())
+            .map_err(|e| (e.error, e.leases)),
         Work::Recv(part) => w.post_recv(qp, part, ()).map_err(|e| (e.error, e.leases)),
     }
 }

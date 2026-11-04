@@ -241,26 +241,38 @@ impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
     /// the state still in hand, from the buffers where the state put them: one move less of them.
     #[inline(always)]
     fn poll_posted(&mut self, seq: Seq, cx: &Context<'_>) -> Poll<K::Output> {
+        // Declared first, so that it goes after the state is let go of: a waker's destructor is
+        // the program's.
+        let mut replaced = None;
         let mut state = self.q.lock();
         let mut s = state.qp(self.q.qp_key());
         s.drain();
         let output = if s.completed(K::QUEUE, seq) {
             match s.take_request(K::QUEUE, seq) {
-                Some((result, mut leases)) => Some(K::done(result, &mut leases)),
+                Some((result, mut leases)) => {
+                    let output = K::done(result, &mut leases);
+                    s.let_go_of(&mut leases);
+                    Some(output)
+                }
                 None => None,
             }
         } else {
             // One poll of the CQ completes the requests of all its QPs.
             s.engine().progress();
             match s.take_request(K::QUEUE, seq) {
-                Some((result, mut leases)) => Some(K::done(result, &mut leases)),
+                Some((result, mut leases)) => {
+                    let output = K::done(result, &mut leases);
+                    s.let_go_of(&mut leases);
+                    Some(output)
+                }
                 None => {
-                    s.set_waker(K::QUEUE, seq, cx.waker());
+                    replaced = s.set_waker(K::QUEUE, seq, cx.waker());
                     None
                 }
             }
         };
         drop(state);
+        drop(replaced);
         match output {
             Some(output) => {
                 self.state = OpState::Done;
@@ -305,12 +317,11 @@ impl<Q: QueueAccess, K: Outcome<Q::N>> Op<'_, Q, K> {
     #[inline(never)]
     fn give_up(&mut self) {
         match self.state {
-            OpState::Posted(seq) => self.q.with_state(|s| s.detach(K::QUEUE, seq)),
-            OpState::Queued(ticket) => self.q.with_state(|s| {
-                if let Some(seq) = s.cancel(K::QUEUE, ticket) {
-                    s.detach(K::QUEUE, seq);
-                }
-            }),
+            OpState::Posted(seq) => drop(self.q.with_state(|s| s.detach(K::QUEUE, seq))),
+            OpState::Queued(ticket) => drop(self.q.with_state(|s| {
+                let seq = s.cancel(K::QUEUE, ticket)?;
+                s.detach(K::QUEUE, seq)
+            })),
             OpState::Failed(_) | OpState::Done => {}
         }
     }

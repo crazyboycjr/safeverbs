@@ -62,7 +62,7 @@ use safeverbs_spec::share::*;
 use safeverbs_spec::types::{CqId, Key, PdId, QpId};
 use vstd::prelude::*;
 
-use crate::buf::{BufError, Leases, Part};
+use crate::buf::{BufError, Lease, Leases, Part};
 use crate::error::{Error, Result};
 use crate::nic::{
     ConnectAttr, DeviceCaps, Endpoint, Nic as Device, NicCq, NicQp, QpCaps, QpType, Sge, WrOp,
@@ -76,9 +76,12 @@ use crate::wc::{Completed, CompletionError, CompletionResult, Opcode, Received, 
 use crate::wr_id::*;
 
 mod completion;
+mod open;
 mod outcomes;
 mod send_outcomes;
 mod separation;
+
+pub use open::{OpenRequest, OpenWqe};
 
 // On this branch the specs and proofs in this file still describe the representation before the
 // fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
@@ -123,7 +126,9 @@ pub struct Completion<C = (), N: Device = Verbs> {
     pub queue: Side,
     /// Its sequence number in that queue.
     pub seq: RingSeq,
-    /// Its buffers.
+    /// Its buffers. What [`Engine::poll`](crate::engine::Engine::poll) hands out of a request of
+    /// several holds only the unique ones: frozen ones have no way back and are released as it
+    /// comes back, so that the list stays with the QP for its next request of several.
     pub leases: Leases<N>,
 }
 
@@ -190,11 +195,12 @@ pub struct HwQp<C, N: Device> {
     /// M's name of the QP.
     #[allow(dead_code)]
     id: Ghost<QpId>,
-    /// The request being gathered: nothing of it reaches the hardware until it is finished,
-    /// when its signaling is known. Its WQEs, their scatter/gather lists and its leases.
-    open_wqes: Vec<OpenWqe>,
-    open_sges: Vec<Sge>,
-    open_leases: Leases<N>,
+    /// What the next request being written takes, kept from the last one, so that nothing is
+    /// allocated per request: where its WQEs go (empty while one has it), where the scatter/gather
+    /// lists of several elements go, and a list for several buffers.
+    spare_wqes: Vec<OpenWqe>,
+    spare_sges: Vec<Sge>,
+    spare_leases: Vec<Lease<N>>,
     /// The parts of a gather list, until it is checked.
     building: Vec<Part<N>>,
     /// The final WR written for each send request (erased).
@@ -225,21 +231,42 @@ pub struct Refusal<C, N: Device> {
     pub leases: Leases<N>,
 }
 
-/// A WQE of the request being gathered: its operation and where its scatter/gather list lies
-/// in `HwQp::open_sges`.
-#[derive(Clone, Copy)]
-struct OpenWqe {
-    op: WrOp,
-    first_sge: usize,
-    sges: usize,
-    /// Its local bytes, for the success a later completion implies.
-    bytes: u32,
+/// What giving up a QP's requests let go of whose destructors are the program's: the `wr_id`s of
+/// requests not delivered and the wakers of futures gone. They may reach back into a handle over
+/// the engine (a `wr_id` may hold a QP), so whoever holds the engine behind a borrow takes this
+/// and drops it after letting go.
+pub struct LetGo<C> {
+    /// The contexts of the requests given up.
+    pub wr_ids: Vec<C>,
+    /// The wakers of those requests.
+    pub wakers: Vec<core::task::Waker>,
+}
+
+impl<C> LetGo<C> {
+    /// Nothing yet.
+    pub(crate) fn new() -> Self {
+        LetGo { wr_ids: Vec::new(), wakers: Vec::new() }
+    }
+
+    /// What giving up one request let go of.
+    fn keep(&mut self, ctx: Option<C>, waker: Option<core::task::Waker>) {
+        match ctx {
+            Some(ctx) => self.wr_ids.push(ctx),
+            None => {},
+        }
+        match waker {
+            Some(waker) => self.wakers.push(waker),
+            None => {},
+        }
+    }
 }
 
 /// The hardware side of an engine: its CQ, its QPs and its share of M.
 #[verifier::reject_recursive_types(C)]
 #[verifier::reject_recursive_types(N)]
 pub struct Hw<C, N: Device> {
+    /// What giving up requests let go of, until it is taken.
+    let_go: LetGo<C>,
     cq: N::Cq,
     /// The device, alive as long as the CQ is.
     ctx: Context<N>,
@@ -1316,6 +1343,7 @@ impl<C, N: Device> Hw<C, N> {
             Err(e) => return Err(e),
         };
         let hw = Hw {
+            let_go: LetGo::new(),
             cq,
             ctx,
             caps,
@@ -1464,9 +1492,9 @@ impl<C, N: Device> Hw<C, N> {
             qp_type,
             pd: pd.clone(),
             id: Ghost(q),
-            open_wqes: Vec::new(),
-            open_sges: Vec::new(),
-            open_leases: no_leases(),
+            spare_wqes: Vec::new(),
+            spare_sges: Vec::new(),
+            spare_leases: Vec::new(),
             building: Vec::new(),
             send_tails: Ghost(Map::empty()),
         };
@@ -2289,7 +2317,10 @@ impl<C, N: Device> Hw<C, N> {
         if passed && matches!(slot.leases, Some(Payload { ctx: Some(_), .. })) {
             let result = slot.outcome;
             match slot.leases.take() {
-                Some(Payload { ctx: Some(wr_id), leases }) => {
+                Some(Payload { ctx: Some(wr_id), mut leases }) => {
+                    if leases.is_many() {
+                        leases.hand_back_many(&mut e.spare_leases);
+                    }
                     Some(Completion { wr_id, result, qp: index, qp_num: e.qp_num, queue, seq, leases })
                 },
                 other => {
@@ -2298,7 +2329,7 @@ impl<C, N: Device> Hw<C, N> {
                 },
             }
         } else {
-            Self::hand_out_other(ring, i, seq, index, e.qp_num, queue)
+            Self::hand_out_other(ring, &mut e.spare_leases, i, seq, index, e.qp_num, queue)
         }
     }
 
@@ -2307,14 +2338,17 @@ impl<C, N: Device> Hw<C, N> {
     /// (without an owner, or taken since it was refused).
     #[cold]
     #[inline(never)]
-    fn hand_out_other(ring: &mut Ring<Payload<C, N>>, i: usize, seq: RingSeq, index: usize, qp_num: u32, queue: Side) -> (r: Option<Completion<C, N>>)
+    fn hand_out_other(ring: &mut Ring<Payload<C, N>>, spare: &mut Vec<Lease<N>>, i: usize, seq: RingSeq, index: usize, qp_num: u32, queue: Side) -> (r: Option<Completion<C, N>>)
     {
         let slot = ring.retired_slot(i);
         let result = slot.outcome;
         let taken = slot.leases.take();
         ring.advance_head();
         match taken {
-            Some(Payload { ctx: Some(wr_id), leases }) => {
+            Some(Payload { ctx: Some(wr_id), mut leases }) => {
+                if leases.is_many() {
+                    leases.hand_back_many(spare);
+                }
                 Some(Completion { wr_id, result, qp: index, qp_num, queue, seq, leases })
             },
             // A request with an owner holds a context, so nothing is lost here.
@@ -2455,7 +2489,7 @@ impl<C, N: Device> Hw<C, N> {
                         WrOp::Read(r) => e.reliable && part_writable_of(&part) && sge.length as u64 <= r.len,
                         WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. } => false,
                     };
-                    if fits && e.takes_work && e.open_wqes.len() == 0 && !(ring && e.started) && part_pd_of(&part) == e.pd_id && sge.length <= e.max_len && e.send.can_post() {
+                    if fits && e.takes_work && !(ring && e.started) && part_pd_of(&part) == e.pd_id && sge.length <= e.max_len && e.send.can_post() {
                         let ghost q = e.id();
                         let implied = implied_outcome(&op, sge.length);
                         // Its region is registered (its lease says so).
@@ -2503,13 +2537,24 @@ impl<C, N: Device> Hw<C, N> {
         let op = unposted.op;
         let part = unposted.part;
         let ctx = unposted.ctx;
-        // A request left open by a program that forgot its builder goes out as it is.
-        let _ = self.close(index, true, None);
-        match self.push(index, op, part) {
+        let mut open = self.open_request(index);
+        match self.push_other(index, &mut open, op, part) {
             Ok(()) => {},
-            Err(e) => return Err(Refusal { error: e.error, ctx, leases: Leases::from(e.buf) }),
+            Err(e) => {
+                self.give_back(index, &mut open);
+                return Err(Refusal { error: e.error, ctx, leases: Leases::from(e.buf) });
+            },
         }
-        let seq = match self.close(index, signal, ctx) {
+        match self.make_send_room(index, 1) {
+            Ok(()) => {},
+            Err(error) => {
+                self.give_back(index, &mut open);
+                return Err(Refusal { error, ctx, leases: open.take_leases() });
+            },
+        }
+        let closed = self.close(index, &mut open, signal, ctx);
+        self.give_back(index, &mut open);
+        let seq = match closed {
             Ok(seq) => seq,
             Err(ctx) => return Err(Refusal { error: Error::Invalid("a request without a WQE"), ctx, leases: Leases::new() }),
         };
@@ -2662,27 +2707,12 @@ proof fn lemma_held_wr_ok<N: Device>(h: Held, parts: Seq<Part<N>>, index: u16, n
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// Whether QP `index` has a request open (between its first WQE and
-    /// [`Hw::close`]).
-    pub fn is_open(&self, index: usize) -> bool
-        requires
-            self.inv(),
-    {
-        if index >= self.qps.len() {
-            return false;
-        }
-        match &self.qps[index] {
-            Some(e) => e.open_wqes.len() > 0,
-            None => false,
-        }
-    }
-
-    /// Closes QP `index`'s open request: its signaling is known now, so its WQEs are written, the
-    /// last signaled if `signal` or if the ring says so, and it is staged in the ring with `ctx`
-    /// for its owner; without one if nobody will take it back. Returns its sequence number;
-    /// without an open request, `ctx` back. It goes out at the next doorbell.
+    /// Closes `open` on QP `index`: its signaling is known now, so its WQEs are written, the last
+    /// signaled if `signal` or if the ring says so, and it is staged in the ring with `ctx` for its
+    /// owner; without one if nobody will take it back. Returns its sequence number; if it has no
+    /// WQE, or the queue no room for them, `ctx` back. It goes out at the next doorbell.
     #[verifier::spinoff_prover]
-    pub fn close(&mut self, index: usize, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
+    pub fn close(&mut self, index: usize, open: &mut OpenRequest<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
         requires
             old(self).inv(),
         ensures
@@ -2690,48 +2720,212 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             r matches Err(back) ==> back == ctx,
     {
-        if index >= self.qps.len() {
-            return Err(ctx);
-        }
-        let open = match &self.qps[index] {
-            Some(e) => e.open_wqes.len() > 0,
-            None => false,
-        };
-        if !open {
+        let n = open.n;
+        if n == 0 || index >= self.qps.len() {
             return Err(ctx);
         }
         match &mut self.qps[index] {
             Some(e) => {
+                if !e.send.can_post() || n as u64 > e.send.wqe_room() as u64 {
+                    return Err(ctx);
+                }
                 let ghost q = e.id();
                 // Its regions are registered (its leases say so).
-                registered_all(&e.open_leases, &e.pd, Tracked(self.token.borrow_mut()));
-                let n = e.open_wqes.len();
+                open.keeps_registered(&e.pd, Tracked(self.token.borrow_mut()));
                 let signaled = signal || e.send.must_signal(n as u64);
                 if !e.started {
                     start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                     e.started = true;
                 }
                 let first = e.send.next_wqe();
+                // Every WQE but the last, which is signaled if the request is.
                 let mut i = 0;
-                while i < n
+                while i + 1 < n
                 {
-                    let wqe = &e.open_wqes[i];
-                    let sges = vstd::slice::slice_subrange(e.open_sges.as_slice(), wqe.first_sge, wqe.first_sge + wqe.sges);
-                    let id = wr_id(index as u16, false, first + i as u64);
-                    post(&mut e.hw, id, signaled && i + 1 == n, &wqe.op, sges, Ghost(q), Tracked(self.token.borrow_mut()));
+                    let sges = open.sges_of(i);
+                    post(&mut e.hw, wr_id(index as u16, false, first + i as u64), false, open.op_of(i), sges, Ghost(q), Tracked(self.token.borrow_mut()));
                     i += 1;
                 }
-                let last = e.open_wqes[n - 1];
-                let implied = implied_outcome(&last.op, last.bytes);
-                let mut leases = no_leases();
-                core::mem::swap(&mut leases, &mut e.open_leases);
+                let sges = open.sges_of(i);
+                post(&mut e.hw, wr_id(index as u16, false, first + i as u64), signaled, open.op_of(i), sges, Ghost(q), Tracked(self.token.borrow_mut()));
+                let last = &open.wqes[n - 1];
+                let bytes = if last.sges == 1 { last.sge.length } else { open.last_gathered_bytes() };
+                let implied = implied_outcome(&last.op, bytes);
+                let leases = open.take_leases_with(&mut e.spare_leases);
+                let many = leases.is_many();
                 let detached = ctx.is_none();
                 let seq = e.send.stage(n as u64, signaled, detached, implied, Payload { ctx, leases });
-                e.open_wqes.clear();
-                e.open_sges.clear();
+                if many {
+                    e.send.take_general_path(seq);
+                }
+                open.gathered.clear();
                 Ok(seq)
             },
             None => Err(ctx),
+        }
+    }
+
+    /// A request to write on QP `index`, with what the QP keeps for it. A QP that takes no work
+    /// has its WQEs say so one by one: they are collected too, and the doorbell is refused.
+    #[inline(always)]
+    pub fn open_request(&mut self, index: usize) -> OpenRequest<N> {
+        if index < self.qps.len() {
+            match &mut self.qps[index] {
+                Some(e) if e.spare_wqes.len() > 0 => {
+                    let mut wqes = Vec::new();
+                    core::mem::swap(&mut wqes, &mut e.spare_wqes);
+                    return OpenRequest {
+                        wqes,
+                        n: 0,
+                        limit: e.open_limit(),
+                        max_len: e.max_len,
+                        pd_id: e.pd_id,
+                        last: None,
+                        leases: no_leases(),
+                        gathered: Vec::new(),
+                    };
+                },
+                _ => {},
+            }
+        }
+        self.open_request_other(index)
+    }
+
+    /// [`Hw::open_request`] on a QP whose storage is out, or not made yet.
+    #[cold]
+    #[inline(never)]
+    fn open_request_other(&mut self, index: usize) -> OpenRequest<N> {
+        if index < self.qps.len() {
+            match &mut self.qps[index] {
+                Some(e) => {
+                    let wqes = vec![open::EMPTY_WQE; e.send.max_wqes() as usize];
+                    return OpenRequest {
+                        wqes,
+                        n: 0,
+                        limit: e.open_limit(),
+                        max_len: e.max_len,
+                        pd_id: e.pd_id,
+                        last: None,
+                        leases: no_leases(),
+                        gathered: Vec::new(),
+                    };
+                },
+                None => {},
+            }
+        }
+        OpenRequest::closed()
+    }
+
+    /// What `open` keeps from QP `index` goes back there for the next request.
+    #[inline(always)]
+    pub fn give_back(&mut self, index: usize, open: &mut OpenRequest<N>) {
+        if index < self.qps.len() {
+            match &mut self.qps[index] {
+                Some(e) => {
+                    if e.spare_wqes.len() == 0 {
+                        core::mem::swap(&mut e.spare_wqes, &mut open.wqes);
+                    }
+                    open.limit = 0;
+                    if open.gathered.capacity() > 0 {
+                        core::mem::swap(&mut e.spare_sges, &mut open.gathered);
+                    }
+                },
+                None => {},
+            }
+        }
+    }
+
+    /// [`Hw::close`], first waiting for room (this polls the CQ).
+    pub fn close_waiting(&mut self, index: usize, open: &mut OpenRequest<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>) {
+        if open.n > 0 && !self.open_fits(index, open) {
+            let _ = self.make_send_room(index, open.n as u32);
+        }
+        self.close(index, open, signal, ctx)
+    }
+
+    /// `open` as a request of its own: closed, signaled if `signal`, with `ctx` to come back with
+    /// its completion, and the doorbell; what it keeps from the QP goes back. If the queue has no
+    /// room it waits for some (this polls the CQ). If that or the doorbell fails, its context and
+    /// its buffers come back.
+    #[inline]
+    pub fn submit_open(&mut self, index: usize, open: &mut OpenRequest<N>, signal: bool, ctx: C) -> (r: core::result::Result<RingSeq, Refusal<C, N>>) {
+        match self.close(index, open, signal, Some(ctx)) {
+            Ok(seq) => {
+                self.give_back(index, open);
+                self.commit_own(index, seq)
+            },
+            Err(ctx) => self.submit_open_other(index, open, signal, ctx),
+        }
+    }
+
+    /// [`Hw::submit_open`] out of the common: no WQE, or no room.
+    #[cold]
+    #[inline(never)]
+    fn submit_open_other(&mut self, index: usize, open: &mut OpenRequest<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Refusal<C, N>>) {
+        if open.is_empty() {
+            self.give_back(index, open);
+            return Err(Refusal { error: Error::Invalid("a request without a WQE"), ctx, leases: Leases::new() });
+        }
+        match self.make_send_room(index, open.n as u32) {
+            Ok(()) => {},
+            Err(error) => {
+                self.give_back(index, open);
+                return Err(Refusal { error, ctx, leases: open.take_leases() });
+            },
+        }
+        let closed = self.close(index, open, signal, ctx);
+        self.give_back(index, open);
+        match closed {
+            Ok(seq) => self.commit_own(index, seq),
+            Err(ctx) => Err(Refusal { error: Error::QueueFull, ctx, leases: open.take_leases() }),
+        }
+    }
+
+    /// What an owner holds of a completed request of several buffers: frozen ones are released, and
+    /// the list goes back to QP `index` for the next such request, unless several unique buffers
+    /// have to leave in it.
+    #[cold]
+    #[inline(never)]
+    pub fn hand_back_leases(&mut self, index: usize, leases: &mut Leases<N>) {
+        if index < self.qps.len() {
+            match &mut self.qps[index] {
+                Some(e) => leases.hand_back_many(&mut e.spare_leases),
+                None => {},
+            }
+        }
+    }
+
+    /// Takes what giving up requests let go of.
+    pub fn take_let_go(&mut self) -> (let_go: LetGo<C>) {
+        let mut let_go = LetGo::new();
+        core::mem::swap(&mut let_go, &mut self.let_go);
+        let_go
+    }
+
+    /// Whether `open` can be closed now on QP `index`: its WQEs fit in the queue.
+    #[inline(always)]
+    pub fn open_fits(&self, index: usize, open: &OpenRequest<N>) -> (fits: bool) {
+        if index < self.qps.len() {
+            match &self.qps[index] {
+                Some(e) => e.send.can_post() && open.n as u64 <= e.send.wqe_room() as u64,
+                None => false,
+            }
+        } else {
+            false
+        }
+    }
+}
+
+impl<C, N: Device> HwQp<C, N> {
+    /// How many WQEs a request being written may take without asking: as many as a request may
+    /// have; none while it takes no work. The queue's room is looked at when it goes out, since a
+    /// request is written with nothing held.
+    #[inline(always)]
+    fn open_limit(&self) -> (limit: usize) {
+        if self.takes_work {
+            self.send.max_wqes() as usize
+        } else {
+            0
         }
     }
 }
@@ -2805,7 +2999,7 @@ impl<C, N: Device> Hw<C, N> {
     /// nobody took, or if the doorbell is refused.
     #[verifier::exec_allows_no_decreases_clause]
     #[verifier::spinoff_prover]
-    fn make_send_room(&mut self, index: usize) -> (r: Result<()>)
+    fn make_send_room(&mut self, index: usize, wqes: u32) -> (r: Result<()>)
         requires
             old(self).inv(),
             old(self).has_qp(index as int),
@@ -2826,7 +3020,7 @@ impl<C, N: Device> Hw<C, N> {
                 assert(self.entry_ok(index as int, self.token@, self.token@.nic()));
             }
             let (can, clogged) = match &self.qps[index] {
-                Some(e) => (e.send.can_post(), e.send.is_clogged()),
+                Some(e) => (e.send.can_post() && wqes <= e.send.wqe_room(), e.send.is_clogged()),
                 None => (false, false),
             };
             if can {
@@ -2943,78 +3137,37 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// Makes room for one more WQE in QP `index`'s open request: a request that is full, or that
-    /// the queue has no more room for, goes out as a request of its own (signaled, without an
-    /// owner), and a new one waits for room (this polls the CQ).
+    /// Makes room for one more WQE in `open`: a request that is full goes out as a request of its
+    /// own (signaled, without an owner), once it fits (this polls the CQ).
     #[inline]
-    fn open_room(&mut self, index: usize) -> (r: Result<()>)
+    fn open_room(&mut self, index: usize, open: &mut OpenRequest<N>) -> (r: Result<()>)
     {
-        let (k, full) = match &self.qps[index] {
-            Some(e) => {
-                let k = e.open_wqes.len() as u32;
-                (k, k >= e.send.max_wqes() || k >= e.send.wqe_room())
-            },
-            None => (0, false),
-        };
-        if k > 0 {
-            if !full {
-                return Ok(());
-            }
-            let _ = self.close(index, true, None);
-        }
-        let can = match &self.qps[index] {
-            Some(e) => e.send.can_post(),
+        let k = open.n as u32;
+        let full = match &self.qps[index] {
+            Some(e) => k >= e.send.max_wqes(),
             None => false,
         };
-        if can {
-            Ok(())
-        } else {
-            self.make_send_room(index)
+        if full {
+            match self.make_send_room(index, k) {
+                Ok(()) => {},
+                Err(error) => return Err(error),
+            }
+            let _ = self.close(index, open, true, None);
         }
+        Ok(())
     }
 
-    /// Adds a WQE doing `op` on `part` to QP `index`'s open request, or opens one for it. On error
+    /// Adds a WQE doing `op` on `part` to `open`, whatever it takes: its QP is asked what
+    /// [`OpenRequest::try_push`] could not tell, and a request that is full goes out. On error
     /// nothing is added and the part is handed back.
     #[verifier::spinoff_prover]
-    pub fn push(&mut self, index: usize, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
+    #[inline(never)]
+    pub fn push_other(&mut self, index: usize, open: &mut OpenRequest<N>, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
         requires
             old(self).inv(),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
-    {
-        if index < self.qps.len() {
-            match &mut self.qps[index] {
-                Some(e) => {
-                    let sge = part_sge_of(&part);
-                    // One comparison each, as for a request of one WQE; a QP that takes no work
-                    // collects its WQEs too, and its doorbell is refused.
-                    let fits = match op {
-                        WrOp::Send | WrOp::SendImm(_) => true,
-                        WrOp::Write(r) | WrOp::WriteImm(r, _) => sge.length as u64 <= r.len,
-                        WrOp::Read(_) | WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. } => false,
-                    };
-                    let k = e.open_wqes.len() as u32;
-                    if fits && k > 0 && k < e.send.max_wqes() && k < e.send.wqe_room()
-                        && part_pd_of(&part) == e.pd_id && sge.length <= e.max_len
-                    {
-                        let first_sge = e.open_sges.len();
-                        e.open_sges.push(sge);
-                        e.open_wqes.push(OpenWqe { op, first_sge, sges: 1, bytes: sge.length });
-                        keep_lease(&mut e.open_leases, part, Ghost(safeverbs_spec::abs::Dir::Out));
-                        return Ok(());
-                    }
-                },
-                None => {},
-            }
-        }
-        self.push_other(index, op, part)
-    }
-
-    /// [`Hw::push`] out of the common: the request's first WQE, an operation with more to check,
-    /// no room, or a check that fails.
-    #[inline(never)]
-    fn push_other(&mut self, index: usize, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -3032,30 +3185,30 @@ impl<C, N: Device> Hw<C, N> {
                 return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
             },
         };
-        let bytes = match checked {
-            Ok(bytes) => bytes,
+        match checked {
+            Ok(_) => {},
             Err(error) => return Err(BufError { error, buf: part }),
-        };
-        match self.open_room(index) {
+        }
+        match self.open_room(index, open) {
             Ok(()) => {},
             Err(error) => return Err(BufError { error, buf: part }),
         }
         match &mut self.qps[index] {
             Some(e) => {
-                let first_sge = e.open_sges.len();
-                e.open_sges.push(part_sge_of(&part));
-                e.open_wqes.push(OpenWqe { op, first_sge, sges: 1, bytes: bytes as u32 });
-                keep_lease(&mut e.open_leases, part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }));
+                let k = open.n;
+                open.wqes[k] = OpenWqe { op, sge: part_sge_of(&part), first_sge: 0, sges: 1 };
+                open.n = k + 1;
+                open.keep_general(part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }), &mut e.spare_leases);
             },
             None => {},
         }
         Ok(())
     }
 
-    /// Finishes the WQE gathered on QP `index` with operation `op`, as [`Hw::push`] does a WQE of
-    /// one part. On error nothing is added and the parts are dropped.
+    /// Finishes the WQE gathered on QP `index` with operation `op`, as [`Hw::push_other`] does a WQE
+    /// of one part. On error nothing is added and the parts are dropped.
     #[verifier::spinoff_prover]
-    pub fn push_gathered(&mut self, index: usize, op: WrOp) -> (r: Result<()>)
+    pub fn push_gathered(&mut self, index: usize, open: &mut OpenRequest<N>, op: WrOp) -> (r: Result<()>)
     {
         if index >= self.qps.len() {
             no_qp(index);
@@ -3073,14 +3226,14 @@ impl<C, N: Device> Hw<C, N> {
                 return Err(Error::Invalid("no such QP"));
             },
         };
-        let bytes = match checked {
-            Ok(bytes) => bytes,
+        match checked {
+            Ok(_) => {},
             Err(error) => {
                 self.drop_gathered(index);
                 return Err(error);
             },
-        };
-        match self.open_room(index) {
+        }
+        match self.open_room(index, open) {
             Ok(()) => {},
             Err(error) => {
                 self.drop_gathered(index);
@@ -3089,20 +3242,25 @@ impl<C, N: Device> Hw<C, N> {
         }
         match &mut self.qps[index] {
             Some(e) => {
-                let first_sge = e.open_sges.len();
                 let sges = e.building.len();
+                if open.gathered.capacity() == 0 {
+                    core::mem::swap(&mut open.gathered, &mut e.spare_sges);
+                }
+                let first_sge = open.gathered.len() as u32;
                 let mut i = 0;
                 while i < sges
                 {
-                    e.open_sges.push(part_sge_of(&e.building[i]));
+                    open.gathered.push(part_sge_of(&e.building[i]));
                     i += 1;
                 }
-                e.open_wqes.push(OpenWqe { op, first_sge, sges, bytes: bytes as u32 });
+                let k = open.n;
+                open.wqes[k] = OpenWqe { op, sge: part_sge_of(&e.building[0]), first_sge, sges: sges as u32 };
+                open.n = k + 1;
                 // In the order the hardware reads them is no matter to the leases.
                 while e.building.len() > 0
                 {
                     match e.building.pop() {
-                        Some(part) => keep_lease(&mut e.open_leases, part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out })),
+                        Some(part) => open.keep_general(part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }), &mut e.spare_leases),
                         None => {},
                     }
                 }
@@ -3242,7 +3400,29 @@ impl<C, N: Device> Hw<C, N> {
     /// Gives up request `seq` of QP `index`'s ring of `side`: its buffers are
     /// released when it retires (now, if it has). Its context comes back.
     #[verifier::spinoff_prover]
-    pub fn detach(&mut self, index: usize, side: Side, seq: RingSeq) -> (ctx: Option<C>)
+    pub fn detach(&mut self, index: usize, side: Side, seq: RingSeq) -> (given_up: (Option<C>, Option<core::task::Waker>))
+        requires
+            old(self).inv(),
+        ensures
+            final(self).inv(),
+            final(self).same_table(old(self)),
+    {
+        if index >= self.qps.len() {
+            return (None, None);
+        }
+        match &mut self.qps[index] {
+            Some(e) => match side {
+                Side::Send => e.send.give_up(seq),
+                Side::Recv => e.recv.give_up(seq),
+            },
+            None => (None, None),
+        }
+    }
+
+    /// Wakes `waker` when request `seq` of QP `index`'s ring of `side`
+    /// retires.
+    #[verifier::spinoff_prover]
+    pub fn set_waker(&mut self, index: usize, side: Side, seq: RingSeq, waker: &core::task::Waker) -> (replaced: Option<core::task::Waker>)
         requires
             old(self).inv(),
         ensures
@@ -3252,49 +3432,28 @@ impl<C, N: Device> Hw<C, N> {
         if index >= self.qps.len() {
             return None;
         }
-        match &mut self.qps[index] {
-            Some(e) => match side {
-                Side::Send => e.send.give_up(seq),
-                Side::Recv => e.recv.give_up(seq),
-            },
-            None => None,
-        }
-    }
-
-    /// Wakes `waker` when request `seq` of QP `index`'s ring of `side`
-    /// retires.
-    #[verifier::spinoff_prover]
-    pub fn set_waker(&mut self, index: usize, side: Side, seq: RingSeq, waker: &core::task::Waker)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).inv(),
-            final(self).same_table(old(self)),
-    {
-        if index >= self.qps.len() {
-            return;
-        }
         let ghost start = *self;
         let ghost t = self.token@;
         let ghost m = t.nic();
         proof {
             assert(start.entry_ok(index as int, t, m));
         }
-        match &mut self.qps[index] {
+        let replaced = match &mut self.qps[index] {
             Some(e) => {
                 let ghost send = e.send;
                 let ghost recv = e.recv;
-                match side {
+                let replaced = match side {
                     Side::Send => e.send.set_waker(seq, waker),
                     Side::Recv => e.recv.set_waker(seq, waker),
-                }
+                };
                 proof {
                     lemma_resources_kept(send, e.send);
                     lemma_resources_kept(recv, e.recv);
                 }
+                replaced
             },
-            None => {},
-        }
+            None => None,
+        };
         proof {
             if start.qps@[index as int] is Some {
                 let pre = start.qps@[index as int]->0;
@@ -3315,6 +3474,7 @@ impl<C, N: Device> Hw<C, N> {
                 self.lemma_inv_fields(&start, t, m);
             }
         }
+        replaced
     }
 
     /// The first error of a send request without an owner on QP `index`,
@@ -3443,10 +3603,6 @@ impl<C, N: Device> Hw<C, N> {
         let busy = match &mut self.qps[index] {
             Some(e) => {
                 let ghost q = e.id();
-                e.open_wqes.clear();
-                e.open_sges.clear();
-                let mut leases = no_leases();
-                core::mem::swap(&mut leases, &mut e.open_leases);
                 if e.started {
                     e.started = false;
                     abort(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
@@ -3456,15 +3612,17 @@ impl<C, N: Device> Hw<C, N> {
                 let mut seq = e.send.head();
                 while seq < e.send.posted()
                 {
-                    // A context's destructor is the user's: it runs here, between
-                    // two consistent states, never during a poll.
-                    let _ctx = e.send.give_up(seq);
+                    // A context's destructor is the program's: it runs when the engine is let
+                    // go of, never during a poll.
+                    let (ctx, waker) = e.send.give_up(seq);
+                    self.let_go.keep(ctx, waker);
                     seq += 1;
                 }
                 let mut seq = e.recv.head();
                 while seq < e.recv.posted()
                 {
-                    let _ctx = e.recv.give_up(seq);
+                    let (ctx, waker) = e.recv.give_up(seq);
+                    self.let_go.keep(ctx, waker);
                     seq += 1;
                 }
                 e.send.in_flight_wqes() > 0 || e.recv.in_flight_wqes() > 0
@@ -3650,7 +3808,7 @@ impl<C, N: Device> Hw<C, N> {
             return false;
         }
         let idle = match &self.qps[index] {
-            Some(e) => e.removed && !e.started && e.open_wqes.len() == 0 && e.send.in_flight_wqes() == 0
+            Some(e) => e.removed && !e.started && e.send.in_flight_wqes() == 0
                 && e.recv.in_flight_wqes() == 0,
             None => false,
         };
@@ -3751,7 +3909,7 @@ impl<C, N: Device> Hw<C, N> {
             no_qp(index);
             return Err(Error::Invalid("no such QP"));
         }
-        self.make_send_room(index)
+        self.make_send_room(index, 1)
     }
 }
 

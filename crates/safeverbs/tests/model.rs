@@ -461,10 +461,11 @@ fn a_sink_error_names_its_item() {
                 .await
                 .unwrap();
         }
-        // The sink holds its last item back: only then does this go between them.
+        // Sent, so that this goes between them.
         tx.feed(WriteOp::new(src.clone(), dst.remote()))
             .await
             .unwrap();
+        tx.flush().await.unwrap();
         drop(a.write(src.clone(), dst.remote()));
         tx.feed(WriteOp::new(src.clone(), dst.remote()))
             .await
@@ -488,6 +489,163 @@ fn a_sink_error_names_its_item() {
         );
         assert_eq!(error.status(), Some(Status::REM_ACCESS_ERR));
     });
+}
+
+/// A sink looks at the CQ when it has no room, on a flush and on the close: its error waits for
+/// those, and still names its item, in a later request of the sink's as in the first.
+#[test]
+fn a_sink_error_surfaces_at_the_next_flush() {
+    let (m, pd, a, _b) = pair::<RC>(1205, 64);
+    block_on(async {
+        let dst = pd.alloc::<u8>(64).unwrap().expose().unwrap();
+        let src = filled(&pd, 8, 1);
+        let mut bad = dst.remote();
+        bad.rkey ^= 0x55aa;
+        let mut tx = a.sink();
+        for _ in 0..4 {
+            tx.feed(WriteOp::new(src.clone(), dst.remote()))
+                .await
+                .unwrap();
+        }
+        tx.flush().await.unwrap();
+        // The second request: items 4 and 5 are fine, item 6 fails.
+        for _ in 0..2 {
+            tx.feed(WriteOp::new(src.clone(), dst.remote()))
+                .await
+                .unwrap();
+        }
+        tx.feed(WriteOp::new(src.clone(), bad)).await.unwrap();
+        m.halt(true);
+        tx.flush().await.unwrap();
+        m.halt(false);
+        m.run();
+        // Nothing has looked at the CQ since: feeding goes on.
+        tx.feed(WriteOp::new(src.clone(), dst.remote()))
+            .await
+            .unwrap();
+        let error = tx.flush().await.unwrap_err();
+        assert_eq!(
+            error,
+            Error::SinkItem {
+                item: 6,
+                error: CompletionError::Failed {
+                    status: Status::REM_ACCESS_ERR,
+                    vendor_err: 0,
+                    position: 0
+                }
+            }
+        );
+    });
+}
+
+/// An item refused at once, for another protection domain or a WRITE longer than its destination,
+/// is the error of its `start_send`, and takes no number.
+#[test]
+fn a_sink_refuses_an_invalid_item_at_once() {
+    let (_m, pd, a, _b) = pair::<RC>(1206, 32);
+    block_on(async {
+        let dst = pd.alloc::<u8>(8).unwrap().expose().unwrap();
+        let src = filled(&pd, 8, 1);
+        let long = filled(&pd, 64, 1);
+        let mut tx = a.sink();
+        tx.feed(WriteOp::new(src.clone(), dst.remote()))
+            .await
+            .unwrap();
+        let error = tx
+            .feed(WriteOp::new(long.clone(), dst.remote()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::TooLong { .. }), "{error:?}");
+        let mut bad = dst.remote();
+        bad.rkey ^= 0x55aa;
+        tx.feed(WriteOp::new(src.clone(), bad)).await.unwrap();
+        let error = tx.close().await.unwrap_err();
+        assert!(
+            matches!(error, Error::SinkItem { item: 1, .. }),
+            "{error:?}"
+        );
+    });
+}
+
+/// A waker that drops a QP of the same CQ when it goes: the waker is the program's, so that may
+/// not happen with the CQ borrowed, whichever way it goes.
+#[test]
+fn a_wakers_destructor_may_drop_a_qp_of_its_cq() {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use std::rc::Rc;
+
+    type Held = Rc<Qp<RC>>;
+    fn raw(held: Held) -> RawWaker {
+        RawWaker::new(Rc::into_raw(held).cast(), &VTABLE)
+    }
+    fn get(data: *const ()) -> Held {
+        // SAFETY: `data` comes from `raw`, one count each.
+        unsafe { Rc::from_raw(data.cast()) }
+    }
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |data| {
+            let held = get(data);
+            let clone = held.clone();
+            core::mem::forget(held);
+            raw(clone)
+        },
+        |data| drop(get(data)),
+        |_| {},
+        |data| drop(get(data)),
+    );
+    fn waker_holding(qp: Qp<RC>) -> Waker {
+        // SAFETY: the vtable's functions keep the counts of `raw`, on this thread only.
+        unsafe { Waker::from_raw(raw(Rc::new(qp))) }
+    }
+
+    let (m, pd, cq, mut qps) = pairs_on_cq(1207, 3, 8);
+    m.halt(true);
+    let dst = pd.alloc::<u8>(8).unwrap().expose().unwrap();
+    let src = filled(&pd, 8, 1);
+    let (e, _f) = (qps.pop().unwrap(), qps.pop().unwrap());
+    let (c, d) = (qps.pop().unwrap(), qps.pop().unwrap());
+    let (a, _b) = (qps.pop().unwrap(), qps.pop().unwrap());
+
+    // Replaced by another waker, while the future polls.
+    let mut first = a.write(src.clone(), dst.remote());
+    let waker = waker_holding(c);
+    let mut cx = TaskContext::from_waker(&waker);
+    assert!(Pin::new(&mut first).poll(&mut cx).is_pending());
+    drop(waker);
+    let reserved = cq.with(|w| w.reserved());
+    let other = noop_waker();
+    let mut cx = TaskContext::from_waker(&other);
+    assert!(Pin::new(&mut first).poll(&mut cx).is_pending());
+    assert_eq!(cq.with(|w| w.reserved()), reserved - 16, "the first went");
+
+    // With its future.
+    let mut second = a.write(src.clone(), dst.remote());
+    let waker = waker_holding(d);
+    let mut cx = TaskContext::from_waker(&waker);
+    assert!(Pin::new(&mut second).poll(&mut cx).is_pending());
+    drop(waker);
+    drop(second);
+    assert_eq!(
+        cq.with(|w| w.reserved()),
+        reserved - 2 * 16,
+        "the second went"
+    );
+
+    // With its QP.
+    let mut third = a.write(src.clone(), dst.remote());
+    let waker = waker_holding(e);
+    let mut cx = TaskContext::from_waker(&waker);
+    assert!(Pin::new(&mut third).poll(&mut cx).is_pending());
+    drop(waker);
+    core::mem::forget(third);
+    core::mem::forget(first);
+    m.halt(false);
+    drop(a);
+    assert_eq!(
+        cq.with(|w| w.reserved()),
+        reserved - 4 * 16,
+        "the third went, with `a`"
+    );
 }
 
 /// Another request's failure reaches a sink too, as nobody's item.

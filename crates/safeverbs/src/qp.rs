@@ -6,15 +6,15 @@ use core::ops::DerefMut;
 use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
-use safeverbs_core::engine::{MAX_SGES, Unposted};
+use safeverbs_core::engine::{LetGo, MAX_SGES, OpenRequest, Unposted};
 use safeverbs_core::{
-    Buf, BufMut, Endpoint, Engine, Error, Leases, Nic, Part, QpKey, Queue, Reliable, RemoteBuf,
-    Result, Seq, Transport, WrOp,
+    Buf, BufError, BufMut, Endpoint, Engine, Error, Leases, Nic, Part, QpKey, Queue, Reliable,
+    RemoteBuf, Result, Seq, Transport, WrOp,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::backlog::{self, Backlog, Posted, Work};
-use crate::batch::Batch;
+use crate::batch::{Batch, BatchQp};
 use crate::cq::AsyncCq;
 use crate::op::{Flush, Op, OpState, Read, Recv, Sent, TakenResult};
 use crate::receiver::Receiver;
@@ -54,6 +54,12 @@ pub struct State<N: Nic> {
     pending: usize,
 }
 
+/// What a QP's removal leaves to drop once its CQ is let go of.
+pub(crate) struct LeftBehind<N: Nic> {
+    _let_go: LetGo<()>,
+    _queues: Option<Queues<N>>,
+}
+
 impl<N: Nic> State<N> {
     pub(crate) fn new(engine: Engine<(), N>) -> Self {
         State {
@@ -77,16 +83,24 @@ impl<N: Nic> State<N> {
         });
     }
 
-    /// Destroys a QP of the engine, then drops the work and results the
-    /// futures left with it.
-    pub(crate) fn remove_qp<T: Transport>(&mut self, key: QpKey<T>) {
+    /// Destroys a QP of the engine. What it let go of, and the work and results the futures left
+    /// with it, come back to be dropped once the state is let go of: their destructors are the
+    /// program's.
+    #[must_use]
+    pub(crate) fn remove_qp<T: Transport>(&mut self, key: QpKey<T>) -> LeftBehind<N> {
         // A QP the device does not flush stays in the engine with its
         // buffers (`Error::NotFlushed`): nothing more to do here.
-        let _ = self.engine.remove_qp(key);
+        let (_, let_go) = self.engine.remove_qp_later(key);
+        let mut queues = None;
         if let Some(q) = self.queues.get_mut(key.index())
             && let Some(gone) = q.take()
         {
             self.pending -= gone.count();
+            queues = Some(gone);
+        }
+        LeftBehind {
+            _let_go: let_go,
+            _queues: queues,
         }
     }
 
@@ -227,8 +241,15 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
         seq < ring.retired()
     }
 
-    /// Wakes `waker` when request `seq` completes.
-    pub(crate) fn set_waker(&mut self, side: Queue, seq: Seq, waker: &core::task::Waker) {
+    /// Wakes `waker` when request `seq` completes. The waker it replaces comes back, to drop once
+    /// the state is let go of.
+    #[must_use]
+    pub(crate) fn set_waker(
+        &mut self,
+        side: Queue,
+        seq: Seq,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Waker> {
         let w = &mut self.state.engine;
         match side {
             Queue::Send => w.set_send_waker(self.key, seq, waker),
@@ -340,8 +361,9 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
     }
 
     /// Gives up a posted request (its buffers are released when it
-    /// completes).
-    pub(crate) fn detach(&mut self, side: Queue, seq: Seq) {
+    /// completes). Its waker comes back, to drop once the state is let go of.
+    #[must_use]
+    pub(crate) fn detach(&mut self, side: Queue, seq: Seq) -> Option<core::task::Waker> {
         let key = self.key;
         if self.state.pending != 0 {
             let moved = self.with_queues(|q, _| {
@@ -358,41 +380,53 @@ impl<T: Transport, N: Nic> QpState<'_, T, N> {
                 }
             });
             if moved {
-                return;
+                return None;
             }
         }
-        let w = &mut self.state.engine;
-        let _ = match side {
-            Queue::Send => w.detach_send(key, seq),
-            Queue::Recv => w.detach_recv(key, seq),
-        };
+        self.state.engine.give_up(key, side, seq).1
     }
 
-    /// A batch's closure runs here: straight into the send queue when it has room for a whole
-    /// batch and nothing waits, else collected and queued.
-    fn post_batch(&mut self, f: impl FnOnce(&mut Batch<'_, T, N>)) -> OpState<N> {
+    /// What is left of a completed request's buffers: a list of several goes back to the QP.
+    #[inline(always)]
+    pub(crate) fn let_go_of(&mut self, leases: &mut Leases<N>) {
+        if leases.is_many() {
+            let key = self.key;
+            self.state.engine.hand_back_leases(key, leases);
+        }
+    }
+
+    /// A request to write on this QP, as a batch or a sink does with nothing held.
+    pub(crate) fn open_request(&mut self) -> OpenRequest<N> {
+        let key = self.key;
+        self.state.engine.open_request(key)
+    }
+
+    /// What a batch's closure collected: posted when nothing waits and it fits, else queued. What
+    /// it holds besides an error goes out without an owner, if nothing waits; else it goes with
+    /// the error.
+    pub(crate) fn post_batch(&mut self, batch: &mut Batch<'_, N>) -> OpState<N> {
         self.drain();
         let idle = self.sends_idle();
         let key = self.key;
-        if idle {
-            let w = self.engine();
-            let ring = w.send_ring(key);
-            let room = ring.depth() - ring.in_flight_wqes();
-            if ring.can_post() && room >= ring.max_wqes() {
-                let mut batch = Batch::direct(w.request(key));
-                f(&mut batch);
-                return match batch.post(()) {
-                    Ok(seq) => OpState::Posted(seq),
-                    Err(e) => OpState::failed(e.error, e.leases),
-                };
+        if let Some(error) = batch.take_error() {
+            if idle {
+                let _ = self.engine().submit_open_detached(key, batch.open());
             }
+            return OpState::failed(error, Leases::default());
         }
-        let mut batch = Batch::collect();
-        f(&mut batch);
-        match batch.into_ops() {
-            Ok(ops) => self.with_queues(|q, _| OpState::Queued(q.sends.push(Work::Batch(ops)))),
-            Err(error) => OpState::failed(error, Leases::default()),
+        if batch.is_empty() {
+            self.engine().give_back(key, batch.open());
+            return OpState::failed(Error::Invalid("an empty batch"), Leases::default());
         }
+        let w = self.engine();
+        if idle && w.open_fits(key, batch.open()) {
+            return match w.submit_open(key, batch.open(), true, ()) {
+                Ok(seq) => OpState::Posted(seq),
+                Err(e) => OpState::failed(e.error, e.leases),
+            };
+        }
+        let open = batch.take_open();
+        self.with_queues(|q, _| OpState::Queued(q.sends.push(Work::Open(open))))
     }
 }
 
@@ -470,7 +504,8 @@ impl<T: Transport, N: Nic> QpGuard<T, N> {
 impl<T: Transport, N: Nic> Drop for QpGuard<T, N> {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            state.borrow_mut().remove_qp(self.key);
+            let left_behind = state.borrow_mut().remove_qp(self.key);
+            drop(left_behind);
         }
     }
 }
@@ -692,10 +727,13 @@ macro_rules! qp_api {
             /// Posts the SENDs and WRITEs `f` adds as one request: one
             /// doorbell, one completion. A batch longer than the QP's
             /// `max_batch` is split into requests of that size (which may
-            /// wait for room by polling). `f` runs with the QP's CQ
-            /// borrowed: it must not use another QP of the same CQ.
-            pub fn batch(&self, f: impl FnOnce(&mut Batch<'_, T, N>)) -> Op<'_, Self, Sent> {
-                let state = self.with_state(|s| s.post_batch(f));
+            /// wait for room by polling). `f` runs with nothing held: it may use this QP, others
+            /// of the CQ, and the CQ. They go out when it returns, after what it posted.
+            pub fn batch(&self, f: impl FnOnce(&mut Batch<'_, N>)) -> Op<'_, Self, Sent> {
+                let open = self.with_state(|s| s.open_request());
+                let mut batch = Batch::new(open, self);
+                f(&mut batch);
+                let state = self.with_state(|s| s.post_batch(&mut batch));
                 Op::new(self, state)
             }
 
@@ -746,6 +784,26 @@ macro_rules! qp_api {
             /// completes with a flush error, handing its buffers back.
             pub fn force_error(&self) -> Result<()> {
                 self.with(|w, qp| w.to_error(qp))
+            }
+        }
+
+        impl<T: Transport, N: Nic> BatchQp<N> for $ty<T, N> {
+            fn push_general(
+                &self,
+                open: &mut OpenRequest<N>,
+                op: WrOp,
+                part: Part<N>,
+            ) -> core::result::Result<(), BufError<Part<N>>> {
+                self.with_state(|s| {
+                    // A part that goes out goes after what waits.
+                    s.drain();
+                    while !s.sends_idle() {
+                        s.engine().progress();
+                        s.drain();
+                    }
+                    let key = s.key();
+                    s.engine().push_open(key, open, op, part)
+                })
             }
         }
 

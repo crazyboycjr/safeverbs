@@ -4,13 +4,14 @@
 use core::cell::{RefCell, RefMut};
 use std::rc::Rc;
 
+use safeverbs_core::engine::{MAX_SGES, OpenRequest};
 use safeverbs_core::{
-    Buf, BufMut, Completion, Endpoint, Engine, Error, Leases, Nic, Part, QpKey, Reliable,
+    Buf, BufError, BufMut, Completion, Endpoint, Engine, Error, Leases, Nic, Part, QpKey, Reliable,
     RemoteBuf, Result, Transport, Unposted, WrOp,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::batch::Batch;
+use crate::batch::{Batch, BatchQp};
 use crate::cq::{Cq, sealed};
 use crate::{Pd, Verbs};
 
@@ -27,8 +28,9 @@ const POLL_ONE_READS: usize = 16;
 /// to it or any of its QPs.
 ///
 /// A `wr_id` comes back exactly once, or, if its request is never handed out, is dropped when its
-/// QP goes, with the CQ borrowed: the destructor of a `wr_id` must not use the CQ or its QPs, nor
-/// drop the last handle to one of them, which would panic.
+/// QP goes. Its destructor may do anything: nothing is borrowed when it runs, so a `wr_id` may hold
+/// an `Rc` of something that holds a QP of this CQ, or poll it. One that holds a handle to its own
+/// QP keeps the QP alive until its request comes back, as any `Rc` cycle would.
 ///
 /// ```no_run
 /// # use safeverbs::{Context, LocalCq, LocalQp, QpCaps, RC, Result, Buf};
@@ -75,8 +77,10 @@ impl<W, N: Nic> Cq for LocalCq<W, N> {
 
     fn remove<T: Transport>(&self, key: QpKey<T>) {
         // A QP the device does not flush stays in the engine with its buffers
-        // (`Error::NotFlushed`): nothing more to do here.
-        let _ = self.engine.borrow_mut().remove_qp(key);
+        // (`Error::NotFlushed`): nothing more to do here. What it let go of goes once the engine
+        // is let go of, since a `wr_id` may hold a handle to a QP of this CQ, or poll it.
+        let (_, let_go) = self.engine.borrow_mut().remove_qp_later(key);
+        drop(let_go);
     }
 
     fn into_qp<T: Transport>(self, key: QpKey<T>, endpoint: Endpoint) -> LocalQp<T, W, N> {
@@ -155,7 +159,9 @@ impl<W, N: Nic> LocalCq<W, N> {
     ///
     /// # Panics
     ///
-    /// If called while the handle's other methods are running (the `RefCell` is borrowed).
+    /// If called while the handle's other methods are running (the `RefCell` is borrowed), which
+    /// holds the other way round as well: `wr_id`s dropped by [`Engine::remove_qp`] on what this
+    /// returns must not use the CQ.
     pub fn as_raw(&self) -> RefMut<'_, Engine<W, N>> {
         self.engine.borrow_mut()
     }
@@ -164,7 +170,8 @@ impl<W, N: Nic> LocalCq<W, N> {
 /// A request that completed, as [`LocalCq::poll`] hands it out: an owned value, with only what
 /// its operation defines: the `wr_id` it was posted with, what it did or why it did not
 /// (`result`), [`qp_num`](Completion::qp_num) and its buffers
-/// ([`buf_mut`](Completion::buf_mut), `leases`).
+/// ([`buf_mut`](Completion::buf_mut), `leases`). Of a batch of several buffers, those are the
+/// unique ones: frozen ones have no way back and are released as it comes back.
 pub type Wc<W = u64, N = Verbs> = Completion<W, N>;
 
 /// A request that could not be posted: why (`error`), and its `wr_id` and buffers
@@ -315,10 +322,24 @@ impl<T: Transport, W, N: Nic> LocalQp<T, W, N> {
         bufs: impl IntoIterator<Item = Buf<U, N>>,
         wr_id: W,
     ) -> Posted<W, N> {
-        let parts = bufs.into_iter().map(Buf::into_part);
-        let mut engine = self.cq.engine.borrow_mut();
+        // The program's iterator runs before the engine is borrowed.
+        let mut parts: [Option<Part<N>>; MAX_SGES] = core::array::from_fn(|_| None);
+        for (i, buf) in bufs.into_iter().enumerate() {
+            if i == MAX_SGES {
+                return Err(PostError {
+                    error: Error::TooManySges {
+                        got: i + 1,
+                        max: MAX_SGES,
+                    },
+                    wr_id,
+                    leases: Leases::default(),
+                });
+            }
+            parts[i] = Some(buf.into_part());
+        }
+        let mut engine = self.engine();
         let mut req = engine.request(self.key);
-        match req.push_gather(WrOp::Send, parts) {
+        match req.push_gather(WrOp::Send, parts.into_iter().flatten()) {
             Ok(()) => req.submit(true, wr_id).map(|_| ()),
             Err(error) => Err(PostError {
                 error,
@@ -329,15 +350,18 @@ impl<T: Transport, W, N: Nic> LocalQp<T, W, N> {
     }
 
     /// Posts the SENDs and WRITEs `f` adds as one request, of one doorbell and one completion,
-    /// with one `wr_id`. A batch longer than the QP's `max_batch` is split into requests of that
-    /// size, those before the last without a `wr_id` (which may wait for room by polling, keeping
-    /// the completions of others for the next [`LocalCq::poll`]). `f` runs with the CQ borrowed: it
-    /// must not use this QP, another QP of the CQ, or the CQ.
-    pub fn post_batch(&self, wr_id: W, f: impl FnOnce(&mut Batch<'_, T, N, W>)) -> Posted<W, N> {
-        let mut engine = self.cq.engine.borrow_mut();
-        let mut batch = Batch::direct(engine.request(self.key));
+    /// with one `wr_id`. They are collected first, with nothing held and nothing allocated, so
+    /// `f` may use this QP, others of the CQ and the CQ; they go out when it returns, after what
+    /// it posted. If the queue has no room for them then, this waits for some, polling and keeping
+    /// the completions of others for the next [`LocalCq::poll`]. A batch longer than the QP's
+    /// `max_batch` is split into requests of that size, those before the last without a `wr_id`.
+    #[inline]
+    pub fn post_batch(&self, wr_id: W, f: impl FnOnce(&mut Batch<'_, N>)) -> Posted<W, N> {
+        let open = self.engine().open_request(self.key);
+        let mut batch = Batch::new(open, self);
         f(&mut batch);
-        match batch.post(wr_id) {
+        let mut engine = self.engine();
+        match batch.post(&mut engine, self.key, wr_id) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -419,6 +443,17 @@ impl<T: Transport, W, N: Nic> LocalQp<T, W, N> {
     /// The QP's key in the engine under its CQ ([`LocalCq::as_raw`]).
     pub fn as_raw(&self) -> QpKey<T> {
         self.key
+    }
+}
+
+impl<T: Transport, W, N: Nic> BatchQp<N> for LocalQp<T, W, N> {
+    fn push_general(
+        &self,
+        open: &mut OpenRequest<N>,
+        op: WrOp,
+        part: Part<N>,
+    ) -> core::result::Result<(), BufError<Part<N>>> {
+        self.engine().push_open(self.key, open, op, part)
     }
 }
 

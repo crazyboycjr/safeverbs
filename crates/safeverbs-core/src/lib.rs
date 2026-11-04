@@ -60,7 +60,7 @@ pub mod verbs;
 pub mod wc;
 pub(crate) mod wr_id;
 
-pub use buf::{Buf, BufError, BufMut, Chunks, Exposed, Leases, Part, RingBuf};
+pub use buf::{Buf, BufError, BufMut, BufView, Chunks, Exposed, Leases, Lend, Part, RingBuf};
 pub use engine::{Completion, DetachedError, Engine, PostError, QpKey, Queue, Request, Unposted};
 pub use error::{Error, Result};
 pub use nic::{

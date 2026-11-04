@@ -97,6 +97,8 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let q = this.q;
+        // Goes after the state is let go of: a waker's destructor is the program's.
+        let mut replaced = None;
         let next = q.with_state(|s| {
             s.unclog();
             let qp = s.key();
@@ -126,7 +128,7 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
                         Poll::Ready(Some((result.map(received), buf)))
                     }
                     None => {
-                        s.set_waker(Queue::Recv, seq, cx.waker());
+                        replaced = s.set_waker(Queue::Recv, seq, cx.waker());
                         Poll::Pending
                     }
                 },
@@ -134,6 +136,7 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
                 None => Poll::Pending,
             }
         });
+        drop(replaced);
         if next.is_pending() {
             cx.waker().wake_by_ref();
         }
@@ -144,10 +147,13 @@ impl<Q: QueueAccess, U: FromBytes + IntoBytes> Stream for Receiver<'_, Q, U> {
 impl<Q: QueueAccess, U> Drop for Receiver<'_, Q, U> {
     fn drop(&mut self) {
         let posted = &self.posted;
-        self.q.with_state(|s| {
-            for &seq in posted {
-                s.detach(Queue::Recv, seq);
-            }
+        // A waker's destructor is the program's: they go after the state is let go of.
+        let wakers: Vec<_> = self.q.with_state(|s| {
+            posted
+                .iter()
+                .filter_map(|&seq| s.detach(Queue::Recv, seq))
+                .collect()
         });
+        drop(wakers);
     }
 }

@@ -103,7 +103,7 @@
 //! // One doorbell, one completion.
 //! qp.batch(|b| {
 //!     for i in 0..128 {
-//!         b.write(buf.slice(..64), dst.offset(i * 64));
+//!         b.write(buf.view(..64), dst.offset(i * 64)); // by reference: nothing to count
 //!     }
 //! })
 //! .await?;
@@ -340,9 +340,9 @@ pub use receiver::Receiver;
 pub use safeverbs_core::model::Model;
 pub use safeverbs_core::verbs::{Verbs, devices};
 pub use safeverbs_core::{
-    Access, Buf, BufError, BufMut, Chunks, Completed, CompletionError, CompletionResult, Endpoint,
-    Error, Exposed, Gid, GidEntry, Leases, Nic, Part, PortInfo, QpCaps, RC, Received, Reliable,
-    RemoteBuf, Result, RingBuf, Status, Transport, UC, WrOp,
+    Access, Buf, BufError, BufMut, BufView, Chunks, Completed, CompletionError, CompletionResult,
+    Endpoint, Error, Exposed, Gid, GidEntry, Leases, Lend, Nic, Part, PortInfo, QpCaps, RC,
+    Received, Reliable, RemoteBuf, Result, RingBuf, Status, Transport, UC, WrOp,
 };
 pub use sink::{WriteOp, WriteSink};
 
@@ -391,8 +391,8 @@ pub use sink::{WriteOp, WriteSink};
 /// ```
 pub mod raw {
     pub use safeverbs_core::engine::{
-        Completion, DetachedError, Engine, MAX_QPS, MAX_SGES, POLL_MAX, PostError, QpKey, Queue,
-        Request,
+        Completion, DetachedError, Engine, LetGo, MAX_QPS, MAX_SGES, OpenRequest, POLL_MAX,
+        PostError, QpKey, Queue, Request,
     };
     pub use safeverbs_core::nic::QpCaps;
     pub use safeverbs_core::ring::{Ring, State};

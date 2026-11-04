@@ -132,7 +132,7 @@ impl<L> Ring<L> {
 impl<C, N: Nic> Ring<Payload<C, N>> {
     /// Gives up ownership of request `seq`, as [`Ring::detach`] does, and hands
     /// back its context, if it has one.
-    pub fn give_up(&mut self, seq: Seq) -> (ctx: Option<C>)
+    pub fn give_up(&mut self, seq: Seq) -> (given_up: (Option<C>, Option<Waker>))
         requires
             old(self).inv(),
         ensures
@@ -184,8 +184,8 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
                 None => None,
             }
         };
-        self.detach(seq);
-        ctx
+        let waker = self.detach(seq);
+        (ctx, waker)
     }
 }
 

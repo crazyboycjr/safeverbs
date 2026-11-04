@@ -614,10 +614,9 @@ fn a_batch_is_one_request_with_one_wr_id() {
     while got.len() < 2 {
         cq.poll(32, |wc| got.push((wc.wr_id, wc.leases.len())));
     }
-    assert!(
-        got.contains(&(1, 2)),
-        "one wr_id with its two buffers: {got:?}"
-    );
+    // Frozen buffers have no way back: those of a request of several are released as it comes back.
+    assert!(got.contains(&(1, 0)), "one wr_id: {got:?}");
+    assert!(other.is_unique());
     assert!(got.contains(&(100, 1)));
     assert_eq!(a.in_flight(), 0);
 
@@ -891,4 +890,225 @@ fn random_operations_on_a_cq() {
         assert_eq!(model.registered(), 0, "nothing stays registered");
     }
     assert!(handed_out > 1000, "{handed_out} handed out");
+}
+
+/// A `wr_id` that does something when it goes.
+struct OnDrop(Option<Box<dyn FnOnce()>>);
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+fn on_drop(f: impl FnOnce() + 'static) -> OnDrop {
+    OnDrop(Some(Box::new(f)))
+}
+
+/// A model with its protection domain, one CQ and connected QPs of that CQ.
+type Connected = (Model, Pd<Model>, Cq<OnDrop>, Vec<Qp<RC, OnDrop>>);
+
+/// `2 * pairs` connected QPs of one model on one CQ of exactly their queues.
+fn qps(seed: u64, pairs: usize, depth: u32) -> Connected {
+    let model = Model::new(seed);
+    let ctx = Context::new(model.clone());
+    let pd = ctx.alloc_pd().unwrap();
+    let cq = ctx.create_local_cq(4 * pairs as u32 * depth).unwrap();
+    let mut qps = Vec::new();
+    for _ in 0..pairs {
+        let a = pd.create_qp::<RC, _>(&cq, caps(depth)).unwrap();
+        let b = pd.create_qp::<RC, _>(&cq, caps(depth)).unwrap();
+        let (ea, eb) = (a.endpoint(), b.endpoint());
+        qps.push(a.handshake(eb).unwrap());
+        qps.push(b.handshake(ea).unwrap());
+    }
+    (model, pd, cq, qps)
+}
+
+/// A `wr_id` not delivered goes when its QP goes, and its destructor may poll the CQ, post on any
+/// QP and drop the last handle of another QP, whose own undelivered `wr_id` may do the same.
+#[test]
+fn a_wr_id_destructor_may_use_the_cq_when_its_qp_goes() {
+    let (m, pd, cq, mut all) = qps(30, 3, 8);
+    m.halt(true);
+    let dst = pd.alloc::<u8>(8).unwrap().expose().unwrap();
+    let to = dst.remote();
+    let src = filled(&pd, 8, 1);
+    let log = Rc::new(RefCell::new(Vec::new()));
+
+    // The peers are never dropped by this test's chain.
+    let f = all.pop().unwrap();
+    let e = Rc::new(all.pop().unwrap());
+    let d = all.pop().unwrap();
+    let c = all.pop().unwrap();
+    let _b = all.pop().unwrap();
+    let a = all.pop().unwrap();
+    let _f = f;
+
+    // The last in the chain: posts on `e` and polls.
+    let (last_log, last_cq, last_e, last_src) = (log.clone(), cq.clone(), e.clone(), src.clone());
+    let last = on_drop(move || {
+        last_cq.poll(32, drop);
+        let posted_log = last_log.clone();
+        let posted = on_drop(move || posted_log.borrow_mut().push("what the last posted"));
+        last_e
+            .post_write(last_src, to, posted)
+            .expect("room on another QP");
+        last_log.borrow_mut().push("the last");
+    });
+    d.post_write(src.clone(), to, last).unwrap();
+
+    // Holds the last handles of `c` and `d`: dropping `d` runs the wr_id above.
+    let (first_log, first_cq) = (log.clone(), cq.clone());
+    let held = RefCell::new(Some((c, d)));
+    let first = on_drop(move || {
+        drop(held.borrow_mut().take());
+        first_cq.poll(32, drop);
+        first_log.borrow_mut().push("the first");
+    });
+    a.post_write(src.clone(), to, first).unwrap();
+
+    let reserved = cq.reserved();
+    // The NIC flushes what the removals give up.
+    m.halt(false);
+    drop(a);
+    assert_eq!(
+        *log.borrow(),
+        ["the last", "what the last posted", "the first"]
+    );
+    assert_eq!(
+        cq.reserved(),
+        reserved - 3 * 16,
+        "`a`, `c` and `d` are gone"
+    );
+}
+
+/// A `wr_id` may hold the last handle of its own QP: that keeps the QP until the request comes back,
+/// and then the closure's drop of it removes the QP.
+#[test]
+fn a_wr_id_may_hold_the_last_handle_of_its_own_qp() {
+    struct Conn {
+        qp: Qp<RC, Rc<Conn>>,
+        gone: Rc<Cell<bool>>,
+    }
+    impl Drop for Conn {
+        fn drop(&mut self) {
+            self.gone.set(true);
+        }
+    }
+    let model = Model::new(31);
+    let ctx = Context::new(model.clone());
+    let pd = ctx.alloc_pd().unwrap();
+    let cq: Cq<Rc<Conn>> = ctx.create_local_cq(64).unwrap();
+    let a = pd.create_qp::<RC, _>(&cq, caps(8)).unwrap();
+    let b = pd.create_qp::<RC, _>(&cq, caps(8)).unwrap();
+    let (ea, eb) = (a.endpoint(), b.endpoint());
+    let gone = Rc::new(Cell::new(false));
+    let conn = Rc::new(Conn {
+        qp: a.handshake(eb).unwrap(),
+        gone: gone.clone(),
+    });
+    let _b = b.handshake(ea).unwrap();
+    let dst = pd.alloc::<u8>(8).unwrap().expose().unwrap();
+    let src = filled(&pd, 8, 1);
+    for _ in 0..3 {
+        conn.qp
+            .post_write(src.clone(), dst.remote(), conn.clone())
+            .unwrap();
+    }
+    let reserved = cq.reserved();
+    drop(conn);
+    assert!(!gone.get(), "its requests hold it");
+    let mut handed = 0;
+    while !gone.get() {
+        model.run();
+        handed += cq.poll(1, drop);
+    }
+    assert_eq!(handed, 3);
+    assert_eq!(cq.reserved(), reserved - 16);
+    assert!(src.try_thaw().is_ok());
+}
+
+/// A batch's closure runs with nothing held: it may post on its own QP and others, and poll.
+#[test]
+fn a_batch_closure_may_use_the_qp_and_the_cq() {
+    let (m, pd, cq, a, b) = pair::<RC, u32>(32, 16);
+    let dst = pd.alloc::<u8>(64).unwrap().expose().unwrap();
+    let src = filled(&pd, 8, 1);
+    a.post_write(src.clone(), dst.remote(), 1).unwrap();
+    m.run();
+    let mut got = Vec::new();
+    a.post_batch(4, |batch| {
+        batch.write(&src, dst.remote());
+        cq.poll(32, |wc| got.push(wc.wr_id));
+        a.post_write(src.clone(), dst.remote(), 2).unwrap();
+        b.post_write(src.clone(), dst.remote(), 3).unwrap();
+        batch.write(src.view(..4), dst.remote());
+    })
+    .unwrap();
+    assert_eq!(got, [1]);
+    m.run();
+    while got.len() < 4 {
+        cq.poll(32, |wc| got.push(wc.wr_id));
+    }
+    // On its QP, what the closure posted went first.
+    assert_eq!(got[1..], [3, 2, 4]);
+    assert!(src.try_thaw().is_ok());
+}
+
+/// Many WQEs of one buffer by reference keep one reference to it, and the request holds it until
+/// it completes.
+#[test]
+fn a_batch_by_reference_keeps_one_lease_of_one_buffer() {
+    let (m, pd, cq, a, _b) = pair::<RC, u32>(33, 32);
+    let dst = pd.alloc::<u8>(64).unwrap().expose().unwrap();
+    let src = filled(&pd, 8, 1);
+    a.post_batch(1, |batch| {
+        for i in 0..8 {
+            batch.write(&src, dst.remote().offset(i));
+        }
+        for i in 0..8 {
+            batch.write(src.view(i..i + 1), dst.remote().offset(i as u64));
+        }
+        assert_eq!(batch.len(), 16);
+    })
+    .unwrap();
+    assert!(!src.is_unique(), "the request holds it");
+    m.run();
+    let mut got = Vec::new();
+    while got.is_empty() {
+        cq.poll(32, |wc| got.push((wc.wr_id, wc.leases.len())));
+    }
+    assert_eq!(got, [(1, 1)]);
+    assert!(src.is_unique(), "released");
+}
+
+/// Several buffers in one batch, unique ones among them: what can come back comes back, on either
+/// way of driving a CQ, and a list of them is used again.
+#[test]
+fn a_batch_of_several_buffers_comes_back_or_is_released() {
+    let (m, pd, cq, a, _b) = pair::<RC, u32>(34, 32);
+    let dst = pd.alloc::<u8>(64).unwrap().expose().unwrap();
+    let srcs: Vec<_> = (0..4).map(|i| filled(&pd, 8, i)).collect();
+    for round in 0..10 {
+        a.post_batch(round, |batch| {
+            for src in &srcs {
+                batch.write(src, dst.remote());
+            }
+        })
+        .unwrap();
+        assert!(
+            srcs.iter().all(|src| !src.is_unique()),
+            "the request holds them"
+        );
+        m.run();
+        let mut got = Vec::new();
+        while got.is_empty() {
+            cq.poll(32, |wc| got.push((wc.wr_id, wc.leases.len())));
+        }
+        assert_eq!(got, [(round, 0)]);
+        assert!(srcs.iter().all(|src| src.is_unique()), "released");
+    }
 }

@@ -195,7 +195,7 @@ pub open spec fn covers_inputs(wqes: Seq<WqeLoans>, frontier: int) -> bool {
 /// The only new primitive here: std Arc's pointer comparison. Equality implies
 /// both references retain exactly the same frozen allocation.
 #[verifier::external_body]
-fn same_frozen_arc<N: Nic>(a: &Arc<Frozen<N>>, b: &Arc<Frozen<N>>) -> (same: bool)
+pub(crate) fn same_frozen_arc<N: Nic>(a: &Arc<Frozen<N>>, b: &Arc<Frozen<N>>) -> (same: bool)
     ensures same ==> **a == **b,
 {
     Arc::ptr_eq(a, b)
@@ -210,6 +210,26 @@ pub struct Part<N: Nic = Verbs> {
 }
 
 impl<N: Nic> Part<N> {
+    /// The frozen allocation that keeps it alive, if it is one.
+    #[inline(always)]
+    pub(crate) fn frozen_of(&self) -> (frozen: Option<&Arc<Frozen<N>>>)
+    {
+        match &self.lease {
+            Lease::Shared(frozen) => Some(frozen),
+            _ => None,
+        }
+    }
+
+    /// What keeps it alive: a frozen allocation, or another resource.
+    #[inline(always)]
+    pub(crate) fn into_frozen(self) -> (r: core::result::Result<Arc<Frozen<N>>, Lease<N>>)
+    {
+        match self.lease {
+            Lease::Shared(frozen) => Ok(frozen),
+            other => Err(other),
+        }
+    }
+
     /// The SGE's bytes are covered by the permission of its retained owner.
     #[verifier::type_invariant]
     pub closed spec fn inv(self) -> bool {
@@ -741,7 +761,7 @@ impl<N: Nic> Leases<N> {
     /// Retains an incoming resource or drops only a redundant shared reference.
     #[allow(clippy::collapsible_if)] // Keep the pattern and pointer primitive explicit for Verus.
     #[inline(always)]
-    fn push_resource(&mut self, lease: Lease<N>)
+    fn push_resource(&mut self, lease: Lease<N>, spare: &mut Vec<Lease<N>>)
         ensures
             final(self).loans() == old(self).loans(),
             final(self).wqes() == old(self).wqes(),
@@ -766,18 +786,18 @@ impl<N: Nic> Leases<N> {
         if matches!(self.held, Held::Nothing) {
             self.held = Held::One(lease);
         } else {
-            self.push_rest(lease);
+            self.push_rest(lease, spare);
         }
     }
 
     /// Retains a resource after the first one.
     #[inline(never)]
-    fn push_rest(&mut self, lease: Lease<N>)
+    fn push_rest(&mut self, lease: Lease<N>, spare: &mut Vec<Lease<N>>)
     {
         match &mut self.held {
             Held::Many(rest) => rest.push(lease),
             held => {
-                let mut rest = Vec::new();
+                let mut rest = core::mem::take(spare);
                 if let Held::One(first) = core::mem::replace(held, Held::Nothing) {
                     rest.push(first);
                 }
@@ -793,19 +813,100 @@ impl<N: Nic> Leases<N> {
         ensures old(self).inv() ==> final(self).inv(),
             final(self).loans() == old(self).loans().push(Loan { part, access: None }),
             final(self).wqes() == old(self).wqes(),
-    { self.push_loan(part, Ghost(None)); }
+    { self.push_loan(part, Ghost(None), &mut Vec::new()); }
 
-    /// Record the operation's access without storing it at run time.
+    /// Record the operation's access without storing it at run time. A list of several resources
+    /// starts from `spare`, which keeps what it took to hold such a list before.
+    #[allow(dead_code)] // The proofs' way in, until they are back: `OpenRequest` keeps leases now.
     #[inline(always)]
-    pub(crate) fn push_access(&mut self, part: Part<N>, Ghost(access): Ghost<Dir>)
+    pub(crate) fn push_access(&mut self, part: Part<N>, Ghost(access): Ghost<Dir>, spare: &mut Vec<Lease<N>>)
         requires access is In ==> part.spec_writable(),
         ensures old(self).inv() ==> final(self).inv(),
             final(self).loans() == old(self).loans().push(Loan { part, access: Some(access) }),
             final(self).wqes() == old(self).wqes(),
-    { self.push_loan(part, Ghost(Some(access))); }
+    { self.push_loan(part, Ghost(Some(access)), spare); }
+
+    /// Keeps a resource, starting a list of several from the room in `spare`. A frozen allocation
+    /// that is its last resource already is kept once.
+    pub(crate) fn keep_lease(&mut self, lease: Lease<N>, spare: &mut Vec<Lease<N>>)
+    {
+        self.push_resource(lease, spare);
+    }
+
+    /// [`Leases::keep_lease`] of a frozen allocation.
+    pub(crate) fn keep_frozen(&mut self, frozen: Arc<Frozen<N>>, spare: &mut Vec<Lease<N>>)
+    {
+        self.push_resource(Lease::Shared(frozen), spare);
+    }
+
+    /// Whether one more resource takes no allocation: it holds none, or a list with room.
+    #[inline(always)]
+    pub(crate) fn has_room(&self) -> (room: bool)
+    {
+        match &self.held {
+            Held::Nothing => true,
+            Held::One(_) => false,
+            Held::Many(rest) => rest.len() < rest.capacity(),
+        }
+    }
+
+    /// Keeps a resource, for which [`Leases::has_room`] says it has room.
+    #[inline(always)]
+    pub(crate) fn keep_in_room(&mut self, lease: Lease<N>)
+    {
+        match &mut self.held {
+            Held::Many(rest) => rest.push(lease),
+            _ => core::mem::forget(core::mem::replace(&mut self.held, Held::One(lease))),
+        }
+    }
+
+    /// Whether it holds a list of several resources.
+    #[inline(always)]
+    pub fn is_many(&self) -> (many: bool)
+    {
+        matches!(self.held, Held::Many(_))
+    }
+
+    /// What a completed request hands back of its list of several resources: frozen ones have no
+    /// way back and are released here, so that the list goes to `spare` for the next request of
+    /// several, unless more than one unique buffer has to leave in it.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn hand_back_many(&mut self, spare: &mut Vec<Lease<N>>)
+    {
+        let mut rest = match core::mem::replace(&mut self.held, Held::Nothing) {
+            Held::Many(rest) => rest,
+            other => {
+                self.held = other;
+                return;
+            },
+        };
+        // The unique ones first, in their order; the frozen ones go.
+        let mut kept = 0;
+        let mut i = 0;
+        while i < rest.len()
+        {
+            if matches!(&rest[i], Lease::Unique(_)) {
+                rest.swap(kept, i);
+                kept += 1;
+            }
+            i += 1;
+        }
+        rest.truncate(kept);
+        if kept > 1 {
+            self.held = Held::Many(rest);
+            return;
+        }
+        if let Some(unique) = rest.pop() {
+            self.held = Held::One(unique);
+        }
+        if spare.capacity() < rest.capacity() {
+            *spare = rest;
+        }
+    }
 
     #[inline(always)]
-    fn push_loan(&mut self, part: Part<N>, Ghost(access): Ghost<Option<Dir>>)
+    fn push_loan(&mut self, part: Part<N>, Ghost(access): Ghost<Option<Dir>>, spare: &mut Vec<Lease<N>>)
         requires access == Some(Dir::In) ==> part.spec_writable(),
         ensures
             old(self).inv() ==> final(self).inv(),
@@ -823,7 +924,7 @@ impl<N: Nic> Leases<N> {
             lease
         };
         proof { if before.inv() { self.lemma_incoming(incoming); } }
-        self.push_resource(lease);
+        self.push_resource(lease, spare);
         self.loans = Ghost(before.loans().push(Loan { part: incoming, access }));
         proof {
             if before.inv() {
