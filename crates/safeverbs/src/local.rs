@@ -26,6 +26,10 @@ const POLL_ONE_READS: usize = 16;
 /// `RefCell` flag: no atomics, no locks. Cheap to clone (a handle). It lives as long as any handle
 /// to it or any of its QPs.
 ///
+/// A `wr_id` comes back exactly once, or, if its request is never handed out, is dropped when its
+/// QP goes, with the CQ borrowed: the destructor of a `wr_id` must not use the CQ or its QPs, nor
+/// drop the last handle to one of them, which would panic.
+///
 /// ```no_run
 /// # use safeverbs::{Context, LocalCq, LocalQp, QpCaps, RC, Result, Buf};
 /// enum Req {
