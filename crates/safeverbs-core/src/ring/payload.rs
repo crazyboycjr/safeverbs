@@ -11,6 +11,7 @@
 use super::*;
 use crate::buf::Leases;
 use crate::nic::Nic;
+use crate::refine::Holds;
 
 verus! {
 
@@ -22,6 +23,8 @@ pub struct Payload<C, N: Nic> {
     pub ctx: Option<C>,
     /// Its buffers.
     pub leases: Leases<N>,
+    /// The leases of A these buffers stand for (erased).
+    pub holds: Ghost<Holds>,
 }
 
 impl<C, N: Nic> Payload<C, N> {

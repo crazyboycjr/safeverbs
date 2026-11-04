@@ -12,14 +12,6 @@ use send_outcomes::{send_range, send_reports_outcome};
 
 verus! {
 
-/// The other queue of a QP.
-pub open spec fn other_queue(queue: Queue) -> Queue {
-    match queue {
-        Queue::Send => Queue::Recv,
-        Queue::Recv => Queue::Send,
-    }
-}
-
 /// The queue M names by this name.
 pub open spec fn queue_of(side: Side) -> Queue {
     match side {
@@ -276,6 +268,7 @@ impl<C, N: Device> HwQp<C, N> {
         ensures
             *final(self) == (HwQp { send: final(self).send, recv: final(self).recv, ..*old(self) }),
             ring_of(*final(self), e.queue).walked(&ring_of(*old(self), e.queue), e.queue is Recv, e.seq as u64, *wc, true),
+            ring_of(*final(self), e.queue).completed_with(&ring_of(*old(self), e.queue), e.queue is Recv, e.seq as u64, *wc, true),
             ring_of(*final(self), other_queue(e.queue)) == ring_of(*old(self), other_queue(e.queue)),
     {
         let recv = is_recv(wc.wr_id);
@@ -1218,7 +1211,7 @@ impl<C, N: Device> Hw<C, N> {
             self.polled_at == if spent { pre.polled_at + 1 } else { pre.polled_at as int },
             self.pending@ == if spent { pre.pending@.drop_first() } else { pre.pending@ },
         ensures
-            self.inv(),
+            self.inv_m(),
             self.keeps_requests(pre),
     {
         let e = pre.pending@[0];
@@ -1296,7 +1289,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& r.meta(s)->0.end as int <= e.seq as int + 1
                 &&& spent == (r.meta(s)->0.end as int == e.seq as int + 1)
                 &&& c.result == r.retire_outcome(s, recv, e.seq as u64, wc)
-                &&& r.req(s)->0.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases })
+                &&& r.req(s)->0.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases, ..r.req(s)->0.leases })
                 &&& c.qp == i
                 &&& c.seq == s
                 &&& queue_of(c.queue) == e.queue
@@ -1314,7 +1307,7 @@ impl<C, N: Device> Hw<C, N> {
             self.polled_at == if spent { pre.polled_at + 1 } else { pre.polled_at as int },
             self.pending@ == if spent { pre.pending@.drop_first() } else { pre.pending@ },
         ensures
-            self.inv(),
+            self.inv_m(),
             self.keeps_requests(start),
             start.hands_out(c),
     {
@@ -1427,10 +1420,12 @@ impl<C, N: Device> Hw<C, N> {
             self.polled_at == pre.polled_at,
             self.polled_len == pre.polled_len,
             self.pending == pre.pending,
+            self.refined == pre.refined,
         ensures
             self.inv(),
             self.keeps_requests(pre),
             self.same_table(pre),
+            self.keeps_free(pre),
     {
     }
 
@@ -1452,14 +1447,17 @@ impl<C, N: Device> Hw<C, N> {
             self.polled_at == pre.polled_at,
             self.polled_len == pre.polled_len,
             self.pending == pre.pending,
+            self.refined == pre.refined,
         ensures
             self.inv(),
             self.keeps_requests(pre),
             self.same_table(pre),
+            self.keeps_free(pre),
     {
         let t = pre.token@;
         let m = pre.nic();
         let y = pre.qps@[index]->0;
+        refines::lemma_linked_same_rings(pre.qps@, self.qps@, m, pre.refined@);
         assert(qp_ok(pre.qps@[index], index, t, m));
         lemma_same_kept(y.send, y.send);
         lemma_same_kept(y.recv, y.recv);
@@ -1500,7 +1498,7 @@ impl<C, N: Device> Hw<C, N> {
             self.polled_len == pre.polled_len,
             self.pending == pre.pending,
         ensures
-            self.inv(),
+            self.inv_m(),
             self.keeps_requests(pre),
     {
         let (x, y) = (self.qps@[index]->0, pre.qps@[index]->0);

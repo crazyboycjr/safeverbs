@@ -218,7 +218,7 @@ impl<C, N: Device> Hw<C, N> {
     pub closed spec fn recv_taken_matches(&self, index: usize, seq: RingSeq, c: Completion<C, N>) -> bool {
         &&& self.has_qp(index as int)
         &&& self.qps@[index as int]->0.recv.req(seq as int) is Some
-        &&& self.qps@[index as int]->0.recv.req(seq as int)->0.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases })
+        &&& self.qps@[index as int]->0.recv.req(seq as int)->0.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases, ..self.qps@[index as int]->0.recv.req(seq as int)->0.leases })
         &&& self.recv_wqe(index, seq) is Some
         &&& self.nic().retired.contains_key(self.recv_wqe(index, seq)->0)
         &&& {
@@ -235,7 +235,7 @@ impl<C, N: Device> Hw<C, N> {
             self.inv(),
             self.has_qp(index as int),
             self.recv_taken_from(index, seq, t),
-            t.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases }),
+            t.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases, ..t.leases }),
             c.result == t.outcome,
         ensures
             c.leases.inv() && c.leases.fully_recorded(),

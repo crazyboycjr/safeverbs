@@ -1,46 +1,27 @@
-//! The ring refines the abstract machine A (`safeverbs_spec::abs`).
+//! The steps of the abstract machine A (`safeverbs_spec::abs`) behind an engine's requests.
 //!
-//! Every operation of [`Ring`] is specified by what A sees of the ring: its
-//! requests (`Ring::req`: posted and not freed), the requests written but
-//! not posted (`Ring::staged`) and the wakers woken (`Ring::woken`).
-//! This module proves that each of those changes is zero or more steps of
-//! A, from any state of A in which the ring's requests sit (`placed`) to
-//! one in which they sit again. That is the ring's share of the obligations
-//! of `safeverbs_spec::refinement::Refines`:
+//! What A sees of an engine is a [`View`]: its requests by key (`req`: posted to the NIC and not
+//! freed), those written and not posted (`staged`), whose leases are still the program's, and those
+//! whose doorbell was refused (`refused`), which never reached A. This module proves, one request at
+//! a time, that each change of what A sees is zero or more steps of A, from any state of A in which
+//! the view sits (`placed`) to one in which it sits again. The engine (`crate::hw::refines`) makes
+//! one view of all its rings, so these lemmas leave the other rings alone by construction.
 //!
-//! | Ring operation | Steps of A |
+//! | What changes of a request | Steps of A |
 //! | --- | --- |
-//! | `fill`, `unfill`, `take_general_path`, `take_detached_error` | none (`lemma_ring_stutter`) |
-//! | `stage`, `stage_filled` | none: a staged request's leases are still the program's (`lemma_ring_end`) |
-//! | `commit` | `post_request` for each staged request, then its `register` or `detach` (`lemma_ring_commit`) |
-//! | `abort`, `abort_keeping` | `drop` of each lease of each staged request without an owner; none for the others, whose leases the ring keeps for their owners (refused) or hands back (`lemma_ring_abort`) |
-//! | `complete`, `retire_next` | `complete` for each request retired, in order, waking the same wakers (`lemma_ring_complete`) |
-//! | `retire_oldest`, its slot emptied | `complete`, then `take`, of the oldest request in flight (`lemma_ring_oldest`) |
-//! | `take`, `take_retired` | `take` (`lemma_ring_take`); none for a refused request (`lemma_ring_take_refused`) |
-//! | `detach` | `detach`, none for a staged request, `drop` of each lease for a refused one (`lemma_ring_detach`) |
-//! | `set_waker` | `register`, none for a staged request (`lemma_ring_register`) |
-//! | `release_all` | `complete` for each request in flight, then `detach`, and `drop` of each lease of each staged or refused one (`lemma_ring_release_all`) |
+//! | it is staged | none: a staged request's leases are still the program's (`lemma_end`) |
+//! | it is posted | `post_request`, then its `register` or `detach` (`lemma_post_one`) |
+//! | its doorbell is refused | `drop` of each lease of one without an owner; none for the others, whose leases wait for their owners or go back (`lemma_abort`) |
+//! | M retired it | `complete` (`lemma_complete_one`) |
+//! | its owner takes it | `take`, and `drop` of its shared leases (`lemma_take`); of a refused one, those `drop`s alone (`lemma_forget`) |
+//! | its owner gives it up | `detach`, none for a staged one, `drop` of each lease of a refused one (`lemma_detach`) |
+//! | a future registers a waker | `register`, none for a staged one (`lemma_register`) |
+//! | its queue pair goes, nothing in flight | `detach` (`lemma_release_one`), and `drop` of each lease of a refused one |
 //!
-//! A request whose doorbell was refused never reached A: its leases stay
-//! the program's, and the ring only keeps them for the owner (`View::refused`),
-//! who takes them back with a refusal or drops them.
-//!
-//! The async layer's side list of results moved out of a clogged ring is
-//! covered too (`with_side`, `lemma_side_move`, `lemma_side_take`,
-//! `lemma_side_detach` and their `_refused` forms): moving a result there
-//! is no step, taking it is A's `take` with the outcome and leases the ring
-//! gave (none for a refused one), dropping its future A's `detach` (`drop`
-//! of each lease for a refused one).
-//!
-//! Leases are tracked as values: the `L` that A sees a request hold is the
-//! one `stage` moved into the ring, and `take` and `abort_keeping` hand back
-//! that value. With the linearity of `L` (Rust moves it; the ring never
-//! duplicates it), this proves retention of the ring's resource values: its leases stay
-//! in its slot, unreachable, from `stage` until A says the NIC is done with
-//! them (complete, or never posted), and leave it exactly once.
-//!
-//! Which request of A a request of the ring is (`reqs`) and which leases of A
-//! its value `L` stands for (`Held`) are ghost; the ring needs neither.
+//! A request whose doorbell was refused never reached A: its leases stay the program's, and the
+//! ring only keeps them for the owner, who takes them back with a refusal or drops them. A shared
+//! lease is the request's alone (`share` makes it when the request is written): it has no way back
+//! to the program, so it goes with the request. A unique one comes back under its own name.
 //!
 //! Everything here is ghost code: a plain build erases it.
 // The imports are used by ghost code only.
@@ -52,18 +33,29 @@ use safeverbs_spec::types::{Outcome, QpId, Status};
 use vstd::prelude::*;
 
 use crate::ring::{ReqView, Ring};
-use crate::wc::Wc;
 
 verus! {
 
-/// Which leases of A a request's value `L` stands for, each with how the NIC
-/// touches it, given the request's sequence number: equal shared values in
-/// different requests stand for different leases. Building it from the engine's
-/// buffers is the engine's proof; these adapters prove that the ring preserves it.
-pub type Held<L> = spec_fn(int, L) -> Map<LeaseId, Dir>;
+/// A lease a request holds, as the request knows it: how the NIC touches it, and its bytes.
+pub ghost struct Hold {
+    /// How the NIC touches it.
+    pub dir: Dir,
+    /// Its bytes.
+    pub mem: ISet<int>,
+}
 
-/// What A sees of a ring: its requests and its staged requests, by sequence
-/// number.
+/// The leases of A a request holds, by name.
+pub type Holds = Map<LeaseId, Hold>;
+
+/// Which leases of A a request's value `L` stands for, given its key.
+pub type Held<L> = spec_fn(int, L) -> Holds;
+
+/// The directions of `holds`, as A's `post_request` takes them.
+pub open spec fn dirs_of(holds: Holds) -> Map<LeaseId, Dir> {
+    holds.map_values(|h: Hold| h.dir)
+}
+
+/// What A sees of a set of requests, by key.
 pub ghost struct View<L> {
     /// The requests A sees: posted and not freed.
     pub req: spec_fn(int) -> Option<ReqView<L>>,
@@ -108,7 +100,7 @@ pub open spec fn holds<L>(v: View<L>, s: int) -> bool {
 }
 
 /// The leases of A that request `s` of `v` holds.
-pub open spec fn leases_of<L>(v: View<L>, held: Held<L>, s: int) -> Map<LeaseId, Dir> {
+pub open spec fn leases_of<L>(v: View<L>, held: Held<L>, s: int) -> Holds {
     if (v.req)(s) is Some {
         held(s, (v.req)(s)->0.leases)
     } else if (v.staged)(s) is Some {
@@ -125,22 +117,32 @@ pub open spec fn as_req<L>(r: ReqView<L>, q: QpId) -> Req {
     Req { qp: q, phase: r.phase, waker: r.waker, detached: r.detached }
 }
 
-/// Request `r` of `a` holds exactly the leases `dirs`, each in its direction.
-pub open spec fn holds_exactly(a: Abs::State, r: ReqId, dirs: Map<LeaseId, Dir>) -> bool {
-    &&& forall|l: LeaseId| #[trigger] dirs.contains_key(l) ==> a.leases.contains_key(l)
-        && a.leases[l].holder == (Holder::Request { req: r, dir: dirs[l] })
+/// Request `r` of `a` holds exactly the leases `h`, each in its direction, with its bytes.
+pub open spec fn holds_exactly(a: Abs::State, r: ReqId, h: Holds) -> bool {
+    &&& forall|l: LeaseId| #[trigger] h.contains_key(l) ==> a.leases.contains_key(l)
+        && a.leases[l].holder == (Holder::Request { req: r, dir: h[l].dir })
+        && a.leases[l].mem == h[l].mem
     &&& forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && a.leases[l].held_by(r)
-        ==> dirs.contains_key(l)
+        ==> h.contains_key(l)
 }
 
-/// Request `s` of `v` sits in `a`: a posted one is request `reqs[s]` of `a`, on
-/// queue pair `q`, with the same phase, waker and owner, and holds exactly its
-/// leases; the leases of a staged or refused one are the program's, and may
-/// be posted in their directions.
+/// The program holds the leases `h`, with their bytes, and may post them in their directions.
+pub open spec fn may_post_holds(a: Abs::State, h: Holds) -> bool {
+    forall|l: LeaseId| #[trigger] h.contains_key(l) ==> {
+        &&& a.is_program(l)
+        &&& h[l].dir is In ==> a.leases[l].writable()
+        &&& a.leases[l].mem == h[l].mem
+    }
+}
+
+/// Request `s` of `v` sits in `a`: a posted one is request `reqs[s]` of `a`, on its queue pair, with
+/// the same phase, waker and owner, and holds exactly its leases; the leases of a staged or
+/// refused one are the program's, and may be posted in their directions, a staged one on a queue
+/// pair that exists.
 pub open spec fn sits<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
@@ -148,48 +150,38 @@ pub open spec fn sits<L>(
     &&& (v.req)(s) is Some ==> {
         &&& reqs.contains_key(s)
         &&& a.requests.contains_key(reqs[s])
-        &&& a.requests[reqs[s]] == as_req((v.req)(s)->0, q)
+        &&& a.requests[reqs[s]] == as_req((v.req)(s)->0, q((v.req)(s)->0.leases))
         &&& holds_exactly(a, reqs[s], held(s, (v.req)(s)->0.leases))
     }
-    &&& (v.staged)(s) is Some ==> a.may_post(held(s, (v.staged)(s)->0.leases))
-    &&& (v.refused)(s) is Some ==> a.may_post(held(s, (v.refused)(s)->0))
+    &&& (v.staged)(s) is Some ==> {
+        &&& may_post_holds(a, held(s, (v.staged)(s)->0.leases))
+        &&& a.qps.contains(q((v.staged)(s)->0.leases))
+    }
+    &&& (v.refused)(s) is Some ==> may_post_holds(a, held(s, (v.refused)(s)->0))
 }
 
-/// The ring's requests sit in `a`, and no two hold the same lease or are the
+/// Request `r` of A is one of `v`.
+pub open spec fn names_request<L>(v: View<L>, reqs: Map<int, ReqId>, r: ReqId) -> bool {
+    exists|s: int| #[trigger] (v.req)(s) is Some && reqs[s] == r
+}
+
+/// The requests of `v` sit in `a` and are all it has, and no two hold the same lease or are the
 /// same request of `a`.
 pub open spec fn placed<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
 ) -> bool {
     &&& abs_inv(a)
     &&& wf(v)
-    &&& a.qps.contains(q)
     &&& forall|s: int| #[trigger] sits(v, a, q, reqs, held, s)
     &&& forall|s: int, t: int| #![trigger leases_of(v, held, s), leases_of(v, held, t)]
         s != t ==> leases_of(v, held, s).dom().disjoint(leases_of(v, held, t).dom())
     &&& forall|s: int, t: int| #![trigger reqs[s], reqs[t]]
         (v.req)(s) is Some && (v.req)(t) is Some && s != t ==> reqs[s] != reqs[t]
-}
-
-/// The names of the wakers held by requests `[from, to)` of `v`, in order.
-pub open spec fn wakers<L>(v: View<L>, from: int, to: int) -> Seq<WakerId>
-    decreases to - from,
-{
-    if to <= from {
-        Seq::empty()
-    } else {
-        let before = wakers(v, from, to - 1);
-        match (v.req)(to - 1) {
-            Some(r) => match r.waker {
-                Some(w) => before.push(w),
-                None => before,
-            },
-            None => before,
-        }
-    }
+    &&& forall|r: ReqId| #[trigger] a.requests.contains_key(r) ==> names_request(v, reqs, r)
 }
 
 /// `v` and `w` agree.
@@ -199,9 +191,34 @@ pub open spec fn same<L>(v: View<L>, w: View<L>) -> bool {
     &&& forall|s: int| #[trigger] (v.refused)(s) == (w.refused)(s)
 }
 
-/// The outcome A gives a request in flight when its queue pair is destroyed.
-pub open spec fn flushed() -> Outcome {
-    Outcome { status: Status::FlushErr, kind: safeverbs_spec::types::CompletionKind::StatusOnly, byte_len: 0, imm: None }
+/// The program holds lease `l` of `a`, and no request of `v` keeps it for its owner.
+pub open spec fn free_lease<L>(v: View<L>, a: Abs::State, held: Held<L>, l: LeaseId) -> bool {
+    &&& a.is_program(l)
+    &&& forall|s: int| !(#[trigger] leases_of(v, held, s).contains_key(l))
+}
+
+/// What the program holds free in `a` it still holds free in `a2`, as it was.
+pub open spec fn kept_free<L>(v: View<L>, a: Abs::State, w: View<L>, a2: Abs::State, held: Held<L>) -> bool {
+    forall|l: LeaseId| #[trigger] free_lease(v, a, held, l)
+        ==> free_lease(w, a2, held, l) && a2.leases[l] == a.leases[l]
+}
+
+/// `a2` has the queue pairs and outcomes of `a`, and no request it did not have, each as it was as
+/// far as its queue pair and its being in flight go.
+pub open spec fn kept_requests(a: Abs::State, a2: Abs::State) -> bool {
+    &&& a2.qps == a.qps
+    &&& a2.outcomes == a.outcomes
+    &&& a2.next_id == a.next_id
+    &&& forall|r: ReqId| #[trigger] a2.requests.contains_key(r) ==> {
+        &&& a.requests.contains_key(r)
+        &&& a2.requests[r].qp == a.requests[r].qp
+        &&& a2.in_flight(r) == a.in_flight(r)
+    }
+}
+
+/// The shared ones among the leases `h`, in `a`.
+pub open spec fn shared_in(a: Abs::State, h: Holds) -> Set<LeaseId> {
+    h.dom().filter(|l: LeaseId| !a.leases[l].unique)
 }
 
 // =============================================================================
@@ -275,8 +292,17 @@ pub open spec fn take_state(a: Abs::State, r: ReqId) -> Abs::State {
     Abs::State { requests: a.requests.remove(r), leases: a.leases_returned(r), ..a }
 }
 
+/// A's state after `share` of the shared lease `l`, for the bytes `sub`.
+pub open spec fn share_state(a: Abs::State, l: LeaseId, sub: ISet<int>) -> Abs::State {
+    Abs::State {
+        leases: a.leases.insert(a.next_id, Lease { mem: sub, ..a.leases[l] }),
+        next_id: a.next_id + 1,
+        ..a
+    }
+}
+
 /// One step of A keeps its invariants and is an execution.
-proof fn lemma_step_one(a: Abs::State, a2: Abs::State, step: Abs::Step)
+pub proof fn lemma_step_one(a: Abs::State, a2: Abs::State, step: Abs::Step)
     requires
         abs_inv(a),
         abs_step(a, a2, step),
@@ -290,7 +316,7 @@ proof fn lemma_step_one(a: Abs::State, a2: Abs::State, step: Abs::Step)
 }
 
 /// Dropping a set of the program's leases is A's `drop` of each.
-proof fn lemma_drop_leases(a: Abs::State, ls: Set<LeaseId>) -> (a2: Abs::State)
+pub proof fn lemma_drop_leases(a: Abs::State, ls: Set<LeaseId>) -> (a2: Abs::State)
     requires
         abs_inv(a),
         forall|l: LeaseId| #[trigger] ls.contains(l) ==> a.is_program(l),
@@ -318,14 +344,14 @@ proof fn lemma_drop_leases(a: Abs::State, ls: Set<LeaseId>) -> (a2: Abs::State)
 }
 
 // =============================================================================
-// Single steps
+// Placement
 
 /// Placement carries over to a view that agrees.
 pub proof fn lemma_same<L>(
     v: View<L>,
     w: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
 )
@@ -334,6 +360,7 @@ pub proof fn lemma_same<L>(
         same(v, w),
     ensures
         placed(w, a, q, reqs, held),
+        kept_free(v, a, w, a, held),
 {
     assert forall|s: int| #[trigger] wf_at(w, s) by {
         assert(wf_at(v, s));
@@ -343,27 +370,42 @@ pub proof fn lemma_same<L>(
         assert(sits(v, a, q, reqs, held, s));
         assert((v.req)(s) == (w.req)(s) && (v.staged)(s) == (w.staged)(s) && (v.refused)(s) == (w.refused)(s));
     }
+    assert forall|s: int| #[trigger] leases_of(w, held, s) == leases_of(v, held, s) by {
+        assert((v.req)(s) == (w.req)(s) && (v.staged)(s) == (w.staged)(s) && (v.refused)(s) == (w.refused)(s));
+    }
     assert forall|s: int, t: int| #![trigger leases_of(w, held, s), leases_of(w, held, t)]
         s != t implies leases_of(w, held, s).dom().disjoint(leases_of(w, held, t).dom()) by {
+        assert(leases_of(w, held, s) == leases_of(v, held, s));
+        assert(leases_of(w, held, t) == leases_of(v, held, t));
         assert(leases_of(v, held, s).dom().disjoint(leases_of(v, held, t).dom()));
-        assert((v.req)(s) == (w.req)(s) && (v.staged)(s) == (w.staged)(s) && (v.refused)(s) == (w.refused)(s));
-        assert((v.req)(t) == (w.req)(t) && (v.staged)(t) == (w.staged)(t) && (v.refused)(t) == (w.refused)(t));
     }
     assert forall|s: int, t: int| #![trigger reqs[s], reqs[t]]
         (w.req)(s) is Some && (w.req)(t) is Some && s != t implies reqs[s] != reqs[t] by {
         assert((v.req)(s) == (w.req)(s) && (v.req)(t) == (w.req)(t));
+    }
+    assert forall|r: ReqId| #[trigger] a.requests.contains_key(r) implies names_request(w, reqs, r) by {
+        assert(names_request(v, reqs, r));
+        let s = choose|s: int| #[trigger] (v.req)(s) is Some && reqs[s] == r;
+        assert((v.req)(s) == (w.req)(s));
+    }
+    assert forall|l: LeaseId| #[trigger] free_lease(v, a, held, l)
+        implies free_lease(w, a, held, l) && a.leases[l] == a.leases[l] by {
+        assert forall|s: int| !(#[trigger] leases_of(w, held, s).contains_key(l)) by {
+            assert(leases_of(w, held, s) == leases_of(v, held, s));
+            assert(!leases_of(v, held, s).contains_key(l));
+        }
     }
 }
 
 /// `w` is placed in `a2` when it agrees with `v`, placed in `a`, but at request
 /// `s`, which sits in `a2`, and `a2` keeps what `a` has but request `r` and the
 /// leases of `s`, which request `r` or the program holds if they are left.
-proof fn lemma_placed_but<L>(
+pub proof fn lemma_placed_but<L>(
     v: View<L>,
     w: View<L>,
     a: Abs::State,
     a2: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     reqs2: Map<int, ReqId>,
     held: Held<L>,
@@ -380,7 +422,9 @@ proof fn lemma_placed_but<L>(
         forall|t: int| t != s && #[trigger] reqs.contains_key(t) ==> reqs2.contains_key(t) && reqs2[t] == reqs[t],
         forall|t: ReqId| #[trigger] a.requests.contains_key(t) && t != r
             ==> a2.requests.contains_key(t) && a2.requests[t] == a.requests[t],
-        r == a.next_id || ((v.req)(s) is Some && r == reqs[s]),
+        forall|t: ReqId| #[trigger] a2.requests.contains_key(t) && t != r ==> a.requests.contains_key(t),
+        a2.requests.contains_key(r) ==> (w.req)(s) is Some && reqs2[s] == r,
+        (r == a.next_id && (v.req)(s) is None) || ((v.req)(s) is Some && r == reqs[s]),
         forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && !leases_of(v, held, s).contains_key(l)
             ==> a2.leases.contains_key(l) && a2.leases[l] == a.leases[l],
         forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) ==> a.leases.contains_key(l)
@@ -392,9 +436,11 @@ proof fn lemma_placed_but<L>(
         (w.req)(s) is Some ==> reqs2[s] == r,
     ensures
         placed(w, a2, q, reqs2, held),
+        kept_free(v, a, w, a2, held),
 {
     assert forall|t: int| t != s && #[trigger] (v.req)(t) is Some implies reqs[t] != r by {
         assert(sits(v, a, q, reqs, held, t));
+        assert(a.requests.contains_key(reqs[t]));
     }
     assert forall|t: int| #[trigger] wf_at(w, t) by {
         if t != s {
@@ -408,46 +454,54 @@ proof fn lemma_placed_but<L>(
             assert(leases_of(v, held, t).dom().disjoint(leases_of(v, held, s).dom()));
             assert((w.req)(t) == (v.req)(t) && (w.staged)(t) == (v.staged)(t) && (w.refused)(t) == (v.refused)(t));
             if (v.req)(t) is Some {
-                let dirs = held(t, (v.req)(t)->0.leases);
-                assert(dirs == leases_of(v, held, t));
+                let h = held(t, (v.req)(t)->0.leases);
+                assert(h == leases_of(v, held, t));
                 assert(reqs2.contains_key(t) && reqs2[t] == reqs[t]);
-                assert forall|l: LeaseId| #[trigger] dirs.contains_key(l) implies a2.leases.contains_key(l)
-                    && a2.leases[l].holder == (Holder::Request { req: reqs[t], dir: dirs[l] }) by {
+                assert forall|l: LeaseId| #[trigger] h.contains_key(l) implies a2.leases.contains_key(l)
+                    && a2.leases[l].holder == (Holder::Request { req: reqs[t], dir: h[l].dir })
+                    && a2.leases[l].mem == h[l].mem by {
                     assert(!leases_of(v, held, s).dom().contains(l));
                 }
                 assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) && a2.leases[l].held_by(reqs[t])
-                    implies dirs.contains_key(l) by {
+                    implies h.contains_key(l) by {
                     assert(a.leases.contains_key(l));
                     assert(reqs[t] != r);
                 }
             }
             if (v.staged)(t) is Some {
-                let dirs = held(t, (v.staged)(t)->0.leases);
-                assert(dirs == leases_of(v, held, t));
-                assert forall|l: LeaseId| #[trigger] dirs.contains_key(l) implies a2.is_program(l)
-                    && (dirs[l] is In ==> a2.leases[l].writable()) by {
+                let h = held(t, (v.staged)(t)->0.leases);
+                assert(h == leases_of(v, held, t));
+                assert forall|l: LeaseId| #[trigger] h.contains_key(l) implies {
+                    &&& a2.is_program(l)
+                    &&& h[l].dir is In ==> a2.leases[l].writable()
+                    &&& a2.leases[l].mem == h[l].mem
+                } by {
                     assert(!leases_of(v, held, s).dom().contains(l));
                 }
             }
             if (v.refused)(t) is Some {
-                let dirs = held(t, (v.refused)(t)->0);
-                assert(dirs == leases_of(v, held, t));
-                assert forall|l: LeaseId| #[trigger] dirs.contains_key(l) implies a2.is_program(l)
-                    && (dirs[l] is In ==> a2.leases[l].writable()) by {
+                let h = held(t, (v.refused)(t)->0);
+                assert(h == leases_of(v, held, t));
+                assert forall|l: LeaseId| #[trigger] h.contains_key(l) implies {
+                    &&& a2.is_program(l)
+                    &&& h[l].dir is In ==> a2.leases[l].writable()
+                    &&& a2.leases[l].mem == h[l].mem
+                } by {
                     assert(!leases_of(v, held, s).dom().contains(l));
                 }
             }
         }
     }
+    assert forall|t: int| t != s implies #[trigger] leases_of(w, held, t) == leases_of(v, held, t) by {
+        assert((w.req)(t) == (v.req)(t) && (w.staged)(t) == (v.staged)(t) && (w.refused)(t) == (v.refused)(t));
+    }
     assert forall|t: int, u: int| #![trigger leases_of(w, held, t), leases_of(w, held, u)]
         t != u implies leases_of(w, held, t).dom().disjoint(leases_of(w, held, u).dom()) by {
         assert(leases_of(v, held, t).dom().disjoint(leases_of(v, held, u).dom()));
         if t != s {
-            assert((w.req)(t) == (v.req)(t) && (w.staged)(t) == (v.staged)(t) && (w.refused)(t) == (v.refused)(t));
             assert(leases_of(w, held, t) == leases_of(v, held, t));
         }
         if u != s {
-            assert((w.req)(u) == (v.req)(u) && (w.staged)(u) == (v.staged)(u) && (w.refused)(u) == (v.refused)(u));
             assert(leases_of(w, held, u) == leases_of(v, held, u));
         }
     }
@@ -462,19 +516,127 @@ proof fn lemma_placed_but<L>(
             assert((w.req)(u) == (v.req)(u) && reqs2[u] == reqs[u]);
         }
     }
+    assert forall|t: ReqId| #[trigger] a2.requests.contains_key(t) implies names_request(w, reqs2, t) by {
+        if t == r {
+            assert((w.req)(s) is Some && reqs2[s] == r);
+        } else {
+            assert(a.requests.contains_key(t));
+            assert(names_request(v, reqs, t));
+            let u = choose|u: int| #[trigger] (v.req)(u) is Some && reqs[u] == t;
+            assert(sits(v, a, q, reqs, held, u));
+            // `s`, if it was posted, is request `r`.
+            assert(u != s);
+            assert((w.req)(u) == (v.req)(u) && reqs2[u] == reqs[u]);
+        }
+    }
+    assert forall|l: LeaseId| #[trigger] free_lease(v, a, held, l)
+        implies free_lease(w, a2, held, l) && a2.leases[l] == a.leases[l] by {
+        assert(!leases_of(v, held, s).contains_key(l));
+        assert forall|t: int| !(#[trigger] leases_of(w, held, t).contains_key(l)) by {
+            assert(!leases_of(v, held, t).contains_key(l));
+            if t != s {
+                assert(leases_of(w, held, t) == leases_of(v, held, t));
+            } else {
+                assert(!leases_of(v, held, s).dom().contains(l));
+            }
+        }
+    }
 }
 
-/// `w` is placed in `a`: it agrees with `v` but at request `s`, whose leases
-/// (if any are left to it) are the program's: no step of A.
-proof fn lemma_reshape<L>(
+/// A lease a request of `v` holds or keeps is one `a` has.
+pub proof fn lemma_held_exists<L>(
     v: View<L>,
-    w: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
+    l: LeaseId,
 )
+    requires
+        placed(v, a, q, reqs, held),
+        leases_of(v, held, s).contains_key(l),
+    ensures
+        a.leases.contains_key(l),
+{
+    assert(sits(v, a, q, reqs, held, s));
+}
+
+/// `v` stays placed through a change of A that leaves its requests, and every lease of its own, as
+/// they were: a lease of the program changes, or a queue pair no request is on.
+pub proof fn lemma_placed_apart<L>(
+    v: View<L>,
+    a: Abs::State,
+    a2: Abs::State,
+    q: spec_fn(L) -> QpId,
+    reqs: Map<int, ReqId>,
+    held: Held<L>,
+)
+    requires
+        placed(v, a, q, reqs, held),
+        abs_inv(a2),
+        a2.requests == a.requests,
+        forall|s: int, l: LeaseId| #[trigger] leases_of(v, held, s).contains_key(l)
+            ==> a2.leases.contains_key(l) && a2.leases[l] == a.leases[l],
+        forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) && a2.leases[l].holder is Request
+            ==> a.leases.contains_key(l) && a2.leases[l] == a.leases[l],
+        forall|s: int| #[trigger] (v.staged)(s) is Some ==> a2.qps.contains(q((v.staged)(s)->0.leases)),
+    ensures
+        placed(v, a2, q, reqs, held),
+{
+    assert forall|s: int| #[trigger] sits(v, a2, q, reqs, held, s) by {
+        assert(sits(v, a, q, reqs, held, s));
+        assert(wf_at(v, s));
+        if (v.req)(s) is Some {
+            let h = held(s, (v.req)(s)->0.leases);
+            assert(h == leases_of(v, held, s));
+            assert forall|l: LeaseId| #[trigger] h.contains_key(l) implies a2.leases.contains_key(l)
+                && a2.leases[l].holder == (Holder::Request { req: reqs[s], dir: h[l].dir })
+                && a2.leases[l].mem == h[l].mem by {
+                assert(leases_of(v, held, s).contains_key(l));
+            }
+        }
+        if (v.staged)(s) is Some {
+            let h = held(s, (v.staged)(s)->0.leases);
+            assert(h == leases_of(v, held, s));
+            assert forall|l: LeaseId| #[trigger] h.contains_key(l) implies {
+                &&& a2.is_program(l)
+                &&& h[l].dir is In ==> a2.leases[l].writable()
+                &&& a2.leases[l].mem == h[l].mem
+            } by {
+                assert(leases_of(v, held, s).contains_key(l));
+            }
+        }
+        if (v.refused)(s) is Some {
+            let h = held(s, (v.refused)(s)->0);
+            assert(h == leases_of(v, held, s));
+            assert forall|l: LeaseId| #[trigger] h.contains_key(l) implies {
+                &&& a2.is_program(l)
+                &&& h[l].dir is In ==> a2.leases[l].writable()
+                &&& a2.leases[l].mem == h[l].mem
+            } by {
+                assert(leases_of(v, held, s).contains_key(l));
+            }
+        }
+    }
+    assert forall|r: ReqId| #[trigger] a2.requests.contains_key(r) implies names_request(v, reqs, r) by {
+        assert(a.requests.contains_key(r));
+    }
+}
+
+/// `w` is placed in `a2`: it agrees with `v` but at request `s`, of which it has no posted request,
+/// nor `v` had, and the leases `gone` of the program, which only `s` kept, are dropped; what is left
+/// to `s` of its leases is the program's.
+pub proof fn lemma_forget<L>(
+    v: View<L>,
+    w: View<L>,
+    a: Abs::State,
+    q: spec_fn(L) -> QpId,
+    reqs: Map<int, ReqId>,
+    held: Held<L>,
+    s: int,
+    gone: Set<LeaseId>,
+) -> (a2: Abs::State)
     requires
         placed(v, a, q, reqs, held),
         forall|t: int| t != s ==> #[trigger] (w.req)(t) == (v.req)(t),
@@ -483,15 +645,177 @@ proof fn lemma_reshape<L>(
         (v.req)(s) is None,
         (w.req)(s) is None,
         wf_at(w, s),
-        sits(w, a, q, reqs, held, s),
-        leases_of(w, held, s).dom().subset_of(leases_of(v, held, s).dom()),
+        (w.staged)(s) is Some ==> a.qps.contains(q((w.staged)(s)->0.leases)),
+        (w.staged)(s) is Some ==> leases_of(w, held, s) == leases_of(v, held, s),
+        (w.refused)(s) is Some ==> leases_of(w, held, s) == leases_of(v, held, s),
+        gone.subset_of(leases_of(v, held, s).dom()),
+        (w.staged)(s) is Some || (w.refused)(s) is Some ==> gone == Set::<LeaseId>::empty(),
     ensures
-        placed(w, a, q, reqs, held),
+        abs_reaches(a, a2),
+        placed(w, a2, q, reqs, held),
+        kept_free(v, a, w, a2, held),
+        kept_requests(a, a2),
+        a2.requests == a.requests,
+        forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && !gone.contains(l)
+            ==> a2.leases.contains_key(l) && a2.leases[l] == a.leases[l],
 {
     assert(sits(v, a, q, reqs, held, s));
     assert(wf_at(v, s));
-    lemma_placed_but(v, w, a, a, q, reqs, reqs, held, s, a.next_id);
+    let h = leases_of(v, held, s);
+    assert forall|l: LeaseId| #[trigger] gone.contains(l) implies a.is_program(l) by {
+        assert(h.dom().contains(l));
+        if (v.staged)(s) is Some {
+            assert(h == held(s, (v.staged)(s)->0.leases));
+        } else {
+            assert(h == held(s, (v.refused)(s)->0));
+        }
+    }
+    let a2 = lemma_drop_leases(a, gone);
+    assert(sits(w, a2, q, reqs, held, s)) by {
+        if (w.staged)(s) is Some {
+            let g = held(s, (w.staged)(s)->0.leases);
+            assert(g == h);
+            assert forall|l: LeaseId| #[trigger] g.contains_key(l) implies {
+                &&& a2.is_program(l)
+                &&& g[l].dir is In ==> a2.leases[l].writable()
+                &&& a2.leases[l].mem == g[l].mem
+            } by {
+                assert(!gone.contains(l));
+                if (v.staged)(s) is Some {
+                    assert(h == held(s, (v.staged)(s)->0.leases));
+                } else {
+                    assert(h == held(s, (v.refused)(s)->0));
+                }
+            }
+        }
+        if (w.refused)(s) is Some {
+            let g = held(s, (w.refused)(s)->0);
+            assert(g == h);
+            assert forall|l: LeaseId| #[trigger] g.contains_key(l) implies {
+                &&& a2.is_program(l)
+                &&& g[l].dir is In ==> a2.leases[l].writable()
+                &&& a2.leases[l].mem == g[l].mem
+            } by {
+                assert(!gone.contains(l));
+                if (v.staged)(s) is Some {
+                    assert(h == held(s, (v.staged)(s)->0.leases));
+                } else {
+                    assert(h == held(s, (v.refused)(s)->0));
+                }
+            }
+        }
+    }
+    assert(leases_of(w, held, s).dom().subset_of(h.dom()));
+    assert(!a.requests.contains_key(a.next_id));
+    assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) implies a.leases.contains_key(l)
+        && (leases_of(v, held, s).contains_key(l) ==> a2.leases[l].holder is Program) by {
+        if leases_of(v, held, s).contains_key(l) {
+            if (v.staged)(s) is Some {
+                assert(h == held(s, (v.staged)(s)->0.leases));
+            } else {
+                assert(h == held(s, (v.refused)(s)->0));
+            }
+        }
+    }
+    lemma_placed_but(v, w, a, a2, q, reqs, reqs, held, s, a.next_id);
+    a2
 }
+
+/// `share` of a lease of the program: a new lease of the program, no request's.
+pub proof fn lemma_share<L>(
+    v: View<L>,
+    a: Abs::State,
+    q: spec_fn(L) -> QpId,
+    reqs: Map<int, ReqId>,
+    held: Held<L>,
+    l: LeaseId,
+    sub: ISet<int>,
+)
+    requires
+        placed(v, a, q, reqs, held),
+        a.is_program(l),
+        !a.leases[l].unique,
+        sub.subset_of(a.leases[l].mem),
+    ensures
+        abs_step(a, share_state(a, l, sub), Abs::Step::share(l, sub)),
+        abs_reaches(a, share_state(a, l, sub)),
+        placed(v, share_state(a, l, sub), q, reqs, held),
+        free_lease(v, share_state(a, l, sub), held, a.next_id),
+        forall|k: LeaseId| #[trigger] free_lease(v, a, held, k)
+            ==> free_lease(v, share_state(a, l, sub), held, k) && share_state(a, l, sub).leases[k] == a.leases[k],
+{
+    let a2 = share_state(a, l, sub);
+    assert(abs_step(a, a2, Abs::Step::share(l, sub)));
+    lemma_step_one(a, a2, Abs::Step::share(l, sub));
+    assert forall|s: int, k: LeaseId| #[trigger] leases_of(v, held, s).contains_key(k)
+        implies a.leases.contains_key(k) by {
+        assert(sits(v, a, q, reqs, held, s));
+        assert(wf_at(v, s));
+        if (v.req)(s) is Some {
+            assert(held(s, (v.req)(s)->0.leases) == leases_of(v, held, s));
+        } else if (v.staged)(s) is Some {
+            assert(held(s, (v.staged)(s)->0.leases) == leases_of(v, held, s));
+        } else {
+            assert(held(s, (v.refused)(s)->0) == leases_of(v, held, s));
+        }
+    }
+    assert forall|s: int| !(#[trigger] leases_of(v, held, s).contains_key(a.next_id)) by {
+        if leases_of(v, held, s).contains_key(a.next_id) {
+            assert(a.leases.contains_key(a.next_id));
+        }
+    }
+    assert forall|s: int, k: LeaseId| #[trigger] leases_of(v, held, s).contains_key(k)
+        implies a2.leases.contains_key(k) && #[trigger] a2.leases[k] == a.leases[k] by {
+        assert(a.leases.contains_key(k));
+        assert(k < a.next_id);
+    }
+    assert forall|s: int| #[trigger] (v.staged)(s) is Some implies a2.qps.contains(q((v.staged)(s)->0.leases)) by {
+        assert(sits(v, a, q, reqs, held, s));
+    }
+    lemma_placed_apart(v, a, a2, q, reqs, held);
+}
+
+/// What is free stays free through two changes.
+pub proof fn lemma_kept_free_trans<L>(
+    v1: View<L>,
+    a1: Abs::State,
+    v2: View<L>,
+    a2: Abs::State,
+    v3: View<L>,
+    a3: Abs::State,
+    held: Held<L>,
+)
+    requires
+        kept_free(v1, a1, v2, a2, held),
+        kept_free(v2, a2, v3, a3, held),
+    ensures
+        kept_free(v1, a1, v3, a3, held),
+{
+    assert forall|l: LeaseId| #[trigger] free_lease(v1, a1, held, l)
+        implies free_lease(v3, a3, held, l) && a3.leases[l] == a1.leases[l] by {
+        assert(free_lease(v2, a2, held, l));
+    }
+}
+
+/// `kept_requests` is transitive.
+pub proof fn lemma_kept_requests_trans(a1: Abs::State, a2: Abs::State, a3: Abs::State)
+    requires
+        kept_requests(a1, a2),
+        kept_requests(a2, a3),
+    ensures
+        kept_requests(a1, a3),
+{
+    assert forall|r: ReqId| #[trigger] a3.requests.contains_key(r) implies {
+        &&& a1.requests.contains_key(r)
+        &&& a3.requests[r].qp == a1.requests[r].qp
+        &&& a3.in_flight(r) == a1.in_flight(r)
+    } by {
+        assert(a2.requests.contains_key(r));
+    }
+}
+
+// =============================================================================
+// Single steps
 
 /// A's `complete` of request `s`, in flight, with `o`: the view after it.
 pub open spec fn completed<L>(v: View<L>, s: int, o: Outcome) -> View<L> {
@@ -515,7 +839,7 @@ pub open spec fn completed<L>(v: View<L>, s: int, o: Outcome) -> View<L> {
 pub proof fn lemma_complete_one<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
@@ -526,12 +850,9 @@ pub proof fn lemma_complete_one<L>(
         (v.req)(s) is Some,
         (v.req)(s)->0.phase is InFlight,
     ensures
-        abs_step(a, complete_state(a, reqs[s], o), Abs::Step::complete(reqs[s], o)),
+        abs_reaches(a, complete_state(a, reqs[s], o)),
         placed(completed(v, s, o), complete_state(a, reqs[s], o), q, reqs, held),
-        complete_state(a, reqs[s], o).wakes == match (v.req)(s)->0.waker {
-            Some(w) => a.wakes.push(w),
-            None => a.wakes,
-        },
+        kept_free(v, a, completed(v, s, o), complete_state(a, reqs[s], o), held),
 {
     let r = reqs[s];
     let a2 = complete_state(a, r, o);
@@ -540,15 +861,28 @@ pub proof fn lemma_complete_one<L>(
     assert(wf_at(v, s));
     assert(abs_step(a, a2, Abs::Step::complete(r, o)));
     lemma_step_one(a, a2, Abs::Step::complete(r, o));
+    let h = held(s, (v.req)(s)->0.leases);
+    assert(h == leases_of(v, held, s));
+    assert forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && !leases_of(v, held, s).contains_key(l)
+        implies a2.leases.contains_key(l) && a2.leases[l] == a.leases[l] by {
+        assert(!a.leases[l].held_by(r));
+    }
+    assert(sits(w, a2, q, reqs, held, s)) by {
+        if !(v.req)(s)->0.detached {
+            assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) && a2.leases[l].held_by(r)
+                implies h.contains_key(l) by {
+                assert(a.leases[l].held_by(r));
+            }
+        }
+    }
     lemma_placed_but(v, w, a, a2, q, reqs, reqs, held, s, r);
 }
 
-/// Requests `[from, to)` of `v` retired with outcomes `o`: each in flight
-/// completes (and is gone if detached); refused ones A never saw.
-pub open spec fn retired_range<L>(v: View<L>, from: int, to: int, o: spec_fn(int) -> Outcome) -> View<L> {
+/// The requests of `[from, to)` that `done` says in flight, each completed with its `o`.
+pub open spec fn completed_where<L>(v: View<L>, from: int, to: int, done: spec_fn(int) -> bool, o: spec_fn(int) -> Outcome) -> View<L> {
     View {
         req: |t: int|
-            if from <= t < to && (v.req)(t) is Some {
+            if from <= t < to && done(t) && (v.req)(t) is Some {
                 if (v.req)(t)->0.detached {
                     None
                 } else {
@@ -562,51 +896,76 @@ pub open spec fn retired_range<L>(v: View<L>, from: int, to: int, o: spec_fn(int
     }
 }
 
-/// Retiring requests `[from, to)` in order is A's `complete` of each, and
-/// wakes their wakers in that order.
-pub proof fn lemma_complete<L>(
+/// Completing those requests is A's `complete` of each.
+pub proof fn lemma_complete_where<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     from: int,
     to: int,
+    done: spec_fn(int) -> bool,
     o: spec_fn(int) -> Outcome,
 ) -> (a2: Abs::State)
     requires
         placed(v, a, q, reqs, held),
         from <= to,
-        forall|s: int| from <= s < to && #[trigger] (v.req)(s) is Some ==> (v.req)(s)->0.phase is InFlight,
+        forall|s: int| from <= s < to && done(s) && #[trigger] (v.req)(s) is Some ==> (v.req)(s)->0.phase is InFlight,
     ensures
         abs_reaches(a, a2),
-        placed(retired_range(v, from, to, o), a2, q, reqs, held),
-        a2.wakes == a.wakes + wakers(v, from, to),
+        placed(completed_where(v, from, to, done, o), a2, q, reqs, held),
+        kept_free(v, a, completed_where(v, from, to, done, o), a2, held),
+        a2.qps == a.qps,
+        a2.next_id == a.next_id,
+        forall|t: ReqId| #[trigger] a2.requests.contains_key(t) ==> a.requests.contains_key(t)
+            && a2.requests[t].qp == a.requests[t].qp,
+        forall|t: ReqId| #[trigger] a2.in_flight(t) ==> a.in_flight(t),
+        forall|t: ReqId| #[trigger] a.outcomes.contains_key(t) ==> a2.outcomes.contains_key(t)
+            && a2.outcomes[t] == a.outcomes[t],
+        forall|t: ReqId| #[trigger] a2.outcomes.contains_key(t) && !a.outcomes.contains_key(t)
+            ==> exists|s: int| from <= s < to && done(s) && #[trigger] (v.req)(s) is Some
+                && reqs[s] == t && a2.outcomes[t] == o(s),
     decreases to - from,
 {
     if to == from {
         lemma_abs_reaches_refl(a);
-        lemma_same(v, retired_range(v, from, to, o), a, q, reqs, held);
-        assert(a.wakes =~= a.wakes + wakers(v, from, to));
+        lemma_same(v, completed_where(v, from, to, done, o), a, q, reqs, held);
         a
-    } else if (v.req)(to - 1) is None {
-        let s = to - 1;
-        let a1 = lemma_complete(v, a, q, reqs, held, from, s, o);
-        lemma_same(retired_range(v, from, s, o), retired_range(v, from, to, o), a1, q, reqs, held);
-        a1
     } else {
         let s = to - 1;
-        let a1 = lemma_complete(v, a, q, reqs, held, from, s, o);
-        let v1 = retired_range(v, from, s, o);
-        assert((v1.req)(s) == (v.req)(s));
-        lemma_complete_one(v1, a1, q, reqs, held, s, o(s));
-        let a2 = complete_state(a1, reqs[s], o(s));
-        lemma_same(completed(v1, s, o(s)), retired_range(v, from, to, o), a2, q, reqs, held);
-        lemma_abs_step_is_next(a1, a2, Abs::Step::complete(reqs[s], o(s)));
-        lemma_abs_reaches_next(a1, a2);
-        lemma_abs_reaches_trans(a, a1, a2);
-        assert(a2.wakes =~= a.wakes + wakers(v, from, to));
-        a2
+        let a1 = lemma_complete_where(v, a, q, reqs, held, from, s, done, o);
+        let v1 = completed_where(v, from, s, done, o);
+        let w = completed_where(v, from, to, done, o);
+        if done(s) && (v.req)(s) is Some {
+            assert((v1.req)(s) == (v.req)(s));
+            let r = reqs[s];
+            let a2 = complete_state(a1, r, o(s));
+            lemma_complete_one(v1, a1, q, reqs, held, s, o(s));
+            lemma_abs_reaches_trans(a, a1, a2);
+            assert(sits(v1, a1, q, reqs, held, s));
+            assert(a1.in_flight(r));
+            assert(!a1.outcomes.contains_key(r));
+            lemma_same(completed(v1, s, o(s)), w, a2, q, reqs, held);
+            lemma_kept_free_trans(v, a, v1, a1, completed(v1, s, o(s)), a2, held);
+            lemma_kept_free_trans(v, a, completed(v1, s, o(s)), a2, w, a2, held);
+            assert forall|t: ReqId| #[trigger] a2.outcomes.contains_key(t) && !a.outcomes.contains_key(t)
+                implies exists|u: int| from <= u < to && done(u) && #[trigger] (v.req)(u) is Some
+                    && reqs[u] == t && a2.outcomes[t] == o(u) by {
+                if t != r {
+                    assert(a1.outcomes.contains_key(t));
+                    let u = choose|u: int| from <= u < s && done(u) && #[trigger] (v.req)(u) is Some
+                        && reqs[u] == t && a1.outcomes[t] == o(u);
+                } else {
+                    assert(from <= s < to && done(s) && (v.req)(s) is Some && reqs[s] == t && a2.outcomes[t] == o(s));
+                }
+            }
+            a2
+        } else {
+            lemma_same(v1, w, a1, q, reqs, held);
+            lemma_kept_free_trans(v, a, v1, a1, w, a1, held);
+            a1
+        }
     }
 }
 
@@ -634,7 +993,7 @@ pub open spec fn posted<L>(v: View<L>, s: int) -> View<L> {
 pub proof fn lemma_post_one<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
@@ -645,20 +1004,32 @@ pub proof fn lemma_post_one<L>(
     ensures
         abs_reaches(a, a2),
         placed(posted(v, s), a2, q, reqs.insert(s, a.next_id), held),
-        a2.wakes == a.wakes,
+        kept_free(v, a, posted(v, s), a2, held),
+        a2.qps == a.qps,
+        a2.outcomes == a.outcomes,
+        a2.next_id == a.next_id + 1,
+        a2.in_flight(a.next_id),
+        a2.requests[a.next_id].qp == q((v.staged)(s)->0.leases),
+        forall|t: ReqId| t != a.next_id ==> (#[trigger] a2.requests.contains_key(t)
+            <==> a.requests.contains_key(t)),
+        forall|t: ReqId| t != a.next_id && #[trigger] a.requests.contains_key(t)
+            ==> a2.requests[t] == a.requests[t],
 {
     let st = (v.staged)(s)->0;
-    let dirs = held(s, st.leases);
+    let h = held(s, st.leases);
+    let dirs = dirs_of(h);
     let r = a.next_id;
     let reqs2 = reqs.insert(s, r);
     let w = posted(v, s);
     assert(sits(v, a, q, reqs, held, s));
     assert(wf_at(v, s));
-    assert(leases_of(v, held, s) == dirs);
+    assert(leases_of(v, held, s) == h);
+    assert(dirs.dom() =~= h.dom());
     // post_request
-    let a1 = post_state(a, dirs, q);
-    assert(abs_step(a, a1, Abs::Step::post_request(dirs, q)));
-    lemma_step_one(a, a1, Abs::Step::post_request(dirs, q));
+    let a1 = post_state(a, dirs, q(st.leases));
+    assert(a.may_post(dirs));
+    assert(abs_step(a, a1, Abs::Step::post_request(dirs, q(st.leases))));
+    lemma_step_one(a, a1, Abs::Step::post_request(dirs, q(st.leases)));
     // register or detach
     let a2 = if st.waker is Some {
         register_state(a1, r, st.waker->0)
@@ -677,7 +1048,26 @@ pub proof fn lemma_post_one<L>(
         lemma_abs_reaches_trans(a, a1, a2);
     }
     assert(a2.leases == a1.leases);
-    assert(holds_exactly(a2, r, dirs));
+    assert(!a.leases.contains_key(r) || a.leases[r].holder is Program || true);
+    assert forall|l: LeaseId| #[trigger] h.contains_key(l) implies a2.leases.contains_key(l)
+        && a2.leases[l].holder == (Holder::Request { req: r, dir: h[l].dir })
+        && a2.leases[l].mem == h[l].mem by {
+        assert(dirs.contains_key(l));
+    }
+    assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) && a2.leases[l].held_by(r)
+        implies h.contains_key(l) by {
+        if !h.contains_key(l) {
+            // No lease is held by a name not given yet.
+            assert(a.leases[l].held_by(r));
+            assert(a.requests.contains_key(r));
+        }
+    }
+    assert(holds_exactly(a2, r, h));
+    assert forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && !leases_of(v, held, s).contains_key(l)
+        implies a2.leases.contains_key(l) && a2.leases[l] == a.leases[l] by {
+        assert(!dirs.contains_key(l));
+    }
+    assert((w.req)(s) == Some(st));
     lemma_placed_but(v, w, a, a2, q, reqs, reqs2, held, s, r);
     a2
 }
@@ -698,44 +1088,6 @@ pub open spec fn posted_range<L>(v: View<L>, from: int, to: int) -> View<L> {
                 (v.staged)(t)
             },
         refused: v.refused,
-    }
-}
-
-/// Posting staged requests `[from, to)` is A's `post_request` of each (with
-/// its `register` or `detach`).
-pub proof fn lemma_commit<L>(
-    v: View<L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-    from: int,
-    to: int,
-) -> (r: (Abs::State, Map<int, ReqId>))
-    requires
-        placed(v, a, q, reqs, held),
-        from <= to,
-        forall|s: int| from <= s < to ==> #[trigger] (v.staged)(s) is Some,
-    ensures
-        abs_reaches(a, r.0),
-        placed(posted_range(v, from, to), r.0, q, r.1, held),
-        r.0.wakes == a.wakes,
-    decreases to - from,
-{
-    if to == from {
-        lemma_abs_reaches_refl(a);
-        lemma_same(v, posted_range(v, from, to), a, q, reqs, held);
-        (a, reqs)
-    } else {
-        let s = to - 1;
-        let (a1, reqs1) = lemma_commit(v, a, q, reqs, held, from, s);
-        let v1 = posted_range(v, from, s);
-        assert((v1.staged)(s) == (v.staged)(s));
-        let a2 = lemma_post_one(v1, a1, q, reqs1, held, s);
-        let reqs2 = reqs1.insert(s, a1.next_id);
-        lemma_same(posted(v1, s), posted_range(v, from, to), a2, q, reqs2, held);
-        lemma_abs_reaches_trans(a, a1, a2);
-        (a2, reqs2)
     }
 }
 
@@ -760,13 +1112,13 @@ pub open spec fn refused_range<L>(v: View<L>, from: int, to: int, keep: int) -> 
     }
 }
 
-/// Refusing staged requests `[from, to)` is A's `drop` of each detached
-/// one's leases; the others' leases stay the program's: `keep`'s go back to
-/// it, the rest wait in the ring for their owners.
+/// Refusing staged requests `[from, to)` is A's `drop` of each detached one's leases, and of
+/// the shared ones of `keep`, whose unique ones are the program's again; the others' leases stay
+/// the program's and wait in the ring for their owners.
 pub proof fn lemma_abort<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     from: int,
@@ -780,19 +1132,13 @@ pub proof fn lemma_abort<L>(
     ensures
         abs_reaches(a, a2),
         placed(refused_range(v, from, to, keep), a2, q, reqs, held),
-        a2.wakes == a.wakes,
-        a2.requests == a.requests,
-        a2.outcomes == a.outcomes,
-        (v.staged)(keep) is Some ==> forall|l: LeaseId| #[trigger] held(keep, (v.staged)(keep)->0.leases).contains_key(l)
-            ==> a2.is_program(l) && a2.leases[l] == a.leases[l],
+        kept_free(v, a, refused_range(v, from, to, keep), a2, held),
+        kept_requests(a, a2),
     decreases to - from,
 {
     if to == from {
         lemma_abs_reaches_refl(a);
         lemma_same(v, refused_range(v, from, to, keep), a, q, reqs, held);
-        if (v.staged)(keep) is Some {
-            assert(sits(v, a, q, reqs, held, keep));
-        }
         a
     } else {
         let s = to - 1;
@@ -801,90 +1147,27 @@ pub proof fn lemma_abort<L>(
         let w = refused_range(v, from, to, keep);
         assert((v1.staged)(s) == (v.staged)(s));
         assert((v1.refused)(s) == (v.refused)(s));
+        assert(wf_at(v, s));
         assert(wf_at(v1, s));
         assert(sits(v1, a1, q, reqs, held, s));
-        if s == keep || !(v.staged)(s)->0.detached {
-            // The program keeps the leases (back in its hands, or held in the
-            // ring for the owner): no step.
-            lemma_abs_reaches_refl(a1);
-            lemma_reshape(v1, w, a1, q, reqs, held, s);
-            a1
+        let h = held(s, (v.staged)(s)->0.leases);
+        assert(leases_of(v1, held, s) == h);
+        let gone = if s == keep {
+            shared_in(a1, h)
+        } else if (v.staged)(s)->0.detached {
+            h.dom()
         } else {
-            let dirs = held(s, (v.staged)(s)->0.leases);
-            assert(leases_of(v1, held, s) == dirs);
-            let a2 = lemma_drop_leases(a1, dirs.dom());
-            lemma_placed_but(v1, w, a1, a2, q, reqs, reqs, held, s, a1.next_id);
-            lemma_abs_reaches_trans(a, a1, a2);
-            if (v.staged)(keep) is Some {
-                // `keep`'s leases are not `s`'s.
-                assert(keep != s);
-                let kept = held(keep, (v.staged)(keep)->0.leases);
-                assert forall|l: LeaseId| #[trigger] kept.contains_key(l)
-                    implies a2.is_program(l) && a2.leases[l] == a.leases[l] by {
-                    assert(leases_of(v, held, keep) == kept) by {
-                        assert(wf_at(v, keep));
-                    }
-                    assert(leases_of(v, held, s) == dirs) by {
-                        assert(wf_at(v, s));
-                    }
-                    assert(leases_of(v, held, keep).dom().disjoint(leases_of(v, held, s).dom()));
-                }
-            }
-            a2
+            Set::empty()
+        };
+        assert(gone.subset_of(h.dom()));
+        assert((w.refused)(s) is Some ==> gone == Set::<LeaseId>::empty());
+        if (w.refused)(s) is Some {
+            assert(leases_of(w, held, s) == h);
         }
-    }
-}
-
-/// Staged requests `[from, to)` of `v` dropped: every lease released.
-pub open spec fn dropped_range<L>(v: View<L>, from: int, to: int) -> View<L> {
-    View {
-        req: v.req,
-        staged: |t: int|
-            if from <= t < to {
-                None
-            } else {
-                (v.staged)(t)
-            },
-        refused: v.refused,
-    }
-}
-
-/// Dropping staged requests `[from, to)` is A's `drop` of each lease.
-pub proof fn lemma_drop_staged<L>(
-    v: View<L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-    from: int,
-    to: int,
-) -> (a2: Abs::State)
-    requires
-        placed(v, a, q, reqs, held),
-        from <= to,
-        forall|s: int| from <= s < to ==> #[trigger] (v.staged)(s) is Some,
-    ensures
-        abs_reaches(a, a2),
-        placed(dropped_range(v, from, to), a2, q, reqs, held),
-    decreases to - from,
-{
-    if to == from {
-        lemma_abs_reaches_refl(a);
-        lemma_same(v, dropped_range(v, from, to), a, q, reqs, held);
-        a
-    } else {
-        let s = to - 1;
-        let a1 = lemma_drop_staged(v, a, q, reqs, held, from, s);
-        let v1 = dropped_range(v, from, s);
-        let w = dropped_range(v, from, to);
-        assert((v1.staged)(s) == (v.staged)(s));
-        assert(wf_at(v1, s));
-        assert(sits(v1, a1, q, reqs, held, s));
-        let dirs = held(s, (v.staged)(s)->0.leases);
-        assert(leases_of(v1, held, s) == dirs);
-        let a2 = lemma_drop_leases(a1, dirs.dom());
-        lemma_placed_but(v1, w, a1, a2, q, reqs, reqs, held, s, a1.next_id);
+        let a2 = lemma_forget(v1, w, a1, q, reqs, held, s, gone);
         lemma_abs_reaches_trans(a, a1, a2);
+        lemma_kept_free_trans(v, a, v1, a1, w, a2, held);
+        lemma_kept_requests_trans(a, a1, a2);
         a2
     }
 }
@@ -917,33 +1200,12 @@ pub open spec fn without_refused<L>(v: View<L>, s: int) -> View<L> {
     }
 }
 
-/// Taking refused request `s` is no step of A: its leases were the
-/// program's all along.
+/// Taking refused request `s` is A's `drop` of its shared leases: its unique ones were the
+/// program's all along, and are in its hands again.
 pub proof fn lemma_take_refused<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-    s: int,
-)
-    requires
-        placed(v, a, q, reqs, held),
-        (v.refused)(s) is Some,
-    ensures
-        placed(without_refused(v, s), a, q, reqs, held),
-        a.may_post(held(s, (v.refused)(s)->0)),
-{
-    assert(sits(v, a, q, reqs, held, s));
-    assert(wf_at(v, s));
-    lemma_reshape(v, without_refused(v, s), a, q, reqs, held, s);
-}
-
-/// Dropping refused request `s` is A's `drop` of each of its leases.
-pub proof fn lemma_drop_refused<L>(
-    v: View<L>,
-    a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
@@ -954,23 +1216,50 @@ pub proof fn lemma_drop_refused<L>(
     ensures
         abs_reaches(a, a2),
         placed(without_refused(v, s), a2, q, reqs, held),
-        a2.wakes == a.wakes,
+        kept_free(v, a, without_refused(v, s), a2, held),
+        kept_requests(a, a2),
 {
-    assert(sits(v, a, q, reqs, held, s));
     assert(wf_at(v, s));
-    let dirs = held(s, (v.refused)(s)->0);
-    assert(leases_of(v, held, s) == dirs);
-    let a2 = lemma_drop_leases(a, dirs.dom());
-    lemma_placed_but(v, without_refused(v, s), a, a2, q, reqs, reqs, held, s, a.next_id);
-    a2
+    let h = held(s, (v.refused)(s)->0);
+    assert(leases_of(v, held, s) == h);
+    let w = without_refused(v, s);
+    assert(wf_at(w, s));
+    lemma_forget(v, w, a, q, reqs, held, s, shared_in(a, h))
 }
 
-/// Taking complete request `s`, with outcome `o` and value `l`, is A's
-/// `take`: the program holds each of its leases again, under its own name.
+/// Dropping refused request `s` is A's `drop` of each of its leases.
+pub proof fn lemma_drop_refused<L>(
+    v: View<L>,
+    a: Abs::State,
+    q: spec_fn(L) -> QpId,
+    reqs: Map<int, ReqId>,
+    held: Held<L>,
+    s: int,
+) -> (a2: Abs::State)
+    requires
+        placed(v, a, q, reqs, held),
+        (v.refused)(s) is Some,
+    ensures
+        abs_reaches(a, a2),
+        placed(without_refused(v, s), a2, q, reqs, held),
+        kept_free(v, a, without_refused(v, s), a2, held),
+        kept_requests(a, a2),
+{
+    assert(wf_at(v, s));
+    let h = held(s, (v.refused)(s)->0);
+    assert(leases_of(v, held, s) == h);
+    let w = without_refused(v, s);
+    assert(wf_at(w, s));
+    lemma_forget(v, w, a, q, reqs, held, s, h.dom())
+}
+
+/// Taking complete request `s`, with outcome `o` and value `l`, is A's `take`: the program holds
+/// each of its unique leases again, under its own name; its shared ones, which have no way back,
+/// are dropped.
 pub proof fn lemma_take<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
@@ -982,31 +1271,49 @@ pub proof fn lemma_take<L>(
         (v.req)(s) == Some(ReqView { phase: Phase::Complete(o), waker: None, detached: false, leases: l }),
     ensures
         abs_reaches(a, a2),
-        abs_step(a, a2, Abs::Step::take(reqs[s], o)),
         placed(without(v, s), a2, q, reqs, held),
-        a2.wakes == a.wakes,
-        forall|k: LeaseId| #[trigger] held(s, l).contains_key(k)
+        kept_free(v, a, without(v, s), a2, held),
+        kept_requests(a, a2),
+        forall|k: LeaseId| #[trigger] held(s, l).contains_key(k) && a.leases[k].unique
             ==> a2.is_program(k) && a2.leases[k].same_as(a.leases[k]),
 {
     let r = reqs[s];
-    let a2 = take_state(a, r);
+    let a1 = take_state(a, r);
+    let h = held(s, l);
     assert(sits(v, a, q, reqs, held, s));
     assert(wf_at(v, s));
-    assert(abs_step(a, a2, Abs::Step::take(r, o)));
-    lemma_step_one(a, a2, Abs::Step::take(r, o));
+    assert(leases_of(v, held, s) == h);
+    assert(abs_step(a, a1, Abs::Step::take(r, o)));
+    lemma_step_one(a, a1, Abs::Step::take(r, o));
+    let gone = shared_in(a1, h);
+    assert forall|k: LeaseId| #[trigger] gone.contains(k) implies a1.is_program(k) by {
+        assert(a.leases[k].held_by(r));
+    }
+    let a2 = lemma_drop_leases(a1, gone);
+    lemma_abs_reaches_trans(a, a1, a2);
     assert forall|k: LeaseId| #[trigger] a.leases.contains_key(k) && !leases_of(v, held, s).contains_key(k)
         implies a2.leases.contains_key(k) && a2.leases[k] == a.leases[k] by {
         assert(!a.leases[k].held_by(r));
+        assert(!gone.contains(k));
     }
-    assert forall|k: LeaseId| #[trigger] held(s, l).contains_key(k)
+    assert forall|k: LeaseId| #[trigger] held(s, l).contains_key(k) && a.leases[k].unique
         implies a2.is_program(k) && a2.leases[k].same_as(a.leases[k]) by {
         assert(a.leases[k].held_by(r));
+        assert(!gone.contains(k));
     }
-    lemma_placed_but(v, without(v, s), a, a2, q, reqs, reqs, held, s, r);
+    assert forall|k: LeaseId| #[trigger] a2.leases.contains_key(k) implies a.leases.contains_key(k)
+        && (leases_of(v, held, s).contains_key(k) ==> a2.leases[k].holder is Program || a2.leases[k].held_by(r)) by {
+        if leases_of(v, held, s).contains_key(k) {
+            assert(a.leases[k].held_by(r));
+        }
+    }
+    let w = without(v, s);
+    assert(wf_at(w, s));
+    lemma_placed_but(v, w, a, a2, q, reqs, reqs, held, s, r);
     a2
 }
 
-/// `v` with the owner of request `s` gone, as the ring's `detach` says.
+/// `v` with the owner of request `s` gone.
 pub open spec fn detached<L>(v: View<L>, s: int) -> View<L> {
     View {
         req: |t: int|
@@ -1040,7 +1347,7 @@ pub open spec fn detached<L>(v: View<L>, s: int) -> View<L> {
 pub proof fn lemma_detach<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
@@ -1050,7 +1357,8 @@ pub proof fn lemma_detach<L>(
     ensures
         abs_reaches(a, a2),
         placed(detached(v, s), a2, q, reqs, held),
-        a2.wakes == a.wakes,
+        kept_free(v, a, detached(v, s), a2, held),
+        kept_requests(a, a2),
 {
     let w = detached(v, s);
     assert(sits(v, a, q, reqs, held, s));
@@ -1060,11 +1368,27 @@ pub proof fn lemma_detach<L>(
         let a2 = detach_state(a, r);
         assert(abs_step(a, a2, Abs::Step::detach(r)));
         lemma_step_one(a, a2, Abs::Step::detach(r));
+        let h = held(s, (v.req)(s)->0.leases);
+        assert(h == leases_of(v, held, s));
+        assert forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && !leases_of(v, held, s).contains_key(l)
+            implies a2.leases.contains_key(l) && a2.leases[l] == a.leases[l] by {
+            assert(!a.leases[l].held_by(r));
+        }
+        assert(sits(w, a2, q, reqs, held, s)) by {
+            if (v.req)(s)->0.phase is InFlight {
+                assert forall|l: LeaseId| #[trigger] a2.leases.contains_key(l) && a2.leases[l].held_by(r)
+                    implies h.contains_key(l) by {
+                    assert(a.leases[l].held_by(r));
+                }
+            }
+        }
         lemma_placed_but(v, w, a, a2, q, reqs, reqs, held, s, r);
         a2
     } else if (v.refused)(s) is Some {
         let a2 = lemma_drop_refused(v, a, q, reqs, held, s);
+        assert forall|t: int| #[trigger] (without_refused(v, s).staged)(t) == (w.staged)(t) by {}
         lemma_same(without_refused(v, s), w, a2, q, reqs, held);
+        lemma_kept_free_trans(v, a, without_refused(v, s), a2, w, a2, held);
         a2
     } else {
         // Nothing A sees changes.
@@ -1072,15 +1396,18 @@ pub proof fn lemma_detach<L>(
         if (v.req)(s) is Some {
             assert((v.req)(s)->0.detach() == (v.req)(s)->0);
             lemma_same(v, w, a, q, reqs, held);
+            a
         } else {
-            lemma_reshape(v, w, a, q, reqs, held, s);
+            if (v.staged)(s) is Some {
+                assert(leases_of(w, held, s) == leases_of(v, held, s));
+            }
+            assert(wf_at(w, s));
+            lemma_forget(v, w, a, q, reqs, held, s, Set::empty())
         }
-        a
     }
 }
 
-/// `v` with waker `wk` registered on request `s`, as the ring's
-/// `set_waker` says.
+/// `v` with waker `wk` registered on request `s`.
 pub open spec fn registered<L>(v: View<L>, s: int, wk: WakerId) -> View<L> {
     View {
         req: |t: int|
@@ -1106,7 +1433,7 @@ pub open spec fn registered<L>(v: View<L>, s: int, wk: WakerId) -> View<L> {
 pub proof fn lemma_register<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
@@ -1117,7 +1444,7 @@ pub proof fn lemma_register<L>(
     ensures
         abs_reaches(a, a2),
         placed(registered(v, s, wk), a2, q, reqs, held),
-        a2.wakes == a.wakes,
+        kept_requests(a, a2),
 {
     let w = registered(v, s, wk);
     assert(sits(v, a, q, reqs, held, s));
@@ -1127,16 +1454,25 @@ pub proof fn lemma_register<L>(
         let a2 = register_state(a, r, wk);
         assert(abs_step(a, a2, Abs::Step::register(r, wk)));
         lemma_step_one(a, a2, Abs::Step::register(r, wk));
+        let h = held(s, (v.req)(s)->0.leases);
+        assert(h == leases_of(v, held, s));
         lemma_placed_but(v, w, a, a2, q, reqs, reqs, held, s, r);
         a2
     } else {
         lemma_abs_reaches_refl(a);
         if (v.req)(s) is Some {
             lemma_same(v, w, a, q, reqs, held);
+            a
         } else {
-            lemma_reshape(v, w, a, q, reqs, held, s);
+            if (v.staged)(s) is Some {
+                assert(leases_of(w, held, s) == leases_of(v, held, s));
+            }
+            if (v.refused)(s) is Some {
+                assert(leases_of(w, held, s) == leases_of(v, held, s));
+            }
+            assert(wf_at(w, s));
+            lemma_forget(v, w, a, q, reqs, held, s, Set::empty())
         }
-        a
     }
 }
 
@@ -1155,12 +1491,12 @@ pub open spec fn staged_with<L>(v: View<L>, s: int, detached: bool, l: L) -> Vie
 }
 
 /// Staging a request is no step of A: its leases stay the program's until it
-/// is posted. They may be posted in their directions, and no other request of
-/// the ring holds them.
+/// is posted. They may be posted in their directions, and no other request
+/// holds them.
 pub proof fn lemma_end<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
@@ -1170,7 +1506,8 @@ pub proof fn lemma_end<L>(
     requires
         placed(v, a, q, reqs, held),
         !holds(v, s),
-        a.may_post(held(s, l)),
+        may_post_holds(a, held(s, l)),
+        a.qps.contains(q(l)),
         forall|t: int| #[trigger] leases_of(v, held, t).dom().disjoint(held(s, l).dom()),
     ensures
         placed(staged_with(v, s, detached, l), a, q, reqs, held),
@@ -1190,73 +1527,8 @@ pub proof fn lemma_end<L>(
         assert(leases_of(v, held, t).dom().disjoint(held(s, l).dom()));
         assert(leases_of(v, held, u).dom().disjoint(held(s, l).dom()));
     }
-}
-
-/// Releasing request `s` when its queue pair is destroyed is A's
-/// `complete` (with a flush, if it is in flight) and then its `detach` (if
-/// it has an owner).
-pub proof fn lemma_release_one<L>(
-    v: View<L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-    s: int,
-) -> (a2: Abs::State)
-    requires
-        placed(v, a, q, reqs, held),
-        (v.req)(s) is Some,
-    ensures
-        abs_reaches(a, a2),
-        placed(without(v, s), a2, q, reqs, held),
-{
-    let rv = (v.req)(s)->0;
-    let r = reqs[s];
-    assert(sits(v, a, q, reqs, held, s));
-    assert(wf_at(v, s));
-    let a1 = if rv.phase is InFlight {
-        complete_state(a, r, flushed())
-    } else {
-        a
-    };
-    let rv1 = if rv.phase is InFlight {
-        ReqView { phase: Phase::Complete(flushed()), waker: None, ..rv }
-    } else {
-        rv
-    };
-    let v1 = View {
-        req: |t: int|
-            if t == s {
-                if rv.detached {
-                    None
-                } else {
-                    Some(rv1)
-                }
-            } else {
-                (v.req)(t)
-            },
-        staged: v.staged,
-        refused: v.refused,
-    };
-    if rv.phase is InFlight {
-        assert(abs_step(a, a1, Abs::Step::complete(r, flushed())));
-        lemma_step_one(a, a1, Abs::Step::complete(r, flushed()));
-        lemma_placed_but(v, v1, a, a1, q, reqs, reqs, held, s, r);
-    } else {
-        lemma_abs_reaches_refl(a);
-        lemma_same(v, v1, a, q, reqs, held);
-    }
-    if rv.detached {
-        lemma_same(v1, without(v, s), a1, q, reqs, held);
-        a1
-    } else {
-        let a2 = detach_state(a1, r);
-        assert(sits(v1, a1, q, reqs, held, s));
-        assert(abs_step(a1, a2, Abs::Step::detach(r)));
-        lemma_step_one(a1, a2, Abs::Step::detach(r));
-        lemma_placed_but(v1, without(v, s), a1, a2, q, reqs, reqs, held, s, r);
-        lemma_abs_reaches_trans(a, a1, a2);
-        a2
+    assert forall|r: ReqId| #[trigger] a.requests.contains_key(r) implies names_request(w, reqs, r) by {
+        assert(names_request(v, reqs, r));
     }
 }
 
@@ -1279,12 +1551,13 @@ pub open spec fn without_range<L>(v: View<L>, from: int, to: int) -> View<L> {
     }
 }
 
-/// Releasing requests `[from, to)` is A's `complete` and `detach` of each,
-/// and `drop` of each refused one's leases.
+/// Releasing requests `[from, to)`, none of them in flight or staged, is A's `detach` of each that
+/// has an owner, and `drop` of each lease of each refused one. Nothing made up: A has no outcome to
+/// give a request in flight here, and none is.
 pub proof fn lemma_release<L>(
     v: View<L>,
     a: Abs::State,
-    q: QpId,
+    q: spec_fn(L) -> QpId,
     reqs: Map<int, ReqId>,
     held: Held<L>,
     from: int,
@@ -1293,9 +1566,12 @@ pub proof fn lemma_release<L>(
     requires
         placed(v, a, q, reqs, held),
         from <= to,
+        forall|s: int| from <= s < to && #[trigger] (v.req)(s) is Some ==> (v.req)(s)->0.phase is Complete,
+        forall|s: int| from <= s < to ==> #[trigger] (v.staged)(s) is None,
     ensures
         abs_reaches(a, a2),
         placed(without_range(v, from, to), a2, q, reqs, held),
+        kept_requests(a, a2),
     decreases to - from,
 {
     if to == from {
@@ -1308,690 +1584,28 @@ pub proof fn lemma_release<L>(
         let v1 = without_range(v, from, s);
         assert((v1.req)(s) == (v.req)(s));
         assert((v1.refused)(s) == (v.refused)(s));
-        assert(wf_at(v, s));
-        if (v.req)(s) is Some {
-            let a2 = lemma_release_one(v1, a1, q, reqs, held, s);
-            lemma_same(without(v1, s), without_range(v, from, to), a2, q, reqs, held);
-            lemma_abs_reaches_trans(a, a1, a2);
-            a2
-        } else if (v.refused)(s) is Some {
-            let a2 = lemma_drop_refused(v1, a1, q, reqs, held, s);
-            lemma_same(without_refused(v1, s), without_range(v, from, to), a2, q, reqs, held);
-            lemma_abs_reaches_trans(a, a1, a2);
-            a2
-        } else {
-            lemma_same(v1, without_range(v, from, to), a1, q, reqs, held);
-            a1
-        }
+        assert((v1.staged)(s) == (v.staged)(s));
+        let a2 = lemma_detach(v1, a1, q, reqs, held, s);
+        lemma_abs_reaches_trans(a, a1, a2);
+        lemma_kept_requests_trans(a, a1, a2);
+        lemma_same(detached(v1, s), without_range(v, from, to), a2, q, reqs, held);
+        a2
     }
 }
 
 // =============================================================================
-// The ring's operations
-//
-// Each lemma takes the state of the ring before and after an operation,
-// related by the operation's postcondition, and a state of A in which the
-// ring's requests sit before; it gives the state of A after the steps the
-// table at the top names, in which they sit after.
-
-/// Filling a slot or emptying it again, marking the request's path and `take_detached_error`: no
-/// step.
-pub proof fn lemma_ring_stutter<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-)
-    requires
-        placed(pre.view(), a, q, reqs, held),
-        post.same_view(&pre),
-    ensures
-        placed(post.view(), a, q, reqs, held),
-{
-    post.lemma_same_view(&pre);
-    lemma_same(pre.view(), post.view(), a, q, reqs, held);
-}
-
-/// `stage`: no step; the staged request holds leases of the program's, which
-/// may be posted in their directions.
-pub proof fn lemma_ring_end<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    detached: bool,
-    leases: L,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-)
-    requires
-        pre.inv(),
-        placed(pre.view(), a, q, reqs, held),
-        a.may_post(held(pre.spec_posted() as int, leases)),
-        forall|t: int| #[trigger] leases_of(pre.view(), held, t).dom().disjoint(
-            held(pre.spec_posted() as int, leases).dom(),
-        ),
-        forall|s: int| #[trigger] post.req(s) == pre.req(s),
-        forall|s: int|
-            #[trigger] post.staged(s) == if s == pre.spec_posted() {
-                Some(ReqView::new(detached, leases))
-            } else {
-                pre.staged(s)
-            },
-        forall|s: int| #[trigger] post.refused(s) == pre.refused(s),
-    ensures
-        placed(post.view(), a, q, reqs, held),
-{
-    let p = pre.spec_posted() as int;
-    pre.lemma_view();
-    lemma_end(pre.view(), a, q, reqs, held, p, detached, leases);
-    lemma_same(staged_with(pre.view(), p, detached, leases), post.view(), a, q, reqs, held);
-}
-
-/// `commit`: `post_request` of every staged request (with its `register`
-/// or `detach`). Each becomes a new request of A.
-pub proof fn lemma_ring_commit<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (r: (Abs::State, Map<int, ReqId>))
-    requires
-        pre.inv(),
-        placed(pre.view(), a, q, reqs, held),
-        forall|s: int|
-            #[trigger] post.req(s) == if pre.staged(s) is Some {
-                pre.staged(s)
-            } else {
-                pre.req(s)
-            },
-        forall|s: int| #[trigger] post.staged(s) is None,
-        forall|s: int| #[trigger] post.refused(s) == pre.refused(s),
-    ensures
-        abs_reaches(a, r.0),
-        placed(post.view(), r.0, q, r.1, held),
-        r.0.wakes == a.wakes,
-{
-    pre.lemma_view();
-    let (c, p) = (pre.spec_committed() as int, pre.spec_posted() as int);
-    let (a2, reqs2) = lemma_commit(pre.view(), a, q, reqs, held, c, p);
-    lemma_same(posted_range(pre.view(), c, p), post.view(), a2, q, reqs2, held);
-    (a2, reqs2)
-}
-
-/// `abort_keeping(keep)` (and `abort`): `drop` of the leases of every detached
-/// staged request; `keep`'s are the program's again, unchanged, and the other
-/// staged requests' leases, still the program's, wait in the ring for their owners.
-pub proof fn lemma_ring_abort<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    keep: int,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        pre.inv(),
-        placed(pre.view(), a, q, reqs, held),
-        forall|s: int| #[trigger] post.req(s) == pre.req(s),
-        forall|s: int| #[trigger] post.staged(s) is None,
-        forall|s: int|
-            #[trigger] post.refused(s) == if pre.staged(s) is Some && s != keep && !pre.staged(
-                s,
-            )->0.detached {
-                Some(pre.staged(s)->0.leases)
-            } else {
-                pre.refused(s)
-            },
-    ensures
-        abs_reaches(a, a2),
-        placed(post.view(), a2, q, reqs, held),
-        a2.wakes == a.wakes,
-        a2.requests == a.requests,
-        a2.outcomes == a.outcomes,
-        pre.staged(keep) is Some ==> forall|l: LeaseId| #[trigger] held(keep, pre.staged(keep)->0.leases).contains_key(l)
-            ==> a2.is_program(l) && a2.leases[l] == a.leases[l],
-{
-    pre.lemma_view();
-    let (c, p) = (pre.spec_committed() as int, pre.spec_posted() as int);
-    let a2 = lemma_abort(pre.view(), a, q, reqs, held, c, p, keep);
-    lemma_same(refused_range(pre.view(), c, p, keep), post.view(), a2, q, reqs, held);
-    a2
-}
-
-/// `complete`: A's `complete` of each request retired, in order, with the
-/// outcome the ring gives it (refused ones A never saw); A's wakes grow by
-/// exactly the wakers the ring woke (L1 for the ring).
-pub proof fn lemma_ring_complete<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    recv: bool,
-    wqe: u64,
-    wc: Wc,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        pre.inv(),
-        placed(pre.view(), a, q, reqs, held),
-        pre.spec_retired() <= post.spec_retired() <= pre.spec_committed(),
-        forall|s: int|
-            #[trigger] post.req(s) == if pre.spec_retired() <= s < post.spec_retired() {
-                pre.retired_view(s, pre.retire_outcome(s, recv, wqe, wc))
-            } else {
-                pre.req(s)
-            },
-        forall|s: int| #[trigger] post.staged(s) == pre.staged(s),
-        forall|s: int| #[trigger] post.refused(s) == pre.refused(s),
-        post.woken() == pre.woken() + pre.wakers(
-            pre.spec_retired() as int,
-            post.spec_retired() as int,
-        ),
-    ensures
-        abs_reaches(a, a2),
-        placed(post.view(), a2, q, reqs, held),
-        ({
-            let woke = wakers(pre.view(), pre.spec_retired() as int, post.spec_retired() as int);
-            &&& post.woken() == pre.woken() + woke
-            &&& a2.wakes == a.wakes + woke
-        }),
-{
-    pre.lemma_view();
-    let (r0, r1) = (pre.spec_retired() as int, post.spec_retired() as int);
-    let o = |s: int| crate::wc::result_model(pre.retire_outcome(s, recv, wqe, wc));
-    let a2 = lemma_complete(pre.view(), a, q, reqs, held, r0, r1, o);
-    assert forall|s: int| #[trigger] (retired_range(pre.view(), r0, r1, o).req)(s) == (post.view().req)(
-        s,
-    ) by {
-        if r0 <= s < r1 {
-            pre.lemma_retired_view(s, pre.retire_outcome(s, recv, wqe, wc));
-        }
-    }
-    lemma_same(retired_range(pre.view(), r0, r1, o), post.view(), a2, q, reqs, held);
-    pre.lemma_wakers(r0, r1);
-    a2
-}
-
-/// `retire_oldest`, its caller emptying the slot it returns: A's `complete` of the oldest request in
-/// flight, which holds no waker, then A's `take`.
-pub proof fn lemma_ring_oldest<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    recv: bool,
-    wqe: u64,
-    wc: Wc,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        pre.inv(),
-        placed(pre.view(), a, q, reqs, held),
-        post.retired_and_taken(&pre),
-        pre.req(pre.spec_retired() as int) is Some,
-        !pre.req(pre.spec_retired() as int)->0.detached,
-        pre.req(pre.spec_retired() as int)->0.waker is None,
-    ensures
-        abs_reaches(a, a2),
-        placed(post.view(), a2, q, reqs, held),
-        post.woken() == pre.woken(),
-        a2.wakes == a.wakes,
-{
-    let r = pre.spec_retired() as int;
-    post.lemma_retired_and_taken(&pre);
-    pre.lemma_view();
-    let o = |s: int| crate::wc::result_model(pre.retire_outcome(s, recv, wqe, wc));
-    let a1 = lemma_complete(pre.view(), a, q, reqs, held, r, r + 1, o);
-    let v1 = retired_range(pre.view(), r, r + 1, o);
-    let req = pre.req(r)->0;
-    let a2 = lemma_take(v1, a1, q, reqs, held, r, o(r), req.leases);
-    lemma_abs_reaches_trans(a, a1, a2);
-    lemma_same(without(v1, r), post.view(), a2, q, reqs, held);
-    assert(wakers(pre.view(), r, r) =~= Seq::<WakerId>::empty());
-    assert(a.wakes + wakers(pre.view(), r, r + 1) =~= a.wakes);
-    a2
-}
-
-/// `take(seq)` returning `Some((outcome, leases))` for a request A sees:
-/// A's `take`; the program holds each of the request's leases again.
-pub proof fn lemma_ring_take<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    seq: int,
-    outcome: Outcome,
-    leases: L,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        placed(pre.view(), a, q, reqs, held),
-        pre.req(seq) == Some(
-            ReqView { phase: Phase::Complete(outcome), waker: None, detached: false, leases },
-        ),
-        forall|s: int|
-            #[trigger] post.req(s) == if s == seq {
-                None
-            } else {
-                pre.req(s)
-            },
-        forall|s: int| #[trigger] post.staged(s) == pre.staged(s),
-        forall|s: int|
-            #[trigger] post.refused(s) == if s == seq {
-                None
-            } else {
-                pre.refused(s)
-            },
-    ensures
-        abs_step(a, a2, Abs::Step::take(reqs[seq], outcome)),
-        placed(post.view(), a2, q, reqs, held),
-        a2.wakes == a.wakes,
-        forall|k: LeaseId| #[trigger] held(seq, leases).contains_key(k)
-            ==> a2.is_program(k) && a2.leases[k].same_as(a.leases[k]),
-{
-    let a2 = lemma_take(pre.view(), a, q, reqs, held, seq, outcome, leases);
-    assert(wf_at(pre.view(), seq));
-    lemma_same(without(pre.view(), seq), post.view(), a2, q, reqs, held);
-    a2
-}
-
-/// `take(seq)` returning `Some((outcome, leases))` for a refused request:
-/// no step; the program, which A says held the leases all along, has them in
-/// its hands again.
-pub proof fn lemma_ring_take_refused<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    seq: int,
-    leases: L,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-)
-    requires
-        placed(pre.view(), a, q, reqs, held),
-        pre.refused(seq) == Some(leases),
-        forall|s: int| #[trigger] post.req(s) == pre.req(s),
-        forall|s: int| #[trigger] post.staged(s) == pre.staged(s),
-        forall|s: int|
-            #[trigger] post.refused(s) == if s == seq {
-                None
-            } else {
-                pre.refused(s)
-            },
-    ensures
-        placed(post.view(), a, q, reqs, held),
-        a.may_post(held(seq, leases)),
-{
-    lemma_take_refused(pre.view(), a, q, reqs, held, seq);
-    lemma_same(without_refused(pre.view(), seq), post.view(), a, q, reqs, held);
-}
-
-/// `detach(seq)`: A's `detach`, `drop` of the leases of a refused request, or no step.
-pub proof fn lemma_ring_detach<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    seq: int,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        placed(pre.view(), a, q, reqs, held),
-        forall|s: int|
-            #[trigger] post.req(s) == if s == seq && pre.req(s) is Some {
-                if pre.req(s)->0.phase is Complete {
-                    None
-                } else {
-                    Some(pre.req(s)->0.detach())
-                }
-            } else {
-                pre.req(s)
-            },
-        forall|s: int|
-            #[trigger] post.staged(s) == if s == seq && pre.staged(s) is Some {
-                Some(pre.staged(s)->0.detach())
-            } else {
-                pre.staged(s)
-            },
-        forall|s: int|
-            #[trigger] post.refused(s) == if s == seq {
-                None
-            } else {
-                pre.refused(s)
-            },
-    ensures
-        abs_reaches(a, a2),
-        placed(post.view(), a2, q, reqs, held),
-        a2.wakes == a.wakes,
-{
-    let a2 = lemma_detach(pre.view(), a, q, reqs, held, seq);
-    lemma_same(detached(pre.view(), seq), post.view(), a2, q, reqs, held);
-    a2
-}
-
-/// `set_waker(seq, waker)`: A's `register`, or no step.
-pub proof fn lemma_ring_register<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    seq: int,
-    wk: WakerId,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        placed(pre.view(), a, q, reqs, held),
-        forall|s: int|
-            #[trigger] post.req(s) == if s == seq && pre.req(s) is Some && pre.req(s)->0.phase is InFlight
-                && !pre.req(s)->0.detached {
-                Some(pre.req(s)->0.with_waker(wk))
-            } else {
-                pre.req(s)
-            },
-        forall|s: int|
-            #[trigger] post.staged(s) == if s == seq && pre.staged(s) is Some && !pre.staged(
-                s,
-            )->0.detached {
-                Some(pre.staged(s)->0.with_waker(wk))
-            } else {
-                pre.staged(s)
-            },
-        forall|s: int| #[trigger] post.refused(s) == pre.refused(s),
-    ensures
-        abs_reaches(a, a2),
-        placed(post.view(), a2, q, reqs, held),
-        a2.wakes == a.wakes,
-{
-    let a2 = lemma_register(pre.view(), a, q, reqs, held, seq, wk);
-    lemma_same(registered(pre.view(), seq, wk), post.view(), a2, q, reqs, held);
-    a2
-}
-
-/// `release_all`: A's `complete` (a flush) of every request in flight and
-/// `detach` of every owned one, `drop` of every lease of each staged or refused
-/// one. Nothing of the ring's is left in A, so its queue pair may go (`drop_qp`).
-pub proof fn lemma_ring_release_all<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        pre.inv(),
-        placed(pre.view(), a, q, reqs, held),
-        forall|s: int| #[trigger] post.req(s) is None,
-        forall|s: int| #[trigger] post.staged(s) is None,
-        forall|s: int| #[trigger] post.refused(s) is None,
-    ensures
-        abs_reaches(a, a2),
-        placed(post.view(), a2, q, reqs, held),
-{
-    pre.lemma_view();
-    let (h, c, p) = (pre.spec_head() as int, pre.spec_committed() as int, pre.spec_posted() as int);
-    let a1 = lemma_release(pre.view(), a, q, reqs, held, h, c);
-    let v1 = without_range(pre.view(), h, c);
-    assert forall|s: int| c <= s < p implies #[trigger] (v1.staged)(s) is Some by {}
-    let a2 = lemma_drop_staged(v1, a1, q, reqs, held, c, p);
-    lemma_same(dropped_range(v1, c, p), post.view(), a2, q, reqs, held);
-    lemma_abs_reaches_trans(a, a1, a2);
-    a2
-}
-
-// =============================================================================
-// Results moved out of the ring
-//
-// `safeverbs` moves results nobody has taken yet out of a clogged ring into a
-// side list, where their futures find them. A still sees each such result
-// as a complete request with an owner (`side`), or, for a refused request,
-// as leases of the program (`refused`): moving it is no step, and taking it from
-// the side list (or dropping its future) is A's `take` (or `detach`), with
-// exactly the outcome and leases the ring gave, or no step (or `drop`) for a
-// refused one.
-
-/// `v` with the side list: by sequence number, the outcome and leases of
-/// complete requests moved out of the ring (`side`), each a complete request
-/// with an owner in A, and the leases of refused requests moved out
-/// (`refused`), each leases of the program in A.
-pub open spec fn with_side<L>(v: View<L>, side: Map<int, (Outcome, L)>, refused: Map<int, L>) -> View<L> {
-    View {
-        req: |s: int|
-            if side.contains_key(s) {
-                Some(
-                    ReqView {
-                        phase: Phase::Complete(side[s].0),
-                        waker: None,
-                        detached: false,
-                        leases: side[s].1,
-                    },
-                )
-            } else {
-                (v.req)(s)
-            },
-        staged: v.staged,
-        refused: |s: int|
-            if refused.contains_key(s) {
-                Some(refused[s])
-            } else {
-                (v.refused)(s)
-            },
-    }
-}
-
-/// Moving a complete request's outcome and leases, as `take` returned them,
-/// from the ring to the side list is no step of A.
-pub proof fn lemma_side_move<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    seq: int,
-    outcome: Outcome,
-    leases: L,
-    side: Map<int, (Outcome, L)>,
-    refused: Map<int, L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-)
-    requires
-        placed(with_side(pre.view(), side, refused), a, q, reqs, held),
-        !side.contains_key(seq),
-        !refused.contains_key(seq),
-        pre.req(seq) == Some(
-            ReqView { phase: Phase::Complete(outcome), waker: None, detached: false, leases },
-        ),
-        forall|s: int|
-            #[trigger] post.req(s) == if s == seq {
-                None
-            } else {
-                pre.req(s)
-            },
-        forall|s: int| #[trigger] post.staged(s) == pre.staged(s),
-        forall|s: int| #[trigger] post.refused(s) == pre.refused(s),
-    ensures
-        placed(with_side(post.view(), side.insert(seq, (outcome, leases)), refused), a, q, reqs, held),
-{
-    lemma_same(
-        with_side(pre.view(), side, refused),
-        with_side(post.view(), side.insert(seq, (outcome, leases)), refused),
-        a,
-        q,
-        reqs,
-        held,
-    );
-}
-
-/// Moving a refused request's leases, as `take` returned them, from the
-/// ring to the side list is no step of A.
-pub proof fn lemma_side_move_refused<L>(
-    pre: Ring<L>,
-    post: Ring<L>,
-    seq: int,
-    leases: L,
-    side: Map<int, (Outcome, L)>,
-    refused: Map<int, L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-)
-    requires
-        placed(with_side(pre.view(), side, refused), a, q, reqs, held),
-        !side.contains_key(seq),
-        !refused.contains_key(seq),
-        pre.refused(seq) == Some(leases),
-        forall|s: int| #[trigger] post.req(s) == pre.req(s),
-        forall|s: int| #[trigger] post.staged(s) == pre.staged(s),
-        forall|s: int|
-            #[trigger] post.refused(s) == if s == seq {
-                None
-            } else {
-                pre.refused(s)
-            },
-    ensures
-        placed(with_side(post.view(), side, refused.insert(seq, leases)), a, q, reqs, held),
-{
-    lemma_same(
-        with_side(pre.view(), side, refused),
-        with_side(post.view(), side, refused.insert(seq, leases)),
-        a,
-        q,
-        reqs,
-        held,
-    );
-}
-
-/// Taking a result from the side list is A's `take`: the outcome and the
-/// leases the ring gave, the program holding each of them again.
-pub proof fn lemma_side_take<L>(
-    v: View<L>,
-    seq: int,
-    side: Map<int, (Outcome, L)>,
-    refused: Map<int, L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        placed(with_side(v, side, refused), a, q, reqs, held),
-        side.contains_key(seq),
-        (v.req)(seq) is None,
-    ensures
-        abs_step(a, a2, Abs::Step::take(reqs[seq], side[seq].0)),
-        placed(with_side(v, side.remove(seq), refused), a2, q, reqs, held),
-        forall|k: LeaseId| #[trigger] held(seq, side[seq].1).contains_key(k)
-            ==> a2.is_program(k) && a2.leases[k].same_as(a.leases[k]),
-{
-    let w = with_side(v, side, refused);
-    let a2 = lemma_take(w, a, q, reqs, held, seq, side[seq].0, side[seq].1);
-    lemma_same(without(w, seq), with_side(v, side.remove(seq), refused), a2, q, reqs, held);
-    a2
-}
-
-/// Taking a refused request's leases from the side list is no step of A.
-pub proof fn lemma_side_take_refused<L>(
-    v: View<L>,
-    seq: int,
-    side: Map<int, (Outcome, L)>,
-    refused: Map<int, L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-)
-    requires
-        placed(with_side(v, side, refused), a, q, reqs, held),
-        refused.contains_key(seq),
-        (v.refused)(seq) is None,
-    ensures
-        placed(with_side(v, side, refused.remove(seq)), a, q, reqs, held),
-        a.may_post(held(seq, refused[seq])),
-{
-    let w = with_side(v, side, refused);
-    lemma_take_refused(w, a, q, reqs, held, seq);
-    lemma_same(without_refused(w, seq), with_side(v, side, refused.remove(seq)), a, q, reqs, held);
-}
-
-/// Dropping the future of a result in the side list is A's `detach`, which
-/// releases its leases.
-pub proof fn lemma_side_detach<L>(
-    v: View<L>,
-    seq: int,
-    side: Map<int, (Outcome, L)>,
-    refused: Map<int, L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        placed(with_side(v, side, refused), a, q, reqs, held),
-        side.contains_key(seq),
-        (v.req)(seq) is None,
-    ensures
-        abs_reaches(a, a2),
-        placed(with_side(v, side.remove(seq), refused), a2, q, reqs, held),
-{
-    let w = with_side(v, side, refused);
-    let a2 = lemma_detach(w, a, q, reqs, held, seq);
-    assert(wf_at(w, seq));
-    lemma_same(detached(w, seq), with_side(v, side.remove(seq), refused), a2, q, reqs, held);
-    a2
-}
-
-/// Dropping the owner of a refused result in the side list is A's `drop` of
-/// each of its leases.
-pub proof fn lemma_side_detach_refused<L>(
-    v: View<L>,
-    seq: int,
-    side: Map<int, (Outcome, L)>,
-    refused: Map<int, L>,
-    a: Abs::State,
-    q: QpId,
-    reqs: Map<int, ReqId>,
-    held: Held<L>,
-) -> (a2: Abs::State)
-    requires
-        placed(with_side(v, side, refused), a, q, reqs, held),
-        refused.contains_key(seq),
-        (v.refused)(seq) is None,
-    ensures
-        abs_reaches(a, a2),
-        placed(with_side(v, side, refused.remove(seq)), a2, q, reqs, held),
-{
-    let w = with_side(v, side, refused);
-    let a2 = lemma_drop_refused(w, a, q, reqs, held, seq);
-    lemma_same(without_refused(w, seq), with_side(v, side, refused.remove(seq)), a2, q, reqs, held);
-    a2
-}
-
-// =============================================================================
-// Examples: the adapters' preconditions can be met.
+// Examples: the lemmas' preconditions can be met.
 
 /// A view with no request.
 spec fn no_requests<L>() -> View<L> {
     View { req: |s: int| None, staged: |s: int| None, refused: |s: int| None }
 }
 
-/// A ring with no request sits in any state of A, whatever its values stand for.
-proof fn lemma_no_requests_placed<L>(a: Abs::State, q: QpId, held: Held<L>)
+/// A request with no name is no problem to a state of A with no request.
+proof fn lemma_no_requests_placed<L>(a: Abs::State, q: spec_fn(L) -> QpId, held: Held<L>)
     requires
         abs_inv(a),
-        a.qps.contains(q),
+        a.requests == Map::<ReqId, Req>::empty(),
     ensures
         placed(no_requests::<L>(), a, q, Map::empty(), held),
 {
@@ -2019,49 +1633,57 @@ spec fn source_and_destination() -> Abs::State {
     }
 }
 
+/// What the requests of the examples hold: the destination, to write, and the source, to read.
+spec fn two_leases() -> Holds {
+    Map::empty()
+        .insert(0nat, Hold { dir: Dir::In, mem: source_and_destination().leases[0].mem })
+        .insert(1nat, Hold { dir: Dir::Out, mem: source_and_destination().leases[1].mem })
+}
+
 /// A request with a READ destination and a shared source, of which the program
 /// keeps a clone. `L` is the leases themselves. Posted and given a waker: the NIC writes the
-/// one and reads the other. Completed and taken: each comes back. Or detached: it
-/// stays in flight, and completing releases it.
+/// one and reads the other. Completed and taken: the destination comes back, the source is gone.
+/// Or detached: it stays in flight, and completing releases it.
 #[verifier::spinoff_prover]
 #[verifier::rlimit(20)]
 pub proof fn example_request_of_two_leases() {
     let a0 = source_and_destination();
     assert(abs_inv(a0));
-    let held = |_s: int, dirs: Map<LeaseId, Dir>| dirs;
-    let dirs = Map::empty().insert(0nat, Dir::In).insert(1nat, Dir::Out);
+    let held = |_s: int, h: Holds| h;
+    let q = |_h: Holds| 7nat;
+    let h = two_leases();
     let reqs0 = Map::<int, ReqId>::empty();
-    let v0 = no_requests::<Map<LeaseId, Dir>>();
-    lemma_no_requests_placed(a0, 7, held);
-    assert forall|t: int| #[trigger] leases_of(v0, held, t).dom().disjoint(dirs.dom()) by {}
-    lemma_end(v0, a0, 7, reqs0, held, 0, false, dirs);
-    let staged = staged_with(v0, 0, false, dirs);
-    let a1 = lemma_post_one(staged, a0, 7, reqs0, held, 0);
+    let v0 = no_requests::<Holds>();
+    lemma_no_requests_placed(a0, q, held);
+    assert forall|t: int| #[trigger] leases_of(v0, held, t).dom().disjoint(h.dom()) by {}
+    lemma_end(v0, a0, q, reqs0, held, 0, false, h);
+    let staged = staged_with(v0, 0, false, h);
+    let a1 = lemma_post_one(staged, a0, q, reqs0, held, 0);
     let in_flight = posted(staged, 0);
     let reqs = reqs0.insert(0, a0.next_id);
     let r = a0.next_id;
-    let a2 = lemma_register(in_flight, a1, 7, reqs, held, 0, 9);
+    let a2 = lemma_register(in_flight, a1, q, reqs, held, 0, 9);
     let waiting = registered(in_flight, 0, 9);
-    assert(sits(waiting, a2, 7, reqs, held, 0));
-    assert(a2.in_flight(r) && a2.requests[r].waker == Some(9));
-    assert(dirs.contains_key(0) && a2.place(0) == Place::InFlight(r));
-    assert(dirs.contains_key(1) && a2.place(1) == Place::InFlight(r));
+    assert(sits(waiting, a2, q, reqs, held, 0));
+    assert(a2.in_flight(r));
+    assert(h.contains_key(0) && a2.place(0) == Place::InFlight(r));
+    assert(h.contains_key(1) && a2.place(1) == Place::InFlight(r));
 
-    // Taken: each lease comes back, under its own name, the waker having run.
-    let flush = flushed();
-    lemma_complete_one(waiting, a2, 7, reqs, held, 0, flush);
+    // Taken: the destination comes back, under its own name.
+    let flush = Outcome { status: Status::FlushErr, kind: safeverbs_spec::types::CompletionKind::StatusOnly, byte_len: 0, imm: None };
+    lemma_complete_one(waiting, a2, q, reqs, held, 0, flush);
     let done = complete_state(a2, r, flush);
     let completed = completed(waiting, 0, flush);
-    let taken = lemma_take(completed, done, 7, reqs, held, 0, flush, dirs);
-    assert(taken.is_program(0) && taken.is_program(1));
-    assert(taken.wakes == seq![9nat]);
+    let taken = lemma_take(completed, done, q, reqs, held, 0, flush, h);
+    assert(h.contains_key(0) && done.leases[0].unique);
+    assert(taken.is_program(0));
 
     // Detached: still in flight with its leases, until it completes.
-    let detached_state = lemma_detach(waiting, a2, 7, reqs, held, 0);
+    let detached_state = lemma_detach(waiting, a2, q, reqs, held, 0);
     let detached_view = detached(waiting, 0);
-    assert(sits(detached_view, detached_state, 7, reqs, held, 0));
+    assert(sits(detached_view, detached_state, q, reqs, held, 0));
     assert(detached_state.place(0) == Place::InFlight(r));
-    lemma_complete_one(detached_view, detached_state, 7, reqs, held, 0, flush);
+    lemma_complete_one(detached_view, detached_state, q, reqs, held, 0, flush);
     let released = complete_state(detached_state, r, flush);
     assert(released.place(0) is Released && released.place(1) is Released);
 }
@@ -2073,61 +1695,32 @@ pub proof fn example_request_of_two_leases() {
 pub proof fn example_refused() {
     let a0 = source_and_destination();
     assert(abs_inv(a0));
-    let held = |_s: int, dirs: Map<LeaseId, Dir>| dirs;
-    let owned = Map::empty().insert(0nat, Dir::In);
-    let unowned = Map::empty().insert(1nat, Dir::Out);
+    let held = |_s: int, h: Holds| h;
+    let q = |_h: Holds| 7nat;
+    let owned = Map::empty().insert(0nat, Hold { dir: Dir::In, mem: a0.leases[0].mem });
+    let unowned = Map::empty().insert(1nat, Hold { dir: Dir::Out, mem: a0.leases[1].mem });
     let reqs = Map::<int, ReqId>::empty();
-    let v0 = no_requests::<Map<LeaseId, Dir>>();
-    lemma_no_requests_placed(a0, 7, held);
+    let v0 = no_requests::<Holds>();
+    lemma_no_requests_placed(a0, q, held);
     assert forall|t: int| #[trigger] leases_of(v0, held, t).dom().disjoint(owned.dom()) by {}
-    lemma_end(v0, a0, 7, reqs, held, 0, false, owned);
+    lemma_end(v0, a0, q, reqs, held, 0, false, owned);
     let v1 = staged_with(v0, 0, false, owned);
     assert forall|t: int| #[trigger] leases_of(v1, held, t).dom().disjoint(unowned.dom()) by {
-        assert(t != 0 ==> leases_of(v1, held, t) == Map::<LeaseId, Dir>::empty());
+        assert(t != 0 ==> leases_of(v1, held, t) == Map::<LeaseId, Hold>::empty());
     }
-    lemma_end(v1, a0, 7, reqs, held, 1, true, unowned);
+    lemma_end(v1, a0, q, reqs, held, 1, true, unowned);
     let v2 = staged_with(v1, 1, true, unowned);
 
     // Refused: the one with an owner is kept for it, the other's lease is dropped.
-    let a1 = lemma_abort(v2, a0, 7, reqs, held, 0, 2, -1);
+    let a1 = lemma_abort(v2, a0, q, reqs, held, 0, 2, -1);
     let v3 = refused_range(v2, 0, 2, -1);
     assert((v3.refused)(0) == Some(owned) && (v3.staged)(0) is None);
     assert((v3.refused)(1) is None && (v3.staged)(1) is None);
 
-    // Its owner takes it: no step, and the program never gave the lease up.
-    lemma_take_refused(v3, a1, 7, reqs, held, 0);
+    // Its owner takes it: the program never gave the lease up.
+    assert(sits(v3, a1, q, reqs, held, 0));
     assert(owned.contains_key(0) && a1.is_program(0));
-    assert(a1.requests =~= a0.requests && a1.outcomes =~= a0.outcomes);
-}
-
-/// Equal shared values in different requests stand for different leases: the
-/// interpretation depends on the request's sequence number.
-#[verifier::spinoff_prover]
-pub proof fn example_equal_values_different_leases() {
-    let a0 = source_and_destination();
-    assert(abs_inv(a0));
-    let shared = 64nat;
-    let held = |s: int, _len: nat| Map::empty().insert(if s == 0 { 1nat } else { 2nat }, Dir::Out);
-    let reqs = Map::<int, ReqId>::empty();
-    let v0 = no_requests::<nat>();
-    lemma_no_requests_placed(a0, 7, held);
-    assert forall|t: int| #[trigger] leases_of(v0, held, t).dom().disjoint(held(0, shared).dom()) by {}
-    lemma_end(v0, a0, 7, reqs, held, 0, false, shared);
-    let v1 = staged_with(v0, 0, false, shared);
-    assert forall|t: int| #[trigger] leases_of(v1, held, t).dom().disjoint(held(1, shared).dom()) by {
-        if t != 0 {
-            assert(leases_of(v1, held, t) == Map::<LeaseId, Dir>::empty());
-        }
-    }
-    lemma_end(v1, a0, 7, reqs, held, 1, false, shared);
-    let v2 = staged_with(v1, 1, false, shared);
-    assert((v2.staged)(0)->0.leases == (v2.staged)(1)->0.leases);
-    let (a1, reqs1) = lemma_commit(v2, a0, 7, reqs, held, 0, 2);
-    let v3 = posted_range(v2, 0, 2);
-    assert(sits(v3, a1, 7, reqs1, held, 0) && sits(v3, a1, 7, reqs1, held, 1));
-    assert(held(0, shared).contains_key(1) && held(1, shared).contains_key(2));
-    assert(a1.leases[1].held_by(reqs1[0]) && a1.leases[2].held_by(reqs1[1]));
-    assert(reqs1[0] != reqs1[1]);
+    lemma_take_refused(v3, a1, q, reqs, held, 0);
 }
 
 } // verus!

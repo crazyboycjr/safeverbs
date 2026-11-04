@@ -88,6 +88,22 @@ pub open spec fn posted(m: Nic::State, w: WqeRef) -> bool {
     }
 }
 
+/// The next WQE M retires of queue `queue` of `qp`.
+pub open spec fn head_of(qp: Qp, queue: Queue) -> nat {
+    match queue {
+        Queue::Send => qp.sq_head,
+        Queue::Recv => qp.rq_head,
+    }
+}
+
+/// The other queue of a QP.
+pub open spec fn other_queue(queue: Queue) -> Queue {
+    match queue {
+        Queue::Send => Queue::Recv,
+        Queue::Recv => Queue::Send,
+    }
+}
+
 /// The WQEs a request owns: `[first, end)` of one queue of one QP, in posting order.
 pub struct WqeRange {
     pub qp: QpId,
@@ -361,6 +377,47 @@ pub open spec fn coupled(
     &&& records_wrs(m, wrs)
     &&& forall|x: int| #[trigger] m.nic_may_read(x) ==> a.nic_reads(x)
     &&& forall|x: int| #[trigger] m.nic_may_write(x) ==> a.nic_writes(x)
+}
+
+/// A's start state.
+pub open spec fn abs_start() -> Abs::State {
+    Abs::State {
+        qps: Set::empty(),
+        leases: Map::empty(),
+        requests: Map::empty(),
+        next_id: 0,
+        outcomes: Map::empty(),
+        wakes: Seq::empty(),
+    }
+}
+
+/// [`abs_start`] is a start state of A.
+pub proof fn lemma_abs_start()
+    ensures
+        abs_init(abs_start()),
+        abs_inv(abs_start()),
+{
+    reveal(Abs::State::init);
+    reveal(Abs::State::init_by);
+    assert(Abs::State::start(abs_start()));
+    assert(Abs::State::init_by(abs_start(), Abs::Config::start()));
+    lemma_abs_init_invariant(abs_start());
+}
+
+/// M's start and A's are coupled: M has no queue and no region yet.
+pub proof fn lemma_start_coupled(m: Nic::State)
+    requires
+        nic_init(m),
+    ensures
+        coupled(abs_start(), m, Map::empty(), IMap::empty()),
+{
+    reveal(Nic::State::init);
+    reveal(Nic::State::init_by);
+    crate::nic_proofs::lemma_history_init(m);
+    let caps = choose|caps: Caps| Nic::State::open(m, caps);
+    assert(Nic::State::open(m, caps));
+    assert forall|x: int| !#[trigger] m.nic_may_read(x) by {}
+    assert forall|x: int| !#[trigger] m.nic_may_write(x) by {}
 }
 
 // =========================================================================================

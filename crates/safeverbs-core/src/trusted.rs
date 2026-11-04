@@ -457,7 +457,7 @@ pub fn create_cq<N: Device>(ctx: &Context<N>, entries: u32) -> (r: Result<
         r matches Ok((cq, caps, t)) ==> {
             let m = t@.nic();
             let sh = t@.share();
-            &&& nic_inv(m)
+            &&& exists|m0: Nic::State| nic_init(m0) && nic_reaches(m0, m)
             &&& share_wf(m, sh)
             &&& cq_of(cq) == sh.cq
             &&& m.cqs[sh.cq].cap == entries

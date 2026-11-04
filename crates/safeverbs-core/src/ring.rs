@@ -874,9 +874,23 @@ impl<L> Ring<L> {
                 && self.req(s)->0.leases == self.dma(s, w)->0,
             self.spec_wqe_committed() <= w ==> self.staged(s) is Some && self.staged(s)->0.leases
                 == self.dma(s, w)->0,
+            self.meta(s) is Some,
+            self.meta(s)->0.first <= w < self.meta(s)->0.end,
     {
         reveal(Ring::inv_slots_but);
         assert(self.live_ok(s));
+    }
+
+    /// The WQEs of the requests not retired are in order: a later request's come after an earlier
+    /// one's.
+    pub proof fn lemma_meta_ordered(&self, s: int, t: int)
+        requires
+            self.inv(),
+            self.spec_retired() <= s < t < self.spec_posted(),
+        ensures
+            self.meta(s) is Some && self.meta(t) is Some ==> self.meta(s)->0.end <= self.meta(t)->0.first,
+    {
+        self.lemma_ordered(s, t);
     }
 
     /// Two live requests cannot authorize the same WQE number. This is
@@ -958,15 +972,6 @@ impl<L> Ring<L> {
         }
     }
 
-    /// A stuttering step changes nothing A sees.
-    pub proof fn lemma_same_view(&self, other: &Self)
-        requires
-            self.same_view(other),
-        ensures
-            crate::refine::same(other.view(), self.view()),
-    {
-    }
-
     /// A request in flight retires as A's `complete` says.
     pub proof fn lemma_retired_view(&self, s: int, outcome: CompletionResult)
         requires
@@ -982,22 +987,6 @@ impl<L> Ring<L> {
                 },
             },
     {
-    }
-
-    /// The wakers of requests in flight, as A sees them.
-    pub proof fn lemma_wakers(&self, from: int, to: int)
-        requires
-            self.inv(),
-            self.spec_retired() <= from <= to <= self.spec_committed(),
-        ensures
-            self.wakers(from, to) == crate::refine::wakers(self.view(), from, to),
-        decreases to - from,
-    {
-        reveal(Ring::inv_slots_but);
-        if from < to {
-            self.lemma_wakers(from, to - 1);
-            assert(self.live_ok(to - 1));
-        }
     }
 
     /// `self` and `other` agree on the counters, whatever the slots and the wakers.

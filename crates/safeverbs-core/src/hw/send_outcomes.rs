@@ -462,7 +462,7 @@ pub(super) proof fn lemma_prefix_aggregate(range: WqeRange, retired: IMap<WqeRef
 }
 
 /// The aggregate reads the outcomes of the range's own WQEs only.
-proof fn lemma_aggregate_framed(range: WqeRange, before: IMap<WqeRef, Outcome>, after: IMap<WqeRef, Outcome>)
+pub(super) proof fn lemma_aggregate_framed(range: WqeRange, before: IMap<WqeRef, Outcome>, after: IMap<WqeRef, Outcome>)
     requires
         range.wf(),
         range.all_retired(before),
@@ -877,15 +877,15 @@ impl<C, N: Device> Hw<C, N> {
             let range = send_range(e.id(), e.send.meta(seq as int)->0);
             let last = e.send_tails@[seq as int];
             let retired = self.nic().retired;
-            let payload = Payload { ctx: Some(c.wr_id), leases: c.leases };
             if c.result matches Err(CompletionError::Refused) {
-                e.send.req(seq as int) is None && e.send.refused(seq as int) == Some(payload)
+                &&& e.send.req(seq as int) is None
+                &&& e.send.refused(seq as int) == Some(Payload { ctx: Some(c.wr_id), leases: c.leases, ..e.send.refused(seq as int)->0 })
             } else {
                 &&& e.send.req(seq as int) == Some(crate::ring::ReqView {
                     phase: safeverbs_spec::abs::Phase::Complete(range.aggregate(retired)),
                     waker: None,
                     detached: false,
-                    leases: payload,
+                    leases: Payload { ctx: Some(c.wr_id), leases: c.leases, ..e.send.req(seq as int)->0.leases },
                 })
                 &&& send_reports_outcome(range, retired, last, c.result)
             }
@@ -899,7 +899,7 @@ impl<C, N: Device> Hw<C, N> {
             self.inv(),
             self.has_qp(index as int),
             self.send_taken_from(index, seq, t),
-            t.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases }),
+            t.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases, ..t.leases }),
             c.result == t.outcome,
         ensures
             c.leases.inv() && c.leases.fully_recorded(),

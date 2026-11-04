@@ -257,10 +257,34 @@ impl<N: Device> OpenRequest<N> {
         }
     }
 
+    /// It has no WQE.
+    pub open(super) spec fn has_no_wqe(&self) -> bool {
+        self.n == 0
+    }
+
+    /// Its inputs.
+    pub open(super) spec fn loans(&self) -> Seq<Loan<N>> {
+        self.kept.loans()
+    }
+
+    /// Without a WQE it has no input.
+    pub(super) proof fn lemma_no_inputs(&self)
+        requires
+            self.inv(),
+            self.n == 0,
+        ensures
+            self.kept.loans().len() == 0,
+    {
+        if self.kept.loans().len() > 0 {
+            assert(crate::buf::input_is_covered(self.ledger@, 0));
+        }
+    }
+
     /// One that holds nothing and takes nothing.
     pub fn closed() -> (r: Self)
         ensures
             r.inv(),
+            r.has_no_wqe(),
     {
         OpenRequest {
             wqes: Vec::new(),
@@ -458,6 +482,7 @@ impl<N: Device> OpenRequest<N> {
             final(self).reads == old(self).reads,
             final(self).max_sges == old(self).max_sges,
             final(self).gathered@ == old(self).gathered@,
+            final(self).kept.loans().len() == 0,
             final(spare)@.len() == 0,
             leases.inv(),
             leases.loans() == old(self).kept.loans(),

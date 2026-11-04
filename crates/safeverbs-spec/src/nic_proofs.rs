@@ -1481,4 +1481,544 @@ pub proof fn lemma_request_step(range: WqeRange, m: Nic::State, n: Nic::State, s
     }
 }
 
+// =========================================================================================
+// M's history: what its rules keep along a run, beyond its invariants
+
+/// The outcomes queue pair `q`'s queues hold are what the WRs of their WQEs allow.
+pub open spec fn queued_outcomes_ok(m: Nic::State, q: QpId) -> bool {
+    !m.qps.contains_key(q) || {
+        let qp = m.qps[q];
+        &&& forall|k: int| 0 <= k < qp.sq.len() && (#[trigger] qp.sq[k]).outcome is Some
+            ==> qp.sq[k].wr.opcode.allows_outcome(total_len(qp.sq[k].wr.sges), qp.sq[k].outcome->0)
+        &&& forall|k: int| 0 <= k < qp.rq.len() && (#[trigger] qp.rq[k]).outcome is Some
+            ==> qp.rq[k].wr.allows_outcome(qp.rq[k].outcome->0)
+    }
+}
+
+/// Every step keeps the outcomes queue pair `q`'s queues hold valid.
+pub proof fn lemma_queued_outcomes_step(m: Nic::State, n: Nic::State, step: Nic::Step, q: QpId)
+    requires
+        nic_inv(m),
+        nic_step(m, n, step),
+        queued_outcomes_ok(m, q),
+    ensures
+        queued_outcomes_ok(n, q),
+{
+    // The NIC's steps expose their updates once their capacity assertions hold.
+    match step {
+        Nic::Step::execute_send(p, _) => lemma_room_for_send_cqe(m, p),
+        Nic::Step::execute_recv(p, _) => lemma_room_for_recv_cqe(m, p),
+        _ => {},
+    }
+    if n.qps.contains_key(q) {
+        let b = n.qps[q];
+        assert forall|k: int| 0 <= k < b.sq.len() && (#[trigger] b.sq[k]).outcome is Some
+            implies b.sq[k].wr.opcode.allows_outcome(total_len(b.sq[k].wr.sges), b.sq[k].outcome->0) by {
+            match step {
+                Nic::Step::create_qp(p, _) => {},
+                Nic::Step::execute_send(p, o) => {
+                    if p == q && k == m.qps[q].sq_done {
+                        assert(b.sq[k].outcome == Some(o));
+                    } else {
+                        assert(b.sq[k] == m.qps[q].sq[k]);
+                    }
+                },
+                Nic::Step::poll_cq(c) => {
+                    let e = m.cqs[c].entries[0];
+                    if e.qp == q && e.queue is Send {
+                        let old_k = k + e.seq + 1 - m.qps[q].sq_head;
+                        assert(b.sq[k] == m.qps[q].sq[old_k]);
+                    } else {
+                        assert(b.sq[k] == m.qps[q].sq[k]);
+                    }
+                },
+                Nic::Step::post_send(p, _) => {
+                    if p == q && k >= m.qps[q].sq.len() {
+                        assert(b.sq[k].outcome is None);
+                    } else {
+                        assert(b.sq[k] == m.qps[q].sq[k]);
+                    }
+                },
+                _ => {
+                    assert(b.sq[k] == m.qps[q].sq[k]);
+                },
+            }
+        }
+        assert forall|k: int| 0 <= k < b.rq.len() && (#[trigger] b.rq[k]).outcome is Some
+            implies b.rq[k].wr.allows_outcome(b.rq[k].outcome->0) by {
+            match step {
+                Nic::Step::create_qp(p, _) => {},
+                Nic::Step::execute_recv(p, o) => {
+                    if p == q && k == m.qps[q].rq_done {
+                        assert(b.rq[k].outcome == Some(o));
+                    } else {
+                        assert(b.rq[k] == m.qps[q].rq[k]);
+                    }
+                },
+                Nic::Step::poll_cq(c) => {
+                    let e = m.cqs[c].entries[0];
+                    if e.qp == q && e.queue is Recv {
+                        let old_k = k + e.seq + 1 - m.qps[q].rq_head;
+                        assert(b.rq[k] == m.qps[q].rq[old_k]);
+                    } else {
+                        assert(b.rq[k] == m.qps[q].rq[k]);
+                    }
+                },
+                Nic::Step::post_recv(p, _) => {
+                    if p == q && k >= m.qps[q].rq.len() {
+                        assert(b.rq[k].outcome is None);
+                    } else {
+                        assert(b.rq[k] == m.qps[q].rq[k]);
+                    }
+                },
+                _ => {
+                    assert(b.rq[k] == m.qps[q].rq[k]);
+                },
+            }
+        }
+    }
+}
+
+/// M knows WQE `w`: it is posted, or it retired.
+pub open spec fn known(m: Nic::State, w: WqeRef) -> bool {
+    posted(m, w) || m.retired.contains_key(w)
+}
+
+/// What M's rules keep of its history: outcomes its WRs allow; what retired lies before its
+/// queue's head, and everything before that head retired.
+pub open spec fn history_ok(m: Nic::State) -> bool {
+    &&& forall|q: QpId| #[trigger] queued_outcomes_ok(m, q)
+    &&& forall|w: WqeRef| #[trigger] m.retired.contains_key(w) && m.qps.contains_key(w.qp)
+        ==> w.seq < head_of(m.qps[w.qp], w.queue)
+    &&& forall|w: WqeRef| m.qps.contains_key(w.qp) && w.seq < head_of(m.qps[w.qp], w.queue)
+        ==> #[trigger] m.retired.contains_key(w)
+}
+
+/// M's start has no history to speak of.
+pub proof fn lemma_history_init(m: Nic::State)
+    requires
+        nic_init(m),
+    ensures
+        history_ok(m),
+        wr_log(m, IMap::empty()),
+{
+    reveal(Nic::State::init);
+    reveal(Nic::State::init_by);
+    let caps = choose|caps: Caps| Nic::State::open(m, caps);
+    assert(Nic::State::open(m, caps));
+    assert forall|w: WqeRef| !(#[trigger] posted(m, w)) by {}
+}
+
+/// The WQEs `poll_cq` retires are those from its queue's head to the CQE's.
+pub proof fn lemma_polled_wqes(m: Nic::State, n: Nic::State, c: CqId)
+    requires
+        nic_inv(m),
+        history_ok(m),
+        Nic::State::poll_cq(m, n, c),
+    ensures
+        ({
+            let e = m.cqs[c].entries[0];
+            let qp = m.qps[e.qp];
+            let qp2 = n.qps[e.qp];
+            let head = head_of(qp, e.queue);
+            &&& m.qps.contains_key(e.qp)
+            &&& head <= e.seq
+            &&& head_of(qp2, e.queue) == e.seq + 1
+            &&& head_of(qp2, other_queue(e.queue)) == head_of(qp, other_queue(e.queue))
+            &&& n.qps.dom() == m.qps.dom()
+            &&& forall|q: QpId| q != e.qp ==> #[trigger] n.qps[q] == m.qps[q]
+            &&& forall|w: WqeRef| #[trigger] n.retired.contains_key(w) <==> m.retired.contains_key(w)
+                || (w.qp == e.qp && w.queue == e.queue && head <= w.seq <= e.seq)
+            &&& forall|w: WqeRef| #[trigger] m.retired.contains_key(w) ==> n.retired[w] == m.retired[w]
+            &&& forall|w: WqeRef| #![trigger n.retired[w]]
+                w.qp == e.qp && w.queue is Send && e.queue is Send && head <= w.seq <= e.seq
+                ==> qp.sq[w.seq - head].outcome == Some(n.retired[w])
+            &&& e.queue is Send ==> qp2.sq.len() == qp.sq.len() - (e.seq + 1 - head)
+            &&& e.queue is Send ==> forall|k: int| 0 <= k < qp2.sq.len()
+                ==> #[trigger] qp2.sq[k] == qp.sq[k + (e.seq + 1 - head)]
+            &&& e.queue is Send ==> qp2.rq == qp.rq && qp2.rq_head == qp.rq_head
+            &&& e.queue is Send ==> e.seq - head < qp.sq_done
+            &&& e.queue is Recv ==> qp2.rq.len() == qp.rq.len() - (e.seq + 1 - head)
+            &&& e.queue is Recv ==> qp2.sq == qp.sq && qp2.sq_head == qp.sq_head
+        }),
+{
+    let e = m.cqs[c].entries[0];
+    let qp = m.qps[e.qp];
+    lemma_head_is_first(m, c);
+    assert(m.qp_wf(qp));
+    reveal(retires);
+    let fresh = retires(qp, e);
+    assert(n.retired == m.retired.union_prefer_right(fresh));
+    assert forall|w: WqeRef| #[trigger] m.retired.contains_key(w) implies n.retired[w] == m.retired[w] by {
+        if fresh.contains_key(w) {
+            assert(w.seq < head_of(m.qps[w.qp], w.queue));
+        }
+    }
+    assert(n.qps.dom() =~= m.qps.dom());
+}
+
+/// One step of M keeps its history; nothing that retired changes, and what M knows it keeps
+/// knowing.
+pub proof fn lemma_history_step(m: Nic::State, n: Nic::State, step: Nic::Step)
+    requires
+        nic_inv(m),
+        nic_step(m, n, step),
+        history_ok(m),
+    ensures
+        history_ok(n),
+        forall|w: WqeRef| #[trigger] m.retired.contains_key(w)
+            ==> n.retired.contains_key(w) && n.retired[w] == m.retired[w],
+        forall|w: WqeRef| #[trigger] known(m, w) ==> known(n, w),
+{
+    assert forall|q: QpId| #[trigger] queued_outcomes_ok(n, q) by {
+        assert(queued_outcomes_ok(m, q));
+        lemma_queued_outcomes_step(m, n, step, q);
+    }
+    match step {
+        Nic::Step::execute_send(p, _) => lemma_room_for_send_cqe(m, p),
+        Nic::Step::execute_recv(p, _) => lemma_room_for_recv_cqe(m, p),
+        Nic::Step::poll_cq(c) => {
+            lemma_polled_wqes(m, n, c);
+            let e = m.cqs[c].entries[0];
+            assert forall|w: WqeRef| #[trigger] n.retired.contains_key(w) && n.qps.contains_key(w.qp)
+                implies w.seq < head_of(n.qps[w.qp], w.queue) by {
+                if m.retired.contains_key(w) {
+                    assert(w.seq < head_of(m.qps[w.qp], w.queue));
+                }
+                if w.queue != e.queue {
+                    assert(w.queue == other_queue(e.queue));
+                }
+            }
+            assert forall|w: WqeRef| n.qps.contains_key(w.qp) && w.seq < head_of(n.qps[w.qp], w.queue)
+                implies #[trigger] n.retired.contains_key(w) by {
+                if w.qp == e.qp && w.queue != e.queue {
+                    assert(w.queue == other_queue(e.queue));
+                }
+                if !(w.qp == e.qp && w.queue == e.queue && head_of(m.qps[e.qp], e.queue) <= w.seq) {
+                    assert(m.retired.contains_key(w));
+                }
+            }
+            assert forall|w: WqeRef| #[trigger] known(m, w) implies known(n, w) by {
+                if w.qp == e.qp && w.queue != e.queue {
+                    assert(w.queue == other_queue(e.queue));
+                }
+            }
+        },
+        _ => {},
+    }
+}
+
+/// `wrs` holds the WRs of the send WQEs M knows, and no other.
+pub open spec fn wr_log(m: Nic::State, wrs: IMap<WqeRef, SendWr>) -> bool {
+    &&& records_wrs(m, wrs)
+    &&& forall|w: WqeRef| #[trigger] wrs.contains_key(w) ==> w.queue is Send && known(m, w)
+}
+
+/// One step of M: its log grows by the WRs it posts, and no entry changes.
+pub proof fn lemma_wr_log_step(m: Nic::State, n: Nic::State, step: Nic::Step, wrs: IMap<WqeRef, SendWr>) -> (more: IMap<WqeRef, SendWr>)
+    requires
+        nic_inv(m),
+        nic_step(m, n, step),
+        history_ok(m),
+        wr_log(m, wrs),
+    ensures
+        wr_log(n, more),
+        wrs.submap_of(more),
+{
+    lemma_history_step(m, n, step);
+    match step {
+        Nic::Step::post_send(q, list) => {
+            let qp = m.qps[q];
+            let base = qp.sq_head + qp.sq.len();
+            let added = IMap::new(
+                |w: WqeRef| w.qp == q && w.queue is Send && base <= w.seq < base + list.len(),
+                |w: WqeRef| list[w.seq - base],
+            );
+            let more = wrs.union_prefer_right(added);
+            assert forall|w: WqeRef| #[trigger] wrs.contains_key(w) implies !added.contains_key(w) by {
+                assert(known(m, w));
+                if m.retired.contains_key(w) && w.qp == q {
+                    assert(w.seq < head_of(m.qps[w.qp], w.queue));
+                }
+            }
+            assert forall|w: WqeRef| #[trigger] posted(n, w) && w.queue is Send implies {
+                &&& more.contains_key(w)
+                &&& more[w] == n.qps[w.qp].sq[w.seq - n.qps[w.qp].sq_head].wr
+            } by {
+                if w.qp == q && w.seq >= base {
+                    assert(added.contains_key(w));
+                } else {
+                    assert(posted(m, w));
+                }
+            }
+            assert forall|w: WqeRef| #[trigger] n.retired.contains_key(w) && w.queue is Send implies {
+                &&& more.contains_key(w)
+                &&& more[w].opcode.allows_outcome(total_len(more[w].sges), n.retired[w])
+            } by {
+                assert(wrs.contains_key(w));
+            }
+            assert forall|w: WqeRef| #[trigger] more.contains_key(w) implies w.queue is Send && known(n, w) by {
+                if wrs.contains_key(w) {
+                    assert(known(m, w));
+                } else {
+                    assert(added.contains_key(w));
+                    assert(posted(n, w));
+                }
+            }
+            more
+        },
+        Nic::Step::poll_cq(c) => {
+            lemma_polled_wqes(m, n, c);
+            let e = m.cqs[c].entries[0];
+            let qp = m.qps[e.qp];
+            let head = head_of(qp, e.queue);
+            assert forall|w: WqeRef| #[trigger] posted(n, w) && w.queue is Send implies {
+                &&& wrs.contains_key(w)
+                &&& wrs[w] == n.qps[w.qp].sq[w.seq - n.qps[w.qp].sq_head].wr
+            } by {
+                assert(posted(m, w));
+            }
+            assert forall|w: WqeRef| #[trigger] n.retired.contains_key(w) && w.queue is Send implies {
+                &&& wrs.contains_key(w)
+                &&& wrs[w].opcode.allows_outcome(total_len(wrs[w].sges), n.retired[w])
+            } by {
+                if !m.retired.contains_key(w) {
+                    assert(w.qp == e.qp && w.queue == e.queue && head <= w.seq <= e.seq);
+                    assert(e.queue is Send);
+                    assert(posted(m, w));
+                    let k = w.seq - head;
+                    assert(qp.sq[k].outcome == Some(n.retired[w]));
+                    assert(queued_outcomes_ok(m, e.qp));
+                }
+            }
+            assert forall|w: WqeRef| #[trigger] wrs.contains_key(w) implies w.queue is Send && known(n, w) by {
+                assert(known(m, w));
+            }
+            wrs
+        },
+        Nic::Step::execute_send(p, o) => {
+            lemma_room_for_send_cqe(m, p);
+            assert forall|w: WqeRef| #[trigger] posted(n, w) && w.queue is Send implies {
+                &&& wrs.contains_key(w)
+                &&& wrs[w] == n.qps[w.qp].sq[w.seq - n.qps[w.qp].sq_head].wr
+            } by {
+                assert(posted(m, w));
+            }
+            assert forall|w: WqeRef| #[trigger] wrs.contains_key(w) implies w.queue is Send && known(n, w) by {
+                assert(known(m, w));
+            }
+            wrs
+        },
+        Nic::Step::execute_recv(p, o) => {
+            lemma_room_for_recv_cqe(m, p);
+            assert forall|w: WqeRef| #[trigger] posted(n, w) && w.queue is Send implies {
+                &&& wrs.contains_key(w)
+                &&& wrs[w] == n.qps[w.qp].sq[w.seq - n.qps[w.qp].sq_head].wr
+            } by {
+                assert(posted(m, w));
+            }
+            assert forall|w: WqeRef| #[trigger] wrs.contains_key(w) implies w.queue is Send && known(n, w) by {
+                assert(known(m, w));
+            }
+            wrs
+        },
+        _ => {
+            assert forall|w: WqeRef| #[trigger] posted(n, w) && w.queue is Send implies {
+                &&& wrs.contains_key(w)
+                &&& wrs[w] == n.qps[w.qp].sq[w.seq - n.qps[w.qp].sq_head].wr
+            } by {
+                assert(posted(m, w));
+            }
+            assert forall|w: WqeRef| #[trigger] wrs.contains_key(w) implies w.queue is Send && known(n, w) by {
+                assert(known(m, w));
+            }
+            wrs
+        },
+    }
+}
+
+/// The step behind a step of M.
+proof fn lemma_next_step(m: Nic::State, n: Nic::State) -> (step: Nic::Step)
+    requires
+        Nic::State::next(m, n),
+    ensures
+        nic_step(m, n, step),
+{
+    reveal(Nic::State::next);
+    reveal(Nic::State::next_by);
+    choose|step: Nic::Step| Nic::State::next_by(m, n, step)
+}
+
+/// A prefix of an execution of M is one.
+proof fn lemma_run_prefix(run: Seq<Nic::State>)
+    requires
+        run.len() > 1,
+        nic_run(run),
+    ensures
+        nic_run(run.drop_last()),
+        run.drop_last().last() == run[run.len() - 2],
+        Nic::State::next(run[run.len() - 2], run.last()),
+{
+    let prefix = run.drop_last();
+    assert forall|i: int| 0 <= i < prefix.len() - 1 implies Nic::State::next(#[trigger] prefix[i], prefix[i + 1]) by {
+        assert(prefix[i] == run[i] && prefix[i + 1] == run[i + 1]);
+    }
+    assert(Nic::State::next(run[run.len() - 2], run[run.len() - 2 + 1]));
+}
+
+proof fn lemma_history_run(run: Seq<Nic::State>, wrs: IMap<WqeRef, SendWr>) -> (more: IMap<WqeRef, SendWr>)
+    requires
+        run.len() > 0,
+        nic_run(run),
+        nic_inv(run[0]),
+        history_ok(run[0]),
+        wr_log(run[0], wrs),
+    ensures
+        nic_inv(run.last()),
+        history_ok(run.last()),
+        wr_log(run.last(), more),
+        wrs.submap_of(more),
+        forall|w: WqeRef| #[trigger] run[0].retired.contains_key(w)
+            ==> run.last().retired.contains_key(w) && run.last().retired[w] == run[0].retired[w],
+        forall|w: WqeRef| #[trigger] known(run[0], w) ==> known(run.last(), w),
+    decreases run.len(),
+{
+    if run.len() == 1 {
+        wrs
+    } else {
+        lemma_run_prefix(run);
+        let prefix = run.drop_last();
+        let log = lemma_history_run(prefix, wrs);
+        let (a, b) = (prefix.last(), run.last());
+        let step = lemma_next_step(a, b);
+        let more = lemma_wr_log_step(a, b, step, log);
+        lemma_history_step(a, b, step);
+        crate::nic::lemma_step_keeps_invariant(a, b);
+        assert forall|w: WqeRef| #[trigger] run[0].retired.contains_key(w)
+            implies b.retired.contains_key(w) && b.retired[w] == run[0].retired[w] by {
+            assert(prefix[0] == run[0]);
+            assert(a.retired.contains_key(w));
+        }
+        assert forall|w: WqeRef| #[trigger] known(run[0], w) implies known(b, w) by {
+            assert(prefix[0] == run[0]);
+            assert(known(a, w));
+        }
+        assert(prefix[0] == run[0]);
+        more
+    }
+}
+
+/// A run of M keeps its history, its log only grows, and what retired stays as it retired.
+pub proof fn lemma_history_reaches(m: Nic::State, n: Nic::State, wrs: IMap<WqeRef, SendWr>) -> (more: IMap<WqeRef, SendWr>)
+    requires
+        nic_inv(m),
+        history_ok(m),
+        wr_log(m, wrs),
+        nic_reaches(m, n),
+    ensures
+        nic_inv(n),
+        history_ok(n),
+        wr_log(n, more),
+        wrs.submap_of(more),
+        forall|w: WqeRef| #[trigger] m.retired.contains_key(w)
+            ==> n.retired.contains_key(w) && n.retired[w] == m.retired[w],
+        forall|w: WqeRef| #[trigger] known(m, w) ==> known(n, w),
+{
+    let run = choose|run: Seq<Nic::State>| run.len() > 0 && run[0] == m && run.last() == n && nic_run(run);
+    lemma_history_run(run, wrs)
+}
+
+proof fn lemma_request_run(range: WqeRange, run: Seq<Nic::State>)
+    requires
+        range.queue is Send,
+        run.len() > 0,
+        nic_run(run),
+        nic_inv(run[0]),
+        history_ok(run[0]),
+        range.pending(run[0]),
+        range.errors_stick(run[0]),
+    ensures
+        nic_inv(run.last()),
+        history_ok(run.last()),
+        range.pending(run.last()) && range.errors_stick(run.last())
+            || range.all_retired(run.last().retired) && range.no_success_after_error(run.last().retired),
+    decreases run.len(),
+{
+    if run.len() > 1 {
+        lemma_run_prefix(run);
+        let prefix = run.drop_last();
+        assert(prefix[0] == run[0]);
+        lemma_request_run(range, prefix);
+        let (a, b) = (prefix.last(), run.last());
+        let step = lemma_next_step(a, b);
+        lemma_history_step(a, b, step);
+        crate::nic::lemma_step_keeps_invariant(a, b);
+        if range.pending(a) && range.errors_stick(a) {
+            lemma_request_step(range, a, b, step);
+        } else {
+            assert forall|s: nat| range.first <= s < range.end
+                implies b.retired.contains_key(#[trigger] range.at(s)) by {
+                assert(a.retired.contains_key(range.at(s)));
+            }
+            assert forall|j: nat, k: nat| #![trigger b.retired[range.at(j)], b.retired[range.at(k)]]
+                range.first <= j < k < range.end && b.retired[range.at(j)].status.is_err()
+                implies b.retired[range.at(k)].status.is_err() by {
+                assert(a.retired.contains_key(range.at(j)) && a.retired.contains_key(range.at(k)));
+                assert(a.retired[range.at(j)].status.is_err());
+            }
+        }
+    }
+}
+
+/// **What M gives a request, along a run.** A send request whose WQEs M holds, those after a
+/// failure failing too, stays so; or all its WQEs retired, none successful after one that failed.
+pub proof fn lemma_request_reaches(range: WqeRange, m: Nic::State, n: Nic::State)
+    requires
+        range.queue is Send,
+        nic_inv(m),
+        history_ok(m),
+        nic_reaches(m, n),
+        range.pending(m),
+        range.errors_stick(m),
+    ensures
+        range.pending(n) && range.errors_stick(n)
+            || range.all_retired(n.retired) && range.no_success_after_error(n.retired),
+{
+    let run = choose|run: Seq<Nic::State>| run.len() > 0 && run[0] == m && run.last() == n && nic_run(run);
+    lemma_request_run(range, run);
+}
+
+/// A request whose last WQE is posted is pending: what lies before its queue's head retired, and
+/// the rest is posted.
+pub proof fn lemma_pending_of_last(range: WqeRange, m: Nic::State)
+    requires
+        range.wf(),
+        history_ok(m),
+        posted(m, range.last()),
+    ensures
+        range.pending(m),
+{
+    let qp = m.qps[range.qp];
+    let head = head_of(qp, range.queue);
+    let cut = if range.first <= head { head } else { range.first };
+    assert forall|s: nat| range.first <= s < cut implies {
+        let w = #[trigger] range.at(s);
+        m.retired.contains_key(w) && !posted(m, w)
+    } by {
+        assert(s < head);
+        assert(m.retired.contains_key(range.at(s)));
+    }
+    assert forall|s: nat| cut <= s < range.end implies {
+        let w = #[trigger] range.at(s);
+        posted(m, w) && !m.retired.contains_key(w)
+    } by {
+        let w = range.at(s);
+        assert(head <= s);
+        if m.retired.contains_key(w) {
+            assert(s < head_of(m.qps[w.qp], w.queue));
+        }
+    }
+    assert(range.pending_at(m, cut));
+}
+
 } // verus!

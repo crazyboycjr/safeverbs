@@ -26,6 +26,7 @@
 //! so the per-worker views compose into executions of M.
 #![allow(unused_imports)]
 
+use crate::abs::Abs;
 use crate::nic::*;
 use crate::refinement::*;
 use crate::types::*;
@@ -48,6 +49,42 @@ pub open spec fn share_wf(m: Nic::State, sh: Share) -> bool {
         ==> m.qps[q].attr.send_cq == sh.cq && m.qps[q].attr.recv_cq == sh.cq
     &&& forall|q: QpId| #[trigger] m.qps.contains_key(q) && (m.qps[q].attr.send_cq == sh.cq
         || m.qps[q].attr.recv_cq == sh.cq) ==> sh.owns.contains(q)
+}
+
+/// The NIC may read byte `a` beyond the queues of share `sh`: for a WQE of another queue pair, or
+/// for a peer holding the rkey of a region.
+pub open spec fn outside_reads(m: Nic::State, sh: Share, a: int) -> bool {
+    ||| exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] !sh.owns.contains(q) && m.qps.contains_key(q)
+            && 0 <= k < m.qps[q].sq.len() && {
+            let wr = m.qps[q].sq[k].wr;
+            !wr.inline && !wr.opcode.writes_local() && covers(wr.sges, a)
+        }
+    ||| exists|key: Key| #[trigger] m.mrs.contains_key(key) && m.mrs[key].remote_read
+            && m.mrs[key].span.contains(a)
+}
+
+/// The NIC may write byte `a` beyond the queues of share `sh`: for a WQE of another queue pair, or
+/// for a peer holding the rkey of a region.
+pub open spec fn outside_writes(m: Nic::State, sh: Share, a: int) -> bool {
+    ||| exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] !sh.owns.contains(q) && m.qps.contains_key(q)
+            && 0 <= k < m.qps[q].sq.len() && {
+            let wr = m.qps[q].sq[k].wr;
+            wr.opcode.writes_local() && covers(wr.sges, a)
+        }
+    ||| exists|q: QpId, k: int| #![trigger m.qps[q].rq[k]] !sh.owns.contains(q) && m.qps.contains_key(q)
+            && 0 <= k < m.qps[q].rq.len() && covers(m.qps[q].rq[k].wr.sges, a)
+    ||| exists|key: Key| #[trigger] m.mrs.contains_key(key) && m.mrs[key].remote_write
+            && m.mrs[key].span.contains(a)
+}
+
+/// What the NIC may touch beyond the queues of share `sh`, A gives it: the regions open to a peer
+/// are leases exposed in A, and other workers' WQEs are too. Theorem 1 for one worker takes this
+/// as a premise of each state: nothing in that worker can say it, since those belong to the control
+/// path and to the others. For a worker alone with no region open to a peer, there is nothing to
+/// say.
+pub open spec fn outside_covered(a: Abs::State, m: Nic::State, sh: Share) -> bool {
+    &&& forall|x: int| #[trigger] outside_reads(m, sh, x) ==> a.nic_reads(x)
+    &&& forall|x: int| #[trigger] outside_writes(m, sh, x) ==> a.nic_writes(x)
 }
 
 /// The memory regions a list of send WRs names (inline data names none).
