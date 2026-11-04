@@ -13,9 +13,9 @@ buf.fill(42);
 let buf = buf.freeze();                    // Buf: shared, read only, cheap to clone and slice
 qp.send(buf.slice(..)).await?;
 qp.send(buf.slice(4096..8192)).await?;
-qp.batch(|b| {                             // one doorbell, one completion
+qp.batch(|b| {                             // one doorbell, one completion, nothing allocated
     for i in 0..128 {
-        b.write(buf.slice(..64), dst.offset(i * 64));
+        b.write(buf.view(..64), dst.offset(i * 64));
     }
 })
 .await?;
@@ -157,8 +157,8 @@ __Data Path__
 - __Completion ring__: each queue pair has a ring of slots indexed by sequence number. Send queues complete in order, so one completion completes every request before it: unsignaled requests and batches are safe, and flushes after an error hand every buffer back with the error. A doorbell the device refuses hands each of its requests back as refused; sequence numbers are never reused.
 - __Typed `wr_id`s and results__: a request carries a value of your own type, kept in its slot and handed back once with its buffers. Its result has only the fields its operation defines: a SEND has no length, a receive is a message or the notification of a peer's WRITE, and an error names the WQE that failed.
 - __One completion queue per thread__: a `LocalCq` or `AsyncCq` is one completion queue and the queue pairs attached to it, on a thread domain where the device has them, with an `Rc` and a `RefCell` flag on the way and no atomics. Each queue pair reserves room on the CQ for every completion it may produce, and completions are routed to their queue pair by the hardware `wr_id` with no lookup.
-- __An event loop at the cost of a hand-written one__: a single operation has its own path (check, slot, WQE, doorbell), polling handles each CQE in one pass, and nothing is allocated. A full queue is an error that hands the `wr_id` and the buffers back. `scripts/measure.sh` prints what each path costs against code written by hand.
-- __Asynchronous operations__: every operation is a `Future` (dropping it never cancels the request), WRITEs stream through a `futures::Sink` and receives through a `futures::Stream`. A full queue means waiting, not an error.
+- __An event loop at the cost of a hand-written one__: a single operation has its own path (check, slot, WQE, doorbell), polling handles each CQE in one pass, and nothing is allocated. A batch collects its WQEs first, in storage that stays with its QP, with nothing held while its closure runs. A full queue is an error that hands the `wr_id` and the buffers back. `scripts/measure.sh` prints what each path costs against code written by hand.
+- __Asynchronous operations__: every operation is a `Future` (dropping it never cancels the request), WRITEs stream through a `futures::Sink`, which gathers them into requests and looks at the CQ only when it has no room, on a flush and on the close, and receives through a `futures::Stream`. A full queue means waiting, not an error.
 - __An engine under the handles__, for those who want to remove the `Rc` too: an `Engine` is a CQ with its QPs by index, one value that moves between threads, reachable with `as_raw()`.
 
 __Control Path__

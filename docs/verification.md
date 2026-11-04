@@ -1,8 +1,9 @@
 # Verification
 
 > **Status on this branch.** The executable data path of the core moved (one operation's
-> own path, batches that collect first, one pass per CQE, smaller slots, `Ring<L>` without its
-> `state` and `open` fields), and its proofs have not moved with it yet. So `scripts/verify.sh`
+> own path, a request being written as a value of its own, `hw/open.rs`, one pass per CQE,
+> smaller slots, `Ring<L>` without its `state` and `open` fields), and its proofs have not moved
+> with it yet. So `scripts/verify.sh`
 > verifies `crates/safeverbs-spec` in full and fails on `crates/safeverbs-core`, whose specs and
 > lemmas still describe the old representation. What this document says is proved of the
 > implementation was proved of the commit before the rewrite (`e28c2e8`); it is what the proofs must

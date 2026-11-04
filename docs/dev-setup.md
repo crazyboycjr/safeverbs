@@ -192,7 +192,9 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
   on the simulated NIC: `wr_id`s back exactly once with their buffers (their
   destructors count), a closure that posts on any QP with every queue full,
   polls again, drops QPs or panics, a full queue as an error, refused
-  doorbells, batches, CQ capacity to the entry, and random operation sequences.
+  doorbells, batches (whose closure may use the QP and the CQ), CQ capacity to
+  the entry, `wr_id`s whose destructors poll, post and drop the last handles of
+  QPs, and random operation sequences.
 - `safeverbs` (`crates/safeverbs/tests/model.rs`): the futures' API on the
   simulated NIC (`Model`), which needs no device: every operation, the sink
   and the stream, dropped futures, errors and flushes, QPs sharing one
@@ -212,8 +214,10 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
 `scripts/measure.sh` prints what one round of each public path costs on the
 simulated NIC against programs written by hand with the same structure
 (`crates/safeverbs/examples/measure.rs`): instructions per round, with the NIC
-subtracted, and the ratio to the baseline. `-v <workload>` gives one workload's
-cost function by function. It needs valgrind. Instruction counts say nothing of
+subtracted (all its functions run, its allocations and copies too), and the
+ratio to the baseline. `-v <workload>` gives one workload's cost function by
+function, `-s` the bytes of a slot and of the handles. It needs valgrind and
+python3. Instruction counts say nothing of
 atomics, caches or MMIO; the numbers that finally count come from a real NIC
 against perftest.
 

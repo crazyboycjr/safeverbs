@@ -5,7 +5,7 @@ Rules for anyone changing this repository, agents included.
 - **Keep the public documents honest about the verified boundary.** README.md,
   `docs/design.md` and `docs/verification.md` say what is proved, what is only stated
   and what is assumed. A verified component, such as the completion ring or the
-  worker's hardware side, does not make Theorem 1 hold for the whole library: say
+  engine's hardware side, does not make Theorem 1 hold for the whole library: say
   which part a claim covers.
 - **Never strengthen M, the NIC model, only to make a proof pass.** M is what users
   trust. Change the implementation or the proof instead. No `assume` or `admit`

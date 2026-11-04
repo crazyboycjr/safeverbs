@@ -272,7 +272,7 @@ qp.send(buf.slice(..)).await?;
 qp.send(buf.slice(4096..8192)).await?;
 qp.batch(|b| {                             // one doorbell, one CQE
     for i in 0..128 {
-        b.write(buf.slice(..64), dst.offset(i * 64));
+        b.write(buf.view(..64), dst.offset(i * 64));
     }
 })
 .await?;
@@ -303,10 +303,17 @@ loses nothing: the CQEs read stay for the next poll.
 into the request's ring slot. Since the buffer is shared and read-only, sending the same
 buffer twice, or any sub-ranges of it, needs no check at all. `batch` posts many WRs with
 one doorbell and signals only the last; its future completes when that CQE arrives, which
-completes the whole batch. `sink` turns a queue pair into a `futures::Sink<WriteOp>`:
-`poll_ready` waits for ring space, `start_send` writes a WQE, `poll_flush` rings the
-doorbell and `poll_close` waits until everything completed. `receiver` turns a set of
-buffers into a stream of received messages, each with its buffer, which the user may repost.
+completes the whole batch. Its closure runs with nothing held, so it may use the QP, others of its
+CQ and the CQ; what it adds goes out when it returns. Its WRs take a `Buf` by value or by reference
+or a `buf.view(range)`: by reference they touch no reference count after the first, and consecutive
+ones keep one lease on the buffer. `sink` turns a queue pair into a `futures::Sink<WriteOp>`:
+`start_send` adds a WQE to a request of its own, as a batch does, `poll_ready` waits only when
+that request is full and the send queue has no room for it, `poll_flush` sends the request, rings
+the doorbell and polls the CQ, and `poll_close` waits until everything completed. The sink looks at
+the CQ only then, so an error is reported by the next `poll_ready` that starts or sends a request,
+the next flush or the close, with the position of its item. Until a flush, items have no order
+against other requests of the queue pair. `receiver` turns a set of buffers into a stream of
+received messages, each with its buffer, which the user may repost.
 
 Results have only the fields their operation defines. Sends, writes, batches and the sink
 resolve to `Ok(())`; a READ gives its buffer back; a receive says `Received::Message { len, imm }` (a SEND, whose `len` bytes are in the buffer) or
@@ -486,7 +493,12 @@ handles and rings, the CQEs read, the engine's share of M) lives in `hw::Hw`, in
 **The data path.** A single operation has its own path: the checks (one comparison each: the buffer
 is of the QP's protection domain, fits, the queue has room), then the slot, so that it keeps the
 memory alive before the NIC hears of it, then the WQE and the doorbell. A batch collects its WQEs
-first, so the signaling decision is known before any is written, and writes them all with its slot.
+first, so the signaling decision is known before any is written, and writes them all with its slot:
+a request being written is a value of its own (`OpenRequest`), which neither the hardware nor the
+ring has a state for, with nothing held meanwhile. Its storage comes from its queue pair and goes
+back, so nothing is allocated per batch, and a list of several buffers is reused the same way: what
+a poll hands out of such a request is its unique buffers, since frozen ones have no way back and are
+released as it comes back.
 Polling handles each CQE in one pass: route it, walk its ring up to it, hand out or wake; one test
 covers the common case, and everything else is out of line (errors, refusals, drain, requests
 without an owner). A slot is its WQEs' end, its outcome, its owner flag and its buffers: states are
@@ -495,7 +507,9 @@ from its CQE. `scripts/measure.sh` prints what a round of each public path costs
 written by hand with the same structure (a table of QPs, a ring of requests per QP, routing by
 `wr_id`), since instruction counts on the simulated NIC are the one number that needs no hardware;
 they miss atomics, caches and MMIO, and the numbers that finally count come from real NICs against
-perftest.
+perftest. The NIC subtracted is everything its functions run, by their call arcs, so what its own
+collections ask of the allocator and its copies count on neither side, and what the library asks of
+the same allocator would count against it.
 
 **Capacity.** Each queue pair reserves a CQ entry for every completion it may produce, its
 send and receive depths, when it is created, and one that does not fit in what is left is
@@ -521,10 +535,14 @@ second) without a completion, `remove_qp` fails with `Error::NotFlushed` and kee
 pair, its buffers, its index and its reservation; dropping the engine tries once more and
 otherwise leaks them, with the CQ and the thread domain (destroying those needs the queue pair
 gone). The cost is waiting for the NIC's flush when a queue pair or an engine is dropped. The
-`wr_id`s of requests not delivered yet are dropped when the removal gives those requests up,
-before any poll; their buffers follow once the NIC is done. A slot without an owner holds no
-`wr_id`, so a poll never runs a destructor of the user's and none can unwind through it with
-completions still to record.
+`wr_id`s of requests not delivered yet are given up by the removal, before any poll, and their
+buffers follow once the NIC is done. A slot without an owner holds no `wr_id`, so a poll never runs a
+destructor of the user's and none can unwind through it with completions still to record. Nor does
+a handle: a removal collects the `wr_id`s and wakers it gives up, and the handle drops them after
+letting go of the CQ, so that a `wr_id` may hold an `Rc` of something with a `LocalQp` of the same
+CQ, and its destructor may poll, post or drop the last handle of any QP. (A waker's `wake` is the
+exception: it runs in the poll, as it did, and a panic from it follows the policy of a panicking
+waker.)
 
 **State.** M accepts work only on a queue pair in RTS or ERR, and a connection starts from
 RESET. The engine records what it knows: a queue pair takes work once `connect` succeeded or

@@ -37,7 +37,8 @@ Read these files in order:
 | --- | --- |
 | [`local.rs`](../crates/safeverbs/src/local.rs) | `LocalQp::post_send`, `LocalQp::post_recv` and `LocalCq::poll`: thin handles over the engine, which keep no state of their own |
 | [`engine.rs`](../crates/safeverbs-core/src/engine.rs) | `Engine::try_post`, `Engine::poll`, `Engine::read_completions`, `Engine::next_completion`, then the general path, `Engine::request`, `Request::push`, `Request::finish`, `Engine::commit` |
-| [`hw.rs`](../crates/safeverbs-core/src/hw.rs) | `Hw::post_one`, `Hw::post_recv`, `read_completions`, `next_completion`, `progress`, then `push`, `close`, `commit`: per-QP state, hardware calls, CQ routing and ring updates |
+| [`hw.rs`](../crates/safeverbs-core/src/hw.rs) | `Hw::post_one`, `Hw::post_recv`, `read_completions`, `next_completion`, `progress`, then `open_request`, `push_other`, `close`, `commit`: per-QP state, hardware calls, CQ routing and ring updates |
+| [`hw/open.rs`](../crates/safeverbs-core/src/hw/open.rs) | `OpenRequest`: a request being written, a value of its own, in storage that comes from its QP |
 | [`ring.rs`](../crates/safeverbs-core/src/ring.rs) | `fill`, `stage_filled`, `commit`, `retire_oldest`, `retire_next`, `complete_with_wakes`, `take`, `detach`: the request lifecycle independently of FFI |
 | [`ring/payload.rs`](../crates/safeverbs-core/src/ring/payload.rs) | what a slot of an engine's rings holds: the buffers and the `wr_id`, one generic value to the ring |
 | [`wr_id.rs`](../crates/safeverbs-core/src/wr_id.rs) | how a CQE identifies its QP, queue and WQE number (internal: users have their own `wr_id`s, kept in the slots) |
@@ -49,7 +50,7 @@ There are three useful traces:
 ```text
 post_send -> checks, one comparison each -> slot -> WQE -> doorbell -> slot staged and committed
 poll -> read the CQEs, update the consumer index -> for each: decode wr_id, retire in the ring, hand out
-batch -> collect its WQEs -> close (signaling now known) -> slot -> WQEs -> doorbell at commit
+batch -> open_request -> its WQEs collected, nothing held -> close (signaling now known) -> WQEs -> slot -> doorbell
 ```
 
 A CQE can retire earlier unsignaled WQEs too, and then hands out those requests first.
