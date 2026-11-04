@@ -18,14 +18,6 @@ use crate::nic::Nic;
 
 verus! {
 
-/// Registration/finalization is the remaining lifetime boundary; range ownership
-/// and byte permissions are visible, rather than the whole RawMut being opaque.
-#[cfg(verus_keep_ghost)]
-#[verifier::external_type_specification]
-#[verifier::external_body]
-#[verifier::reject_recursive_types(N)]
-pub struct ExRegion<N: Nic>(Region<N>);
-
 /// The fallible zeroed counterpart of vstd's global allocator primitive.
 /// No permission is returned for an invalid layout or a null allocation.
 #[verifier::external_body]
@@ -212,6 +204,17 @@ pub(crate) struct RawMut<N: Nic> {
 }
 
 impl<N: Nic> RawMut<N> {
+    /// A range of a region, kept alive by it.
+    #[inline(always)]
+    pub(super) fn new(region: Arc<Region<N>>, range: OwnedRange) -> (r: Self)
+        ensures
+            r.region == region,
+            r.range == range,
+    {
+        proof { use_type_invariant(&range); }
+        RawMut { region, range }
+    }
+
     #[verifier::type_invariant]
     pub(crate) closed spec fn inv(self) -> bool { self.range.inv() }
     pub(crate) closed spec fn pointer(self) -> *mut u8 { self.range.pointer() }
@@ -262,6 +265,7 @@ impl<N: Nic> RawMut<N> {
         ensures r.0.inv(), r.1.inv(),
             *r.0.region == *self.region, *r.1.region == *self.region,
             r.0.pointer() == self.pointer(),
+            r.1.pointer().addr() == self.pointer().addr() + at,
             r.0.byte_len() == at, r.1.byte_len() == self.byte_len() - at,
             r.0.provenance() == self.provenance(), r.1.provenance() == self.provenance(),
             r.0.byte_domain().disjoint(r.1.byte_domain()),

@@ -906,10 +906,10 @@ impl<N: Device> OpenRequest<N> {
     pub(crate) fn try_push_peek(&mut self, op: WrOp, peek: Peek<'_, N>) -> (pushed: bool)
         requires
             old(self).inv(),
-            peek.inv(),
         ensures
             final(self).inv(),
     {
+        proof { use_type_invariant(&peek); }
         if self.takes_peek(&peek) && plain_op(&op, peek.bytes as u64) {
             let k = self.n;
             let ghost before = *self;
@@ -940,10 +940,10 @@ impl<N: Device> OpenRequest<N> {
     pub(crate) fn try_push_peek_write(&mut self, dst: RemoteBuf, peek: Peek<'_, N>) -> (pushed: bool)
         requires
             old(self).inv(),
-            peek.inv(),
         ensures
             final(self).inv(),
     {
+        proof { use_type_invariant(&peek); }
         if self.takes_peek(&peek) && peek.bytes as u64 <= dst.len {
             let k = self.n;
             let ghost before = *self;

@@ -8,9 +8,9 @@ use core::marker::PhantomData;
 use std::sync::Arc;
 use vstd::prelude::*;
 
-use super::Part;
 use super::memory::{Frozen, RawMut, thaw};
 use super::range::{ByteRange, ElementRange};
+use super::{BufMut, Part, Peek};
 use crate::nic::Nic;
 use crate::verbs::Verbs;
 
@@ -173,14 +173,60 @@ impl<T, N: Nic> Buf<T, N> {
         }
     }
 
-    /// Builds the SGE only from the checked view and its frozen keeper.
-    /// The caller supplies registration metadata, not byte geometry.
+    /// Its whole frozen buffer, thawed, if no other `Buf` (of any part of it) and no request in
+    /// flight holds it; else itself, unchanged.
+    pub fn try_thaw(self) -> (r: Result<BufMut<T, N>, Self>)
+        ensures
+            r matches Err(same) ==> same.byte_domain() == self.byte_domain(),
+    {
+        match self.try_thaw_raw() {
+            Ok(raw) => Ok(BufMut::from_raw(raw)),
+            Err(same) => Err(same),
+        }
+    }
+
+    /// The protection domain it is registered in.
     #[inline]
-    pub(super) fn try_part_with_keys(self, lkey: u32, pd: u64) -> (r: Result<Part<N>, Self>)
+    pub fn pd_id(&self) -> u64 {
+        self.frozen.raw.region.pd_id
+    }
+
+    /// Its bytes, and what they belong to, with nothing touched.
+    #[inline(always)]
+    pub(super) fn peek_bytes(&self) -> (p: Peek<'_, N>)
+    {
+        proof { use_type_invariant(self); }
+        peek_of(&self.frozen, &self.view, core::mem::size_of::<T>())
+    }
+
+    /// The elements `[start, end)` by reference, if they are within it.
+    #[inline]
+    pub(super) fn view_elements(&self, start: usize, end: usize) -> (r: Option<BufView<'_, T, N>>)
+        ensures
+            r is Some <==> start <= end && end <= self.element_len(),
+    {
+        proof { use_type_invariant(self); }
+        match self.view.slice(start, end, core::mem::size_of::<T>()) {
+            Some(view) => {
+                proof {
+                    vstd::arithmetic::div_mod::lemma_mod_multiples_vanish(start as int,
+                        self.view.spec_offset() as int, self.view.spec_width() as int);
+                    vstd::arithmetic::mul::lemma_mul_is_commutative(start as int, self.view.spec_width() as int);
+                    assert(view.spec_offset() as nat % view.spec_width() as nat == 0);
+                }
+                Some(BufView { frozen: &self.frozen, view, _t: PhantomData })
+            },
+            None => None,
+        }
+    }
+
+    /// Builds the SGE only from the checked view and its frozen keeper.
+    #[inline]
+    pub(super) fn try_part(self) -> (r: Result<Part<N>, Self>)
         ensures
             r is Ok <==> self.view.spec_bytes().spec_len() <= u32::MAX,
             r matches Ok(part) ==> part.inv() && part.byte_domain() == self.byte_domain()
-                && part.spec_pd() == pd && !part.spec_writable(),
+                && !part.spec_writable(),
             r matches Err(same) ==> same.inv() && *same.frozen == *self.frozen
                 && same.view == self.view && same.byte_domain() == self.byte_domain(),
     {
@@ -192,13 +238,61 @@ impl<T, N: Nic> Buf<T, N> {
         let ghost expected = self.byte_domain();
         let len = self.view.byte_len(core::mem::size_of::<T>());
         if len > u32::MAX as usize { return Err(self); }
-        let part = Part::shared(self.frozen, self.view.offset(), len, lkey, pd);
+        let part = Part::shared(self.frozen, self.view.offset(), len);
         proof {
             part.lemma_byte_backing();
             assert(part.byte_domain().to_iset() =~= expected.to_iset());
             assert(part.byte_domain() =~= expected);
         }
         Ok(part)
+    }
+}
+
+/// What a view's bytes are.
+#[inline(always)]
+fn peek_of<'a, N: Nic>(frozen: &'a Arc<Frozen<N>>, view: &ElementRange, width: usize) -> (p: Peek<'a, N>)
+    requires
+        view.inv(),
+        width == view.spec_width(),
+        view.spec_bytes().spec_capacity() == (**frozen).byte_len(),
+{
+    Peek::new(frozen, view.offset(), view.byte_len(width))
+}
+
+/// A part of a [`Buf`] by reference ([`Buf::view`]).
+#[verifier::reject_recursive_types(N)]
+pub struct BufView<'a, T, N: Nic = Verbs> {
+    frozen: &'a Arc<Frozen<N>>,
+    view: ElementRange,
+    _t: PhantomData<&'a [T]>,
+}
+
+impl<'a, T, N: Nic> BufView<'a, T, N> {
+    /// As [`Buf::inv`].
+    #[verifier::type_invariant]
+    closed spec fn inv(self) -> bool {
+        &&& (**self.frozen).inv()
+        &&& self.frozen.raw.fits_type::<T>()
+        &&& self.view.inv()
+        &&& self.view.spec_width() == vstd::layout::size_of::<T>()
+        &&& self.view.spec_offset() as nat % self.view.spec_width() as nat == 0
+        &&& self.view.spec_bytes().spec_capacity() == (**self.frozen).byte_len()
+    }
+
+    /// Its bytes, and what they belong to, with nothing touched.
+    #[inline(always)]
+    pub(super) fn peek_bytes(&self) -> (p: Peek<'_, N>)
+    {
+        proof { use_type_invariant(self); }
+        peek_of(self.frozen, &self.view, core::mem::size_of::<T>())
+    }
+
+    /// The same bytes, keeping their allocation alive.
+    #[inline(always)]
+    pub(super) fn to_buf(&self) -> (r: Buf<T, N>)
+    {
+        proof { use_type_invariant(self); }
+        Buf { frozen: self.frozen.clone(), view: self.view, _t: PhantomData }
     }
 }
 

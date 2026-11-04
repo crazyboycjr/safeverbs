@@ -14,22 +14,28 @@
 //! is shared and read only (like an `Arc<[T]>`), so it can be sent any
 //! number of times at once; memory a peer may write is only reachable
 //! through [`Exposed`], which never hands out a `&[T]`.
+//!
+//! What a buffer is, its bytes and its linear permission for them, is verified (`verus!` here and
+//! in `buf/`). What is not is the bridge to the program's values: the zerocopy bounds of the methods
+//! outside `verus!`, and the references [`Deref`] makes (`docs/verification.md`, trusted computing
+//! base).
 
 use core::alloc::Layout;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, align_of, size_of};
 use core::ops::{Bound, Deref, DerefMut, RangeBounds};
-use core::ptr::NonNull;
-use std::alloc::dealloc;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use vstd::prelude::*;
+use vstd::raw_ptr::{Dealloc, PointsToRaw};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::error::{Error, Result};
 use crate::nic::{Access, Nic, RemoteBuf};
 use crate::pd::Pd;
+use crate::trusted::{clone_pd, pd_id_of, register_region};
 use crate::verbs::Verbs;
 
 mod range;
@@ -39,7 +45,7 @@ mod permissions;
 mod view;
 use memory::OwnedRange;
 pub(crate) use memory::{Frozen, RawMut};
-pub use view::Buf;
+pub use view::{Buf, BufView};
 mod lease;
 #[allow(unused_imports)] // Named only by contracts erased from plain cargo builds.
 pub(crate) use lease::Loan;
@@ -52,27 +58,102 @@ pub use lease::{Leases, Part, Peek};
 #[cfg(verus_keep_ghost)]
 pub(crate) use lease::{covers_inputs, input_is_covered};
 
-/// Linux's `ENOMEM`.
-const ENOMEM: i32 = 12;
-
 /// The alignment of every region: a cache line.
 const REGION_ALIGN: usize = 64;
 
+verus! {
+
+/// Linux's `ENOMEM`.
+const ENOMEM: i32 = 12;
+
 /// Zeroed memory registered in a protection domain.
+#[verifier::reject_recursive_types(N)]
 pub(crate) struct Region<N: Nic> {
     /// Deregistered first, in `drop`.
     mr: ManuallyDrop<N::Mr>,
-    ptr: NonNull<u8>,
-    layout: Layout,
-    lkey: u32,
+    pub(crate) ptr: *mut u8,
+    size: usize,
+    align: usize,
+    pub(crate) lkey: u32,
     /// The number of its protection domain ([`Pd::id`]), which every post compares.
-    pd_id: u64,
+    pub(crate) pd_id: u64,
     /// Retained with the MR and allocation if revocation fails or unwinds.
     pd: ManuallyDrop<Pd<N>>,
-    /// Allocation identity retained with the registration (proof only).
+    /// What frees its allocation, once.
     #[allow(dead_code)]
-    deallocation: vstd::prelude::Tracked<vstd::raw_ptr::Dealloc>,
+    deallocation: Tracked<Option<Dealloc>>,
 }
+
+impl<N: Nic> Region<N> {
+    /// Its allocation is the one `deallocation` frees.
+    closed spec fn inv(self) -> bool {
+        self.deallocation@ matches Some(d) && {
+            &&& d.addr() == self.ptr.addr()
+            &&& d.size() == self.size
+            &&& d.align() == self.align
+            &&& d.provenance() == self.ptr@.provenance
+        }
+    }
+
+    /// Allocates `size` zeroed bytes aligned to `align` and registers them in `pd` for local writes,
+    /// or frees them.
+    fn allocated(pd: &Pd<N>, size: usize, align: usize) -> (r: Result<(Arc<Region<N>>, OwnedRange)>)
+        ensures
+            r matches Ok((region, range)) ==> region.inv() && range.inv()
+                && range.base() == region.ptr
+                && range.geometry().spec_len() == size,
+    {
+        let (address, range, deallocation) = match memory::allocate(size, align) {
+            Some(allocation) => allocation,
+            None => return Err(Error::Os(ENOMEM)),
+        };
+        proof { use_type_invariant(&range); }
+        match register_region(pd, address, size) {
+            Ok((mr, lkey)) => {
+                let Tracked(deallocation) = deallocation;
+                let region = Region {
+                    lkey,
+                    mr: ManuallyDrop::new(mr),
+                    ptr: address,
+                    size,
+                    align,
+                    pd_id: pd_id_of(pd),
+                    pd: ManuallyDrop::new(clone_pd(pd)),
+                    deallocation: Tracked(Some(deallocation)),
+                };
+                Ok((Arc::new(region), range))
+            },
+            Err(e) => {
+                memory::release_failed_allocation(address, size, align, range, deallocation);
+                Err(e)
+            },
+        }
+    }
+
+    /// Its allocation goes back to the allocator, with the permissions split from it.
+    fn free_memory(&mut self)
+        requires
+            old(self).inv(),
+    {
+        let raw = bytes_back(&*self);
+        let tracked deallocation = self.deallocation.borrow_mut().tracked_take();
+        vstd::raw_ptr::deallocate(self.ptr, self.size, self.align, raw, Tracked(deallocation));
+    }
+}
+
+/// **The permissions split from a region are its own again when it goes.** Each one lives in a
+/// [`RawMut`], which holds an `Arc` of the region: `Region::drop` runs when the last `Arc` goes, so
+/// when none of them is left. Each is gone with its holder, so its bytes are nobody's.
+#[verifier::external_body]
+fn bytes_back<N: Nic>(_region: &Region<N>) -> (raw: Tracked<PointsToRaw>)
+    ensures
+        raw@.is_range(_region.ptr.addr() as int, _region.size as int),
+        raw@.provenance() == _region.ptr@.provenance,
+{
+    Tracked::assume_new()
+}
+
+} // verus!
 
 // SAFETY: the region is plain memory plus a registration handle; who may
 // read or write which bytes is decided by the buffers over it, which carry
@@ -90,40 +171,7 @@ impl<N: Nic> Region<N> {
         }
         let layout = Layout::from_size_align(bytes, align.max(REGION_ALIGN))
             .map_err(|_| Error::Invalid("buffer size"))?;
-        let (address, range, deallocation) =
-            memory::allocate(layout.size(), layout.align()).ok_or(Error::Os(ENOMEM))?;
-        let ptr = NonNull::new(address).expect("the allocation primitive returns nonnull memory");
-        // SAFETY: the memory stays allocated until `drop`, which deregisters
-        // it first.
-        let mr = unsafe {
-            pd.context()
-                .nic()
-                .reg_mr(pd.raw(), ptr.as_ptr(), bytes, Access::LOCAL_WRITE)
-        };
-        match mr {
-            Ok(mr) => Ok((
-                Arc::new(Region {
-                    lkey: N::mr_keys(&mr).0,
-                    mr: ManuallyDrop::new(mr),
-                    ptr,
-                    layout,
-                    pd_id: pd.id(),
-                    pd: ManuallyDrop::new(pd.clone()),
-                    deallocation,
-                }),
-                range,
-            )),
-            Err(e) => {
-                memory::release_failed_allocation(
-                    address,
-                    layout.size(),
-                    layout.align(),
-                    range,
-                    deallocation,
-                );
-                Err(e)
-            }
-        }
+        Region::allocated(pd, layout.size(), layout.align())
     }
 }
 
@@ -134,12 +182,11 @@ impl<N: Nic> Drop for Region<N> {
         if close_registration::<N>(&mut self.mr).is_err() {
             return;
         }
-        // SAFETY: successful revocation (or the legacy backend's completed MR
-        // destructor) excludes further access through this registration.
-        unsafe {
-            dealloc(self.ptr.as_ptr(), self.layout);
-            ManuallyDrop::drop(&mut self.pd);
-        }
+        // Successful revocation (or the legacy backend's completed MR destructor) excludes
+        // further access through this registration.
+        self.free_memory();
+        // SAFETY: dropped once, here, as the allocation goes.
+        unsafe { ManuallyDrop::drop(&mut self.pd) };
     }
 }
 
@@ -164,15 +211,233 @@ impl<N: Nic> RawMut<N> {
     }
 }
 
+verus! {
+
 /// A unique, writable buffer of registered memory: `[T]` that the NIC can
 /// receive into, read into, or that can be frozen into a [`Buf`] to send.
 ///
 /// Made by `Pd::alloc` (zeroed, so `T` is [`FromBytes`]), by splitting
 /// another `BufMut`, or by thawing a `Buf` nobody else holds.
+#[verifier::reject_recursive_types(N)]
 pub struct BufMut<T, N: Nic = Verbs> {
-    raw: RawMut<N>,
+    pub(crate) raw: RawMut<N>,
     _t: PhantomData<T>,
 }
+
+/// What lies `k` elements of a type into memory aligned for it is aligned for it, and `k` of them
+/// and the others, whose length fits them, keep that.
+proof fn lemma_elements(address: int, bytes: int, k: int, width: int, alignment: int)
+    requires
+        width > 0,
+        alignment > 0,
+        width % alignment == 0,
+        address % alignment == 0,
+        bytes % width == 0,
+        bytes >= 0,
+        0 <= k <= bytes / width,
+    ensures
+        0 <= k * width <= bytes,
+        (k * width) % width == 0,
+        (bytes - k * width) % width == 0,
+        (address + k * width) % alignment == 0,
+{
+    use vstd::arithmetic::div_mod::*;
+    use vstd::arithmetic::mul::*;
+    lemma_fundamental_div_mod(bytes, width);
+    lemma_mul_is_commutative(width, bytes / width);
+    lemma_mul_inequality(k, bytes / width, width);
+    lemma_mul_nonnegative(k, width);
+    lemma_mod_multiples_basic(k, width);
+    lemma_mul_is_distributive_sub(width, bytes / width, k);
+    lemma_mul_is_commutative(width, k);
+    lemma_mod_multiples_basic(bytes / width - k, width);
+    lemma_mul_is_commutative(width, bytes / width - k);
+    lemma_mul_mod_noop_right(k, width, alignment);
+    lemma_small_mod(0, alignment as nat);
+    lemma_mod_adds(address, k * width, alignment);
+}
+
+impl<T, N: Nic> BufMut<T, N> {
+    /// Its bytes hold whole elements, aligned for them.
+    #[verifier::type_invariant]
+    closed spec fn inv(self) -> bool {
+        self.raw.fits_type::<T>()
+    }
+
+    /// The bytes it owns, by its linear permission.
+    pub closed spec fn byte_domain(self) -> Set<int> {
+        self.raw.byte_domain()
+    }
+
+    /// The number of its elements.
+    pub closed spec fn element_len(self) -> nat {
+        self.raw.byte_len() as nat / vstd::layout::size_of::<T>()
+    }
+
+    /// Unique bytes that fit `T`. They hold valid `T` because every `BufMut` starts zeroed with
+    /// `T: FromBytes` and the NIC only writes into buffers of `T: FromBytes`.
+    #[inline]
+    fn from_raw(raw: RawMut<N>) -> (r: BufMut<T, N>)
+        requires
+            raw.fits_type::<T>(),
+        ensures
+            r.raw == raw,
+    {
+        BufMut { raw, _t: PhantomData }
+    }
+
+    /// Unique bytes, as a `BufMut<T>` if they fit `T`.
+    #[inline(always)]
+    pub(crate) fn from_checked(raw: RawMut<N>) -> (r: Option<BufMut<T, N>>)
+    {
+        if raw.fits::<T>() {
+            Some(BufMut::from_raw(raw))
+        } else {
+            release(raw);
+            None
+        }
+    }
+
+    /// The number of elements.
+    pub fn len(&self) -> (r: usize)
+        ensures
+            r == self.element_len(),
+    {
+        proof {
+            use_type_invariant(self);
+        }
+        self.raw.len() / core::mem::size_of::<T>()
+    }
+
+    /// Whether it has no elements.
+    pub fn is_empty(&self) -> bool {
+        self.raw.len() == 0
+    }
+
+    /// The protection domain it is registered in.
+    #[inline]
+    pub fn pd_id(&self) -> u64 {
+        self.raw.region.pd_id
+    }
+
+    /// `[0, mid)` and `[mid, len)`, or itself if `mid` is past its end.
+    pub(crate) fn try_split_at(self, mid: usize) -> (r: core::result::Result<(Self, Self), Self>)
+        ensures
+            r is Ok <==> mid <= self.element_len(),
+            r matches Ok((a, b)) ==> {
+                &&& a.byte_domain().disjoint(b.byte_domain())
+                &&& a.byte_domain().union(b.byte_domain()) == self.byte_domain()
+            },
+            r matches Err(same) ==> same == self,
+    {
+        proof {
+            use_type_invariant(&self);
+            use_type_invariant(&self.raw);
+        }
+        let len = self.len();
+        if mid > len {
+            return Err(self);
+        }
+        vstd::layout::layout_for_type_is_valid::<T>();
+        let width = core::mem::size_of::<T>();
+        proof {
+            lemma_elements(self.raw.pointer().addr() as int, self.raw.byte_len() as int, mid as int, width as int, vstd::layout::align_of::<T>() as int);
+        }
+        let (a, b) = self.raw.split_at(mid * width);
+        Ok((BufMut::from_raw(a), BufMut::from_raw(b)))
+    }
+
+    /// Frozen, a shared [`Buf`] over all of it.
+    #[inline]
+    pub(crate) fn frozen(self) -> (r: Buf<T, N>)
+    {
+        proof {
+            use_type_invariant(&self);
+        }
+        Buf::from_frozen(self.raw.freeze())
+    }
+
+    /// One scatter/gather element over all of it; a panic if it has more bytes than one holds.
+    #[inline(always)]
+    pub(crate) fn part(self) -> (part: Part<N>)
+        ensures
+            part.spec_writable(),
+    {
+        if self.raw.len() > u32::MAX as usize {
+            // Released first, so that no buffer stays alive across the panic: the `Part` is then
+            // built in place.
+            release(self);
+            sge_too_long()
+        }
+        Part::unique(self.raw)
+    }
+}
+
+/// Releases what it is given.
+#[inline]
+fn release<T>(_value: T) {
+}
+
+/// A buffer of more bytes than one scatter/gather element holds, which is the program's error.
+#[cold]
+#[inline(never)]
+#[verifier::external_body]
+fn sge_too_long() -> ! {
+    panic!("a single SGE exceeds u32::MAX bytes")
+}
+
+} // verus!
+
+verus! {
+
+impl<N: Nic> BufMut<u8, N> {
+    /// Bytes, as a buffer of bytes.
+    #[inline(always)]
+    fn of_bytes(raw: RawMut<N>) -> (r: Self)
+        ensures
+            r.raw == raw,
+    {
+        proof {
+            broadcast use {vstd::layout::layout_of_primitives, vstd::layout::align_of_u8};
+
+            assert(raw.fits_type::<u8>());
+        }
+        BufMut::from_raw(raw)
+    }
+}
+
+impl<N: Nic> Leases<N> {
+    /// The first unique buffer of it, as a `BufMut<T>` if its bytes can hold `[T]`.
+    #[inline(always)]
+    pub(crate) fn into_unique_as<T>(self) -> (r: Option<BufMut<T, N>>) {
+        match self.into_unique_raw() {
+            Some(raw) => BufMut::from_checked(raw),
+            None => None,
+        }
+    }
+
+    /// [`Leases::into_unique_as`], leaving the others.
+    #[inline(always)]
+    pub(crate) fn take_unique_as<T>(&mut self) -> (r: Option<BufMut<T, N>>) {
+        match self.take_unique_raw() {
+            Some(raw) => BufMut::from_checked(raw),
+            None => None,
+        }
+    }
+}
+
+impl<N: Nic> Part<N> {
+    /// A unique buffer, as a `BufMut<T>` if its bytes can hold `[T]`.
+    #[inline(always)]
+    pub(crate) fn unique_as<T>(self) -> (r: Option<BufMut<T, N>>) {
+        match self.lease {
+            Lease::Unique(raw) => BufMut::from_checked(raw),
+            Lease::Shared(_) => None,
+        }
+    }
+}
+
+} // verus!
 
 impl<T, N: Nic> Clone for Buf<T, N> {
     fn clone(&self) -> Self {
@@ -190,10 +455,8 @@ impl<N: Nic> Pd<N> {
             .checked_mul(size_of::<T>())
             .ok_or(Error::Invalid("buffer size"))?;
         let (region, range) = Region::new(self, bytes, align_of::<T>())?;
-        Ok(BufMut {
-            raw: RawMut { region, range },
-            _t: PhantomData,
-        })
+        // Whole elements, in memory aligned for them: this always holds.
+        BufMut::from_checked(RawMut::new(region, range)).ok_or(Error::Invalid("buffer size"))
     }
 
     /// A ring of `capacity` registered bytes for streaming messages.
@@ -210,46 +473,17 @@ impl<N: Nic> Pd<N> {
 }
 
 impl<T, N: Nic> BufMut<T, N> {
-    /// Re-types unique bytes; they hold valid `T` because every `BufMut`
-    /// starts zeroed with `T: FromBytes` and the NIC only writes into
-    /// buffers of `T: FromBytes`.
-    fn from_raw(raw: RawMut<N>) -> BufMut<T, N> {
-        debug_assert!(raw.fits::<T>());
-        BufMut {
-            raw,
-            _t: PhantomData,
-        }
-    }
-
-    /// The number of elements.
-    pub fn len(&self) -> usize {
-        self.raw.range.len() / size_of::<T>()
-    }
-
-    /// Whether it has no elements.
-    pub fn is_empty(&self) -> bool {
-        self.raw.range.len() == 0
-    }
-
-    /// The protection domain it is registered in.
-    #[inline]
-    pub fn pd_id(&self) -> u64 {
-        self.raw.region.pd_id
-    }
-
     /// Splits into `[0, mid)` and `[mid, len)`.
     ///
     /// # Panics
     ///
     /// If `mid > len`.
     pub fn split_at(self, mid: usize) -> (BufMut<T, N>, BufMut<T, N>) {
-        assert!(
-            mid <= self.len(),
-            "split at {mid} of a buffer of {}",
-            self.len()
-        );
-        let (a, b) = self.raw.split_at(mid * size_of::<T>());
-        (BufMut::from_raw(a), BufMut::from_raw(b))
+        let len = self.len();
+        match self.try_split_at(mid) {
+            Ok(parts) => parts,
+            Err(_) => panic!("split at {mid} of a buffer of {len}"),
+        }
     }
 
     /// Splits into buffers of `n` elements (the last may be shorter).
@@ -282,7 +516,7 @@ impl<T, N: Nic> BufMut<T, N> {
     where
         T: Immutable,
     {
-        Buf::from_frozen(self.raw.freeze())
+        self.frozen()
     }
 
     /// Exposes it to peers for RDMA WRITE, READ and atomics: registers it
@@ -298,19 +532,18 @@ impl<T, N: Nic> BufMut<T, N> {
             | Access::REMOTE_ATOMIC;
         let pd = self.raw.pd().clone();
         // SAFETY: the region stays allocated while `Exposed` holds it; the
-        // remote registration is revoked before `raw` lets go of it,
+        // remote registration is revoked before `buf` lets go of it,
         // and `Exposed` never gives out the bytes as Rust values.
         let mr = unsafe {
             pd.context()
                 .nic()
-                .reg_mr(pd.raw(), self.raw.ptr(), self.raw.range.len(), access)
+                .reg_mr(pd.raw(), self.raw.ptr(), self.raw.len(), access)
         };
         match mr {
             Ok(mr) => Ok(Exposed {
                 rkey: N::mr_keys(&mr).1,
                 mr: ManuallyDrop::new(mr),
-                raw: ManuallyDrop::new(self.raw),
-                _t: PhantomData,
+                buf: ManuallyDrop::new(self),
             }),
             Err(error) => Err(BufError { error, buf: self }),
         }
@@ -338,9 +571,7 @@ impl<T, N: Nic> BufMut<T, N> {
     where
         T: IntoBytes,
     {
-        let lkey = self.raw.region.lkey;
-        let pd = self.raw.region.pd_id;
-        Part::unique(self.raw, lkey, pd)
+        self.part()
     }
 
     /// Its bytes.
@@ -414,12 +645,6 @@ impl<T, N: Nic> Iterator for Chunks<T, N> {
 }
 
 impl<T, N: Nic> Buf<T, N> {
-    /// The protection domain it is registered in.
-    #[inline]
-    pub fn pd_id(&self) -> u64 {
-        self.frozen.raw.region.pd_id
-    }
-
     /// The elements `range` of it, sharing the memory.
     ///
     /// # Panics
@@ -458,30 +683,13 @@ impl<T, N: Nic> Buf<T, N> {
             Bound::Excluded(&e) => e,
             Bound::Unbounded => self.len(),
         };
-        let view = self
-            .view
-            .slice(start, end, size_of::<T>())
-            .unwrap_or_else(|| panic!("range {start}..{end} of a buffer of {}", self.len()));
-        BufView {
-            frozen: &self.frozen,
-            view,
-            _t: PhantomData,
-        }
+        self.view_elements(start, end)
+            .unwrap_or_else(|| panic!("range {start}..{end} of a buffer of {}", self.len()))
     }
 
     /// Whether no other `Buf` and no request holds the frozen buffer.
     pub fn is_unique(&self) -> bool {
         Arc::strong_count(&self.frozen) == 1
-    }
-
-    /// Thaws the whole buffer that was frozen back into a [`BufMut`], if no
-    /// other `Buf` (of any part of it) and no request in flight holds it;
-    /// else gives it back unchanged.
-    pub fn try_thaw(self) -> Result<BufMut<T, N>, Buf<T, N>> {
-        match self.try_thaw_raw() {
-            Ok(raw) => Ok(BufMut::from_raw(raw)),
-            Err(same) => Err(same),
-        }
     }
 
     /// Lends it to the NIC as one scatter/gather element (for sends and
@@ -496,7 +704,7 @@ impl<T, N: Nic> Buf<T, N> {
     where
         T: IntoBytes + Immutable,
     {
-        match self.try_into_part() {
+        match self.try_part() {
             Ok(part) => part,
             Err(view) => {
                 // Released first, so that no `Result` stays alive across the panic: the
@@ -514,9 +722,7 @@ impl<T, N: Nic> Buf<T, N> {
     where
         T: IntoBytes + Immutable,
     {
-        let lkey = self.frozen.raw.region.lkey;
-        let pd = self.pd_id();
-        self.try_part_with_keys(lkey, pd)
+        self.try_part()
     }
 
     /// Its bytes.
@@ -539,13 +745,6 @@ impl<T, N: Nic> Buf<T, N> {
     }
 }
 
-/// A part of a [`Buf`] by reference ([`Buf::view`]).
-pub struct BufView<'a, T, N: Nic = Verbs> {
-    frozen: &'a Arc<Frozen<N>>,
-    view: range::ElementRange,
-    _t: PhantomData<&'a [T]>,
-}
-
 /// What a request's WQE can send from: a [`Buf`], by value or by reference, or a [`BufView`]. A
 /// request keeps one reference to the frozen allocation its consecutive WQEs come from, so by
 /// reference they touch no reference count after the first.
@@ -561,12 +760,7 @@ pub trait Lend<N: Nic> {
 impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for Buf<U, N> {
     #[inline(always)]
     fn peek(&self) -> Peek<'_, N> {
-        Peek {
-            frozen: &self.frozen,
-            offset: self.view.offset(),
-            bytes: self.view.byte_len(size_of::<U>()),
-            lkey: self.frozen.raw.region.lkey,
-        }
+        self.peek_bytes()
     }
     #[inline(always)]
     fn lend(self) -> Part<N> {
@@ -577,12 +771,7 @@ impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for Buf<U, N> {
 impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for &Buf<U, N> {
     #[inline(always)]
     fn peek(&self) -> Peek<'_, N> {
-        Peek {
-            frozen: &self.frozen,
-            offset: self.view.offset(),
-            bytes: self.view.byte_len(size_of::<U>()),
-            lkey: self.frozen.raw.region.lkey,
-        }
+        self.peek_bytes()
     }
     #[inline(always)]
     fn lend(self) -> Part<N> {
@@ -593,21 +782,11 @@ impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for &Buf<U, N> {
 impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for BufView<'_, U, N> {
     #[inline(always)]
     fn peek(&self) -> Peek<'_, N> {
-        Peek {
-            frozen: self.frozen,
-            offset: self.view.offset(),
-            bytes: self.view.byte_len(size_of::<U>()),
-            lkey: self.frozen.raw.region.lkey,
-        }
+        self.peek_bytes()
     }
     #[inline(always)]
     fn lend(self) -> Part<N> {
-        Buf::<U, N> {
-            frozen: self.frozen.clone(),
-            view: self.view,
-            _t: PhantomData,
-        }
-        .into_part()
+        self.to_buf().into_part()
     }
 }
 
@@ -640,31 +819,30 @@ impl<T, N: Nic> fmt::Debug for Buf<T, N> {
 /// exposed; [`Exposed::reclaim`] revokes the peers' access and gives it back
 /// as a [`BufMut`].
 pub struct Exposed<T, N: Nic = Verbs> {
-    /// Kept together with `raw` if revocation fails.
+    /// Kept together with `buf` if revocation fails.
     mr: ManuallyDrop<N::Mr>,
-    raw: ManuallyDrop<RawMut<N>>,
+    buf: ManuallyDrop<BufMut<T, N>>,
     rkey: u32,
-    _t: PhantomData<T>,
 }
 
 impl<T, N: Nic> Exposed<T, N> {
     /// What a peer needs to address it.
     pub fn remote(&self) -> RemoteBuf {
         RemoteBuf {
-            addr: self.raw.ptr() as u64,
-            len: self.raw.range.len() as u64,
+            addr: self.buf.raw.ptr() as u64,
+            len: self.buf.raw.len() as u64,
             rkey: self.rkey,
         }
     }
 
     /// The number of elements.
     pub fn len(&self) -> usize {
-        self.raw.range.len() / size_of::<T>()
+        self.buf.len()
     }
 
     /// Whether it has no elements.
     pub fn is_empty(&self) -> bool {
-        self.raw.range.len() == 0
+        self.buf.is_empty()
     }
 
     /// Copies its first `out.len()` elements into `out` with volatile reads,
@@ -692,7 +870,7 @@ impl<T, N: Nic> Exposed<T, N> {
             out.len(),
             self.len()
         );
-        memory::volatile_copy(self.raw.ptr(), out.as_mut_bytes());
+        memory::volatile_copy(self.buf.raw.ptr(), out.as_mut_bytes());
     }
 
     /// Revokes the peers' access and gives the buffer back. A refused revocation
@@ -707,9 +885,8 @@ impl<T, N: Nic> Exposed<T, N> {
             });
         }
         // SAFETY: the registration was revoked and its handle destroyed above;
-        // `this` will not drop, and this is the only extraction of its raw owner.
-        let raw = unsafe { ManuallyDrop::take(&mut this.raw) };
-        Ok(BufMut::from_raw(raw))
+        // `this` will not drop, and this is the only extraction of its owner.
+        Ok(unsafe { ManuallyDrop::take(&mut this.buf) })
     }
 
     /// Revokes the peers' access (invalidating the remote key) and gives the
@@ -730,9 +907,9 @@ impl<T, N: Nic> Exposed<T, N> {
 impl<T, N: Nic> Drop for Exposed<T, N> {
     fn drop(&mut self) {
         if close_registration::<N>(&mut self.mr).is_ok() {
-            // SAFETY: remote access has been revoked; the raw owner is dropped
+            // SAFETY: remote access has been revoked; the owner is dropped
             // exactly once. On failure both ManuallyDrop fields stay retained.
-            unsafe { ManuallyDrop::drop(&mut self.raw) };
+            unsafe { ManuallyDrop::drop(&mut self.buf) };
         }
     }
 }
@@ -798,22 +975,14 @@ impl<N: Nic> Leases<N> {
     /// `[T]`.
     #[inline]
     pub fn into_buf_mut<T: FromBytes>(self) -> Option<BufMut<T, N>> {
-        match self.into_unique_raw() {
-            Some(raw) if raw.fits::<T>() => Some(BufMut::from_raw(raw)),
-            _ => None,
-        }
+        self.into_unique_as()
     }
-}
 
-impl<N: Nic> Leases<N> {
     /// Takes the first unique buffer out as a `BufMut<T>`, leaving the others; `None` if there is
     /// none or its bytes cannot hold `[T]` (it is released then).
     #[inline(always)]
     pub fn take_buf_mut<T: FromBytes>(&mut self) -> Option<BufMut<T, N>> {
-        match self.take_unique_raw() {
-            Some(raw) if raw.fits::<T>() => Some(BufMut::from_raw(raw)),
-            _ => None,
-        }
+        self.take_unique_as()
     }
 }
 
@@ -829,10 +998,7 @@ impl<N: Nic> Part<N> {
     /// Gives back a unique buffer as a `BufMut<T>`; `None` for a frozen one
     /// or if its bytes cannot hold `[T]`.
     pub fn into_buf_mut<T: FromBytes>(self) -> Option<BufMut<T, N>> {
-        match self.lease {
-            Lease::Unique(raw) if raw.fits::<T>() => Some(BufMut::from_raw(raw)),
-            _ => None,
-        }
+        self.unique_as()
     }
 }
 
@@ -858,7 +1024,7 @@ impl<N: Nic> RingBuf<N> {
         self.reclaim();
         let mut n = 0;
         for c in &self.chunks {
-            n += c.raw.range.len();
+            n += c.raw.len();
         }
         n
     }
@@ -887,8 +1053,8 @@ impl<N: Nic> RingBuf<N> {
             return (len <= self.capacity).then_some(0);
         };
         // The ring owns its whole region: offsets are positions in the ring.
-        let tail = front.raw.range.offset(self.region.ptr.as_ptr());
-        let head = back.raw.range.end(self.region.ptr.as_ptr());
+        let tail = front.raw.range.offset(self.region.ptr);
+        let head = back.raw.range.end(self.region.ptr);
         // Chunks lie from `tail` to `head`, or wrapped from `tail` to the end
         // and from the start to `head`. A wrapped head never reaches the
         // tail (strict comparisons), so `head >= tail` means not wrapped.
@@ -911,13 +1077,13 @@ impl<N: Nic> RingBuf<N> {
     /// returns it frozen; `None` while the ring has no room for it.
     pub fn write_with(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Buf<u8, N>> {
         let at = self.place(len)?;
-        let mut buf: BufMut<u8, N> = BufMut::from_raw(RawMut {
-            region: self.region.clone(),
-            range: OwnedRange::ring_chunk(
-                self.region.ptr.as_ptr(),
+        let mut buf: BufMut<u8, N> = BufMut::of_bytes(RawMut::new(
+            self.region.clone(),
+            OwnedRange::ring_chunk(
+                self.region.ptr,
                 ByteRange::new(at, len, self.capacity).expect("a chunk fits the ring"),
             ),
-        });
+        ));
         fill(&mut buf);
         let buf = buf.freeze();
         self.chunks.push_back(buf.frozen.clone());
@@ -969,7 +1135,7 @@ mod revocation_tests {
         let ctx = Context::new(model.clone());
         let pd = ctx.alloc_pd().unwrap();
         let exposed = pd.alloc::<u8>(16).unwrap().expose().unwrap();
-        let backing = Arc::downgrade(&exposed.raw.region);
+        let backing = Arc::downgrade(&exposed.buf.raw.region);
         model.refuse_mr_closes(Model::mr_keys(&exposed.mr).0, 1);
         drop(exposed);
         assert_eq!(model.registered(), 2);
@@ -984,7 +1150,7 @@ mod revocation_tests {
         let ctx = Context::new(model.clone());
         let pd = ctx.alloc_pd().unwrap();
         let exposed = pd.alloc::<u8>(16).unwrap().expose().unwrap();
-        let backing = Arc::downgrade(&exposed.raw.region);
+        let backing = Arc::downgrade(&exposed.buf.raw.region);
         drop(exposed);
         assert_eq!(model.registered(), 0);
         assert!(backing.upgrade().is_none());

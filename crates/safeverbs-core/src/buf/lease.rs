@@ -13,7 +13,6 @@ use safeverbs_spec::abs::Dir;
 use std::sync::Arc;
 use vstd::prelude::*;
 
-use super::range::checked_sge_len;
 use super::{Frozen, RawMut};
 use crate::nic::{Nic, Sge};
 use crate::verbs::Verbs;
@@ -272,11 +271,6 @@ pub(crate) fn same_frozen_arc<N: Nic>(a: &Arc<Frozen<N>>, b: &Arc<Frozen<N>>) ->
     Arc::ptr_eq(a, b)
 }
 
-/// Releases what it is given.
-#[inline]
-fn release<T>(_value: T) {
-}
-
 /// `core::mem::replace`, which vstd does not specify.
 #[verifier::external_body]
 #[inline(always)]
@@ -422,9 +416,13 @@ impl<N: Nic> Part<N> {
             Lease::Unique(raw) => raw.inv()
                 && self.byte_domain() == raw.byte_domain()
                 && self.sge.addr == raw.pointer().addr()
-                && self.sge.length == raw.byte_len(),
+                && self.sge.length == raw.byte_len()
+                && self.sge.lkey == (*raw.region).lkey
+                && self.pd == (*raw.region).pd_id,
             Lease::Shared(frozen) => (*frozen).inv()
-                && self.byte_domain().subset_of((*frozen).byte_domain()),
+                && self.byte_domain().subset_of((*frozen).byte_domain())
+                && self.sge.lkey == (*frozen.raw.region).lkey
+                && self.pd == (*frozen.raw.region).pd_id,
         }
     }
 
@@ -435,47 +433,40 @@ impl<N: Nic> Part<N> {
 
     /// No arbitrary SGE/keeper pair is assembled by the typed buffer wrapper.
     #[inline]
-    pub(super) fn unique(raw: RawMut<N>, lkey: u32, pd: u64) -> (r: Self)
+    pub(super) fn unique(raw: RawMut<N>) -> (r: Self)
         requires raw.byte_len() <= u32::MAX,
         ensures r.inv(), r.resource() == Lease::Unique(raw).observation(),
             r.spec_sge() == (Sge {
-                addr: raw.pointer().addr() as u64, length: raw.byte_len() as u32, lkey,
+                addr: raw.pointer().addr() as u64, length: raw.byte_len() as u32, lkey: (*raw.region).lkey,
             }),
-            r.spec_pd() == pd, r.spec_writable(),
+            r.spec_writable(),
     {
         proof { use_type_invariant(&raw); raw.lemma_domain(); }
-        let length = match checked_sge_len(raw.len()) {
-            Some(length) => length,
-            None => {
-                // Released first, so that no buffer stays alive across the panic: the `Part` is
-                // then built in place.
-                release(raw);
-                panic!("a single SGE exceeds u32::MAX bytes")
-            },
-        };
+        let length = raw.len() as u32;
+        let lkey = raw.region.lkey;
+        let pd = raw.region.pd_id;
         Part { sge: Sge { addr: raw.ptr().addr() as u64, length, lkey }, pd, lease: Lease::Unique(raw) }
     }
 
     /// A shared SGE is a bounded view of the frozen owner's permission.
     #[inline]
-    pub(super) fn shared(frozen: Arc<Frozen<N>>, offset: usize, len: usize, lkey: u32, pd: u64) -> (r: Self)
+    pub(super) fn shared(frozen: Arc<Frozen<N>>, offset: usize, len: usize) -> (r: Self)
         requires offset <= (*frozen).byte_len(), len <= (*frozen).byte_len() - offset,
             len <= u32::MAX,
         ensures r.inv(), r.resource() == Lease::Shared(frozen).observation(),
             r.spec_sge() == (Sge {
-                addr: (frozen.pointer().addr() + offset) as u64, length: len as u32, lkey,
+                addr: (frozen.pointer().addr() + offset) as u64, length: len as u32, lkey: (*frozen.raw.region).lkey,
             }),
-            r.spec_pd() == pd, !r.spec_writable(),
+            !r.spec_writable(),
     {
         proof {
             use_type_invariant(&*frozen);
             frozen.lemma_contents();
             frozen.raw.lemma_domain();
         }
-        let length = match checked_sge_len(len) {
-            Some(length) => length,
-            None => panic!("a single SGE exceeds u32::MAX bytes"),
-        };
+        let length = len as u32;
+        let lkey = frozen.raw.region.lkey;
+        let pd = frozen.raw.region.pd_id;
         let ptr = frozen.raw.ptr();
         let addr = ptr.addr() + offset;
         let part = Part { sge: Sge { addr: addr as u64, length, lkey }, pd, lease: Lease::Shared(frozen) };
@@ -1400,7 +1391,6 @@ impl<N: Nic> Leases<N> {
 
     /// The number of retained resources.
     pub fn len(&self) -> (len: usize)
-        requires self.view().len() <= usize::MAX,
         ensures len == self.view().len(),
     {
         match &self.held {
@@ -1524,11 +1514,28 @@ pub struct Peek<'a, N: Nic> {
     pub(crate) lkey: u32,
 }
 
-impl<N: Nic> Peek<'_, N> {
-    /// Its bytes lie in the allocation it names, which is all that its maker promises.
-    pub(crate) closed spec fn inv(&self) -> bool {
+impl<'a, N: Nic> Peek<'a, N> {
+    /// Its bytes lie in the allocation it names, under that allocation's key.
+    #[verifier::type_invariant]
+    pub(crate) closed spec fn inv(self) -> bool {
         &&& (**self.frozen).inv()
         &&& self.offset + self.bytes <= (**self.frozen).byte_len()
+        &&& self.lkey == (*self.frozen.raw.region).lkey
+    }
+
+    /// The protection domain of its allocation.
+    pub(crate) closed spec fn pd_id(self) -> u64 {
+        (*self.frozen.raw.region).pd_id
+    }
+
+    /// `bytes` bytes of `frozen`, `offset` bytes into it.
+    #[inline(always)]
+    pub(super) fn new(frozen: &'a Arc<Frozen<N>>, offset: usize, bytes: usize) -> (p: Self)
+        requires
+            offset + bytes <= (**frozen).byte_len(),
+    {
+        proof { use_type_invariant(&**frozen); }
+        Peek { frozen, offset, bytes, lkey: frozen.raw.region.lkey }
     }
 
     /// Its scatter/gather element, for a length that fits one.
@@ -1550,6 +1557,7 @@ impl<N: Nic> Peek<'_, N> {
         requires
             self.inv(),
             self.bytes <= u32::MAX,
+            pd == self.pd_id(),
         ensures
             self.part(pd).inv(),
             !self.part(pd).spec_writable(),
@@ -1565,13 +1573,13 @@ impl<N: Nic> Peek<'_, N> {
     #[inline(always)]
     pub(crate) fn sge(&self) -> (sge: Sge)
         requires
-            self.inv(),
             self.bytes <= u32::MAX,
         ensures
             sge == self.spec_sge(),
             sge.length == self.bytes,
     {
         proof {
+            use_type_invariant(self);
             use_type_invariant(&**self.frozen);
             self.frozen.lemma_contents();
             self.frozen.raw.lemma_domain();
@@ -1980,14 +1988,23 @@ impl<N: Nic> Kept<N> {
         requires
             old(self).inv(),
             old(self).keeps_frozen(**peek.frozen),
-            peek.inv(),
             peek.bytes <= u32::MAX,
             forall|i: int| 0 <= i < old(self).loans().len() ==> (#[trigger] old(self).loans()[i]).part.spec_pd() == pd,
         ensures
             final(self).inv(),
             final(self).loans() == old(self).loans().push(Loan { part: peek.part(pd), access: Some(Dir::Out) }),
+            pd == peek.pd_id(),
     {
         let ghost before = *self;
+        proof {
+            use_type_invariant(peek);
+            // Its allocation is that of an input before it, which says its domain.
+            let last = before.last->0;
+            let i = choose|i: int|
+                0 <= i < before.loans@.len() && (#[trigger] before.loans@[i]).part.lease == Lease::Shared(last);
+            assert(before.loans()[i].part.spec_pd() == pd);
+            assert(before.loans()[i].part.inv());
+        }
         self.loans = Ghost(before.loans@.push(Loan { part: peek.part(pd), access: Some(Dir::Out) }));
         proof {
             peek.lemma_part(pd);

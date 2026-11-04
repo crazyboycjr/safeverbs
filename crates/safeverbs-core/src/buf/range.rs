@@ -259,16 +259,6 @@ impl ElementRange {
     }
 }
 
-/// A native SGE has a 32-bit byte count. Reject oversize ranges instead of truncating.
-#[inline]
-pub(super) fn checked_sge_len(len: usize) -> (r: Option<u32>)
-    ensures
-        r is Some <==> len <= u32::MAX,
-        r is Some ==> r->0 as usize == len,
-{
-    if len > u32::MAX as usize { None } else { Some(len as u32) }
-}
-
 } // verus!
 
 // Proof metadata must not add a third word to every buffer and retained lease.
@@ -278,17 +268,6 @@ const _: () = assert!(core::mem::size_of::<ElementRange>() == 2 * core::mem::siz
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// No allocation is needed to exercise the native field boundary.
-    #[test]
-    fn sge_lengths_never_truncate() {
-        assert_eq!(checked_sge_len(0), Some(0));
-        assert_eq!(checked_sge_len(u32::MAX as usize), Some(u32::MAX));
-        if usize::BITS > 32 {
-            assert_eq!(checked_sge_len(u32::MAX as usize + 1), None);
-            assert_eq!(checked_sge_len(usize::MAX), None);
-        }
-    }
 
     /// Synthetic capacities cover address-space boundaries without allocating memory.
     #[test]

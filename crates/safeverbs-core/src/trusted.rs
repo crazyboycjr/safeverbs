@@ -45,8 +45,8 @@ use crate::buf::{BufError, Kept, Leases, Part};
 use crate::error::{Error, Result};
 // The device trait as `Device`: `Nic` names M's state machine here.
 use crate::nic::{
-    ConnectAttr, DeviceCaps, Endpoint, Nic as Device, NicCq, NicQp, QpCaps, QpType, RemoteBuf, Sge,
-    WrOp,
+    Access, ConnectAttr, DeviceCaps, Endpoint, Nic as Device, NicCq, NicQp, QpCaps, QpType,
+    RemoteBuf, Sge, WrOp,
 };
 use crate::pd::{Context, Pd};
 use crate::wc::Wc;
@@ -697,6 +697,16 @@ pub fn same_device<N: Device>(ctx: &Context<N>, pd: &Pd<N>) -> (same: bool)
         same == pd_of_device(*ctx, *pd),
 {
     ctx.same_device(pd.context())
+}
+
+/// `ibv_reg_mr` of `bytes` bytes at `address` in `pd`, for local writes: the handle of the region
+/// and its local key, or nothing. No contract of M's: what an engine learns of it is [`registered`].
+#[verifier::external_body]
+pub fn register_region<N: Device>(pd: &Pd<N>, address: *mut u8, bytes: usize) -> (r: Result<(N::Mr, u32)>) {
+    // SAFETY: the memory stays allocated until the region's `drop`, which deregisters it first.
+    let mr = unsafe { pd.context().nic().reg_mr(pd.raw(), address, bytes, Access::LOCAL_WRITE) }?;
+    let lkey = N::mr_keys(&mr).0;
+    Ok((mr, lkey))
 }
 
 /// A handle to the same protection domain.
