@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # What one round of each public path costs, against code written by hand: instructions per
-# round on the simulated NIC, with the NIC subtracted, and the ratio to the baseline each
-# workload is compared with (crates/safeverbs/examples/measure.rs says what each one does).
+# round on the simulated NIC, with the NIC subtracted (all it runs, its allocations and copies
+# too), and the ratio to the baseline each workload is compared with
+# (crates/safeverbs/examples/measure.rs says what each one does).
 #
 #   scripts/measure.sh                the table
 #   scripts/measure.sh -v eventloop   one workload's cost, function by function
 #   scripts/measure.sh -s             the bytes of a slot and of the handles
 #
-# Needs valgrind (callgrind and callgrind_annotate). Each workload runs twice, with no rounds
+# Needs valgrind (callgrind) and python3. Each workload runs twice, with no rounds
 # and with many, and the difference is what the rounds cost; so setup and teardown do not count.
 # Instruction counts say nothing of atomics, caches or MMIO: the numbers that finally count
 # come from a real NIC against perftest.
@@ -26,22 +27,12 @@ trap 'rm -rf "$scratch"' EXIT
 cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p safeverbs --example measure
 probe="$target/release/examples/measure"
 
-# Every function's own instructions in a callgrind output: `<count> <name>`.
-self_costs() {
-    callgrind_annotate --threshold=100 --auto=no "$1" | awk '
-        /PROGRAM TOTALS/ { next }
-        match($0, /^ *[0-9,]+ \( *[0-9.]+%\) +/) {
-            count = substr($0, 1, RLENGTH)
-            name = substr($0, RLENGTH + 1)
-            sub(/ *\(.*$/, "", count)
-            gsub(/[ ,]/, "", count)
-            sub(/^(\?\?\?|\/[^:]*|[^ :\/]*\.(rs|c|h|S|s)):/, "", name)
-            sub(/ \[[^]]*\]$/, "", name)
-            print count, name
-        }'
-}
-
-# What the workload costs per round, function by function: `<per round> <name>`.
+# What the workload costs per round outside the simulated NIC, function by function:
+# `<per round> <name>`. The NIC is everything its own functions run, whatever that is called:
+# what its `Vec`s ask of the allocator and its copies are the NIC's, on both sides of a comparison,
+# and what the library or a baseline asks of the same allocator stays theirs. So a callgrind output
+# is read for its call arcs: a function called from both has its instructions split by what each
+# call took.
 per_round() {
     local name="$1"
     for n in 0 "$rounds"; do
@@ -51,25 +42,71 @@ per_round() {
             echo "measure.sh: $name failed" >&2
             exit 1
         fi
-        self_costs "$scratch/$name.$n.out" >"$scratch/$name.$n.costs"
     done
-    awk -v rounds="$rounds" '
-        FNR == NR { c = $1; $1 = ""; base[$0] += c; next }
-        { c = $1; $1 = ""; cost[$0] += c }
-        END {
-            for (k in cost) { printf "%.1f%s\n", (cost[k] - base[k]) / rounds, k }
-            for (k in base) { if (!(k in cost)) printf "%.1f%s\n", -base[k] / rounds, k }
-        }' "$scratch/$name.0.costs" "$scratch/$name.$rounds.costs"
-}
+    python3 - "$scratch/$name.0.out" "$scratch/$name.$rounds.out" "$rounds" <<'PY'
+import collections
+import re
+import sys
 
-# The simulated NIC: its types, the collections and allocator it uses, memset.
-is_nic='^ *(<?safeverbs_core::model::|<alloc::collections::(btree|vec_deque)|<alloc::raw_vec::RawVec|alloc::raw_vec::|alloc::alloc::|.*finish_grow|malloc$|free$|_int_malloc$|_int_free$|__rustc::__rdl_alloc|__rustc::__rust_alloc|__rustc::__rust_dealloc|__rustc::__rdl_dealloc|__rustc::__rust_no_alloc_shim_is_unstable_v2$|__memset)'
+NIC = re.compile(r"^<?safeverbs_core::model::")
+
+
+def outside_the_nic(path):
+    """Each function's own instructions that did not run on behalf of the NIC."""
+    names = {}
+
+    def name_of(text):
+        m = re.match(r"\((\d+)\)(?: (.*))?$", text)
+        if m.group(2) is not None:
+            names[m.group(1)] = m.group(2)
+        return names[m.group(1)]
+
+    own = collections.Counter()
+    calls_into = collections.defaultdict(collections.Counter)
+    caller = callee = None
+    arc = False
+    with open(path) as f:
+        for line in f:
+            if line.startswith("fn="):
+                caller = name_of(line[3:].strip())
+            elif line.startswith("cfn="):
+                callee = name_of(line[4:].strip())
+            elif line.startswith("calls="):
+                arc = True
+            elif line[0] in "0123456789+-*":
+                cost = int(line.split()[1])
+                if arc:
+                    calls_into[callee][caller] += cost
+                    arc = False
+                else:
+                    own[caller] += cost
+    share = {f: 1.0 if NIC.search(f) else 0.0 for f in own}
+    for _ in range(64):
+        changed = False
+        for f, callers in calls_into.items():
+            if NIC.search(f):
+                continue
+            total = sum(callers.values())
+            s = sum(c * share.get(g, 0.0) for g, c in callers.items()) / total if total else 0.0
+            if abs(s - share.get(f, 0.0)) > 1e-9:
+                share[f] = s
+                changed = True
+        if not changed:
+            break
+    return {f: c * (1.0 - share.get(f, 0.0)) for f, c in own.items()}
+
+
+before = outside_the_nic(sys.argv[1])
+after = outside_the_nic(sys.argv[2])
+rounds = int(sys.argv[3])
+for f in set(before) | set(after):
+    print(f"{(after.get(f, 0.0) - before.get(f, 0.0)) / rounds:.3f} {f}")
+PY
+}
 
 # The instructions per round the workload's own code takes.
 library_cost() {
-    per_round "$1" | awk -v nic="$is_nic" '
-        { c = $1; $1 = ""; sub(/^ /, ""); if ($0 !~ nic) total += c }
-        END { printf "%.0f\n", total }'
+    per_round "$1" | awk '{ total += $1 } END { printf "%.0f\n", total }'
 }
 
 if [ "${1:-}" = "-s" ]; then
@@ -78,8 +115,7 @@ if [ "${1:-}" = "-s" ]; then
 fi
 
 if [ "${1:-}" = "-v" ]; then
-    per_round "$2" | awk -v nic="$is_nic" '
-        { c = $1; $1 = ""; sub(/^ /, ""); if ($0 !~ nic && (c >= 0.5 || c <= -0.5)) printf "%9.1f  %s\n", c, substr($0, 1, 150) }' |
+    per_round "$2" | awk '{ c = $1; $1 = ""; sub(/^ /, ""); if (c >= 0.5 || c <= -0.5) printf "%9.1f  %s\n", c, substr($0, 1, 150) }' |
         sort -n
     exit 0
 fi
@@ -94,8 +130,11 @@ take careful 1
 async careful 1
 batch_careful - 0
 batch batch_careful 1
+batch_owned batch_careful 1
 async_batch batch_careful 1
 sink batch_careful 1
+batch_many_careful - 0
+batch_many batch_many_careful 1
 train_careful - 0
 train train_careful 1
 async_train careful 16'

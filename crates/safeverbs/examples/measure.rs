@@ -13,6 +13,8 @@
 //!   routing, a check of the queue's room before each post.
 //! - `batch_careful`: the same, for 16 WRITEs of one buffer as one request of one doorbell and
 //!   one completion.
+//! - `batch_many_careful`: the same, with a buffer of its own for each WRITE, which the slot keeps in
+//!   a list that it reuses.
 //! - `train_careful`: the same, for 16 SENDs of one buffer as 16 requests of one doorbell, only
 //!   the last signaled, and 16 receives.
 //!
@@ -411,6 +413,75 @@ fn post_train(c: &mut Conn, idx: u64, buf: &Arc<Vec<u8>>, sge: Sge, ctx: u64) {
     unsafe { c.qp.complete().unwrap() };
 }
 
+/// What a careful program keeps for a batch of several buffers: a list of them in the slot, whose
+/// room stays with the slot.
+fn batch_many_careful(rounds: usize) {
+    let s = raw_setup();
+    let mut mems: Vec<Vec<u8>> = (0..TRAIN).map(|_| vec![1u8; SIZE]).collect();
+    let mut dst = vec![0u8; SIZE];
+    let mut regions = Vec::new();
+    let mut sges = Vec::new();
+    for mem in &mut mems {
+        let (mr, sge, _) = register(&s, mem);
+        regions.push(mr);
+        sges.push(sge);
+    }
+    let (m2, _, to) = register(&s, &mut dst);
+    let RawSetup {
+        model,
+        mut cq,
+        a,
+        b,
+        ..
+    } = s;
+    let srcs: Vec<Arc<Vec<u8>>> = mems.into_iter().map(Arc::new).collect();
+    let mut conns = [Conn::new(a), Conn::new(b)];
+    let mut lists: Vec<Vec<Arc<Vec<u8>>>> = (0..DEPTH).map(|_| Vec::with_capacity(TRAIN)).collect();
+    let mut wcs = [Wc::default(); 16];
+    let mut ok = 0usize;
+    for i in 0..rounds {
+        let c = &mut conns[0];
+        let seq = c.send.tail;
+        let list = &mut lists[(seq % DEPTH) as usize];
+        list.extend(srcs.iter().cloned());
+        c.send.slots[(seq % DEPTH) as usize].ctx = i as u64;
+        // SAFETY: the slot's list keeps the buffers until the request completes.
+        unsafe {
+            c.qp.start();
+            for (j, sge) in sges.iter().enumerate() {
+                let wr_id = (seq * TRAIN as u64) + j as u64;
+                c.qp.post(
+                    wr_id,
+                    j + 1 == TRAIN,
+                    &WrOp::Write(to),
+                    core::slice::from_ref(sge),
+                );
+            }
+            c.qp.complete().unwrap();
+        }
+        c.send.tail = seq + 1;
+        model.run();
+        let mut seen = 0;
+        while seen < 1 {
+            let n = cq.poll(&mut wcs);
+            for wc in &wcs[..n] {
+                let id = wc.probe_wr_id();
+                let seq = (id & SEQ_MASK) / TRAIN as u64;
+                let q = &mut conns[(id >> 48) as usize].send;
+                while q.head <= seq {
+                    lists[(q.head % DEPTH) as usize].clear();
+                    black_box(q.slots[(q.head % DEPTH) as usize].ctx);
+                    q.head += 1;
+                }
+                ok += wc.result().is_ok() as usize;
+            }
+            seen += n;
+        }
+    }
+    black_box(ok);
+    black_box((regions, m2));
+}
+
 fn train_careful(rounds: usize) {
     let RawSetup {
         model,
@@ -587,7 +658,7 @@ fn batch(rounds: usize) {
         local
             .post_batch(i as u64, |b| {
                 for _ in 0..TRAIN {
-                    b.write(src.slice(..), to);
+                    b.write(&src, to);
                 }
             })
             .unwrap();
@@ -602,6 +673,67 @@ fn batch(rounds: usize) {
 
 /// 16 SENDs of one buffer as 16 requests of one doorbell, only the last signaled, and 16
 /// receives, on the event loop.
+/// [`batch`] with a slice of the buffer by value for each WRITE, which clones and drops a reference
+/// to it.
+fn batch_owned(rounds: usize) {
+    let Setup {
+        model,
+        pd,
+        cq,
+        local,
+        peer: _peer,
+    } = setup();
+    let src = frozen(&pd);
+    let dst = pd.alloc::<u8>(SIZE).unwrap().expose().unwrap();
+    let to = dst.remote();
+    let mut ok = 0usize;
+    for i in 0..rounds {
+        local
+            .post_batch(i as u64, |b| {
+                for _ in 0..TRAIN {
+                    b.write(src.slice(..), to);
+                }
+            })
+            .unwrap();
+        model.run();
+        cq.poll(16, |wc| {
+            ok += wc.result.is_ok() as usize;
+            black_box(wc.wr_id);
+        });
+    }
+    black_box(ok);
+}
+
+/// [`batch`] with a buffer of its own for each WRITE.
+fn batch_many(rounds: usize) {
+    let Setup {
+        model,
+        pd,
+        cq,
+        local,
+        peer: _peer,
+    } = setup();
+    let srcs: Vec<_> = (0..TRAIN).map(|_| frozen(&pd)).collect();
+    let dst = pd.alloc::<u8>(SIZE).unwrap().expose().unwrap();
+    let to = dst.remote();
+    let mut ok = 0usize;
+    for i in 0..rounds {
+        local
+            .post_batch(i as u64, |b| {
+                for src in &srcs {
+                    b.write(src, to);
+                }
+            })
+            .unwrap();
+        model.run();
+        cq.poll(16, |wc| {
+            ok += wc.result.is_ok() as usize;
+            black_box(wc.wr_id);
+        });
+    }
+    black_box(ok);
+}
+
 fn train(rounds: usize) {
     let Setup {
         model,
@@ -819,7 +951,7 @@ fn async_batch(rounds: usize) {
         for _ in 0..rounds {
             let f = local.batch(|b| {
                 for _ in 0..TRAIN {
-                    b.write(src.slice(..), to);
+                    b.write(&src, to);
                 }
             });
             model.run();
@@ -917,12 +1049,15 @@ fn main() {
         "raw" => raw(rounds),
         "careful" => careful(rounds),
         "batch_careful" => batch_careful(rounds),
+        "batch_many_careful" => batch_many_careful(rounds),
         "train_careful" => train_careful(rounds),
         "eventloop" => eventloop(rounds),
         "poll_one" => poll_one(rounds),
         "engine" => engine_loop(rounds),
         "take" => take(rounds),
         "batch" => batch(rounds),
+        "batch_owned" => batch_owned(rounds),
+        "batch_many" => batch_many(rounds),
         "train" => train(rounds),
         "async" => async_round(rounds),
         "async_batch" => async_batch(rounds),
