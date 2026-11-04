@@ -1938,6 +1938,7 @@ impl<L> Ring<L> {
             slot.end_wqe = wqe;
             if seq == keep {
                 kept = slot.leases.take();
+                slot.outcome = Err(CompletionError::Refused);
             } else if slot.detached {
                 // Releases the leases.
                 slot.leases = None;
@@ -2398,10 +2399,6 @@ impl<L> Ring<L> {
                 _ => break,
             }
         }
-        // Only a request without an owner, or nothing, leaves its slot free as it retires.
-        if self.head < self.retired && self.slots[self.index(self.head)].leases.is_none() {
-            self.advance_head();
-        }
         true
     }
 
@@ -2523,6 +2520,8 @@ impl<L> Ring<L> {
         self.wqe_retired = end;
         if slot.detached || slot.outcome.is_err() {
             Self::retired_cold(slot, seq, first, &mut self.failed, &mut self.detached_error);
+            // A request without an owner leaves its slot free as it retires.
+            self.advance_head();
         }
         if !self.wakers.is_empty() {
             let waker = self.wakers[i].take();
@@ -2533,6 +2532,7 @@ impl<L> Ring<L> {
         // Refused requests after the last WQE in flight: no completion would retire them.
         if self.refused && end == self.wqe_committed {
             self.skip_refused();
+            self.advance_head();
         }
         Some((i, ended))
     }
@@ -3324,6 +3324,10 @@ impl<L> Ring<L> {
 // The checks of the invariants at run time, outside the proofs: tests use them to
 // cross-check the proved invariants on random sequences.
 impl<L> Ring<L> {
+    /// The bytes of a slot, for the measurements.
+    #[doc(hidden)]
+    pub const SLOT_BYTES: usize = core::mem::size_of::<Slot<L>>();
+
     /// Checks the invariants of the module documentation at run time. Tests call it on random
     /// executions.
     pub fn invariant(&self) -> bool {

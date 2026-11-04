@@ -3784,3 +3784,8 @@ spec fn op_writes_local(op: WrOp) -> bool {
 }
 
 } // verus!
+
+impl<C, N: Device> Hw<C, N> {
+    /// The bytes of a QP in the table.
+    pub(crate) const QP_BYTES: usize = core::mem::size_of::<HwQp<C, N>>();
+}

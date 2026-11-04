@@ -4,7 +4,6 @@
 
 use core::future::Future;
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -175,22 +174,22 @@ impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
     }
 
     /// Posts a send request of one WQE now if it fits and nothing waits before it, else queues it.
-    /// Its buffer, in `part`, becomes a `Part` only with the state in hand: nothing with a
+    /// The caller holds the state before it makes a `Part` of the buffer: nothing with a
     /// destructor crosses the state's panic, where it would have to stay in memory.
     #[inline(always)]
-    pub(crate) fn post(q: &'q Q, op: WrOp, part: impl FnOnce() -> Part<Q::N>) -> Self {
-        let part = ManuallyDrop::new(part);
-        let state = q.with_state(|s| s.post_send(op, ManuallyDrop::into_inner(part)()));
-        Self::new(q, state)
+    pub(crate) fn post(q: &'q Q, mut state: Q::Locked<'q>, op: WrOp, part: Part<Q::N>) -> Self {
+        let posted = state.qp(q.qp_key()).post_send(op, part);
+        drop(state);
+        Self::new(q, posted)
     }
 
     /// Posts a receive now if it fits and nothing waits before it, else queues it. See
-    /// [`Op::post`] for `part`.
+    /// [`Op::post`] for `state`.
     #[inline(always)]
-    pub(crate) fn post_recv(q: &'q Q, part: impl FnOnce() -> Part<Q::N>) -> Self {
-        let part = ManuallyDrop::new(part);
-        let state = q.with_state(|s| s.post_recv(ManuallyDrop::into_inner(part)()));
-        Self::new(q, state)
+    pub(crate) fn post_recv(q: &'q Q, mut state: Q::Locked<'q>, part: Part<Q::N>) -> Self {
+        let posted = state.qp(q.qp_key()).post_recv(part);
+        drop(state);
+        Self::new(q, posted)
     }
 
     /// Posts send work of any kind now if it fits and nothing waits before it, else queues it.
@@ -242,14 +241,15 @@ impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
     /// the state still in hand, from the buffers where the state put them: one move less of them.
     #[inline(always)]
     fn poll_posted(&mut self, seq: Seq, cx: &Context<'_>) -> Poll<K::Output> {
-        let output = self.q.with_state(|s| {
-            s.drain();
-            if s.completed(K::QUEUE, seq) {
-                return match s.take_request(K::QUEUE, seq) {
-                    Some((result, mut leases)) => Some(K::done(result, &mut leases)),
-                    None => None,
-                };
+        let mut state = self.q.lock();
+        let mut s = state.qp(self.q.qp_key());
+        s.drain();
+        let output = if s.completed(K::QUEUE, seq) {
+            match s.take_request(K::QUEUE, seq) {
+                Some((result, mut leases)) => Some(K::done(result, &mut leases)),
+                None => None,
             }
+        } else {
             // One poll of the CQ completes the requests of all its QPs.
             s.engine().progress();
             match s.take_request(K::QUEUE, seq) {
@@ -259,7 +259,8 @@ impl<'q, Q: QueueAccess, K: Outcome<Q::N>> Op<'q, Q, K> {
                     None
                 }
             }
-        });
+        };
+        drop(state);
         match output {
             Some(output) => {
                 self.state = OpState::Done;

@@ -300,6 +300,10 @@ pub struct Engine<C = (), N: Nic = Verbs> {
 }
 
 impl<C, N: Nic> Engine<C, N> {
+    /// The bytes of a QP in the table, for the measurements.
+    #[doc(hidden)]
+    pub const QP_BYTES: usize = Hw::<C, N>::QP_BYTES;
+
     /// An engine on the device of `ctx` with a CQ of `cq_size` entries, on a thread domain of
     /// its own where the device has them.
     pub fn new(ctx: &Context<N>, cq_size: u32) -> Result<Engine<C, N>> {

@@ -1,9 +1,10 @@
 //! Connected queue pairs with the asynchronous API: [`AsyncQp`] on a
 //! completion queue of one thread ([`AsyncCq`]), [`SharedQp`] behind a lock.
 
-use core::cell::RefCell;
+use core::cell::{RefCell, RefMut};
+use core::ops::DerefMut;
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use safeverbs_core::engine::{MAX_SGES, Unposted};
 use safeverbs_core::{
@@ -45,7 +46,7 @@ impl<N: Nic> Queues<N> {
 
 /// What a completion queue of the asynchronous layer holds: the engine and, by the index of each
 /// of its QPs, the futures' share of it.
-pub(crate) struct State<N: Nic> {
+pub struct State<N: Nic> {
     pub(crate) engine: Engine<(), N>,
     queues: Vec<Option<Queues<N>>>,
     /// What the shares of all its QPs hold. While this is zero, as it mostly is, the data path
@@ -403,6 +404,23 @@ pub trait QueueAccess: sealed::Sealed {
     type T: Transport;
     /// The NIC.
     type N: Nic;
+    /// What holds the state while it is used: the `RefCell`'s borrow, or the lock's guard.
+    #[doc(hidden)]
+    type Locked<'a>: DerefMut<Target = State<Self::N>>
+    where
+        Self: 'a;
+
+    /// The state of the QP's CQ, held.
+    ///
+    /// # Panics
+    ///
+    /// For an [`AsyncQp`], if it is held already (its `RefCell` is borrowed).
+    #[doc(hidden)]
+    fn lock(&self) -> Self::Locked<'_>;
+
+    /// The QP's key in its engine.
+    #[doc(hidden)]
+    fn qp_key(&self) -> QpKey<Self::T>;
 
     /// Runs `f` on the QP's state.
     ///
@@ -410,7 +428,12 @@ pub trait QueueAccess: sealed::Sealed {
     ///
     /// For an [`AsyncQp`], if called from inside `f` for a QP of the same
     /// CQ (its `RefCell` is borrowed).
-    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<'_, Self::T, Self::N>) -> R) -> R;
+    #[inline(always)]
+    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<'_, Self::T, Self::N>) -> R) -> R {
+        let key = self.qp_key();
+        let mut state = self.lock();
+        f(&mut state.qp(key))
+    }
 
     /// Runs `f` on the engine and the QP's key.
     #[inline]
@@ -491,20 +514,34 @@ impl<T: Transport, N: Nic> sealed::Sealed for SharedQp<T, N> {}
 impl<T: Transport, N: Nic> QueueAccess for AsyncQp<T, N> {
     type T = T;
     type N = N;
+    type Locked<'a>
+        = RefMut<'a, State<N>>
+    where
+        Self: 'a;
     #[inline(always)]
-    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<'_, T, N>) -> R) -> R {
-        let mut state = self.guard.state().borrow_mut();
-        f(&mut state.qp(self.guard.key))
+    fn lock(&self) -> RefMut<'_, State<N>> {
+        self.guard.state().borrow_mut()
+    }
+    #[inline(always)]
+    fn qp_key(&self) -> QpKey<T> {
+        self.guard.key
     }
 }
 
 impl<T: Transport, N: Nic> QueueAccess for SharedQp<T, N> {
     type T = T;
     type N = N;
+    type Locked<'a>
+        = MutexGuard<'a, State<N>>
+    where
+        Self: 'a;
     #[inline]
-    fn with_state<R>(&self, f: impl FnOnce(&mut QpState<'_, T, N>) -> R) -> R {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut state.qp(self.key))
+    fn lock(&self) -> MutexGuard<'_, State<N>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    #[inline(always)]
+    fn qp_key(&self) -> QpKey<T> {
+        self.key
     }
 }
 
@@ -588,7 +625,7 @@ macro_rules! qp_api {
             /// SENDs `buf` into the peer's next receive.
             #[inline(always)]
             pub fn send<U: IntoBytes + Immutable>(&self, buf: Buf<U, N>) -> Op<'_, Self, Sent> {
-                Op::post(self, WrOp::Send, || buf.into_part())
+                Op::post(self, self.lock(), WrOp::Send, buf.into_part())
             }
 
             /// SENDs `buf` with immediate data `imm`.
@@ -598,7 +635,7 @@ macro_rules! qp_api {
                 buf: Buf<U, N>,
                 imm: u32,
             ) -> Op<'_, Self, Sent> {
-                Op::post(self, WrOp::SendImm(imm), || buf.into_part())
+                Op::post(self, self.lock(), WrOp::SendImm(imm), buf.into_part())
             }
 
             /// SENDs the concatenation of `bufs` as one message (a gather
@@ -628,7 +665,7 @@ macro_rules! qp_api {
                 buf: Buf<U, N>,
                 dst: RemoteBuf,
             ) -> Op<'_, Self, Sent> {
-                Op::post(self, WrOp::Write(dst), || buf.into_part())
+                Op::post(self, self.lock(), WrOp::Write(dst), buf.into_part())
             }
 
             /// RDMA WRITEs `buf` to `dst` with immediate data `imm`, which
@@ -639,7 +676,7 @@ macro_rules! qp_api {
                 dst: RemoteBuf,
                 imm: u32,
             ) -> Op<'_, Self, Sent> {
-                Op::post(self, WrOp::WriteImm(dst, imm), || buf.into_part())
+                Op::post(self, self.lock(), WrOp::WriteImm(dst, imm), buf.into_part())
             }
 
             /// Posts a receive into `buf`; yields what it got (a message or the
@@ -649,7 +686,7 @@ macro_rules! qp_api {
                 &self,
                 buf: BufMut<U, N>,
             ) -> Op<'_, Self, Recv<U>> {
-                Op::post_recv(self, || buf.into_part())
+                Op::post_recv(self, self.lock(), buf.into_part())
             }
 
             /// Posts the SENDs and WRITEs `f` adds as one request: one
@@ -720,7 +757,7 @@ macro_rules! qp_api {
                 buf: BufMut<U, N>,
                 src: RemoteBuf,
             ) -> Op<'_, Self, Read<U>> {
-                Op::post(self, WrOp::Read(src), || buf.into_part())
+                Op::post(self, self.lock(), WrOp::Read(src), buf.into_part())
             }
 
             /// Atomically adds `add` to the 8 bytes at `dst` in the peer's
@@ -732,9 +769,8 @@ macro_rules! qp_api {
                 dst: RemoteBuf,
                 add: u64,
             ) -> Op<'_, Self, Read<u64>> {
-                Op::post(self, WrOp::FetchAdd { remote: dst, add }, || {
-                    old.into_part()
-                })
+                let op = WrOp::FetchAdd { remote: dst, add };
+                Op::post(self, self.lock(), op, old.into_part())
             }
 
             /// Atomically replaces the 8 bytes at `dst` in the peer's memory
@@ -752,7 +788,7 @@ macro_rules! qp_api {
                     compare,
                     swap,
                 };
-                Op::post(self, op, || old.into_part())
+                Op::post(self, self.lock(), op, old.into_part())
             }
         }
     };

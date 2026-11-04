@@ -868,6 +868,11 @@ fn random_operations_on_a_cq() {
                     cq.poll(n, &handle);
                 }
             }
+            if let Some(qp) = &qps.borrow()[i] {
+                let engine = cq.as_raw();
+                let (send, recv) = (engine.send_ring(qp.as_raw()), engine.recv_ring(qp.as_raw()));
+                assert!(send.invariant() && recv.invariant());
+            }
         }
         handed_out += handled.get();
         // Everything left goes with the handles.

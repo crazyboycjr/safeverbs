@@ -5,6 +5,7 @@
 #
 #   scripts/measure.sh                the table
 #   scripts/measure.sh -v eventloop   one workload's cost, function by function
+#   scripts/measure.sh -s             the bytes of a slot and of the handles
 #
 # Needs valgrind (callgrind and callgrind_annotate). Each workload runs twice, with no rounds
 # and with many, and the difference is what the rounds cost; so setup and teardown do not count.
@@ -70,6 +71,11 @@ library_cost() {
         { c = $1; $1 = ""; sub(/^ /, ""); if ($0 !~ nic) total += c }
         END { printf "%.0f\n", total }'
 }
+
+if [ "${1:-}" = "-s" ]; then
+    "$probe" sizes
+    exit 0
+fi
 
 if [ "${1:-}" = "-v" ]; then
     per_round "$2" | awk -v nic="$is_nic" '

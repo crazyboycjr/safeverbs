@@ -892,6 +892,23 @@ fn sink(rounds: usize) {
     black_box(ok);
 }
 
+/// The bytes of what the data path moves, and of the handles.
+fn sizes() {
+    use core::mem::size_of;
+    use safeverbs_core::ring::Ring;
+    type Payload<C> = safeverbs_core::ring::Payload<C, safeverbs::Verbs>;
+    type Fut<'q> = safeverbs::Op<'q, AsyncQp<RC>, safeverbs::Sent>;
+    println!("slot, wr_id u64  {}", Ring::<Payload<u64>>::SLOT_BYTES);
+    println!("slot, futures    {}", Ring::<Payload<()>>::SLOT_BYTES);
+    println!("QP in the table  {}", Engine::<u64>::QP_BYTES);
+    println!("Wc<u64>          {}", size_of::<safeverbs::Wc<u64>>());
+    println!("Leases           {}", size_of::<safeverbs::Leases>());
+    println!("LocalCq          {}", size_of::<LocalCq>());
+    println!("LocalQp          {}", size_of::<LocalQp<RC>>());
+    println!("AsyncQp          {}", size_of::<AsyncQp<RC>>());
+    println!("a future         {}", size_of::<Fut<'static>>());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let which = args.get(1).map(String::as_str).unwrap_or("none");
@@ -911,6 +928,7 @@ fn main() {
         "async_batch" => async_batch(rounds),
         "async_train" => async_train(rounds),
         "sink" => sink(rounds),
+        "sizes" => sizes(),
         other => panic!("no workload {other}"),
     }
 }
