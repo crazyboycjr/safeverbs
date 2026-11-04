@@ -23,12 +23,10 @@ impl<L> Ring<L> {
             self.dma(s, w) is Some ==>
                 self.slots@[s % self.n()].leases == self.dma(s, w),
     {
-        reveal(Ring::inv_slots);
+        reveal(Ring::inv_slots_but);
         vstd::arithmetic::div_mod::lemma_mod_bound(s, self.n());
-        if self.req(s) is Some || self.staged(s) is Some || self.refused(s) is Some {
-            if s < self.retired { assert(self.done_ok(s)); }
-            else { assert(self.live_ok(s)); }
-            assert(self.slot(s).leases is Some);
+        if self.staged(s) is Some {
+            assert(self.live_ok(s));
         }
     }
 }

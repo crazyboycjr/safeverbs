@@ -20,8 +20,7 @@
 //! The NIC's state is a ghost token, [`NicToken`], that only these wrappers
 //! make and change. A token is one engine's: it holds M's state as that
 //! engine last saw it, the engine's share of M (`safeverbs_spec::share`: its
-//! CQ and the names of its QPs), the protection domain of its QPs and the
-//! names it gives new QPs. Each verb is on the token's own share (`mine`),
+//! CQ and the names of its QPs) and the names it gives new QPs. Each verb is on the token's own share (`mine`),
 //! so it is within what the other engines rely on, and its precondition,
 //! checked in the state the engine last saw, still holds when the verb
 //! happens (`safeverbs_spec::share::lemma_rely_keeps_enabled`): that is why
@@ -42,7 +41,7 @@ use safeverbs_spec::share::*;
 use safeverbs_spec::types::{CqId, Key, PdId, QpId};
 use vstd::prelude::*;
 
-use crate::buf::{BufError, Leases, Part};
+use crate::buf::{BufError, Kept, Leases, Part};
 use crate::error::{Error, Result};
 // The device trait as `Device`: `Nic` names M's state machine here.
 use crate::nic::{
@@ -109,6 +108,13 @@ pub struct ExConnectAttr(ConnectAttr);
 #[verifier::external_type_specification]
 #[verifier::external_body]
 pub struct ExEndpoint(Endpoint);
+
+/// [`Context`], opaque.
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[verifier::reject_recursive_types(N)]
+pub struct ExContext<N: Device>(Context<N>);
 
 /// [`Pd`], opaque.
 #[cfg(verus_keep_ghost)]
@@ -283,7 +289,7 @@ pub open spec fn send_access(op: WrOp) -> safeverbs_spec::abs::Dir {
 // The token
 
 /// What one engine knows of the NIC: M's state as it last saw it, its share
-/// of M, the protection domain of its QPs, the names it gives new QPs, and
+/// of M, the names it gives new QPs, and
 /// for each of its queue pairs the send WRs written since its last start.
 /// Only the trusted wrappers make or change one: its fields are private, so
 /// no other code can forge one.
@@ -292,7 +298,6 @@ pub open spec fn send_access(op: WrOp) -> safeverbs_spec::abs::Dir {
 pub tracked struct NicToken {
     ghost nic: Nic::State,
     ghost share: Share,
-    ghost pd: PdId,
     ghost name: spec_fn(nat) -> QpId,
     ghost started: Set<QpId>,
     ghost written: Map<QpId, Seq<SendWr>>,
@@ -309,22 +314,15 @@ impl NicToken {
         self.share
     }
 
-    /// The protection domain of the engine's QPs.
-    pub closed spec fn pd(&self) -> PdId {
-        self.pd
-    }
-
     /// The name of the engine's `n`-th QP: names it owns, all different,
     /// none used before the engine was made.
     pub closed spec fn name(&self, n: nat) -> QpId {
         (self.name)(n)
     }
 
-    /// `self` is `other` after calls of the same engine: the same share,
-    /// protection domain and names.
+    /// `self` is `other` after calls of the same engine: the same share and names.
     pub open spec fn same_engine(&self, other: &NicToken) -> bool {
         &&& self.share() == other.share()
-        &&& self.pd() == other.pd()
         &&& forall|n: nat| #[trigger] self.name(n) == other.name(n)
     }
 
@@ -433,7 +431,7 @@ pub open spec fn fresh_engine(t: NicToken) -> bool {
 
 /// The device's limits (`ibv_query_device`, and the ports' message size),
 /// as a specification.
-pub uninterp spec fn spec_device_caps<N: Device>(pd: Pd<N>) -> DeviceCaps;
+pub uninterp spec fn spec_device_caps<N: Device>(ctx: Context<N>) -> DeviceCaps;
 
 /// The limits of the device of `pd`.
 #[verifier::external_body]
@@ -512,13 +510,12 @@ pub fn create_qp<N: Device>(
 ) -> (r: Result<N::Qp>)
     requires
         cq_of(*cq) == old(token).share().cq,
-        pd_of(*pd) == old(token).pd(),
         nic_inv(old(token).nic()),
         share_wf(old(token).nic(), old(token).share()),
         old(token).share().owns.contains(q),
         nic_enabled(
             old(token).nic(),
-            Nic::Step::create_qp(q, qp_attr(old(token).pd(), qp_type, old(token).share().cq, *caps)),
+            Nic::Step::create_qp(q, qp_attr(pd_of(*pd), qp_type, old(token).share().cq, *caps)),
         ),
     ensures
         final(token).same_engine(old(token)),
@@ -530,7 +527,7 @@ pub fn create_qp<N: Device>(
                 final(token).nic(),
                 Nic::Step::create_qp(
                     q,
-                    qp_attr(old(token).pd(), qp_type, old(token).share().cq, *caps),
+                    qp_attr(pd_of(*pd), qp_type, old(token).share().cq, *caps),
                 ),
             ),
         r is Err ==> rely_reaches(
@@ -690,6 +687,18 @@ pub fn part_writable_of<N: Device>(part: &Part<N>) -> (writable: bool)
     part.is_writable()
 }
 
+/// A protection domain exists in M as long as a handle to it does. Learning it moves the token's
+/// view to the present, since the domain may be newer than what the engine last saw.
+#[verifier::external_body]
+pub fn pd_alive<N: Device>(_pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
+    ensures
+        final(token).same_engine(old(token)),
+        final(token).same_writings(old(token)),
+        rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
+        final(token).nic().pds.contains(pd_of(*_pd)),
+{
+}
+
 /// What a buffer's lease promises (`buf.rs`): its bytes lie in a region
 /// registered in its protection domain, locally writable if the buffer is
 /// unique, and the region stays registered while the lease lives. Learning
@@ -700,36 +709,34 @@ pub fn part_writable_of<N: Device>(part: &Part<N>) -> (writable: bool)
 pub fn registered<N: Device>(_part: &Part<N>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
     requires
         part_pd(*_part) == pd_id(*_pd),
-        pd_of(*_pd) == old(token).pd(),
     ensures
         final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
         final(token).nic().registered(
-            final(token).pd(),
+            pd_of(*_pd),
             sge_model(part_sge(*_part)),
             part_writable(*_part),
         ),
 {
 }
 
-/// [`registered`] for several parts at once: every one's region is
-/// registered in the present view.
+/// [`registered`] for the inputs of a request being written: every one's region is
+/// registered in the present view, as long as what `_kept` holds keeps them alive.
 #[verifier::external_body]
 #[inline(always)]
-pub fn registered_all<N: Device>(_leases: &Leases<N>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
+pub(crate) fn registered_all<N: Device>(_kept: &Kept<N>, _pd: &Pd<N>, Tracked(token): Tracked<&mut NicToken>)
     requires
-        forall|j: int| 0 <= j < _parts@.len() ==> part_pd(#[trigger] _parts@[j]) == pd_id(*_pd),
-        pd_of(*_pd) == old(token).pd(),
+        forall|j: int| 0 <= j < _kept.loans().len() ==> part_pd((#[trigger] _kept.loans()[j]).part) == pd_id(*_pd),
     ensures
         final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
         forall|j: int|
-            0 <= j < _parts@.len() ==> final(token).nic().registered(
-                final(token).pd(),
-                sge_model(part_sge(#[trigger] _parts@[j])),
-                part_writable(_parts@[j]),
+            0 <= j < _kept.loans().len() ==> final(token).nic().registered(
+                pd_of(*_pd),
+                sge_model(part_sge((#[trigger] _kept.loans()[j]).part)),
+                part_writable(_kept.loans()[j].part),
             ),
 {
 }
@@ -738,23 +745,9 @@ pub fn registered_all<N: Device>(_leases: &Leases<N>, _pd: &Pd<N>, Tracked(token
 #[inline(always)]
 pub fn no_leases<N: Device>() -> (r: Leases<N>)
     ensures r.inv(), r.view().len() == 0, r.loans().len() == 0, r.wqes().len() == 0,
-        r.fully_recorded(),
+        r.fully_recorded(), !r.spec_many(),
 {
     Leases::new()
-}
-
-/// Keeps a part's lease among `leases` (`Leases::push`).
-#[allow(dead_code)] // The proofs' way in, until they are back: `OpenRequest` keeps leases now.
-#[inline(always)]
-pub fn keep_lease<N: Device>(leases: &mut Leases<N>, part: Part<N>, Ghost(access): Ghost<safeverbs_spec::abs::Dir>, spare: &mut Vec<crate::buf::Lease<N>>)
-    requires access is In ==> part_writable(part),
-    ensures
-        old(leases).inv() ==> final(leases).inv(),
-        final(leases).loans() == old(leases).loans().push(crate::buf::Loan { part, access: Some(access) }),
-        final(leases).wqes() == old(leases).wqes(),
-{
-    proof { part.lemma_fields(); }
-    leases.push_access(part, Ghost(access), spare)
 }
 
 // =============================================================================

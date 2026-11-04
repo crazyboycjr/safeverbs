@@ -6,13 +6,11 @@
 
 use super::*;
 
-// On this branch the specs and proofs in this file still describe the representation before the
-// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
-// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
-/// A receive request's one WQE: pending with nothing cached; or complete, its outcome being the
-/// one M retired, and a success the payload or the notification M allows a receive.
+/// A receive request's one WQE: pending with its success still to come, not named by any
+/// completion the ring has seen; or complete, its outcome being the one M retired, an error at
+/// position 0, and a success the payload or the notification M allows a receive.
 pub(super) open spec fn recv_result<L>(r: Ring<L>, m: Nic::State, q: QpId, s: int) -> bool {
     let req = r.req(s)->0;
     let meta = r.meta(s);
@@ -20,16 +18,18 @@ pub(super) open spec fn recv_result<L>(r: Ring<L>, m: Nic::State, q: QpId, s: in
     &&& meta->0.end as int == meta->0.first as int + 1
     &&& match req.phase {
         safeverbs_spec::abs::Phase::InFlight =>
-            m.qps[q].rq_head <= meta->0.first && meta->0.seen is None,
+            r.spec_routed() <= meta->0.first && meta->0.outcome is Ok,
         safeverbs_spec::abs::Phase::Complete(o) => {
             let w = WqeRef { qp: q, queue: safeverbs_spec::nic::Queue::Recv, seq: meta->0.first as nat };
             &&& w.seq < m.qps[q].rq_head && m.retired.contains_key(w) && m.retired[w] == o
             &&& o.status is Success ==> o.kind is Receive || (o.kind is WriteNotification && o.imm is Some)
+            &&& meta->0.outcome is Err ==> o.status.is_err()
+            &&& meta->0.outcome matches Err(CompletionError::Failed { position, .. }) ==> position == 0
         },
     }
 }
 
-/// Pending single-WQE receives have no cached result; complete requests match M.
+/// Pending single-WQE receives have nothing recorded; complete requests match M.
 #[verifier::opaque]
 pub(super) open spec fn recv_outcomes<L>(r: Ring<L>, m: Nic::State, q: QpId) -> bool {
     &&& m.qps.contains_key(q)
@@ -49,7 +49,7 @@ pub(super) proof fn lemma_recv_empty<L>(r: Ring<L>, m: Nic::State, q: QpId)
 /// An unchanged receive ring and its own M history retain result correspondence.
 pub(super) proof fn lemma_recv_framed<L>(r: Ring<L>, m: Nic::State, n: Nic::State, q: QpId)
     requires recv_outcomes(r, m, q), n.qps.contains_key(q),
-        n.qps[q].rq_head == m.qps[q].rq_head,
+        n.qps[q].rq_head >= m.qps[q].rq_head,
         forall|w: WqeRef| w.qp == q && w.queue is Recv && w.seq < m.qps[q].rq_head
             && #[trigger] m.retired.contains_key(w)
             ==> n.retired.contains_key(w) && n.retired[w] == m.retired[w],
@@ -67,6 +67,7 @@ pub(super) proof fn lemma_recv_framed<L>(r: Ring<L>, m: Nic::State, n: Nic::Stat
 /// Removing results or changing wakers cannot change an existing receive outcome.
 pub(super) proof fn lemma_recv_kept<L>(pre: Ring<L>, post: Ring<L>, m: Nic::State, q: QpId)
     requires recv_outcomes(pre, m, q),
+        post.spec_routed() == pre.spec_routed(),
         forall|s: int| #[trigger] post.refused(s) is Some ==> pre.refused(s) is Some,
         forall|s: int| #[trigger] post.req(s) is Some ==> pre.req(s) is Some
             && post.req(s)->0.phase == pre.req(s)->0.phase && post.meta(s) == pre.meta(s),
@@ -84,11 +85,12 @@ pub(super) proof fn lemma_recv_no_staged<L>(r: Ring<L>)
 /// Posting a receive adds one pending singleton and preserves prior results.
 pub(super) proof fn lemma_recv_added<L>(pre: Ring<L>, post: Ring<L>, m: Nic::State, q: QpId, added: int)
     requires recv_outcomes(pre, m, q),
+        post.spec_routed() == pre.spec_routed(),
         forall|s: int| #[trigger] post.refused(s) is Some ==> pre.refused(s) is Some,
         post.req(added) is Some, post.req(added)->0.phase is InFlight,
-        post.meta(added) is Some, post.meta(added)->0.seen is None,
+        post.meta(added) is Some, post.meta(added)->0.outcome is Ok,
         post.meta(added)->0.end as int == post.meta(added)->0.first as int + 1,
-        m.qps[q].rq_head <= post.meta(added)->0.first,
+        pre.spec_routed() <= post.meta(added)->0.first,
         forall|s: int| #[trigger] post.req(s) is Some && s != added ==> pre.req(s) is Some
             && post.req(s)->0.phase == pre.req(s)->0.phase && post.meta(s) == pre.meta(s),
     ensures recv_outcomes(post, m, q),
@@ -101,62 +103,82 @@ pub(super) proof fn lemma_recv_added<L>(pre: Ring<L>, post: Ring<L>, m: Nic::Sta
     }
 }
 
-/// A real receive CQE completes its own singleton; no later request supplies data.
-pub(super) proof fn lemma_recv_completed<L>(
-    pre: Ring<L>, post: Ring<L>, m: Nic::State, n: Nic::State, q: QpId, wqe: u64, wc: Wc,
+/// The CQE of WQE `wqe`, the one the ring is to see next: what it retires is its own singleton,
+/// and no later request supplies data.
+pub(super) proof fn lemma_recv_routed<L>(
+    pre: Ring<L>, post: Ring<L>, m: Nic::State, q: QpId, wqe: u64, wc: Wc, spent: bool,
 )
     requires
-        pre.inv(), post.inv(), recv_outcomes(pre, m, q), n.qps.contains_key(q),
-        forall|s: int| #[trigger] post.refused(s) is Some ==> pre.refused(s) is Some,
-        wqe == m.qps[q].rq_head, n.qps[q].rq_head == wqe as nat + 1,
-        pre.spec_wqe_retired() <= wqe < pre.spec_wqe_committed(),
-        n.retired.contains_key(WqeRef { qp: q, queue: safeverbs_spec::nic::Queue::Recv, seq: wqe as nat }),
-        n.retired[WqeRef { qp: q, queue: safeverbs_spec::nic::Queue::Recv, seq: wqe as nat }] == wc.outcome(),
-        forall|w: WqeRef| w.qp == q && w.queue is Recv && w.seq < m.qps[q].rq_head
-            && #[trigger] m.retired.contains_key(w)
-            ==> n.retired.contains_key(w) && n.retired[w] == m.retired[w],
-        pre.spec_retired() <= post.spec_retired() <= pre.spec_committed(),
-        forall|s: int| #[trigger] post.req(s) == if pre.spec_retired() <= s < post.spec_retired() {
-            pre.retired_view(s, pre.retire_outcome(s, wqe, wc))
-        } else { pre.req(s) },
-        forall|s: int| #[trigger] post.meta(s)
-            == pre.completion_meta(s, wqe, wc, post.spec_retired() as int),
-        forall|s: int| pre.spec_retired() <= s < post.spec_retired() && #[trigger] pre.req(s) is Some
-            ==> pre.meta(s)->0.end as int <= wqe as int + 1,
-        forall|s: int| #[trigger] post.req(s) is Some && post.req(s)->0.phase is InFlight
-            ==> post.meta(s)->0.end as int > wqe as int + 1,
+        pre.inv(), recv_outcomes(pre, m, q), m.qps.contains_key(q),
+        post.walked(&pre, true, wqe, wc, spent),
+        pre.spec_routed() == wqe,
+        wqe < m.qps[q].rq_head,
+        m.retired.contains_key(WqeRef { qp: q, queue: safeverbs_spec::nic::Queue::Recv, seq: wqe as nat }),
+        m.retired[WqeRef { qp: q, queue: safeverbs_spec::nic::Queue::Recv, seq: wqe as nat }] == wc.outcome(),
         wc.outcome().status is Success ==> wc.outcome().kind is Receive
             || (wc.outcome().kind is WriteNotification && wc.outcome().imm is Some),
-    ensures recv_outcomes(post, n, q),
+    ensures
+        recv_outcomes(post, m, q),
 {
     reveal(recv_outcomes);
     pre.lemma_view();
     post.lemma_view();
-    assert forall|s: int| #[trigger] post.req(s) is Some implies recv_result(post, n, q, s) by {
+    assert forall|s: int| #[trigger] post.req(s) is Some implies recv_result(post, m, q, s) by {
         pre.lemma_meta(s);
         post.lemma_meta(s);
-        pre.lemma_completion_observation(s, wqe, wc, post.spec_retired() as int);
+        pre.lemma_completion_observation(s, true, wqe, wc, post.spec_retired() as int, spent);
         if pre.spec_retired() <= s < post.spec_retired() {
-            pre.lemma_retired_view(s, pre.retire_outcome(s, wqe, wc));
+            pre.lemma_retired_view(s, pre.retire_outcome(s, true, wqe, wc));
             assert(pre.req(s) is Some);
             assert(pre.req(s)->0.phase is InFlight);
+            assert(recv_result(pre, m, q, s));
             assert(pre.meta(s)->0.first == wqe);
-            assert(pre.retire_outcome(s, wqe, wc) == wc);
-            assert(post.req(s)->0.phase == safeverbs_spec::abs::Phase::Complete(wc.outcome()));
+            let o = crate::wc::result_model(pre.retire_outcome(s, true, wqe, wc));
+            if wc.spec_ok() {
+                wc.lemma_received();
+            } else {
+                wc.lemma_failure(0);
+            }
+            assert(post.req(s)->0.phase == safeverbs_spec::abs::Phase::Complete(o));
+            assert(o == wc.outcome());
         } else {
             assert(pre.req(s) is Some);
             assert(recv_result(pre, m, q, s));
             if pre.req(s)->0.phase is InFlight {
                 assert(s >= post.spec_retired());
-                assert(wqe < pre.meta(s)->0.first || pre.meta(s)->0.end as int <= wqe as int + 1);
                 assert(post.meta(s) == pre.meta(s));
-            } else {
-                let w = WqeRef { qp: q, queue: safeverbs_spec::nic::Queue::Recv, seq: pre.meta(s)->0.first as nat };
-                assert(m.retired.contains_key(w));
-                assert(n.retired.contains_key(w));
             }
         }
     }
+    assert forall|s: int| #[trigger] post.refused(s) is None by {
+        assert(pre.refused(s) is None);
+    }
+}
+
+/// What a receive reports is the outcome M retired for its one WQE: a message or a notification if
+/// it succeeded, an error at position 0, and never a refusal, since a receive is posted at once or
+/// not at all.
+pub open spec fn recv_reports_outcome(result: CompletionResult, o: safeverbs_spec::types::Outcome) -> bool {
+    match result {
+        Ok(done) => done.model() == o && done is Received,
+        Err(CompletionError::Failed { status, position, .. }) =>
+            o.status.is_err() && o.status == status.model() && position == 0,
+        Err(CompletionError::Refused) => false,
+    }
+}
+
+/// A receive's outcome, as the invariant has it, reports M's.
+proof fn lemma_recv_reports(result: CompletionResult, o: safeverbs_spec::types::Outcome, kept: CompletionResult)
+    requires
+        result == kept,
+        o == crate::wc::result_model(result),
+        !(result matches Err(CompletionError::Refused)),
+        o.status is Success ==> o.kind is Receive || (o.kind is WriteNotification && o.imm is Some),
+        result is Err ==> o.status.is_err(),
+        result matches Err(CompletionError::Failed { position, .. }) ==> position == 0,
+    ensures
+        recv_reports_outcome(result, o),
+{
 }
 
 impl<C, N: Device> Hw<C, N> {
@@ -195,60 +217,25 @@ impl<C, N: Device> Hw<C, N> {
     pub closed spec fn recv_taken_matches(&self, index: usize, seq: RingSeq, c: Completion<C, N>) -> bool {
         &&& self.has_qp(index as int)
         &&& self.qps@[index as int]->0.recv.req(seq as int) is Some
-        &&& self.qps@[index as int]->0.recv.req(seq as int)->0.leases == (Payload { ctx: Some(c.ctx), leases: c.leases })
+        &&& self.qps@[index as int]->0.recv.req(seq as int)->0.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases })
         &&& self.recv_wqe(index, seq) is Some
         &&& self.nic().retired.contains_key(self.recv_wqe(index, seq)->0)
         &&& {
             let o = self.nic().retired[self.recv_wqe(index, seq)->0];
             &&& self.recv_result(index, seq) == Some(o)
-            &&& match c.result {
-                Ok(done) => done.model() == o && done is Received,
-                Err(CompletionError::Failed { status, position, .. }) =>
-                    o.status.is_err() && o.status == status.model() && position == 0,
-                Err(CompletionError::Refused) => false,
-            }
-        }
-    }
-
-    /// What the ring handed back of a receive holds a context and its buffer, and is no
-    /// refused request.
-    pub(super) proof fn lemma_recv_taken(&self, index: usize, seq: RingSeq, t: Taken<Payload<C, N>>)
-        requires
-            self.inv(),
-            self.has_qp(index as int),
-            self.recv_taken_from(index, seq, t),
-        ensures
-            t.leases.ctx is Some,
-            t.leases.leases.inv() && t.leases.leases.fully_recorded(),
-            !t.refused,
-    {
-        reveal(recv_outcomes);
-        assert(self.entry_ok(index as int, self.token@, self.nic()));
-    }
-
-    /// `result` is what [`recv_result_of`] says of `t`.
-    pub(super) open spec fn recv_result_from(
-        &self, t: Taken<Payload<C, N>>, result: core::result::Result<Completed, CompletionError>,
-    ) -> bool {
-        match result {
-            Ok(done) => t.wc.spec_ok() && (
-                t.wc.outcome().kind is WriteNotification && t.wc.outcome().imm is None
-                    || done.model() == t.wc.outcome()),
-            Err(CompletionError::Failed { status, position, .. }) =>
-                !t.wc.spec_ok() && status == t.wc.spec_status() && position == 0,
-            Err(CompletionError::Refused) => false,
+            &&& recv_reports_outcome(c.result, o)
         }
     }
 
     /// The [`Completion`] made of what the ring handed back is what
-    /// [`Hw::recv_taken_matches`] says.
+    /// [`Hw::recv_taken_matches`] says, and what it holds is in order.
     pub(super) proof fn lemma_recv_finished(&self, index: usize, seq: RingSeq, t: Taken<Payload<C, N>>, c: Completion<C, N>)
         requires
             self.inv(),
             self.has_qp(index as int),
             self.recv_taken_from(index, seq, t),
-            t.leases == (Payload { ctx: Some(c.ctx), leases: c.leases }),
-            self.recv_result_from(t, c.result),
+            t.leases == (Payload { ctx: Some(c.wr_id), leases: c.leases }),
+            c.result == t.outcome,
         ensures
             c.leases.inv() && c.leases.fully_recorded(),
             self.recv_taken_matches(index, seq, c),
@@ -257,14 +244,25 @@ impl<C, N: Device> Hw<C, N> {
         assert(self.entry_ok(index as int, self.token@, self.nic()));
         let e = self.qps@[index as int]->0;
         assert(recv_result(e.recv, self.nic(), e.id(), seq as int));
-        t.wc.lemma_outcome_ok();
-        t.wc.lemma_spec_status();
-        if c.result is Ok {
-            // M allows a receive a payload or a notification with immediate data.
-            assert(t.wc.outcome().kind is Receive
-                || (t.wc.outcome().kind is WriteNotification && t.wc.outcome().imm is Some));
-        }
+        e.recv.lemma_meta(seq as int);
         self.lemma_recv_result(index, seq);
+        lemma_recv_reports(c.result, self.nic().retired[self.recv_wqe(index, seq)->0], e.recv.meta(seq as int)->0.outcome);
+    }
+
+    /// What the ring handed back of a receive holds a context: a receive with an owner does.
+    pub(super) proof fn lemma_recv_taken(&self, index: usize, seq: RingSeq, t: Taken<Payload<C, N>>)
+        requires
+            self.inv(),
+            self.has_qp(index as int),
+            self.recv_taken_from(index, seq, t),
+        ensures
+            t.leases.ctx is Some,
+            t.leases.leases.inv() && t.leases.leases.fully_recorded(),
+    {
+        reveal(recv_outcomes);
+        assert(self.entry_ok(index as int, self.token@, self.nic()));
+        let e = self.qps@[index as int]->0;
+        assert(e.recv.refused(seq as int) is None);
     }
 
     /// Every completed native receive result equals its own retired M outcome.

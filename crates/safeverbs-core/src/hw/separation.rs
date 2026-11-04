@@ -10,16 +10,13 @@ use super::*;
 verus! {
 
 impl<C, N: Device> Hw<C, N> {
-    /// One QP's closed rings, open leases and not-yet-written parts exclude
-    /// the incoming unique SGE's bytes. Completed/refused owners are included.
+    /// One QP's rings and not-yet-written parts exclude the incoming unique SGE's bytes.
+    /// Completed/refused owners are included.
     closed spec fn entry_separated_from(&self, index: int, incoming: Part<N>) -> bool {
         self.qps@[index] is Some ==> {
             let e = self.qps@[index]->0;
             &&& e.send.retained_separated_from(incoming)
             &&& e.recv.retained_separated_from(incoming)
-            &&& e.open_leases.separated_from(incoming.byte_domain())
-            &&& forall|j: int| 0 <= j < e.held_parts@.len()
-                ==> (#[trigger] e.held_parts@[j]).byte_domain().disjoint(incoming.byte_domain())
             &&& forall|j: int| 0 <= j < e.building@.len()
                 ==> (#[trigger] e.building@[j]).byte_domain().disjoint(incoming.byte_domain())
         }
@@ -76,19 +73,6 @@ impl<C, N: Device> Hw<C, N> {
             if let Some(e) = &self.qps[i] {
                 e.send.separate_unique_input(incoming);
                 e.recv.separate_unique_input(incoming);
-                e.open_leases.separate_unique_input(incoming);
-                let mut j = 0;
-                while j < e.held_parts.len()
-                    invariant
-                        incoming.spec_writable(),
-                        *incoming == *old(incoming), j <= e.held_parts@.len(),
-                        forall|k: int| 0 <= k < j
-                            ==> (#[trigger] e.held_parts@[k]).byte_domain().disjoint(incoming.byte_domain()),
-                    decreases e.held_parts@.len() - j,
-                {
-                    incoming.separate_unique_part(&e.held_parts[j]);
-                    j += 1;
-                }
                 let mut j = 0;
                 while j < e.building.len()
                     invariant

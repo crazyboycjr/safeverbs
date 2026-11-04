@@ -135,7 +135,42 @@ pub fn wqe_of(wr_id: u64, retired: u64) -> (wqe: u64)
             retired <= w && w - retired < WQE_SPAN && w & WQE_MASK == wr_id & WQE_MASK ==> wqe
                 == w,
 {
-    retired.wrapping_add(wr_id.wrapping_sub(retired) & WQE_MASK)
+    let wqe = retired.wrapping_add(wr_id.wrapping_sub(retired) & WQE_MASK);
+    proof {
+        assert forall|w: u64|
+            retired <= w && w - retired < WQE_SPAN && w & WQE_MASK == wr_id & WQE_MASK implies wqe == w by {
+            lemma_ahead(wr_id, retired, w);
+        }
+    }
+    wqe
+}
+
+/// How far after `retired` a WQE lies, less than [`WQE_SPAN`], is the difference of the low bits,
+/// and those are the low bits of the difference of the whole words.
+proof fn lemma_ahead(wr_id: u64, retired: u64, w: u64)
+    requires
+        retired <= w,
+        w - retired < WQE_SPAN,
+        w & WQE_MASK == wr_id & WQE_MASK,
+    ensures
+        wr_id.wrapping_sub(retired) & WQE_MASK == w - retired,
+{
+    let x = wr_id.wrapping_sub(retired);
+    assert(sub(w, retired) == w - retired);
+    if retired <= wr_id {
+        assert(x == sub(wr_id, retired));
+        assert(retired <= w && retired <= wr_id && x == sub(wr_id, retired)
+            && sub(w, retired) < 0x8000_0000_0000u64
+            && w & 0x7fff_ffff_ffffu64 == wr_id & 0x7fff_ffff_ffffu64
+            ==> x & 0x7fff_ffff_ffffu64 == sub(w, retired)) by (bit_vector);
+    } else {
+        assert(x == add(sub(0xffff_ffff_ffff_ffffu64, sub(retired, wr_id)), 1u64));
+        assert(retired <= w && retired > wr_id
+            && x == add(sub(0xffff_ffff_ffff_ffffu64, sub(retired, wr_id)), 1u64)
+            && sub(w, retired) < 0x8000_0000_0000u64
+            && w & 0x7fff_ffff_ffffu64 == wr_id & 0x7fff_ffff_ffffu64
+            ==> x & 0x7fff_ffff_ffffu64 == sub(w, retired)) by (bit_vector);
+    }
 }
 
 } // verus!

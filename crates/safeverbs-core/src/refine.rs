@@ -493,7 +493,7 @@ proof fn lemma_reshape<L>(
 }
 
 /// A's `complete` of request `s`, in flight, with `o`: the view after it.
-pub open spec fn completed<L>(v: View<L>, s: int, o: Wc) -> View<L> {
+pub open spec fn completed<L>(v: View<L>, s: int, o: Outcome) -> View<L> {
     View {
         req: |t: int|
             if t == s {
@@ -518,33 +518,33 @@ pub proof fn lemma_complete_one<L>(
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
-    o: Wc,
+    o: Outcome,
 )
     requires
         placed(v, a, q, reqs, held),
         (v.req)(s) is Some,
         (v.req)(s)->0.phase is InFlight,
     ensures
-        abs_step(a, complete_state(a, reqs[s], o.outcome()), Abs::Step::complete(reqs[s], o.outcome())),
-        placed(completed(v, s, o), complete_state(a, reqs[s], o.outcome()), q, reqs, held),
-        complete_state(a, reqs[s], o.outcome()).wakes == match (v.req)(s)->0.waker {
+        abs_step(a, complete_state(a, reqs[s], o), Abs::Step::complete(reqs[s], o)),
+        placed(completed(v, s, o), complete_state(a, reqs[s], o), q, reqs, held),
+        complete_state(a, reqs[s], o).wakes == match (v.req)(s)->0.waker {
             Some(w) => a.wakes.push(w),
             None => a.wakes,
         },
 {
     let r = reqs[s];
-    let a2 = complete_state(a, r, o.outcome());
+    let a2 = complete_state(a, r, o);
     let w = completed(v, s, o);
     assert(sits(v, a, q, reqs, held, s));
     assert(wf_at(v, s));
-    assert(abs_step(a, a2, Abs::Step::complete(r, o.outcome())));
-    lemma_step_one(a, a2, Abs::Step::complete(r, o.outcome()));
+    assert(abs_step(a, a2, Abs::Step::complete(r, o)));
+    lemma_step_one(a, a2, Abs::Step::complete(r, o));
     lemma_placed_but(v, w, a, a2, q, reqs, reqs, held, s, r);
 }
 
 /// Requests `[from, to)` of `v` retired with outcomes `o`: each in flight
 /// completes (and is gone if detached); refused ones A never saw.
-pub open spec fn retired_range<L>(v: View<L>, from: int, to: int, o: spec_fn(int) -> Wc) -> View<L> {
+pub open spec fn retired_range<L>(v: View<L>, from: int, to: int, o: spec_fn(int) -> Outcome) -> View<L> {
     View {
         req: |t: int|
             if from <= t < to && (v.req)(t) is Some {
@@ -571,7 +571,7 @@ pub proof fn lemma_complete<L>(
     held: Held<L>,
     from: int,
     to: int,
-    o: spec_fn(int) -> Wc,
+    o: spec_fn(int) -> Outcome,
 ) -> (a2: Abs::State)
     requires
         placed(v, a, q, reqs, held),
@@ -599,9 +599,9 @@ pub proof fn lemma_complete<L>(
         let v1 = retired_range(v, from, s, o);
         assert((v1.req)(s) == (v.req)(s));
         lemma_complete_one(v1, a1, q, reqs, held, s, o(s));
-        let a2 = complete_state(a1, reqs[s], o(s).outcome());
+        let a2 = complete_state(a1, reqs[s], o(s));
         lemma_same(completed(v1, s, o(s)), retired_range(v, from, to, o), a2, q, reqs, held);
-        lemma_abs_step_is_next(a1, a2, Abs::Step::complete(reqs[s], o(s).outcome()));
+        lemma_abs_step_is_next(a1, a2, Abs::Step::complete(reqs[s], o(s)));
         lemma_abs_reaches_next(a1, a2);
         lemma_abs_reaches_trans(a, a1, a2);
         assert(a2.wakes =~= a.wakes + wakers(v, from, to));
@@ -973,15 +973,15 @@ pub proof fn lemma_take<L>(
     reqs: Map<int, ReqId>,
     held: Held<L>,
     s: int,
-    o: Wc,
+    o: Outcome,
     l: L,
 ) -> (a2: Abs::State)
     requires
         placed(v, a, q, reqs, held),
-        (v.req)(s) == Some(ReqView { phase: Phase::Complete(o.outcome()), waker: None, detached: false, leases: l }),
+        (v.req)(s) == Some(ReqView { phase: Phase::Complete(o), waker: None, detached: false, leases: l }),
     ensures
         abs_reaches(a, a2),
-        abs_step(a, a2, Abs::Step::take(reqs[s], o.outcome())),
+        abs_step(a, a2, Abs::Step::take(reqs[s], o)),
         placed(without(v, s), a2, q, reqs, held),
         a2.wakes == a.wakes,
         forall|k: LeaseId| #[trigger] held(s, l).contains_key(k)
@@ -991,8 +991,8 @@ pub proof fn lemma_take<L>(
     let a2 = take_state(a, r);
     assert(sits(v, a, q, reqs, held, s));
     assert(wf_at(v, s));
-    assert(abs_step(a, a2, Abs::Step::take(r, o.outcome())));
-    lemma_step_one(a, a2, Abs::Step::take(r, o.outcome()));
+    assert(abs_step(a, a2, Abs::Step::take(r, o)));
+    lemma_step_one(a, a2, Abs::Step::take(r, o));
     assert forall|k: LeaseId| #[trigger] a.leases.contains_key(k) && !leases_of(v, held, s).contains_key(k)
         implies a2.leases.contains_key(k) && a2.leases[k] == a.leases[k] by {
         assert(!a.leases[k].held_by(r));
@@ -1468,6 +1468,7 @@ pub proof fn lemma_ring_abort<L>(
 pub proof fn lemma_ring_complete<L>(
     pre: Ring<L>,
     post: Ring<L>,
+    recv: bool,
     wqe: u64,
     wc: Wc,
     a: Abs::State,
@@ -1481,7 +1482,7 @@ pub proof fn lemma_ring_complete<L>(
         pre.spec_retired() <= post.spec_retired() <= pre.spec_committed(),
         forall|s: int|
             #[trigger] post.req(s) == if pre.spec_retired() <= s < post.spec_retired() {
-                pre.retired_view(s, pre.retire_outcome(s, wqe, wc))
+                pre.retired_view(s, pre.retire_outcome(s, recv, wqe, wc))
             } else {
                 pre.req(s)
             },
@@ -1502,13 +1503,13 @@ pub proof fn lemma_ring_complete<L>(
 {
     pre.lemma_view();
     let (r0, r1) = (pre.spec_retired() as int, post.spec_retired() as int);
-    let o = |s: int| pre.retire_outcome(s, wqe, wc);
+    let o = |s: int| crate::wc::result_model(pre.retire_outcome(s, recv, wqe, wc));
     let a2 = lemma_complete(pre.view(), a, q, reqs, held, r0, r1, o);
     assert forall|s: int| #[trigger] (retired_range(pre.view(), r0, r1, o).req)(s) == (post.view().req)(
         s,
     ) by {
         if r0 <= s < r1 {
-            pre.lemma_retired_view(s, o(s));
+            pre.lemma_retired_view(s, pre.retire_outcome(s, recv, wqe, wc));
         }
     }
     lemma_same(retired_range(pre.view(), r0, r1, o), post.view(), a2, q, reqs, held);
@@ -1522,7 +1523,7 @@ pub proof fn lemma_ring_take<L>(
     pre: Ring<L>,
     post: Ring<L>,
     seq: int,
-    outcome: Wc,
+    outcome: Outcome,
     leases: L,
     a: Abs::State,
     q: QpId,
@@ -1532,7 +1533,7 @@ pub proof fn lemma_ring_take<L>(
     requires
         placed(pre.view(), a, q, reqs, held),
         pre.req(seq) == Some(
-            ReqView { phase: Phase::Complete(outcome.outcome()), waker: None, detached: false, leases },
+            ReqView { phase: Phase::Complete(outcome), waker: None, detached: false, leases },
         ),
         forall|s: int|
             #[trigger] post.req(s) == if s == seq {
@@ -1548,7 +1549,7 @@ pub proof fn lemma_ring_take<L>(
                 pre.refused(s)
             },
     ensures
-        abs_step(a, a2, Abs::Step::take(reqs[seq], outcome.outcome())),
+        abs_step(a, a2, Abs::Step::take(reqs[seq], outcome)),
         placed(post.view(), a2, q, reqs, held),
         a2.wakes == a.wakes,
         forall|k: LeaseId| #[trigger] held(seq, leases).contains_key(k)
@@ -1722,13 +1723,13 @@ pub proof fn lemma_ring_release_all<L>(
 /// complete requests moved out of the ring (`side`), each a complete request
 /// with an owner in A, and the leases of refused requests moved out
 /// (`refused`), each leases of the program in A.
-pub open spec fn with_side<L>(v: View<L>, side: Map<int, (Wc, L)>, refused: Map<int, L>) -> View<L> {
+pub open spec fn with_side<L>(v: View<L>, side: Map<int, (Outcome, L)>, refused: Map<int, L>) -> View<L> {
     View {
         req: |s: int|
             if side.contains_key(s) {
                 Some(
                     ReqView {
-                        phase: Phase::Complete(side[s].0.outcome()),
+                        phase: Phase::Complete(side[s].0),
                         waker: None,
                         detached: false,
                         leases: side[s].1,
@@ -1753,9 +1754,9 @@ pub proof fn lemma_side_move<L>(
     pre: Ring<L>,
     post: Ring<L>,
     seq: int,
-    outcome: Wc,
+    outcome: Outcome,
     leases: L,
-    side: Map<int, (Wc, L)>,
+    side: Map<int, (Outcome, L)>,
     refused: Map<int, L>,
     a: Abs::State,
     q: QpId,
@@ -1767,7 +1768,7 @@ pub proof fn lemma_side_move<L>(
         !side.contains_key(seq),
         !refused.contains_key(seq),
         pre.req(seq) == Some(
-            ReqView { phase: Phase::Complete(outcome.outcome()), waker: None, detached: false, leases },
+            ReqView { phase: Phase::Complete(outcome), waker: None, detached: false, leases },
         ),
         forall|s: int|
             #[trigger] post.req(s) == if s == seq {
@@ -1797,7 +1798,7 @@ pub proof fn lemma_side_move_refused<L>(
     post: Ring<L>,
     seq: int,
     leases: L,
-    side: Map<int, (Wc, L)>,
+    side: Map<int, (Outcome, L)>,
     refused: Map<int, L>,
     a: Abs::State,
     q: QpId,
@@ -1835,7 +1836,7 @@ pub proof fn lemma_side_move_refused<L>(
 pub proof fn lemma_side_take<L>(
     v: View<L>,
     seq: int,
-    side: Map<int, (Wc, L)>,
+    side: Map<int, (Outcome, L)>,
     refused: Map<int, L>,
     a: Abs::State,
     q: QpId,
@@ -1847,7 +1848,7 @@ pub proof fn lemma_side_take<L>(
         side.contains_key(seq),
         (v.req)(seq) is None,
     ensures
-        abs_step(a, a2, Abs::Step::take(reqs[seq], side[seq].0.outcome())),
+        abs_step(a, a2, Abs::Step::take(reqs[seq], side[seq].0)),
         placed(with_side(v, side.remove(seq), refused), a2, q, reqs, held),
         forall|k: LeaseId| #[trigger] held(seq, side[seq].1).contains_key(k)
             ==> a2.is_program(k) && a2.leases[k].same_as(a.leases[k]),
@@ -1862,7 +1863,7 @@ pub proof fn lemma_side_take<L>(
 pub proof fn lemma_side_take_refused<L>(
     v: View<L>,
     seq: int,
-    side: Map<int, (Wc, L)>,
+    side: Map<int, (Outcome, L)>,
     refused: Map<int, L>,
     a: Abs::State,
     q: QpId,
@@ -1887,7 +1888,7 @@ pub proof fn lemma_side_take_refused<L>(
 pub proof fn lemma_side_detach<L>(
     v: View<L>,
     seq: int,
-    side: Map<int, (Wc, L)>,
+    side: Map<int, (Outcome, L)>,
     refused: Map<int, L>,
     a: Abs::State,
     q: QpId,
@@ -1914,7 +1915,7 @@ pub proof fn lemma_side_detach<L>(
 pub proof fn lemma_side_detach_refused<L>(
     v: View<L>,
     seq: int,
-    side: Map<int, (Wc, L)>,
+    side: Map<int, (Outcome, L)>,
     refused: Map<int, L>,
     a: Abs::State,
     q: QpId,
@@ -1975,14 +1976,6 @@ spec fn source_and_destination() -> Abs::State {
     }
 }
 
-/// A flush error, as a completion.
-spec fn flush_wc() -> Wc {
-    Wc {
-        wr_id: 1, status: crate::wc::Status::WR_FLUSH_ERR, opcode: crate::wc::Opcode::SEND,
-        byte_len: 0, imm: None, vendor_err: 0,
-    }
-}
-
 /// A request with a READ destination and a shared source, of which the program
 /// keeps a clone. `L` is the leases themselves. Posted and given a waker: the NIC writes the
 /// one and reads the other. Completed and taken: each comes back. Or detached: it
@@ -2012,11 +2005,11 @@ pub proof fn example_request_of_two_leases() {
     assert(dirs.contains_key(1) && a2.place(1) == Place::InFlight(r));
 
     // Taken: each lease comes back, under its own name, the waker having run.
-    let wc = flush_wc();
-    lemma_complete_one(waiting, a2, 7, reqs, held, 0, wc);
-    let done = complete_state(a2, r, wc.outcome());
-    let completed = completed(waiting, 0, wc);
-    let taken = lemma_take(completed, done, 7, reqs, held, 0, wc, dirs);
+    let flush = flushed();
+    lemma_complete_one(waiting, a2, 7, reqs, held, 0, flush);
+    let done = complete_state(a2, r, flush);
+    let completed = completed(waiting, 0, flush);
+    let taken = lemma_take(completed, done, 7, reqs, held, 0, flush, dirs);
     assert(taken.is_program(0) && taken.is_program(1));
     assert(taken.wakes == seq![9nat]);
 
@@ -2025,8 +2018,8 @@ pub proof fn example_request_of_two_leases() {
     let detached_view = detached(waiting, 0);
     assert(sits(detached_view, detached_state, 7, reqs, held, 0));
     assert(detached_state.place(0) == Place::InFlight(r));
-    lemma_complete_one(detached_view, detached_state, 7, reqs, held, 0, wc);
-    let released = complete_state(detached_state, r, wc.outcome());
+    lemma_complete_one(detached_view, detached_state, 7, reqs, held, 0, flush);
+    let released = complete_state(detached_state, r, flush);
     assert(released.place(0) is Released && released.place(1) is Released);
 }
 

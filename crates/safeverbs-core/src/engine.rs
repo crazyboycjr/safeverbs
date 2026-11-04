@@ -708,7 +708,9 @@ impl<C, N: Nic> Engine<C, N> {
         open: &mut OpenRequest<N>,
     ) -> Result<()> {
         let index = qp.index();
-        let _ = self.hw.close_waiting(index, open, true, None);
+        if !open.is_empty() && self.hw.close_waiting(index, open, true, None).is_err() {
+            return Err(Error::QueueFull);
+        }
         self.hw.give_back(index, open);
         self.hw.commit(index, None).map_err(|(e, _)| e)
     }
@@ -720,7 +722,8 @@ impl<C, N: Nic> Engine<C, N> {
         self.hw.hand_back_leases(qp.index(), leases);
     }
 
-    /// What `open` keeps from the QP goes back there, for the next request.
+    /// What `open` keeps from the QP goes back there, for the next request, if it has no WQE: the
+    /// WQEs it has stay in it.
     pub fn give_back<T: Transport>(&mut self, qp: QpKey<T>, open: &mut OpenRequest<N>) {
         self.hw.give_back(qp.index(), open);
     }
@@ -1257,7 +1260,7 @@ mod tests {
     use crate::model::Model;
     use crate::nic::{ConnectAttr, QpCaps};
     use crate::pd::Context;
-    use crate::transport::RC;
+    use crate::transport::{RC, UC};
     use crate::wc::CompletionError;
     use crate::wr_id::{WQE_MASK, index_of, is_recv, wqe_of, wr_id};
 
@@ -1490,6 +1493,94 @@ mod tests {
             drop(pd);
             assert_eq!(model.registered(), if recovers { 0 } else { 1 });
         }
+    }
+
+    /// A request handed back to its QP while it has WQEs keeps them, and they still go out.
+    #[test]
+    fn giving_back_leaves_the_wqes_written() {
+        let model = Model::new(19);
+        let pd = Context::new(model.clone()).alloc_pd().unwrap();
+        let mut w = Engine::new(pd.context(), 64).unwrap();
+        let (a, _b) = connected_pair(&mut w, &pd, 8, 4);
+        let buf = pd.alloc::<u8>(64).unwrap().freeze();
+        let mut open = w.open_request(a);
+        assert!(open.try_push(WrOp::Send, buf.clone().into_part()).is_ok());
+        assert!(open.try_push(WrOp::Send, buf.into_part()).is_ok());
+        w.give_back(a, &mut open);
+        assert_eq!(open.len(), 2);
+        assert!(w.submit_open(a, &mut open, true, ()).is_ok());
+        assert!(open.is_empty());
+        assert_eq!(w.send_ring(a).in_flight_wqes(), 2);
+    }
+
+    /// A request is a value of its own, and it goes out only on a QP that takes what it was written
+    /// for: not on one of another protection domain, nor on an unreliable one if the NIC writes its
+    /// buffers, nor on one whose requests have fewer WQEs. It stays whole for its own QP.
+    #[test]
+    fn a_request_goes_out_only_on_a_qp_that_takes_it() {
+        let model = Model::new(23);
+        let pd = Context::new(model.clone()).alloc_pd().unwrap();
+        let other_pd = pd.context().alloc_pd().unwrap();
+        let mut w = Engine::new(pd.context(), 256).unwrap();
+        let (a, _b) = connected_pair(&mut w, &pd, 8, 4);
+        let other = w.create_qp::<RC>(&other_pd, caps(8), 4).unwrap();
+        let unreliable = w.create_qp::<UC>(&pd, caps(8), 4).unwrap();
+        let short = w.create_qp::<RC>(&pd, caps(8), 1).unwrap();
+        let remote = RemoteBuf {
+            addr: 0,
+            len: 64,
+            rkey: 0,
+        };
+        let mut open = w.open_request(a);
+        w.push_open(
+            a,
+            &mut open,
+            WrOp::Read(remote),
+            pd.alloc::<u8>(64).unwrap().into_part(),
+        )
+        .unwrap();
+        let buf = pd.alloc::<u8>(64).unwrap().freeze();
+        assert!(open.try_push(WrOp::Send, buf.into_part()).is_ok());
+        for refused in [
+            w.close_open(other, &mut open, true, None).is_err(),
+            w.close_open(unreliable, &mut open, true, None).is_err(),
+            w.close_open(short, &mut open, true, None).is_err(),
+        ] {
+            assert!(refused);
+        }
+        // Waiting for room on one of them never ends well: it says so, with the buffers.
+        let error = w.submit_open(short, &mut open, true, ()).unwrap_err();
+        assert_eq!(
+            error.error,
+            Error::Invalid("a request written for another QP")
+        );
+        assert_eq!(error.leases.len(), 2);
+        assert!(open.is_empty());
+    }
+
+    /// A request that holds no storage takes no WQE: pushing to one says so and hands the buffer
+    /// back.
+    #[test]
+    fn pushing_to_a_request_without_storage_is_refused() {
+        let model = Model::new(29);
+        let pd = Context::new(model.clone()).alloc_pd().unwrap();
+        let mut w = Engine::new(pd.context(), 64).unwrap();
+        let (a, _b) = connected_pair(&mut w, &pd, 8, 4);
+        let buf = pd.alloc::<u8>(64).unwrap().freeze();
+        let mut closed = OpenRequest::closed();
+        let refused = w
+            .push_open(a, &mut closed, WrOp::Send, buf.clone().into_part())
+            .unwrap_err();
+        assert_eq!(
+            refused.error,
+            Error::Invalid("a request written for another QP")
+        );
+        let mut open = w.open_request(a);
+        w.give_back(a, &mut open);
+        let refused = w
+            .push_open(a, &mut open, WrOp::Send, buf.into_part())
+            .unwrap_err();
+        assert_eq!(refused.error, Error::Invalid("a request that takes no WQE"));
     }
 
     /// A refused doorbell drops the requests written before it: one

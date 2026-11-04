@@ -253,6 +253,26 @@ impl Completed {
 /// What a request reports: what it did, or why it did not.
 pub type CompletionResult = Result<Completed, CompletionError>;
 
+/// The outcome the formal model M names for what a request reports: an error reports its status
+/// only, and a refusal, which M never saw, is a flush.
+pub open spec fn result_model(result: CompletionResult) -> safeverbs_spec::types::Outcome {
+    match result {
+        Ok(done) => done.model(),
+        Err(CompletionError::Failed { status, .. }) => safeverbs_spec::types::Outcome {
+            status: status.model(),
+            kind: safeverbs_spec::types::CompletionKind::StatusOnly,
+            byte_len: 0,
+            imm: None,
+        },
+        Err(CompletionError::Refused) => safeverbs_spec::types::Outcome {
+            status: safeverbs_spec::types::Status::FlushErr,
+            kind: safeverbs_spec::types::CompletionKind::StatusOnly,
+            byte_len: 0,
+            imm: None,
+        },
+    }
+}
+
 /// Why a request did not complete successfully. Its context and buffers come
 /// back with the error all the same.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -394,6 +414,8 @@ impl Wc {
     pub(crate) const fn received(&self) -> (done: Received)
         requires
             self.spec_ok(),
+        ensures
+            done == self.spec_received(),
     {
         let len = self.byte_len;
         if self.opcode.0 == 129 {
@@ -412,8 +434,7 @@ impl Wc {
     #[inline(always)]
     pub(crate) const fn failure(&self, position: u32) -> (error: CompletionError)
         ensures
-            error matches CompletionError::Failed { status, position: at, .. }
-                && status == self.spec_status() && at == position,
+            error == self.spec_failure(position),
     {
         CompletionError::Failed { status: self.status, vendor_err: self.vendor_err, position }
     }
@@ -427,6 +448,47 @@ impl Wc {
         } else {
             Err(self.failure(0))
         }
+    }
+
+    /// What [`Wc::received`] returns.
+    pub closed spec fn spec_received(&self) -> Received {
+        if self.opcode.0 == 129 {
+            Received::WriteNotification {
+                imm: match self.imm {
+                    Some(imm) => imm,
+                    None => 0,
+                },
+                len: self.byte_len,
+            }
+        } else {
+            Received::Message { len: self.byte_len, imm: self.imm }
+        }
+    }
+
+    /// A receive's success, as M allows it, reports the outcome of its completion.
+    pub proof fn lemma_received(&self)
+        requires
+            self.spec_ok(),
+            self.outcome().kind is Receive
+                || (self.outcome().kind is WriteNotification && self.outcome().imm is Some),
+        ensures
+            Completed::Received(self.spec_received()).model() == self.outcome(),
+    {
+    }
+
+    /// What [`Wc::failure`] returns.
+    pub closed spec fn spec_failure(&self, position: u32) -> CompletionError {
+        CompletionError::Failed { status: self.status, vendor_err: self.vendor_err, position }
+    }
+
+    /// The error of a failed completion reports its outcome, its status and its position.
+    pub proof fn lemma_failure(&self, position: u32)
+        ensures
+            !self.spec_ok() ==> result_model(Err(self.spec_failure(position))) == self.outcome(),
+            self.spec_failure(position) matches CompletionError::Failed { status, position: at, .. }
+                && status == self.spec_status() && at == position,
+            !self.spec_ok() ==> self.outcome().status.is_err(),
+    {
     }
 
     /// Whether the work request succeeded (for proofs).

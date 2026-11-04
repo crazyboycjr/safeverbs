@@ -12,9 +12,6 @@ use super::*;
 use crate::buf::Leases;
 use crate::nic::Nic;
 
-// On this branch the specs and proofs in this file still describe the representation before the
-// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
-// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
 /// What a slot of an engine's rings holds for a request.
@@ -40,9 +37,9 @@ impl<L> Ring<L> {
         requires
             pre.inv(),
             self.same_counters(pre),
+            self.wakers@ == pre.wakers@,
+            self.detached_error == pre.detached_error,
             pre.head <= seq < pre.posted,
-            pre.slot(seq).seq == seq,
-            pre.slot(seq).state != State::Free,
             pre.slot(seq).leases is Some,
             self.slots@ == pre.slots@.update(seq % pre.n(), Slot { leases: Some(new), ..pre.slot(seq) }),
         ensures
@@ -61,7 +58,7 @@ impl<L> Ring<L> {
             } else { pre.dma(s, w) },
             self.same_meta(pre),
     {
-        reveal(Ring::inv_slots);
+        reveal(Ring::inv_slots_but);
         reveal(Ring::inv_wqes);
         let n = pre.n();
         assert(self.slot(seq) == Slot { leases: Some(new), ..pre.slot(seq) });
@@ -74,15 +71,16 @@ impl<L> Ring<L> {
         assert forall|s: int| self.retired <= s < self.posted implies #[trigger] self.live_ok(s) by {
             assert(pre.live_ok(s));
         }
-        assert forall|s: int| self.posted <= s < self.head + self.n() implies #[trigger] self.free_ok(s) by {
+        assert forall|s: int| self.posted <= s < self.head + self.n() && s % self.n() != -1
+            implies #[trigger] self.free_ok(s) by {
             assert(pre.free_ok(s));
         }
-        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe
+        assert forall|s: int| self.retired < s < self.posted implies #[trigger] self.slot(s).first_wqe@
             == self.slot(s - 1).end_wqe by {
-            assert(pre.slot(s).first_wqe == pre.slot(s - 1).end_wqe);
+            assert(pre.slot(s).first_wqe@ == pre.slot(s - 1).end_wqe);
         }
         if self.retired < self.posted {
-            assert(pre.slot(self.retired as int).first_wqe == self.slot(self.retired as int).first_wqe);
+            assert(pre.slot(self.retired as int).first_wqe@ == self.slot(self.retired as int).first_wqe@);
         }
         if self.retired < self.committed {
             assert(pre.slot(self.committed - 1).end_wqe == self.slot(self.committed - 1).end_wqe);
@@ -91,7 +89,7 @@ impl<L> Ring<L> {
             assert(pre.slot(self.posted - 1).end_wqe == self.slot(self.posted - 1).end_wqe);
         }
         if self.head < self.retired {
-            assert(pre.slot(self.head as int).state == self.slot(self.head as int).state);
+            assert(pre.slot(self.head as int).leases is Some == self.slot(self.head as int).leases is Some);
         }
         assert forall|s: int| #[trigger] self.req(s) == if s == seq && pre.req(s) is Some {
             Some(ReqView { leases: new, ..pre.req(s)->0 })
@@ -137,9 +135,9 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
             old(self).inv(),
         ensures
             final(self).inv(),
-            old(self).req(seq as int) matches Some(r) ==> ctx == r.leases.ctx,
-            old(self).staged(seq as int) matches Some(r) ==> ctx == r.leases.ctx,
-            old(self).refused(seq as int) matches Some(p) ==> ctx == p.ctx,
+            old(self).req(seq as int) matches Some(r) ==> given_up.0 == r.leases.ctx,
+            old(self).staged(seq as int) matches Some(r) ==> given_up.0 == r.leases.ctx,
+            old(self).refused(seq as int) matches Some(p) ==> given_up.0 == p.ctx,
             forall|s: int| #[trigger] final(self).req(s) == if s == seq && old(self).req(s) is Some {
                 if old(self).req(s)->0.phase is Complete {
                     None
@@ -161,7 +159,8 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
             },
             final(self).woken() == old(self).woken(),
             final(self).same_wqes(old(self)),
-            final(self).same_open(old(self)),
+            final(self).spec_retired() == old(self).spec_retired(),
+            final(self).spec_committed() == old(self).spec_committed(),
             final(self).spec_posted() == old(self).spec_posted(),
             forall|s: int, w: int| #[trigger] final(self).dma(s, w) == if s == seq && old(self).dma(s, w) is Some {
                 Some(old(self).dma(s, w)->0.without_ctx())
@@ -175,15 +174,38 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
             },
             final(self).spec_detached_error() == old(self).spec_detached_error(),
     {
+        proof {
+            self.lemma_state_views(seq as int);
+        }
+        let ghost pre = *self;
         let ctx = if seq < self.head || seq >= self.posted {
             None
         } else {
             let i = self.index(seq);
-            match &mut self.slots[i].leases {
+            let taken = match &mut self.slots[i].leases {
                 Some(payload) => payload.ctx.take(),
                 None => None,
+            };
+            proof {
+                if pre.slot(seq as int).leases is Some {
+                    self.lemma_payload_update(&pre, seq as int, pre.slot(seq as int).leases->0.without_ctx());
+                } else {
+                    assert(self.slots@ =~= pre.slots@);
+                    Self::lemma_frame(&pre, self);
+                }
             }
+            taken
         };
+        let ghost stripped = *self;
+        proof {
+            if seq < pre.head || seq >= pre.posted {
+                assert forall|w: int| pre.dma(seq as int, w) is None by {
+                    if pre.dma(seq as int, w) is Some {
+                        pre.lemma_dma(seq as int, w);
+                    }
+                }
+            }
+        }
         let waker = self.detach(seq);
         (ctx, waker)
     }

@@ -62,7 +62,7 @@ use safeverbs_spec::share::*;
 use safeverbs_spec::types::{CqId, Key, PdId, QpId};
 use vstd::prelude::*;
 
-use crate::buf::{BufError, Lease, Leases, Part};
+use crate::buf::{BufError, Kept, Lease, Leases, Part, forget_free};
 use crate::error::{Error, Result};
 use crate::nic::{
     ConnectAttr, DeviceCaps, Endpoint, Nic as Device, NicCq, NicQp, QpCaps, QpType, Sge, WrOp,
@@ -81,11 +81,9 @@ mod outcomes;
 mod send_outcomes;
 mod separation;
 
+use open::write_wqe;
 pub use open::{OpenRequest, OpenWqe};
 
-// On this branch the specs and proofs in this file still describe the representation before the
-// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
-// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
 global size_of usize == 8;
@@ -1939,7 +1937,7 @@ impl<C, N: Device> Hw<C, N> {
     {
         if index >= self.qps.len() {
             no_qp(index);
-            return Refusal { error: Error::Invalid("no such QP"), ctx, leases: Leases::from(part) };
+            return Refusal { error: Error::Invalid("no such QP"), ctx, leases: Leases::one(part, Ghost(safeverbs_spec::abs::Dir::Out)) };
         }
         let error = match &self.qps[index] {
             Some(e) => {
@@ -1963,7 +1961,7 @@ impl<C, N: Device> Hw<C, N> {
                 Error::Invalid("no such QP")
             },
         };
-        Refusal { error, ctx, leases: Leases::from(part) }
+        Refusal { error, ctx, leases: Leases::one(part, Ghost(safeverbs_spec::abs::Dir::Out)) }
     }
 }
 
@@ -2260,13 +2258,13 @@ impl<C, N: Device> Hw<C, N> {
                         self.polled_at = at + 1;
                     }
                     let result = slot.outcome;
-                    match slot.leases.take() {
+                    match slot.take_leases() {
                         Some(Payload { ctx: Some(wr_id), leases }) => {
                             let queue = if recv { Side::Recv } else { Side::Send };
                             return Some(Completion { wr_id, result, qp: index, qp_num, queue, seq, leases });
                         },
                         // A request with an owner holds a context, so nothing is lost here.
-                        other => crate::ring::forget_free(other),
+                        other => forget_free(other, Ghost(false)),
                     }
                 },
                 None => {
@@ -2302,56 +2300,25 @@ impl<C, N: Device> Hw<C, N> {
         };
         let (ring, queue) = if recv { (&mut e.recv, Side::Recv) } else { (&mut e.send, Side::Send) };
         let seq = ring.retired();
-        let (i, ended) = match ring.retire_next(recv, wqe, wc, &mut self.panics) {
-            Some(step) => step,
+        match ring.retire_next(recv, wqe, wc, &mut self.panics) {
+            Some(ended) => {
+                if ended {
+                    self.polled_at = at + 1;
+                }
+            },
             None => {
                 self.polled_at = at + 1;
                 return None;
             },
-        };
-        if ended {
-            self.polled_at = at + 1;
         }
-        let passed = ring.pass_retired(seq);
-        let slot = ring.retired_slot(i);
-        if passed && matches!(slot.leases, Some(Payload { ctx: Some(_), .. })) {
-            let result = slot.outcome;
-            match slot.leases.take() {
-                Some(Payload { ctx: Some(wr_id), mut leases }) => {
-                    if leases.is_many() {
-                        leases.hand_back_many(&mut e.spare_leases);
-                    }
-                    Some(Completion { wr_id, result, qp: index, qp_num: e.qp_num, queue, seq, leases })
-                },
-                other => {
-                    crate::ring::forget_free(other);
-                    None
-                },
-            }
-        } else {
-            Self::hand_out_other(ring, &mut e.spare_leases, i, seq, index, e.qp_num, queue)
-        }
-    }
-
-    /// What retiring a request of a CQE leaves besides the common case: the head has to look for
-    /// the next slot in use, now that this one is free, and the request may have held nothing
-    /// (without an owner, or taken since it was refused).
-    #[cold]
-    #[inline(never)]
-    fn hand_out_other(ring: &mut Ring<Payload<C, N>>, spare: &mut Vec<Lease<N>>, i: usize, seq: RingSeq, index: usize, qp_num: u32, queue: Side) -> (r: Option<Completion<C, N>>)
-    {
-        let slot = ring.retired_slot(i);
-        let result = slot.outcome;
-        let taken = slot.leases.take();
-        ring.advance_head();
-        match taken {
-            Some(Payload { ctx: Some(wr_id), mut leases }) => {
+        match ring.take_retired(seq) {
+            Some(Taken { outcome, leases: Payload { ctx: Some(wr_id), mut leases } }) => {
                 if leases.is_many() {
-                    leases.hand_back_many(spare);
+                    leases.hand_back_many(&mut e.spare_leases);
                 }
-                Some(Completion { wr_id, result, qp: index, qp_num, queue, seq, leases })
+                Some(Completion { wr_id, result: outcome, qp: index, qp_num: e.qp_num, queue, seq, leases })
             },
-            // A request with an owner holds a context, so nothing is lost here.
+            // Nothing, if it had no owner; a request with an owner holds a context.
             _ => None,
         }
     }
@@ -2542,22 +2509,27 @@ impl<C, N: Device> Hw<C, N> {
             Ok(()) => {},
             Err(e) => {
                 self.give_back(index, &mut open);
-                return Err(Refusal { error: e.error, ctx, leases: Leases::from(e.buf) });
+                return Err(Refusal { error: e.error, ctx, leases: Leases::one(e.buf, Ghost(safeverbs_spec::abs::Dir::Out)) });
             },
         }
         match self.make_send_room(index, 1) {
             Ok(()) => {},
             Err(error) => {
+                let leases = open.take_leases();
                 self.give_back(index, &mut open);
-                return Err(Refusal { error, ctx, leases: open.take_leases() });
+                return Err(Refusal { error, ctx, leases });
             },
         }
         let closed = self.close(index, &mut open, signal, ctx);
-        self.give_back(index, &mut open);
         let seq = match closed {
             Ok(seq) => seq,
-            Err(ctx) => return Err(Refusal { error: Error::Invalid("a request without a WQE"), ctx, leases: Leases::new() }),
+            Err(ctx) => {
+                let leases = open.take_leases();
+                self.give_back(index, &mut open);
+                return Err(Refusal { error: Error::QueueFull, ctx, leases });
+            },
         };
+        self.give_back(index, &mut open);
         if ring {
             self.commit_own(index, seq)
         } else {
@@ -2726,7 +2698,7 @@ impl<C, N: Device> Hw<C, N> {
         }
         match &mut self.qps[index] {
             Some(e) => {
-                if !e.send.can_post() || n as u64 > e.send.wqe_room() as u64 {
+                if !e.send.can_post() || n as u64 > e.send.wqe_room() as u64 || !e.takes(open) {
                     return Err(ctx);
                 }
                 let ghost q = e.id();
@@ -2751,7 +2723,7 @@ impl<C, N: Device> Hw<C, N> {
                 let last = &open.wqes[n - 1];
                 let bytes = if last.sges == 1 { last.sge.length } else { open.last_gathered_bytes() };
                 let implied = implied_outcome(&last.op, bytes);
-                let leases = open.take_leases_with(&mut e.spare_leases);
+                let leases = open.take_leases_with(&mut e.spare_leases, Ghost(Seq::empty()));
                 let many = leases.is_many();
                 let detached = ctx.is_none();
                 let seq = e.send.stage(n as u64, signaled, detached, implied, Payload { ctx, leases });
@@ -2780,9 +2752,11 @@ impl<C, N: Device> Hw<C, N> {
                         limit: e.open_limit(),
                         max_len: e.max_len,
                         pd_id: e.pd_id,
-                        last: None,
-                        leases: no_leases(),
+                        kept: Kept::new(),
                         gathered: Vec::new(),
+                        reads: false,
+                        max_sges: 1,
+                        ledger: Ghost(Seq::empty()),
                     };
                 },
                 _ => {},
@@ -2805,9 +2779,11 @@ impl<C, N: Device> Hw<C, N> {
                         limit: e.open_limit(),
                         max_len: e.max_len,
                         pd_id: e.pd_id,
-                        last: None,
-                        leases: no_leases(),
+                        kept: Kept::new(),
                         gathered: Vec::new(),
+                        reads: false,
+                        max_sges: 1,
+                        ledger: Ghost(Seq::empty()),
                     };
                 },
                 None => {},
@@ -2816,13 +2792,14 @@ impl<C, N: Device> Hw<C, N> {
         OpenRequest::closed()
     }
 
-    /// What `open` keeps from QP `index` goes back there for the next request.
+    /// What `open` keeps from QP `index` goes back there for the next request, if it has no WQE:
+    /// the WQEs it has stay where they are, to go out or to be dropped with it.
     #[inline(always)]
     pub fn give_back(&mut self, index: usize, open: &mut OpenRequest<N>) {
-        if index < self.qps.len() {
+        if open.n == 0 && index < self.qps.len() {
             match &mut self.qps[index] {
                 Some(e) => {
-                    if e.spare_wqes.len() == 0 {
+                    if e.spare_wqes.len() == 0 && open.wqes.len() == e.send.max_wqes() as usize {
                         core::mem::swap(&mut e.spare_wqes, &mut open.wqes);
                     }
                     open.limit = 0;
@@ -2837,7 +2814,7 @@ impl<C, N: Device> Hw<C, N> {
 
     /// [`Hw::close`], first waiting for room (this polls the CQ).
     pub fn close_waiting(&mut self, index: usize, open: &mut OpenRequest<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>) {
-        if open.n > 0 && !self.open_fits(index, open) {
+        if open.n > 0 && !self.open_fits(index, open) && self.open_belongs(index, open) {
             let _ = self.make_send_room(index, open.n as u32);
         }
         self.close(index, open, signal, ctx)
@@ -2866,18 +2843,28 @@ impl<C, N: Device> Hw<C, N> {
             self.give_back(index, open);
             return Err(Refusal { error: Error::Invalid("a request without a WQE"), ctx, leases: Leases::new() });
         }
+        if !self.open_belongs(index, open) {
+            let leases = open.take_leases();
+            return Err(Refusal { error: Error::Invalid("a request written for another QP"), ctx, leases });
+        }
         match self.make_send_room(index, open.n as u32) {
             Ok(()) => {},
             Err(error) => {
+                let leases = open.take_leases();
                 self.give_back(index, open);
-                return Err(Refusal { error, ctx, leases: open.take_leases() });
+                return Err(Refusal { error, ctx, leases });
             },
         }
-        let closed = self.close(index, open, signal, ctx);
-        self.give_back(index, open);
-        match closed {
-            Ok(seq) => self.commit_own(index, seq),
-            Err(ctx) => Err(Refusal { error: Error::QueueFull, ctx, leases: open.take_leases() }),
+        match self.close(index, open, signal, ctx) {
+            Ok(seq) => {
+                self.give_back(index, open);
+                self.commit_own(index, seq)
+            },
+            Err(ctx) => {
+                let leases = open.take_leases();
+                self.give_back(index, open);
+                Err(Refusal { error: Error::QueueFull, ctx, leases })
+            },
         }
     }
 
@@ -2914,9 +2901,38 @@ impl<C, N: Device> Hw<C, N> {
             false
         }
     }
+
+    /// Whether QP `index` takes what `open` was written for.
+    fn open_belongs(&self, index: usize, open: &OpenRequest<N>) -> (belongs: bool) {
+        if index < self.qps.len() {
+            match &self.qps[index] {
+                Some(e) => e.takes(open),
+                None => false,
+            }
+        } else {
+            false
+        }
+    }
 }
 
 impl<C, N: Device> HwQp<C, N> {
+    /// Whether it takes what `open` was written for, which is a value of its own: of its protection
+    /// domain, as long as its messages, in as many WQEs as a request of it may have. Anything else
+    /// a WQE asks of a QP is out of the common.
+    #[inline(always)]
+    fn takes(&self, open: &OpenRequest<N>) -> (takes: bool) {
+        open.pd_id == self.pd_id && open.max_len <= self.max_len && open.n <= self.send.max_wqes() as usize
+            && (!(open.reads || open.max_sges > 1) || self.takes_other(open))
+    }
+
+    /// [`HwQp::takes`] of WQEs that the NIC reads the answer of, or of several elements.
+    #[cold]
+    #[inline(never)]
+    fn takes_other(&self, open: &OpenRequest<N>) -> (takes: bool) {
+        (!open.reads || self.reliable)
+            && open.max_sges <= self.caps.max_send_sge && open.max_sges <= self.caps.max_recv_sge
+    }
+
     /// How many WQEs a request being written may take without asking: as many as a request may
     /// have; none while it takes no work. The queue's room is looked at when it goes out, since a
     /// request is written with nothing held.
@@ -3142,6 +3158,9 @@ impl<C, N: Device> Hw<C, N> {
     #[inline]
     fn open_room(&mut self, index: usize, open: &mut OpenRequest<N>) -> (r: Result<()>)
     {
+        if !self.open_belongs(index, open) {
+            return Err(Error::Invalid("a request written for another QP"));
+        }
         let k = open.n as u32;
         let full = match &self.qps[index] {
             Some(e) => k >= e.send.max_wqes(),
@@ -3154,7 +3173,11 @@ impl<C, N: Device> Hw<C, N> {
             }
             let _ = self.close(index, open, true, None);
         }
-        Ok(())
+        if open.n < open.wqes.len() {
+            Ok(())
+        } else {
+            Err(Error::Invalid("a request that takes no WQE"))
+        }
     }
 
     /// Adds a WQE doing `op` on `part` to `open`, whatever it takes: its QP is asked what
@@ -3196,9 +3219,10 @@ impl<C, N: Device> Hw<C, N> {
         match &mut self.qps[index] {
             Some(e) => {
                 let k = open.n;
-                open.wqes[k] = OpenWqe { op, sge: part_sge_of(&part), first_sge: 0, sges: 1 };
+                write_wqe(&mut open.wqes, k, OpenWqe { op, sge: part_sge_of(&part), first_sge: 0, sges: 1 });
                 open.n = k + 1;
-                open.keep_general(part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }), &mut e.spare_leases);
+                open.note_op(&op);
+                open.kept.keep_general(part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }), &mut e.spare_leases);
             },
             None => {},
         }
@@ -3246,6 +3270,10 @@ impl<C, N: Device> Hw<C, N> {
                 if open.gathered.capacity() == 0 {
                     core::mem::swap(&mut open.gathered, &mut e.spare_sges);
                 }
+                if open.gathered.len() > u32::MAX as usize - MAX_SGES {
+                    e.building.clear();
+                    return Err(Error::Invalid("a request of too many scatter/gather elements"));
+                }
                 let first_sge = open.gathered.len() as u32;
                 let mut i = 0;
                 while i < sges
@@ -3254,13 +3282,17 @@ impl<C, N: Device> Hw<C, N> {
                     i += 1;
                 }
                 let k = open.n;
-                open.wqes[k] = OpenWqe { op, sge: part_sge_of(&e.building[0]), first_sge, sges: sges as u32 };
+                write_wqe(&mut open.wqes, k, OpenWqe { op, sge: part_sge_of(&e.building[0]), first_sge, sges: sges as u32 });
                 open.n = k + 1;
+                open.note_op(&op);
+                if sges as u32 > open.max_sges {
+                    open.max_sges = sges as u32;
+                }
                 // In the order the hardware reads them is no matter to the leases.
                 while e.building.len() > 0
                 {
                     match e.building.pop() {
-                        Some(part) => open.keep_general(part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }), &mut e.spare_leases),
+                        Some(part) => open.kept.keep_general(part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }), &mut e.spare_leases),
                         None => {},
                     }
                 }

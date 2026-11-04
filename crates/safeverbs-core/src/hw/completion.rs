@@ -3,9 +3,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-// On this branch the specs and proofs in this file still describe the representation before the
-// fast data path (see docs/verification.md): the contracts were kept as they were, the body proofs
-// of rewritten functions are at e28c2e8. A plain build erases them all.
 verus! {
 
 impl<C, N: Device> HwQp<C, N> {

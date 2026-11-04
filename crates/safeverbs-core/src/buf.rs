@@ -45,10 +45,10 @@ mod lease;
 pub(crate) use lease::Loan;
 #[allow(unused_imports)] // Erased WQE provenance used by the verified engine.
 pub(crate) use lease::WqeLoans;
+pub(crate) use lease::{Kept, Lease, forget_free, replace_value};
+pub use lease::{Leases, Part, Peek};
 #[cfg(verus_keep_ghost)]
-pub(crate) use lease::covers_inputs;
-pub(crate) use lease::{Lease, same_frozen_arc};
-pub use lease::{Leases, Part};
+pub(crate) use lease::{covers_inputs, input_is_covered};
 
 /// Linux's `ENOMEM`.
 const ENOMEM: i32 = 12;
@@ -556,26 +556,6 @@ pub trait Lend<N: Nic> {
     fn lend(self) -> Part<N>;
 }
 
-/// The bytes of what can be lent ([`Lend::peek`]).
-#[doc(hidden)]
-pub struct Peek<'a, N: Nic> {
-    pub(crate) frozen: &'a Arc<Frozen<N>>,
-    pub(crate) offset: usize,
-    pub(crate) bytes: usize,
-}
-
-impl<N: Nic> Peek<'_, N> {
-    /// Its scatter/gather element, for a length that fits one.
-    #[inline(always)]
-    pub(crate) fn sge(&self) -> crate::nic::Sge {
-        crate::nic::Sge {
-            addr: (self.frozen.raw.ptr().addr() + self.offset) as u64,
-            length: self.bytes as u32,
-            lkey: self.frozen.raw.region.lkey,
-        }
-    }
-}
-
 impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for Buf<U, N> {
     #[inline(always)]
     fn peek(&self) -> Peek<'_, N> {
@@ -583,6 +563,7 @@ impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for Buf<U, N> {
             frozen: &self.frozen,
             offset: self.view.offset(),
             bytes: self.view.byte_len(size_of::<U>()),
+            lkey: self.frozen.raw.region.lkey,
         }
     }
     #[inline(always)]
@@ -598,6 +579,7 @@ impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for &Buf<U, N> {
             frozen: &self.frozen,
             offset: self.view.offset(),
             bytes: self.view.byte_len(size_of::<U>()),
+            lkey: self.frozen.raw.region.lkey,
         }
     }
     #[inline(always)]
@@ -613,6 +595,7 @@ impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for BufView<'_, U, N> {
             frozen: self.frozen,
             offset: self.view.offset(),
             bytes: self.view.byte_len(size_of::<U>()),
+            lkey: self.frozen.raw.region.lkey,
         }
     }
     #[inline(always)]
