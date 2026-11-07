@@ -413,7 +413,7 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `ring/wake.rs` `try_wake` | `catch_unwind` catches an unwind from `Waker::wake` and does not unwind itself |
 | `ring/wake.rs` `resume` | `resume_unwind` never returns |
 | `ring.rs` `will_wake` | when `Waker::will_wake` says two wakers wake the same task, they have one name in A. It compares two pointers and does not unwind |
-| `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name, and does not unwind: a waker a program makes without `unsafe` comes from `Wake`, whose clone counts an `Arc` |
+| `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name, and does not unwind: a waker a program makes without `unsafe` comes from `Wake`, whose clone counts an `Arc`. (An executor's own waker is its `unsafe` code; its clone runs before the slot changes, so if it did unwind, nothing would be half done) |
 | `buf/lease.rs` `forget_free` | forgetting a value the caller proved holds nothing releases nothing: it writes a free slot with no drop glue, which would be a landing pad on the data path |
 | `buf/lease.rs` `replace_value` | `core::mem::replace` leaves the new value and returns the old one |
 | `buf/lease.rs` `capacity_of` | `Vec::capacity` is at least its length |
