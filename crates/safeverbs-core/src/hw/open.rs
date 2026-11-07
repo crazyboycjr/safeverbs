@@ -36,11 +36,9 @@ pub(super) const EMPTY_WQE: OpenWqe = OpenWqe {
     sges: 0,
 };
 
-/// A request being written, a value of its own: `Engine::open_request` makes one, its WQEs go in
-/// without the engine while all is well, and `Engine::close_open` or `Engine::submit_open` send
-/// it. Dropping it drops its WQEs, which never left it.
+/// What a request being written is ([`OpenRequest`]), its fields changing one at a time.
 #[verifier::reject_recursive_types(N)]
-pub struct OpenRequest<N: Device> {
+pub struct Writing<N: Device> {
     /// Its WQEs, the first `n` of them; as long as its QP's requests may be.
     pub(super) wqes: Vec<OpenWqe>,
     /// How many it has.
@@ -70,6 +68,7 @@ pub struct OpenRequest<N: Device> {
 pub(super) fn plain_op(op: &WrOp, len: u64) -> (plain: bool)
     ensures
         plain ==> !opcode_model(*op).writes_local(),
+    no_unwind
 {
     match *op {
         WrOp::Send | WrOp::SendImm(_) => true,
@@ -84,6 +83,7 @@ pub(super) fn plain_op(op: &WrOp, len: u64) -> (plain: bool)
 pub(super) fn one_of<T>(value: &T) -> (list: &[T])
     ensures
         list@ == seq![*value],
+    no_unwind
 {
     core::slice::from_ref(value)
 }
@@ -147,7 +147,7 @@ pub(super) proof fn lemma_matches_more<N: Device>(entry: WqeLoans, loans: Seq<Lo
     }
 }
 
-impl<N: Device> OpenRequest<N> {
+impl<N: Device> Writing<N> {
     /// The scatter/gather list of WQE `k`.
     pub open(super) spec fn sges_at(&self, k: int) -> Seq<Sge> {
         let w = self.wqes@[k];
@@ -272,15 +272,16 @@ impl<N: Device> OpenRequest<N> {
         ensures
             r.inv(),
             r.has_no_wqe(),
+        no_unwind
     {
-        OpenRequest {
-            wqes: Vec::new(),
+        Writing {
+            wqes: vec_new(),
             n: 0,
             limit: 0,
             max_len: 0,
             pd_id: 0,
             kept: Kept::new(),
-            gathered: Vec::new(),
+            gathered: vec_new(),
             reads: false,
             max_sges: 1,
             ledger: Ghost(Seq::empty()),
@@ -289,7 +290,9 @@ impl<N: Device> OpenRequest<N> {
 
     /// How many WQEs it has.
     #[inline(always)]
-    pub fn len(&self) -> (n: usize) {
+    pub fn len(&self) -> (n: usize)
+        no_unwind
+    {
         self.n
     }
 
@@ -298,6 +301,7 @@ impl<N: Device> OpenRequest<N> {
     pub fn is_empty(&self) -> (empty: bool)
         ensures
             empty == self.has_no_wqe(),
+        no_unwind
     {
         self.n == 0
     }
@@ -318,19 +322,24 @@ impl<N: Device> OpenRequest<N> {
                     sge_model(part_sge((#[trigger] self.kept.loans()[j]).part)),
                     part_writable(self.kept.loans()[j].part),
                 ),
+        no_unwind
     {
         registered_all(&self.kept, pd, Tracked(token));
     }
 
     /// Whether it still holds what it keeps from its QP.
     #[inline(always)]
-    pub(crate) fn holds_storage(&self) -> (holds: bool) {
+    pub(crate) fn holds_storage(&self) -> (holds: bool)
+        no_unwind
+    {
         self.wqes.len() > 0
     }
 
     /// Whether the next WQE goes in without its QP being asked.
     #[inline(always)]
-    pub fn has_room(&self) -> (room: bool) {
+    pub fn has_room(&self) -> (room: bool)
+        no_unwind
+    {
         self.n < self.limit
     }
 
@@ -340,6 +349,7 @@ impl<N: Device> OpenRequest<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
+        no_unwind
     {
         let ghost before = *self;
         self.limit = 0;
@@ -367,6 +377,7 @@ impl<N: Device> OpenRequest<N> {
             final(self).limit == old(self).limit,
             forall|i: int| 0 <= i < final(self).kept.loans().len()
                 ==> #[trigger] hw.table_apart(final(self).kept.loans()[i].part.resource()),
+        no_unwind
     {
         let ghost before = *self;
         self.kept.separate_from_table(hw);
@@ -408,9 +419,9 @@ impl<N: Device> OpenRequest<N> {
             i < self.n,
         ensures
             *op == self.wqes@[i as int].op,
+        no_unwind
     {
-        // SAFETY: `i < n`, and `n` is at most the length of `wqes`.
-        unsafe { &self.wqes.as_slice().get_unchecked(i).op }
+        &element(self.wqes.as_slice(), i).op
     }
 
     /// The scatter/gather list of WQE `i`, one of those it has.
@@ -421,17 +432,17 @@ impl<N: Device> OpenRequest<N> {
             i < self.n,
         ensures
             sges@ == self.sges_at(i as int),
+        no_unwind
     {
         proof {
             assert(self.wqe_ok(i as int));
         }
-        // SAFETY: `i < n`, and `n` is at most the length of `wqes`.
-        let wqe = unsafe { self.wqes.as_slice().get_unchecked(i) };
+        let wqe = element(self.wqes.as_slice(), i);
         if wqe.sges == 1 {
             one_of(&wqe.sge)
         } else {
             let from = wqe.first_sge as usize;
-            vstd::slice::slice_subrange(self.gathered.as_slice(), from, from + wqe.sges as usize)
+            sub_slice(self.gathered.as_slice(), from, from + wqe.sges as usize)
         }
     }
 
@@ -443,6 +454,7 @@ impl<N: Device> OpenRequest<N> {
             self.wqes@[self.n - 1].sges != 1,
         ensures
             bytes == sges_len(self.sges_at(self.n - 1)),
+        no_unwind
     {
         proof {
             assert(self.wqe_ok(self.n - 1));
@@ -507,6 +519,7 @@ impl<N: Device> OpenRequest<N> {
             leases.inv(),
             leases.loans() == old(self).kept.loans(),
             leases.wqes() == wqes,
+        no_unwind
     {
         self.n = 0;
         self.ledger = Ghost(Seq::empty());
@@ -519,8 +532,9 @@ impl<N: Device> OpenRequest<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
+        no_unwind
     {
-        self.take_leases_with(&mut Vec::new(), Ghost(Seq::empty()))
+        self.take_leases_with(&mut vec_new(), Ghost(Seq::empty()))
     }
 
     /// Adds a WQE doing `op` on `part` if nothing is out of the common: the checks pass, it has
@@ -533,6 +547,7 @@ impl<N: Device> OpenRequest<N> {
         ensures
             final(self).inv(),
             r matches Err(back) ==> back == part,
+        no_unwind
     {
         let sge = part_sge_of(&part);
         let k = self.n;
@@ -725,7 +740,7 @@ impl<N: Device> OpenRequest<N> {
         requires
             pre.inv(),
             self.gathered@ == pre.gathered@ || pre.gathered@.len() == 0,
-            *self == (OpenRequest { gathered: self.gathered, ..*pre }),
+            *self == (Writing { gathered: self.gathered, ..*pre }),
         ensures
             self.inv(),
     {
@@ -895,11 +910,12 @@ impl<N: Device> OpenRequest<N> {
         ensures
             takes ==> self.n < self.limit && peek.bytes <= self.max_len
                 && self.kept.keeps_frozen(**peek.frozen),
+        no_unwind
     {
         self.n < self.limit && peek.bytes <= self.max_len as usize && self.kept.keeps_peek(peek)
     }
 
-    /// [`OpenRequest::try_push`] of bytes of the frozen allocation of its last WQE, which is
+    /// [`Writing::try_push`] of bytes of the frozen allocation of its last WQE, which is
     /// already kept alive: nothing to count, and nothing to store but the WQE. Whether it did.
     #[inline(always)]
     pub(crate) fn try_push_peek(&mut self, op: WrOp, peek: Peek<'_, N>) -> (pushed: bool)
@@ -907,6 +923,7 @@ impl<N: Device> OpenRequest<N> {
             old(self).inv(),
         ensures
             final(self).inv(),
+        no_unwind
     {
         proof { use_type_invariant(&peek); }
         if self.takes_peek(&peek) && plain_op(&op, peek.bytes as u64) {
@@ -934,13 +951,14 @@ impl<N: Device> OpenRequest<N> {
         }
     }
 
-    /// [`OpenRequest::try_push_peek`] of a plain WRITE to `dst`, written where it stays.
+    /// [`Writing::try_push_peek`] of a plain WRITE to `dst`, written where it stays.
     #[inline(always)]
     pub(crate) fn try_push_peek_write(&mut self, dst: RemoteBuf, peek: Peek<'_, N>) -> (pushed: bool)
         requires
             old(self).inv(),
         ensures
             final(self).inv(),
+        no_unwind
     {
         proof { use_type_invariant(&peek); }
         if self.takes_peek(&peek) && peek.bytes as u64 <= dst.len {
@@ -981,9 +999,9 @@ pub(super) fn wqe_at(wqes: &mut Vec<OpenWqe>, k: usize) -> (wqe: &mut OpenWqe)
     ensures
         *wqe == old(wqes)@[k as int],
         final(wqes)@ == old(wqes)@.update(k as int, *final(wqe)),
+    no_unwind
 {
-    // SAFETY: `k` is below the length (the precondition).
-    unsafe { wqes.as_mut_slice().get_unchecked_mut(k) }
+    element_mut(wqes.as_mut_slice(), k)
 }
 
 /// Writes WQE `k`, as [`wqe_at`] allows.
@@ -993,24 +1011,114 @@ pub(super) fn write_wqe(wqes: &mut Vec<OpenWqe>, k: usize, wqe: OpenWqe)
         k < old(wqes)@.len(),
     ensures
         final(wqes)@ == old(wqes)@.update(k as int, wqe),
+    no_unwind
 {
     *wqe_at(wqes, k) = wqe;
 }
 
-} // verus!
+/// A request being written, a value of its own: `Engine::open_request` makes one, its WQEs go in
+/// without the engine while all is well, and `Engine::close_open` or `Engine::submit_open` send
+/// it. Dropping it drops its WQEs, which never left it.
+#[verifier::reject_recursive_types(N)]
+pub struct OpenRequest<N: Device> {
+    pub(crate) writing: Writing<N>,
+}
 
 impl<N: Device> OpenRequest<N> {
+    /// Its WQEs are what their ledger says, each input kept alive by what it holds: no program
+    /// promises that, and nothing unwinds while it does not hold.
+    #[verifier::type_invariant]
+    pub(crate) open spec fn inv(self) -> bool {
+        self.writing.inv()
+    }
+
+    /// A request being written, on what comes from its QP.
+    #[inline(always)]
+    pub(crate) fn of(writing: Writing<N>) -> (open: Self)
+        requires
+            writing.inv(),
+    {
+        OpenRequest { writing }
+    }
+
+    /// One that holds nothing and takes nothing.
+    pub fn closed() -> (r: Self) {
+        OpenRequest { writing: Writing::closed() }
+    }
+
+    /// How many WQEs it has.
+    #[inline(always)]
+    pub fn len(&self) -> (n: usize) {
+        self.writing.len()
+    }
+
+    /// Whether it has no WQE.
+    #[inline(always)]
+    pub fn is_empty(&self) -> (empty: bool) {
+        self.writing.is_empty()
+    }
+
+    /// Whether it still holds what it keeps from its QP.
+    #[inline(always)]
+    pub(crate) fn holds_storage(&self) -> (holds: bool) {
+        self.writing.holds_storage()
+    }
+
+    /// Whether the next WQE goes in without its QP being asked.
+    #[inline(always)]
+    pub fn has_room(&self) -> (room: bool) {
+        self.writing.has_room()
+    }
+
+    /// From now on every WQE goes to its QP.
+    pub fn stop(&mut self) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.writing.stop();
+    }
+
+    /// Its buffers, leaving it none (of a request that is not going out).
+    pub fn take_leases(&mut self) -> (leases: Leases<N>) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.writing.take_leases()
+    }
+
+    /// Adds a WQE doing `op` on `part` if nothing is out of the common: the checks pass, it has
+    /// room, and keeping `part` takes no allocation. Otherwise `part` comes back and nothing
+    /// changed, for its QP to say (`Engine::push_open`).
+    #[inline(always)]
+    pub fn try_push(&mut self, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), Part<N>>)
+        ensures
+            r matches Err(back) ==> back == part,
+    {
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.writing.try_push(op, part)
+    }
+
     /// Adds a WQE of `op` over what `buf` lends, when it is of the frozen allocation of the last
     /// WQE, which is already kept alive: nothing to count, and nothing to store but the WQE.
     /// Whether it did.
     #[inline(always)]
-    pub fn try_push_lent<B: Lend<N>>(&mut self, op: WrOp, buf: &B) -> bool {
-        self.try_push_peek(op, buf.peek())
+    pub fn try_push_lent<B: Lend<N>>(&mut self, op: WrOp, buf: &B) -> (pushed: bool) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.writing.try_push_peek(op, buf.peek())
     }
 
     /// [`OpenRequest::try_push_lent`] of a plain WRITE to `dst`, written where it stays.
     #[inline(always)]
-    pub fn try_push_write<B: Lend<N>>(&mut self, dst: RemoteBuf, buf: &B) -> bool {
-        self.try_push_peek_write(dst, buf.peek())
+    pub fn try_push_write<B: Lend<N>>(&mut self, dst: RemoteBuf, buf: &B) -> (pushed: bool) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.writing.try_push_peek_write(dst, buf.peek())
     }
 }
+
+} // verus!

@@ -75,6 +75,7 @@ pub fn wr_id(index: u16, recv: bool, wqe: u64) -> (id: u64)
         id >> INDEX_SHIFT == index as u64,
         (id & RECV_BIT != 0) == recv,
         id & WQE_MASK == wqe & WQE_MASK,
+    no_unwind
 {
     proof {
         lemma_wr_id_fields(index, recv, wqe);
@@ -92,6 +93,7 @@ pub fn index_of(wr_id: u64) -> (index: usize)
     ensures
         index == wr_id >> INDEX_SHIFT,
         index < 0x1_0000,
+    no_unwind
 {
     assert(wr_id >> 48u64 <= 0xffffu64) by (bit_vector);
     (wr_id >> INDEX_SHIFT) as usize
@@ -102,6 +104,7 @@ pub fn index_of(wr_id: u64) -> (index: usize)
 pub fn is_recv(wr_id: u64) -> (recv: bool)
     ensures
         recv == (wr_id & RECV_BIT != 0),
+    no_unwind
 {
     wr_id & RECV_BIT != 0
 }
@@ -117,6 +120,7 @@ pub fn wqe_of(wr_id: u64, retired: u64) -> (wqe: u64)
         forall|w: u64|
             retired <= w && w - retired < WQE_SPAN && w & WQE_MASK == wr_id & WQE_MASK ==> wqe
                 == w,
+    no_unwind
 {
     let wqe = retired.wrapping_add(wr_id.wrapping_sub(retired) & WQE_MASK);
     proof {

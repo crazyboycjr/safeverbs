@@ -96,7 +96,8 @@ impl<N: Nic> Context<N> {
     pub fn alloc_pd(&self) -> Result<Pd<N>> {
         static IDS: AtomicU64 = AtomicU64::new(1);
         let id = reserve_pd_id(&IDS)?;
-        let pd = self.nic.alloc_pd()?;
+        // SAFETY: the `Pd` keeps the device open, and everything that depends on it keeps the `Pd`.
+        let pd = unsafe { self.nic.alloc_pd() }?;
         Ok(Pd {
             inner: Arc::new(PdInner {
                 pd,

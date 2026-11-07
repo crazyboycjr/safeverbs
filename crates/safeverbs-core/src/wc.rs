@@ -55,6 +55,7 @@ impl Status {
     pub const fn is_ok(self) -> (ok: bool)
         ensures
             ok == (self.0 == 0),
+        no_unwind
     {
         self.0 == 0
     }
@@ -151,6 +152,7 @@ impl Opcode {
     pub(crate) const fn has_byte_len(self) -> (has: bool)
         ensures
             has == (self.0 == 2 || self.0 == 3 || self.0 == 4 || self.0 == 128 || self.0 == 129),
+        no_unwind
     {
         self.0 == 2 || self.0 == 3 || self.0 == 4 || self.0 == 128 || self.0 == 129
     }
@@ -159,6 +161,7 @@ impl Opcode {
     pub(crate) const fn is_receive(self) -> (recv: bool)
         ensures
             recv == (self.0 == 128 || self.0 == 129),
+        no_unwind
     {
         self.0 == 128 || self.0 == 129
     }
@@ -302,7 +305,9 @@ pub enum CompletionError {
 impl CompletionError {
     /// The status of the WQE that failed; `None` for a refused request, which
     /// no status describes.
-    pub const fn status(self) -> Option<Status> {
+    pub const fn status(self) -> Option<Status>
+        no_unwind
+    {
         match self {
             CompletionError::Failed { status, .. } => Some(status),
             CompletionError::Refused => None,
@@ -359,6 +364,7 @@ impl Wc {
                 else { safeverbs_spec::types::CompletionKind::StatusOnly },
             wc.outcome().byte_len == if opcode.0 == 2 || opcode.0 == 3 || opcode.0 == 4
                 || opcode.0 == 128 || opcode.0 == 129 { byte_len as nat } else { 0 },
+        no_unwind
     {
         let wc = Wc {
             wr_id: 0,
@@ -377,6 +383,7 @@ impl Wc {
     pub(crate) const fn is_ok(&self) -> (ok: bool)
         ensures
             ok == self.spec_ok(),
+        no_unwind
     {
         self.status.is_ok()
     }
@@ -391,6 +398,7 @@ impl Wc {
         ensures
             self.outcome().kind is WriteNotification && self.outcome().imm is None
                 || done.model() == self.outcome(),
+        no_unwind
     {
         let len = self.byte_len;
         if self.opcode.0 == 128 {
@@ -416,6 +424,7 @@ impl Wc {
             self.spec_ok(),
         ensures
             done == self.spec_received(),
+        no_unwind
     {
         let len = self.byte_len;
         if self.opcode.0 == 129 {
@@ -435,6 +444,7 @@ impl Wc {
     pub(crate) const fn failure(&self, position: u32) -> (error: CompletionError)
         ensures
             error == self.spec_failure(position),
+        no_unwind
     {
         CompletionError::Failed { status: self.status, vendor_err: self.vendor_err, position }
     }
@@ -442,7 +452,9 @@ impl Wc {
     /// What this completion reports on its own, for callers of the raw
     /// [`NicCq::poll`](crate::nic::NicCq::poll): a WQE that failed is at
     /// position 0, as it would be in a request of its own.
-    pub fn result(&self) -> Result<Completed, CompletionError> {
+    pub fn result(&self) -> Result<Completed, CompletionError>
+        no_unwind
+    {
         if self.is_ok() {
             Ok(self.completed())
         } else {

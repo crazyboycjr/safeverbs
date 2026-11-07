@@ -52,8 +52,25 @@ crates/safeverbs-core/src/buf/memory.rs ring_chunk
 crates/safeverbs-core/src/buf/memory.rs volatile_copy
 # The transport trait may bound the generics of a key (declared without specifications).
 crates/safeverbs-core/src/engine.rs ExTransport
-# `ManuallyDrop::deref_mut`, which vstd does not specify.
-crates/safeverbs-core/src/engine.rs hw_mut
+# An engine's hardware side, at the very end of it.
+crates/safeverbs-core/src/engine.rs hw_at_end
+# A transport's QP type, and that it completes in order.
+crates/safeverbs-core/src/engine.rs transport_of
+# A drain's clock: no meaning in M.
+crates/safeverbs-core/src/engine.rs DrainClock
+crates/safeverbs-core/src/engine.rs clock_start
+crates/safeverbs-core/src/engine.rs clock_renew
+crates/safeverbs-core/src/engine.rs clock_idle
+# Standard-library calls vstd does not say do not unwind.
+crates/safeverbs-core/src/trusted.rs vec_new
+crates/safeverbs-core/src/trusted.rs vec_with_capacity
+crates/safeverbs-core/src/trusted.rs vec_push
+crates/safeverbs-core/src/trusted.rs vec_pop
+crates/safeverbs-core/src/trusted.rs vec_clear
+crates/safeverbs-core/src/trusted.rs vec_truncate
+crates/safeverbs-core/src/trusted.rs element
+crates/safeverbs-core/src/trusted.rs element_mut
+crates/safeverbs-core/src/trusted.rs sub_slice
 # The NIC traits, declared without specifications (the wrappers carry them).
 crates/safeverbs-core/src/trusted.rs ExNic
 crates/safeverbs-core/src/trusted.rs ExNicQp
@@ -66,10 +83,15 @@ crates/safeverbs-core/src/trusted.rs connect
 crates/safeverbs-core/src/trusted.rs to_error
 crates/safeverbs-core/src/trusted.rs destroy_qp
 crates/safeverbs-core/src/trusted.rs destroy_cq
+# Handles and domains of no meaning in M.
+crates/safeverbs-core/src/trusted.rs clone_context
+crates/safeverbs-core/src/trusted.rs alloc_td
+crates/safeverbs-core/src/trusted.rs alloc_domain
 # Facts of no meaning in M, and the panic of a bad key.
 crates/safeverbs-core/src/trusted.rs qp_num_of
 crates/safeverbs-core/src/trusted.rs qp_lock_free
 crates/safeverbs-core/src/trusted.rs no_qp
+crates/safeverbs-core/src/trusted.rs no_context
 # PD identity and allocation/registration lifetime (the resource container is verified).
 crates/safeverbs-core/src/trusted.rs pd_id_of
 crates/safeverbs-core/src/trusted.rs same_device

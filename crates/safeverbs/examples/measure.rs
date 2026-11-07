@@ -90,14 +90,18 @@ struct RawSetup {
 
 fn raw_setup() -> RawSetup {
     let model = Model::new(7);
-    let pd = model.alloc_pd().unwrap();
-    let cq = model.create_cq(4 * DEPTH as u32, true).unwrap();
-    let mut a = model
-        .create_qp(&pd, None, &cq, &cq, QpType::Rc, &caps())
-        .unwrap();
-    let mut b = model
-        .create_qp(&pd, None, &cq, &cq, QpType::Rc, &caps())
-        .unwrap();
+    // SAFETY: the setup lives until the program ends.
+    let (pd, cq, mut a, mut b) = unsafe {
+        let pd = model.alloc_pd().unwrap();
+        let cq = model.create_cq(4 * DEPTH as u32, true).unwrap();
+        let a = model
+            .create_qp(&pd, None, &cq, &cq, QpType::Rc, &caps())
+            .unwrap();
+        let b = model
+            .create_qp(&pd, None, &cq, &cq, QpType::Rc, &caps())
+            .unwrap();
+        (pd, cq, a, b)
+    };
     let (an, bn) = (a.qp_num(), b.qp_num());
     let end = |qp_num| Endpoint {
         qp_num,

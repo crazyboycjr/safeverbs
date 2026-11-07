@@ -27,6 +27,7 @@ use crate::nic::{
 use crate::wc::{Opcode, Status, Wc};
 
 /// Linux's `ENOENT`: `ibv_start_poll` on an empty CQ.
+#[cfg(test)]
 const ENOENT: i32 = 2;
 
 /// The names of the RDMA devices of this host.
@@ -215,7 +216,6 @@ impl NicCq for VerbsCq {
             let mut attr = ffi::ibv_poll_cq_attr { comp_mask: 0 };
             let rc = ((*cq).start_poll.unwrap_unchecked())(cq, &mut attr);
             if rc != 0 {
-                debug_assert!(rc == ENOENT, "ibv_start_poll: {rc}");
                 return 0;
             }
             let mut n = 0;
@@ -549,7 +549,7 @@ unsafe impl Nic for Verbs {
         out
     }
 
-    fn alloc_pd(&self) -> Result<VerbsPd> {
+    unsafe fn alloc_pd(&self) -> Result<VerbsPd> {
         // SAFETY: a live context.
         let pd = unsafe { ffi::ibv_alloc_pd(self.ctx) };
         if pd.is_null() {
@@ -597,7 +597,7 @@ unsafe impl Nic for Verbs {
         Ok(())
     }
 
-    fn create_cq(&self, entries: u32, single_threaded: bool) -> Result<VerbsCq> {
+    unsafe fn create_cq(&self, entries: u32, single_threaded: bool) -> Result<VerbsCq> {
         // SAFETY: a live context and a filled attribute.
         unsafe {
             let mut attr: ffi::ibv_cq_init_attr_ex = zeroed();
@@ -621,7 +621,7 @@ unsafe impl Nic for Verbs {
         }
     }
 
-    fn alloc_td(&self) -> Option<VerbsTd> {
+    unsafe fn alloc_td(&self) -> Option<VerbsTd> {
         // SAFETY: a live context and a filled attribute.
         let td = unsafe {
             let mut attr = ffi::ibv_td_init_attr { comp_mask: 0 };
@@ -634,7 +634,7 @@ unsafe impl Nic for Verbs {
         }
     }
 
-    fn alloc_domain(&self, pd: &VerbsPd, td: &VerbsTd) -> Option<VerbsDomain> {
+    unsafe fn alloc_domain(&self, pd: &VerbsPd, td: &VerbsTd) -> Option<VerbsDomain> {
         // SAFETY: a live context, PD and thread domain, and a filled attribute.
         let parent = unsafe {
             let mut attr: ffi::ibv_parent_domain_init_attr = zeroed();
@@ -649,7 +649,7 @@ unsafe impl Nic for Verbs {
         }
     }
 
-    fn create_qp(
+    unsafe fn create_qp(
         &self,
         pd: &VerbsPd,
         domain: Option<&VerbsDomain>,

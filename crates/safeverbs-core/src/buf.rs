@@ -83,22 +83,21 @@ pub(crate) struct Region<N: Nic> {
 }
 
 impl<N: Nic> Region<N> {
-    /// Its allocation is the one `deallocation` frees.
+    /// Its allocation is the one `deallocation` frees, until it was freed, which leaves it no bytes.
+    #[verifier::type_invariant]
     closed spec fn inv(self) -> bool {
-        self.deallocation@ matches Some(d) && {
+        ||| self.size == 0
+        ||| (self.deallocation@ matches Some(d) && {
             &&& d.addr() == self.ptr.addr()
             &&& d.size() == self.size
             &&& d.align() == self.align
             &&& d.provenance() == self.ptr@.provenance
-        }
+        })
     }
 
     /// Allocates `size` zeroed bytes aligned to `align` and registers them in `pd` for local writes,
     /// or frees them.
-    fn allocated(pd: &Pd<N>, size: usize, align: usize) -> (r: Result<RawMut<N>>)
-        ensures
-            r matches Ok(whole) ==> (*whole.region).inv(),
-    {
+    fn allocated(pd: &Pd<N>, size: usize, align: usize) -> (r: Result<RawMut<N>>) {
         let (address, range, deallocation) = match memory::allocate(size, align) {
             Some(allocation) => allocation,
             None => return Err(Error::Os(ENOMEM)),
@@ -126,14 +125,22 @@ impl<N: Nic> Region<N> {
         }
     }
 
-    /// Its allocation goes back to the allocator, with the permissions split from it.
-    fn free_memory(&mut self)
-        requires
-            old(self).inv(),
-    {
+    /// Its allocation goes back to the allocator, with the permissions split from it. Its `Drop`
+    /// comes here once; a region without bytes has none to free.
+    #[cold]
+    #[inline(never)]
+    fn free_memory(&mut self) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        let size = self.size;
+        if size == 0 {
+            return;
+        }
         let raw = bytes_back(&*self);
+        self.size = 0;
         let tracked deallocation = self.deallocation.borrow_mut().tracked_take();
-        vstd::raw_ptr::deallocate(self.ptr, self.size, self.align, raw, Tracked(deallocation));
+        vstd::raw_ptr::deallocate(self.ptr, size, self.align, raw, Tracked(deallocation));
     }
 }
 
@@ -391,7 +398,7 @@ impl<T, N: Nic> BufMut<T, N> {
 
 /// Releases what it is given.
 #[inline]
-fn release<T>(_value: T) {
+pub(crate) fn release<T>(_value: T) {
 }
 
 /// A buffer of more bytes than one scatter/gather element holds, which is the program's error.
@@ -405,6 +412,18 @@ fn sge_too_long() -> ! {
 } // verus!
 
 verus! {
+
+/// What a request's WQE can send from: a [`Buf`], by value or by reference, or a [`BufView`]. A
+/// request keeps one reference to the frozen allocation its consecutive WQEs come from, so by
+/// reference they touch no reference count after the first.
+pub trait Lend<N: Nic>: Sized {
+    /// Its bytes, and what they belong to, with nothing touched.
+    #[doc(hidden)]
+    fn peek(&self) -> Peek<'_, N>;
+    /// One scatter/gather element, keeping its allocation alive.
+    #[doc(hidden)]
+    fn lend(self) -> Part<N>;
+}
 
 impl<N: Nic> BufMut<u8, N> {
     /// Bytes, as a buffer of bytes.
@@ -759,18 +778,6 @@ impl<T, N: Nic> Buf<T, N> {
     {
         U::try_ref_from_bytes(self.as_bytes()).ok()
     }
-}
-
-/// What a request's WQE can send from: a [`Buf`], by value or by reference, or a [`BufView`]. A
-/// request keeps one reference to the frozen allocation its consecutive WQEs come from, so by
-/// reference they touch no reference count after the first.
-pub trait Lend<N: Nic> {
-    /// Its bytes, and what they belong to, with nothing touched.
-    #[doc(hidden)]
-    fn peek(&self) -> Peek<'_, N>;
-    /// One scatter/gather element, keeping its allocation alive.
-    #[doc(hidden)]
-    fn lend(self) -> Part<N>;
 }
 
 impl<U: IntoBytes + Immutable, N: Nic> Lend<N> for Buf<U, N> {

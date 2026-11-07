@@ -330,6 +330,9 @@ pub struct ConnectAttr {
 /// released if deregistration fails. Associated queue methods must honor their
 /// documented posting, cancellation and completion contracts, including
 /// rejecting invalid remote descriptors rather than accessing arbitrary process memory.
+/// No method of a backend or its resources, `Drop` included, may unwind: verified code calls them
+/// with its invariants open (`scripts/trusted.txt`), and whether an engine can be used after a
+/// panic rests on it.
 /// A backend is part of the trusted boundary even when its implementation is software.
 pub unsafe trait Nic: Send + Sync + Sized + 'static {
     /// A protection domain.
@@ -360,7 +363,11 @@ pub unsafe trait Nic: Send + Sync + Sized + 'static {
     fn gids(&self, port: u8) -> Vec<GidEntry>;
 
     /// Allocates a protection domain.
-    fn alloc_pd(&self) -> Result<Self::Pd>;
+    ///
+    /// # Safety
+    ///
+    /// The device must outlive it, and its regions and QPs must go before it.
+    unsafe fn alloc_pd(&self) -> Result<Self::Pd>;
 
     /// Registers `len` bytes at `addr` in `pd` with `access`.
     ///
@@ -401,22 +408,39 @@ pub unsafe trait Nic: Send + Sync + Sized + 'static {
 
     /// Creates a completion queue of at least `entries` entries, polled by
     /// one thread at a time when `single_threaded`.
-    fn create_cq(&self, entries: u32, single_threaded: bool) -> Result<Self::Cq>;
+    ///
+    /// # Safety
+    ///
+    /// The device must outlive it, and the QPs on it must go before it. Their depths must not
+    /// exceed its entries, and if `single_threaded` it must be polled by one thread at a time.
+    unsafe fn create_cq(&self, entries: u32, single_threaded: bool) -> Result<Self::Cq>;
 
     /// Allocates a thread domain; `None` where the device has none (rxe).
-    fn alloc_td(&self) -> Option<Self::Td>;
+    ///
+    /// # Safety
+    ///
+    /// The device must outlive it.
+    unsafe fn alloc_td(&self) -> Option<Self::Td>;
 
     /// Allocates a parent domain over `pd` and `td` (with it, mlx5 drops the locks of the QPs
-    /// created there); `None` if the device refuses. It must be dropped before `pd` and `td`,
-    /// and after the QPs created on it.
-    fn alloc_domain(&self, pd: &Self::Pd, td: &Self::Td) -> Option<Self::Domain>;
+    /// created there); `None` if the device refuses.
+    ///
+    /// # Safety
+    ///
+    /// It must be dropped before `pd` and `td`, and after the QPs created on it.
+    unsafe fn alloc_domain(&self, pd: &Self::Pd, td: &Self::Td) -> Option<Self::Domain>;
 
     /// Creates a QP in `pd` with its queues on the two CQs (they may be the
     /// same). On `domain`, which must be over `pd`, the driver may skip its
     /// own locks: the caller serializes every use of the QP and of the
     /// other QPs of the domain. If the device refuses a QP on the domain,
     /// it is created without.
-    fn create_qp(
+    ///
+    /// # Safety
+    ///
+    /// The device, `pd`, `domain` and the CQs must outlive it. The CQs must have room for every
+    /// completion its queues may produce, on top of the other QPs on them.
+    unsafe fn create_qp(
         &self,
         pd: &Self::Pd,
         domain: Option<&Self::Domain>,

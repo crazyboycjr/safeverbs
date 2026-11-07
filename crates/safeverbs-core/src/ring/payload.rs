@@ -181,6 +181,7 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
             old(self).staged(seq as int) matches Some(r) ==> given_up.0 == r.leases.ctx,
             old(self).refused(seq as int) matches Some(p) ==> given_up.0 == p.ctx,
             final(self).gave_up(old(self), seq as int),
+        no_unwind
     {
         proof {
             self.lemma_state_views(seq as int);

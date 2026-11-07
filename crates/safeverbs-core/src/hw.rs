@@ -62,7 +62,8 @@
     clippy::manual_map,
     clippy::explicit_counter_loop,
     clippy::question_mark,
-    clippy::needless_return
+    clippy::needless_return,
+    clippy::let_and_return
 )]
 
 use safeverbs_spec::nic::*;
@@ -73,7 +74,9 @@ use safeverbs_spec::share::*;
 use safeverbs_spec::types::{CqId, Key, PdId, QpId};
 use vstd::prelude::*;
 
-use crate::buf::{BufError, Kept, Lease, Leases, Part, capacity_of, forget_free};
+use core::mem::ManuallyDrop;
+
+use crate::buf::{BufError, Kept, Lease, Leases, Part, capacity_of, forget_free, replace_value};
 use crate::error::{Error, Result};
 use crate::nic::{
     ConnectAttr, DeviceCaps, Endpoint, Nic as Device, NicCq, NicQp, QpCaps, QpType, Sge, WrOp,
@@ -95,6 +98,7 @@ pub mod refines;
 mod send_outcomes;
 mod separation;
 
+pub(crate) use open::Writing;
 pub use open::{OpenRequest, OpenWqe};
 #[cfg(verus_keep_ghost)]
 use open::{lemma_sges_len_one, parts_sges};
@@ -260,18 +264,22 @@ pub struct LetGo<C> {
 
 impl<C> LetGo<C> {
     /// Nothing yet.
-    pub(crate) fn new() -> Self {
-        LetGo { wr_ids: Vec::new(), wakers: Vec::new() }
+    pub(crate) fn new() -> Self
+        no_unwind
+    {
+        LetGo { wr_ids: vec_new(), wakers: vec_new() }
     }
 
     /// What giving up one request let go of.
-    fn keep(&mut self, ctx: Option<C>, waker: Option<core::task::Waker>) {
+    fn keep(&mut self, ctx: Option<C>, waker: Option<core::task::Waker>)
+        no_unwind
+    {
         match ctx {
-            Some(ctx) => self.wr_ids.push(ctx),
+            Some(ctx) => vec_push(&mut self.wr_ids, ctx),
             None => {},
         }
         match waker {
-            Some(waker) => self.wakers.push(waker),
+            Some(waker) => vec_push(&mut self.wakers, waker),
             None => {},
         }
     }
@@ -283,7 +291,8 @@ impl<C> LetGo<C> {
 pub struct Hw<C, N: Device> {
     /// What giving up requests let go of, until it is taken.
     let_go: LetGo<C>,
-    cq: N::Cq,
+    /// Destroyed by hand, by [`Hw::finish`], or never, if a QP on it is kept.
+    cq: ManuallyDrop<N::Cq>,
     /// The device, alive as long as the CQ is.
     ctx: Context<N>,
     caps: DeviceCaps,
@@ -308,6 +317,7 @@ pub struct Hw<C, N: Device> {
     cq_size: u32,
     /// CQ entries reserved by the QPs attached.
     reserved: u32,
+    #[allow(dead_code)]
     token: Tracked<NicToken>,
     /// The next QP name to use (`NicToken::name`).
     next_name: Ghost<nat>,
@@ -934,7 +944,7 @@ impl<C, N: Device> Hw<C, N> {
     /// the token's share, names and writing).
     pub closed spec fn inv_with(&self, t: NicToken, m: Nic::State) -> bool {
         let sh = t.share();
-        &&& cq_of(self.cq) == sh.cq
+        &&& cq_of(self.cq@) == sh.cq
         &&& m.cqs[sh.cq].cap == self.cq_size
         &&& m.cqs[sh.cq].reserved.len() == self.reserved
         &&& self.reserved <= self.cq_size
@@ -958,6 +968,17 @@ impl<C, N: Device> Hw<C, N> {
         } else {
             None
         }
+    }
+
+    /// A new engine, on a device just opened some time ago.
+    pub closed spec fn born(&self) -> bool {
+        exists|m0: Nic::State| nic_init(m0) && #[trigger] self.born_from(m0)
+    }
+
+    /// QP `index` is still there, with the buffers its requests hold: the keeping of a QP the device
+    /// did not flush.
+    pub closed spec fn keeps_qp(&self, index: int) -> bool {
+        self.has_qp(index)
     }
 
     /// QP `index` is in the table.
@@ -1468,7 +1489,7 @@ impl<C, N: Device> Hw<C, N> {
     proof fn lemma_inv_fields(&self, other: &Self, t: NicToken, m: Nic::State)
         requires
             other.inv_with(t, m),
-            cq_of(self.cq) == cq_of(other.cq),
+            cq_of(self.cq@) == cq_of(other.cq@),
             self.caps == other.caps,
             self.qps@ == other.qps@,
             self.cq_size == other.cq_size,
@@ -1483,8 +1504,7 @@ impl<C, N: Device> Hw<C, N> {
     /// An engine's hardware side on the device of `ctx`, with a CQ of `cq_size` entries.
     pub fn new(ctx: Context<N>, cq_size: u32) -> (r: Result<Hw<C, N>>)
         ensures
-            r matches Ok(hw) ==> hw.inv() && hw.spec_reserved() == 0 && hw.spec_cq_size() == cq_size
-                && exists|m0: Nic::State| nic_init(m0) && #[trigger] hw.born_from(m0),
+            r matches Ok(hw) ==> hw.inv() && hw.spec_reserved() == 0 && hw.spec_cq_size() == cq_size && hw.born(),
     {
         let caps = device_caps(&ctx);
         if cq_size == 0 || cq_size > caps.max_cqe {
@@ -1502,7 +1522,7 @@ impl<C, N: Device> Hw<C, N> {
         }
         let hw = Hw {
             let_go: LetGo::new(),
-            cq,
+            cq: ManuallyDrop::new(cq),
             ctx,
             caps,
             qps: Vec::new(),
@@ -1550,6 +1570,7 @@ impl<C, N: Device> Hw<C, N> {
     pub fn reserved(&self) -> (n: u32)
         ensures
             n == self.spec_reserved(),
+        no_unwind
     {
         self.reserved
     }
@@ -1558,12 +1579,15 @@ impl<C, N: Device> Hw<C, N> {
     pub fn cq_size(&self) -> (n: u32)
         ensures
             n == self.spec_cq_size(),
+        no_unwind
     {
         self.cq_size
     }
 
     /// The device.
-    pub fn context(&self) -> &Context<N> {
+    pub fn context(&self) -> &Context<N>
+        no_unwind
+    {
         &self.ctx
     }
 
@@ -1571,12 +1595,16 @@ impl<C, N: Device> Hw<C, N> {
 
 impl<C, N: Device> Hw<C, N> {
     #[verifier::spinoff_prover]
+    #[verifier::rlimit(30)]
     pub fn create_qp(&mut self, pd: &Pd<N>, domain: Option<&N::Domain>, qp_type: QpType, caps: QpCaps, max_batch: u32) -> (r: Result<usize>)
         requires
             old(self).inv(),
+            domain matches Some(d) ==> domain_over(*d) == pd_id(*pd),
         ensures
             final(self).inv(),
             final(self).moved_from(old(self)),
+            r matches Ok(index) ==> index < MAX_QPS,
+        no_unwind
     {
         let dev = self.caps;
         if caps.max_send_wr == 0 || caps.max_recv_wr == 0 {
@@ -1710,17 +1738,17 @@ impl<C, N: Device> Hw<C, N> {
             qp_type,
             pd: clone_pd(pd),
             id: Ghost(q),
-            spare_wqes: Vec::new(),
-            spare_sges: Vec::new(),
-            spare_leases: Vec::new(),
-            building: Vec::new(),
+            spare_wqes: vec_new(),
+            spare_sges: vec_new(),
+            spare_leases: vec_new(),
+            building: vec_new(),
             send_tails: Ghost(Map::empty()),
         };
         let ghost before = *self;
         if index == self.qps.len() {
-            self.qps.push(Some(entry));
+            vec_push(&mut self.qps, Some(entry));
         } else {
-            self.qps.set(index, Some(entry));
+            let _none = replace_value(&mut self.qps[index], Some(entry));
         }
         self.reserved += need as u32;
         self.next_name = Ghost(self.next_name@ + 1);
@@ -1959,7 +1987,7 @@ impl<C, N: Device> Hw<C, N> {
             self.qps@[index] is Some,
             self.qps@[index]->0.same_config(start.qps@[index]->0),
             self.entry_ok(index, t, n),
-            cq_of(self.cq) == cq_of(start.cq),
+            cq_of(self.cq@) == cq_of(start.cq@),
             self.caps == start.caps,
             self.cq_size == start.cq_size,
             self.reserved == start.reserved,
@@ -2021,9 +2049,9 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         if index >= self.qps.len() {
-            no_qp(index);
             return Err(Error::Invalid("no such QP"));
         }
         let ghost start = *self;
@@ -2035,9 +2063,6 @@ impl<C, N: Device> Hw<C, N> {
         }
         let r = match &mut self.qps[index] {
             Some(e) => {
-                if e.removed {
-                    no_qp(index);
-                }
                 let ghost q = e.id();
                 let r = to_error(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                 if r.is_ok() {
@@ -2047,8 +2072,10 @@ impl<C, N: Device> Hw<C, N> {
                 r
             },
             None => {
-                no_qp(index);
-                Err(Error::Invalid("no such QP"))
+                proof {
+                    assert(self.qps@ =~= start.qps@);
+                }
+                return Err(Error::Invalid("no such QP"));
             },
         };
         proof {
@@ -2178,9 +2205,9 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         if index >= self.qps.len() {
-            no_qp(index);
             return Err(Error::Invalid("no such QP"));
         }
         let ghost start = *self;
@@ -2199,9 +2226,6 @@ impl<C, N: Device> Hw<C, N> {
         }
         let r = match &mut self.qps[index] {
             Some(e) => {
-                if e.removed {
-                    no_qp(index);
-                }
                 let ghost q = e.id();
                 proof {
                     assert(phase_ok(e.phase, m0.qps[q].state));
@@ -2216,7 +2240,6 @@ impl<C, N: Device> Hw<C, N> {
                 r
             },
             None => {
-                no_qp(index);
                 Err(Error::Invalid("no such QP"))
             },
         };
@@ -2295,6 +2318,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             r matches Ok(Err(refused)) ==> refused.ctx == ctx,
             r matches Err((back, c)) ==> back == part && c == ctx,
+        no_unwind
     {
         #[cfg(verus_keep_ghost)]
         let part = part.separate_from_table(&*self);
@@ -2328,7 +2352,7 @@ impl<C, N: Device> Hw<C, N> {
                         let sge = part_sge_of(&part);
                         let wqe = e.recv.next_wqe();
                         let id = wr_id(index as u16, true, wqe);
-                        let sges = [sge];
+                        let sges = one_of(&sge);
                         let ghost part_of_one = part;
                         // The slot first: from then on it keeps the memory alive.
                         let mut leases = Leases::one(part, Ghost(safeverbs_spec::abs::Dir::In));
@@ -2354,7 +2378,7 @@ impl<C, N: Device> Hw<C, N> {
                         }
                         e.recv.fill(1, detached, implied, payload);
                         let ghost filled = e.recv;
-                        match post_recv(&mut e.hw, id, &sges, Ghost(q), Tracked(self.token.borrow_mut())) {
+                        match post_recv(&mut e.hw, id, sges, Ghost(q), Tracked(self.token.borrow_mut())) {
                             Ok(()) => {
                                 let seq = e.recv.stage_filled(1, true);
                                 let ghost staged = e.recv;
@@ -2430,7 +2454,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& id == spec_wr_id(index as u16, true, e0.recv.spec_wqe_posted())
                 &&& ledger_has(resource.leases, id, None, wr.sges)
             }),
-            cq_of(self.cq) == t1.share().cq,
+            cq_of(self.cq@) == t1.share().cq,
             self.caps == start.caps,
             self.cq_size == start.cq_size,
             self.reserved == start.reserved,
@@ -2556,7 +2580,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& e.recv.inv()
                 &&& e.recv.same_but_free(&e0.recv)
             }),
-            cq_of(self.cq) == t1.share().cq,
+            cq_of(self.cq@) == t1.share().cq,
             self.caps == start.caps,
             self.cq_size == start.cq_size,
             self.reserved == start.reserved,
@@ -2591,9 +2615,9 @@ impl<C, N: Device> Hw<C, N> {
         ensures
             *final(self) == *old(self),
             r.ctx == ctx,
+        no_unwind
     {
         if index >= self.qps.len() {
-            no_qp(index);
             return Refusal { error: Error::Invalid("no such QP"), ctx, leases: Leases::one(part, Ghost(safeverbs_spec::abs::Dir::Out)) };
         }
         proof {
@@ -2601,9 +2625,6 @@ impl<C, N: Device> Hw<C, N> {
         }
         let error = match &self.qps[index] {
             Some(e) => {
-                if e.removed {
-                    no_qp(index);
-                }
                 if !matches!(e.phase, Phase::Ready) {
                     Error::NotConnected
                 } else if part_pd_of(&part) != e.pd_id {
@@ -2617,7 +2638,6 @@ impl<C, N: Device> Hw<C, N> {
                 }
             },
             None => {
-                no_qp(index);
                 Error::Invalid("no such QP")
             },
         };
@@ -2661,6 +2681,7 @@ impl<C, N: Device> Hw<C, N> {
             table_ok(final(qps)@, name, t, m, pending.drop_first()),
             same_qps(final(qps)@, old(qps)@),
             refines::linked(final(qps)@, m, g),
+        no_unwind
     {
         let ghost start = qps@;
         proof {
@@ -2693,8 +2714,8 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
-        let mut wakes = WakeBatch::new();
         let ghost start = *self;
         let mut n = self.polled_len - self.polled_at;
         while self.polled_at < self.polled_len
@@ -2712,7 +2733,7 @@ impl<C, N: Device> Hw<C, N> {
             }
             let ghost qps = self.qps@;
             let ghost before = *self;
-            Self::dispatch(&mut self.qps, &self.polled[self.polled_at], &mut wakes, Ghost(self.next_name@), Ghost(self.token@), Ghost(self.token@.nic()), Ghost(self.pending@), Ghost(self.refined@));
+            Self::dispatch(&mut self.qps, &self.polled[self.polled_at], &mut self.panics, Ghost(self.next_name@), Ghost(self.token@), Ghost(self.token@.nic()), Ghost(self.pending@), Ghost(self.refined@));
             self.polled_at += 1;
             self.pending = Ghost(self.pending@.drop_first());
             proof {
@@ -2754,7 +2775,7 @@ impl<C, N: Device> Hw<C, N> {
                 self.polled_at == 0,
                 self.polled_len == 0,
                 self.pending@.len() == 0,
-                cq_of(self.cq) == t.share().cq,
+                cq_of(self.cq@) == t.share().cq,
                 m.cqs[t.share().cq].cap == self.cq_size,
                 m.cqs[t.share().cq].reserved.len() == self.reserved,
                 self.reserved <= self.cq_size,
@@ -2771,7 +2792,7 @@ impl<C, N: Device> Hw<C, N> {
             }
             let ghost qps = self.qps@;
             let ghost before = *self;
-            Self::dispatch(&mut self.qps, &self.polled[i], &mut wakes, Ghost(self.next_name@), Ghost(t), Ghost(m), Ghost(cqes.skip(i as int)), Ghost(self.refined@));
+            Self::dispatch(&mut self.qps, &self.polled[i], &mut self.panics, Ghost(self.next_name@), Ghost(t), Ghost(m), Ghost(cqes.skip(i as int)), Ghost(self.refined@));
             i += 1;
             proof {
                 completion::lemma_same_qps_trans(self.qps@, qps, start.qps@);
@@ -2784,7 +2805,6 @@ impl<C, N: Device> Hw<C, N> {
         // Results wait in the rings, if the event loop wants them.
         self.kept = true;
         self.kept_at = 0;
-        wakes.finish();
         n
     }
 
@@ -2801,6 +2821,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         if self.polled_at < self.polled_len || self.kept {
             return 0;
@@ -2841,6 +2862,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).keeps_requests(old(self)),
             final(self).moved_from(old(self)),
             r matches Some(c) ==> old(self).hands_out(c),
+        no_unwind
     {
         let ghost start = *self;
         proof {
@@ -2956,9 +2978,6 @@ impl<C, N: Device> Hw<C, N> {
                 return kept;
             }
         }
-        if self.panics.pending() {
-            self.resume_panics();
-        }
         None
     }
 
@@ -2993,6 +3012,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).pending@.len() < old(self).pending@.len()
                 || (final(self).pending@ == old(self).pending@ && final(self).walk_to_go() < old(self).walk_to_go()),
             r matches Some(c) ==> old(self).hands_out(c),
+        no_unwind
     {
         let ghost pre = *self;
         let ghost y = pre.qps@[index as int]->0;
@@ -3063,18 +3083,28 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// Resumes the first panic of a waker the event loop's path ran.
+    /// Whether a waker it ran panicked, and the panic waits for the engine to resume it.
+    #[inline(always)]
+    pub fn panicked(&self) -> (panicked: bool)
+        no_unwind
+    {
+        self.panics.pending()
+    }
+
+    /// The panics of the wakers it ran, to resume once the engine is let go of: nothing resumes
+    /// while the invariant may not hold.
     #[cold]
     #[inline(never)]
-    fn resume_panics(&mut self)
+    pub(crate) fn take_panics(&mut self) -> (panics: WakeBatch)
         requires
             old(self).inv(),
         ensures
-            *final(self) == (Hw { panics: final(self).panics, ..*old(self) }),
+            final(self).inv(),
+            final(self).same_table(old(self)),
+            final(self).moved_from(old(self)),
+        no_unwind
     {
-        let mut panics = WakeBatch::new();
-        core::mem::swap(&mut panics, &mut self.panics);
-        panics.finish();
+        replace_value(&mut self.panics, WakeBatch::new())
     }
 
     /// Where the event loop looks for results is as it was.
@@ -3095,6 +3125,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).keeps_requests(old(self)),
             final(self).moved_from(old(self)),
             r matches Some(c) ==> old(self).hands_out(c),
+        no_unwind
     {
         let ghost start = *self;
         proof {
@@ -3415,10 +3446,10 @@ impl<C, N: Device> Hw<C, N> {
             r matches Err((_, Some(kept))) ==> kept.leases.inv() && kept.leases.fully_recorded(),
             r matches Err((_, kept)) ==> (keep matches Some(seq) ==> (old(self).staged_ctx(index as int, seq as int) matches Some(ctx)
                 ==> (kept matches Some(payload) && payload.ctx == ctx))),
+        no_unwind
     {
         if index >= self.qps.len() {
-            no_qp(index);
-            return Ok(());
+            return Err((Error::Invalid("no such QP"), None));
         }
         let ghost start = *self;
         let ghost t0 = self.token@;
@@ -3478,12 +3509,11 @@ impl<C, N: Device> Hw<C, N> {
                     Error::NotConnected
                 };
                 // Only a refused doorbell wakes anyone, its staged requests' wakers;
-                // a waker's panic resumes once the bookkeeping is done.
-                let mut wakes = WakeBatch::new();
+                // a waker's panic resumes once the engine is let go of.
                 let kept = match keep {
-                    Some(seq) => e.send.abort_keeping_with_wakes(seq, &mut wakes),
+                    Some(seq) => e.send.abort_keeping_with_wakes(seq, &mut self.panics),
                     None => {
-                        e.send.abort_with_wakes(&mut wakes);
+                        e.send.abort_with_wakes(&mut self.panics);
                         None
                     },
                 };
@@ -3510,12 +3540,13 @@ impl<C, N: Device> Hw<C, N> {
                     g2.lemma_extends_trans(g1, start.refined@);
                     self.refined@ = g2;
                 }
-                wakes.finish();
                 Err((refused, kept))
             },
             None => {
-                no_qp(index);
-                Ok(())
+                proof {
+                    assert(self.qps@ =~= start.qps@);
+                }
+                Err((Error::Invalid("no such QP"), None))
             },
         }
     }
@@ -3530,6 +3561,7 @@ impl<C, N: Device> Hw<C, N> {
     /// [`Hw::post_one_slow`] sorts all that out, as a request of the general kind.
     #[inline(always)]
     #[verifier::spinoff_prover]
+    #[verifier::rlimit(30)]
     pub fn post_one(&mut self, index: usize, op: WrOp, part: Part<N>, ctx: Option<C>, signal: bool, ring: bool) -> (r: core::result::Result<core::result::Result<RingSeq, Refusal<C, N>>, Unposted<C, N>>)
         requires
             old(self).inv(),
@@ -3539,6 +3571,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             r matches Ok(Err(refused)) ==> refused.ctx == ctx,
             r matches Err(back) ==> back.op == op && back.part == part && back.ctx == ctx,
+        no_unwind
     {
         #[cfg(verus_keep_ghost)]
         let part = part.separate_from_table(&*self);
@@ -3578,7 +3611,7 @@ impl<C, N: Device> Hw<C, N> {
                         }
                         let id = wr_id(index as u16, false, e.send.next_wqe());
                         let signaled = signal || e.send.must_signal(1);
-                        let sges = [sge];
+                        let sges = one_of(&sge);
                         // The slot first: from then on it keeps the memory alive.
                         let mut leases = Leases::one(part, Ghost(if op_writes_local(op) { safeverbs_spec::abs::Dir::In } else { safeverbs_spec::abs::Dir::Out }));
                         let ghost entry = crate::buf::WqeLoans {
@@ -3605,7 +3638,7 @@ impl<C, N: Device> Hw<C, N> {
                         if ring || !e.started {
                             crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                         }
-                        post(&mut e.hw, id, signaled, &op, &sges, Ghost(q), Tracked(self.token.borrow_mut()));
+                        post(&mut e.hw, id, signaled, &op, sges, Ghost(q), Tracked(self.token.borrow_mut()));
                         if ring {
                             let ghost t3 = self.token@;
                             proof {
@@ -3723,7 +3756,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& implied is Ok
                 &&& implied matches Ok(done) ==> wr.opcode.allows_outcome(total_len(wr.sges), done.model())
             }),
-            cq_of(self.cq) == t1.share().cq,
+            cq_of(self.cq@) == t1.share().cq,
             self.caps == start.caps,
             self.cq_size == start.cq_size,
             self.reserved == start.reserved,
@@ -3804,6 +3837,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             r matches Err(refused) ==> refused.ctx == unposted.ctx,
+        no_unwind
     {
         let ghost start = *self;
         let op = unposted.op;
@@ -3891,6 +3925,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             r matches Err(refused) ==> (old(self).staged_ctx(index as int, seq as int) matches Some(ctx) ==> refused.ctx == ctx),
+        no_unwind
     {
         match self.commit(index, Some(seq)) {
             Ok(()) => Ok(seq),
@@ -3917,7 +3952,8 @@ impl<C, N: Device> Hw<C, N> {
     /// WQE, or the queue no room for them, or the QP does not take what it was written for, `ctx`
     /// back. It goes out at the next doorbell.
     #[verifier::spinoff_prover]
-    pub fn close(&mut self, index: usize, open: &mut OpenRequest<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
+    #[verifier::rlimit(30)]
+    pub fn close(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -3925,9 +3961,11 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            final(open).inv(),
             final(open).same_fields(old(open)),
             r matches Err(back) ==> back == ctx,
             r matches Ok(seq) ==> final(self).staged_ctx(index as int, seq as int) == Some(ctx),
+        no_unwind
     {
         let n = open.n;
         if n == 0 || index >= self.qps.len() {
@@ -4061,7 +4099,7 @@ impl<C, N: Device> Hw<C, N> {
                 if many {
                     e.send.take_general_path(seq);
                 }
-                open.gathered.clear();
+                vec_clear(&mut open.gathered);
                 proof {
                     let t = self.token@;
                     let view = crate::ring::ReqView::new(detached, resource);
@@ -4088,7 +4126,7 @@ impl<C, N: Device> Hw<C, N> {
     /// has its WQEs say so one by one: they are collected too, and the doorbell is refused.
     #[inline(always)]
     #[verifier::spinoff_prover]
-    pub fn open_request(&mut self, index: usize) -> (open: OpenRequest<N>)
+    pub fn open_request(&mut self, index: usize) -> (open: Writing<N>)
         requires
             old(self).inv(),
         ensures
@@ -4097,6 +4135,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             open.inv(),
             open.has_no_wqe(),
+        no_unwind
     {
         if index < self.qps.len() {
             let ghost start = *self;
@@ -4106,16 +4145,16 @@ impl<C, N: Device> Hw<C, N> {
             match &mut self.qps[index] {
                 Some(e) => {
                     if e.spare_wqes.len() > 0 {
-                        let mut wqes = Vec::new();
+                        let mut wqes = vec_new();
                         core::mem::swap(&mut wqes, &mut e.spare_wqes);
-                        let open = OpenRequest {
+                        let open = Writing {
                             wqes,
                             n: 0,
                             limit: e.open_limit(),
                             max_len: e.max_len,
                             pd_id: e.pd_id,
                             kept: Kept::new(),
-                            gathered: Vec::new(),
+                            gathered: vec_new(),
                             reads: false,
                             max_sges: 1,
                             ledger: Ghost(Seq::empty()),
@@ -4144,13 +4183,14 @@ impl<C, N: Device> Hw<C, N> {
     /// [`Hw::open_request`] on a QP whose storage is out, or not made yet.
     #[cold]
     #[inline(never)]
-    fn open_request_other(&mut self, index: usize) -> (open: OpenRequest<N>)
+    fn open_request_other(&mut self, index: usize) -> (open: Writing<N>)
         requires
             old(self).inv(),
         ensures
             *final(self) == *old(self),
             open.inv(),
             open.has_no_wqe(),
+        no_unwind
     {
         if index < self.qps.len() {
             proof {
@@ -4159,7 +4199,7 @@ impl<C, N: Device> Hw<C, N> {
             match &self.qps[index] {
                 Some(e) => {
                     let max = e.send.max_wqes() as usize;
-                    let mut wqes = Vec::with_capacity(max);
+                    let mut wqes = vec_with_capacity(max);
                     let mut i = 0;
                     while i < max
                         invariant
@@ -4167,17 +4207,17 @@ impl<C, N: Device> Hw<C, N> {
                             wqes@.len() == i,
                         decreases max - i,
                     {
-                        wqes.push(open::EMPTY_WQE);
+                        vec_push(&mut wqes, open::EMPTY_WQE);
                         i += 1;
                     }
-                    return OpenRequest {
+                    return Writing {
                         wqes,
                         n: 0,
                         limit: e.open_limit(),
                         max_len: e.max_len,
                         pd_id: e.pd_id,
                         kept: Kept::new(),
-                        gathered: Vec::new(),
+                        gathered: vec_new(),
                         reads: false,
                         max_sges: 1,
                         ledger: Ghost(Seq::empty()),
@@ -4186,14 +4226,14 @@ impl<C, N: Device> Hw<C, N> {
                 None => {},
             }
         }
-        OpenRequest::closed()
+        Writing::closed()
     }
 
     /// What `open` keeps from QP `index` goes back there for the next request, if it has no WQE:
     /// the WQEs it has stay where they are, to go out or to be dropped with it.
     #[inline(always)]
     #[verifier::spinoff_prover]
-    pub fn give_back(&mut self, index: usize, open: &mut OpenRequest<N>)
+    pub fn give_back(&mut self, index: usize, open: &mut Writing<N>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4203,6 +4243,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             final(open).inv(),
             forall|seq: int| #[trigger] final(self).staged_ctx(index as int, seq) == old(self).staged_ctx(index as int, seq),
+        no_unwind
     {
         if open.n == 0 && index < self.qps.len() {
             let ghost start = *self;
@@ -4234,7 +4275,7 @@ impl<C, N: Device> Hw<C, N> {
 
     /// [`Hw::close`], first waiting for room (this polls the CQ).
     #[verifier::spinoff_prover]
-    pub fn close_waiting(&mut self, index: usize, open: &mut OpenRequest<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
+    pub fn close_waiting(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4244,6 +4285,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             final(open).inv(),
             r matches Err(back) ==> back == ctx,
+        no_unwind
     {
         let ghost start = *self;
         if open.n > 0 && !self.open_fits(index, open) && self.open_belongs(index, open) {
@@ -4267,7 +4309,7 @@ impl<C, N: Device> Hw<C, N> {
     /// its buffers come back.
     #[inline]
     #[verifier::spinoff_prover]
-    pub fn submit_open(&mut self, index: usize, open: &mut OpenRequest<N>, signal: bool, ctx: C) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
+    pub fn submit_open(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: C) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4277,6 +4319,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             final(open).inv(),
             r matches Err(refused) ==> refused.ctx == Some(ctx),
+        no_unwind
     {
         let ghost start = *self;
         match self.close(index, open, signal, Some(ctx)) {
@@ -4306,7 +4349,7 @@ impl<C, N: Device> Hw<C, N> {
     #[cold]
     #[inline(never)]
     #[verifier::spinoff_prover]
-    fn submit_open_other(&mut self, index: usize, open: &mut OpenRequest<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
+    fn submit_open_other(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4316,6 +4359,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             final(open).inv(),
             r matches Err(refused) ==> refused.ctx == ctx,
+        no_unwind
     {
         let ghost start = *self;
         if open.is_empty() {
@@ -4378,13 +4422,12 @@ impl<C, N: Device> Hw<C, N> {
     pub fn hand_back_leases(&mut self, index: usize, leases: &mut Leases<N>)
         requires
             old(self).inv(),
-            old(leases).inv(),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
-            final(leases).inv(),
             final(leases).uniques() == old(leases).uniques(),
+        no_unwind
     {
         if index < self.qps.len() {
             let ghost start = *self;
@@ -4416,6 +4459,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         let mut let_go = LetGo::new();
         core::mem::swap(&mut let_go, &mut self.let_go);
@@ -4424,9 +4468,10 @@ impl<C, N: Device> Hw<C, N> {
 
     /// Whether `open` can be closed now on QP `index`: its WQEs fit in the queue.
     #[inline(always)]
-    pub fn open_fits(&self, index: usize, open: &OpenRequest<N>) -> (fits: bool)
+    pub fn open_fits(&self, index: usize, open: &Writing<N>) -> (fits: bool)
         requires
             self.inv(),
+        no_unwind
     {
         if index < self.qps.len() {
             proof {
@@ -4442,12 +4487,13 @@ impl<C, N: Device> Hw<C, N> {
     }
 
     /// Whether QP `index` takes what `open` was written for.
-    fn open_belongs(&self, index: usize, open: &OpenRequest<N>) -> (belongs: bool)
+    fn open_belongs(&self, index: usize, open: &Writing<N>) -> (belongs: bool)
         requires
             self.inv(),
             open.inv(),
         ensures
             belongs ==> self.has_qp(index as int) && self.qps@[index as int]->0.spec_takes(*open),
+        no_unwind
     {
         if index < self.qps.len() {
             proof {
@@ -4465,7 +4511,7 @@ impl<C, N: Device> Hw<C, N> {
 
 impl<C, N: Device> HwQp<C, N> {
     /// It takes what `open` was written for, see [`HwQp::takes`].
-    spec fn spec_takes(&self, open: OpenRequest<N>) -> bool {
+    spec fn spec_takes(&self, open: Writing<N>) -> bool {
         &&& open.pd_id == self.pd_id
         &&& open.max_len == self.max_len
         &&& open.n <= self.send.spec_max_wqes()
@@ -4478,7 +4524,7 @@ impl<C, N: Device> HwQp<C, N> {
     /// domain, as long as its messages, in as many WQEs as a request of it may have. Anything else
     /// a WQE asks of a QP is out of the common.
     #[inline(always)]
-    fn takes(&self, open: &OpenRequest<N>) -> (takes: bool)
+    fn takes(&self, open: &Writing<N>) -> (takes: bool)
         requires
             self.send.inv(),
             1 <= open.max_sges,
@@ -4486,6 +4532,7 @@ impl<C, N: Device> HwQp<C, N> {
             1 <= self.caps.max_recv_sge,
         ensures
             takes == self.spec_takes(*open),
+        no_unwind
     {
         open.pd_id == self.pd_id && open.max_len == self.max_len && open.n <= self.send.max_wqes() as usize
             && (!(open.reads || open.max_sges > 1) || self.takes_other(open))
@@ -4494,10 +4541,11 @@ impl<C, N: Device> HwQp<C, N> {
     /// [`HwQp::takes`] of WQEs that the NIC reads the answer of, or of several elements.
     #[cold]
     #[inline(never)]
-    fn takes_other(&self, open: &OpenRequest<N>) -> (takes: bool)
+    fn takes_other(&self, open: &Writing<N>) -> (takes: bool)
         ensures
             takes == ((open.reads ==> self.reliable)
                 && open.max_sges <= self.caps.max_send_sge && open.max_sges <= self.caps.max_recv_sge),
+        no_unwind
     {
         (!open.reads || self.reliable)
             && open.max_sges <= self.caps.max_send_sge && open.max_sges <= self.caps.max_recv_sge
@@ -4513,6 +4561,7 @@ impl<C, N: Device> HwQp<C, N> {
         ensures
             limit <= self.send.spec_max_wqes(),
             limit == 0 || limit == self.send.spec_max_wqes(),
+        no_unwind
     {
         if self.takes_work {
             self.send.max_wqes() as usize
@@ -4599,6 +4648,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         let ghost start = *self;
         loop
@@ -4659,9 +4709,9 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         if index >= self.qps.len() {
-            no_qp(index);
             return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
         }
         let ghost start = *self;
@@ -4677,7 +4727,7 @@ impl<C, N: Device> Hw<C, N> {
                     }
                     Err(BufError { error: Error::TooManySges { got: MAX_SGES + 1, max }, buf: part })
                 } else {
-                    e.building.push(part);
+                    vec_push(&mut e.building, part);
                     proof {
                         self.lemma_flags_only(&start, index as int);
                     }
@@ -4685,7 +4735,9 @@ impl<C, N: Device> Hw<C, N> {
                 }
             },
             None => {
-                no_qp(index);
+                proof {
+                    assert(self.qps@ =~= start.qps@);
+                }
                 Err(BufError { error: Error::Invalid("no such QP"), buf: part })
             },
         }
@@ -4709,6 +4761,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& forall|i: int| 0 <= i < parts@.len() ==> part_pd(#[trigger] parts@[i]) == e.pd_id
                 &&& opcode_model(*op).writes_local() ==> forall|i: int| 0 <= i < parts@.len() ==> part_writable(#[trigger] parts@[i])
             },
+        no_unwind
     {
         let n = parts.len();
         let max_sge = if e.caps.max_send_sge <= e.caps.max_recv_sge {
@@ -4788,7 +4841,7 @@ impl<C, N: Device> Hw<C, N> {
     /// does not take what it was written for, or if it holds no room for a WQE.
     #[inline]
     #[verifier::spinoff_prover]
-    fn open_room(&mut self, index: usize, open: &mut OpenRequest<N>) -> (r: Result<()>)
+    fn open_room(&mut self, index: usize, open: &mut Writing<N>) -> (r: Result<()>)
         requires
             old(self).inv(),
             old(self).has_qp(index as int),
@@ -4802,6 +4855,7 @@ impl<C, N: Device> Hw<C, N> {
                 && final(open).n < usize::MAX
                 && final(open).pd_id == final(self).qps@[index as int]->0.pd_id
                 && final(open).max_len == final(self).qps@[index as int]->0.max_len,
+        no_unwind
     {
         if !self.open_belongs(index, open) {
             return Err(Error::Invalid("a request written for another QP"));
@@ -4837,11 +4891,11 @@ impl<C, N: Device> Hw<C, N> {
     }
 
     /// Adds a WQE doing `op` on `part` to `open`, whatever it takes: its QP is asked what
-    /// [`OpenRequest::try_push`] could not tell, and a request that is full goes out. On error
+    /// [`Writing::try_push`] could not tell, and a request that is full goes out. On error
     /// nothing is added and the part is handed back.
     #[verifier::spinoff_prover]
     #[inline(never)]
-    pub fn push_other(&mut self, index: usize, open: &mut OpenRequest<N>, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
+    pub fn push_other(&mut self, index: usize, open: &mut Writing<N>, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4852,9 +4906,9 @@ impl<C, N: Device> Hw<C, N> {
             final(open).inv(),
             r is Ok ==> final(self).has_qp(index as int),
             r matches Err(e) ==> e.buf == part,
+        no_unwind
     {
         if index >= self.qps.len() {
-            no_qp(index);
             return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
         }
         proof {
@@ -4862,13 +4916,9 @@ impl<C, N: Device> Hw<C, N> {
         }
         let checked = match &self.qps[index] {
             Some(e) => {
-                if e.removed {
-                    no_qp(index);
-                }
                 Self::check_wqe(e, &op, one_of(&part))
             },
             None => {
-                no_qp(index);
                 return Err(BufError { error: Error::Invalid("no such QP"), buf: part });
             },
         };
@@ -4931,9 +4981,10 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         let mut parts = parts;
-        parts.clear();
+        vec_clear(&mut parts);
         let ghost start = *self;
         match &mut self.qps[index] {
             Some(e) => {
@@ -4950,7 +5001,7 @@ impl<C, N: Device> Hw<C, N> {
     /// Finishes the WQE gathered on QP `index` with operation `op`, as [`Hw::push_other`] does a WQE
     /// of one part. On error nothing is added and the parts are dropped.
     #[verifier::spinoff_prover]
-    pub fn push_gathered(&mut self, index: usize, open: &mut OpenRequest<N>, op: WrOp) -> (r: Result<()>)
+    pub fn push_gathered(&mut self, index: usize, open: &mut Writing<N>, op: WrOp) -> (r: Result<()>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4959,9 +5010,9 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(open).inv(),
+        no_unwind
     {
         if index >= self.qps.len() {
-            no_qp(index);
             return Err(Error::Invalid("no such QP"));
         }
         let ghost start = *self;
@@ -4969,17 +5020,16 @@ impl<C, N: Device> Hw<C, N> {
             assert(qp_ok(start.qps@[index as int], index as int, start.token@, start.nic()));
         }
         // The parts leave the QP's list while whatever makes room for them goes on.
-        let mut parts = Vec::new();
+        let mut parts = vec_new();
         let checked = match &mut self.qps[index] {
             Some(e) => {
-                if e.removed {
-                    no_qp(index);
-                }
                 core::mem::swap(&mut parts, &mut e.building);
                 Self::check_wqe(e, &op, parts.as_slice())
             },
             None => {
-                no_qp(index);
+                proof {
+                    assert(self.qps@ =~= start.qps@);
+                }
                 return Err(Error::Invalid("no such QP"));
             },
         };
@@ -5047,7 +5097,7 @@ impl<C, N: Device> Hw<C, N> {
                             forall|k: int| 0 <= k < i ==> #[trigger] open.gathered@[base_gathered.len() + k] == part_sge(built[k]),
                         decreases sges - i,
                     {
-                        open.gathered.push(part_sge_of(&parts[i]));
+                        vec_push(&mut open.gathered, part_sge_of(&parts[i]));
                         i += 1;
                     }
                     let k = open.n;
@@ -5077,7 +5127,7 @@ impl<C, N: Device> Hw<C, N> {
                             access is In ==> forall|j: int| 0 <= j < sges ==> part_writable(#[trigger] built[j]),
                         decreases parts@.len(),
                     {
-                        match parts.pop() {
+                        match vec_pop(&mut parts) {
                             Some(part) => open.kept.keep_general(part, Ghost(access), &mut e.spare_leases),
                             None => {},
                         }
@@ -5118,6 +5168,9 @@ impl<C, N: Device> Hw<C, N> {
     pub fn is_qp(&self, index: usize) -> (b: bool)
         requires
             self.inv(),
+        ensures
+            b ==> self.keeps_qp(index as int),
+        no_unwind
     {
         if index >= self.qps.len() {
             return false;
@@ -5132,6 +5185,7 @@ impl<C, N: Device> Hw<C, N> {
     pub fn ring(&self, index: usize, side: Side) -> Option<&Ring<Payload<C, N>>>
         requires
             self.inv(),
+        no_unwind
     {
         if index >= self.qps.len() {
             return None;
@@ -5158,6 +5212,8 @@ impl<C, N: Device> Hw<C, N> {
 
     /// QP `index`'s protection domain.
     pub fn qp_pd(&self, index: usize) -> Option<&Pd<N>>
+
+        no_unwind
     {
         if index >= self.qps.len() {
             return None;
@@ -5172,6 +5228,7 @@ impl<C, N: Device> Hw<C, N> {
     pub fn qp_caps(&self, index: usize) -> Option<QpCaps>
         requires
             self.inv(),
+        no_unwind
     {
         if index >= self.qps.len() {
             return None;
@@ -5187,6 +5244,7 @@ impl<C, N: Device> Hw<C, N> {
     pub fn qp_num(&self, index: usize) -> Option<(u32, bool)>
         requires
             self.inv(),
+        no_unwind
     {
         if index >= self.qps.len() {
             return None;
@@ -5215,6 +5273,7 @@ impl<C, N: Device> Hw<C, N> {
             side is Recv ==> (r matches Some(c) ==> old(self).recv_taken_matches(index, seq, c)),
             side is Send ==> (r matches Some(c) ==> old(self).send_taken_matches(index, seq, c)),
             old(self).takeable(index, side, seq) ==> r is Some,
+        no_unwind
     {
         let ghost start = *self;
         proof {
@@ -5288,6 +5347,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         if index >= self.qps.len() {
             return (None, None);
@@ -5342,6 +5402,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         if index >= self.qps.len() {
             return None;
@@ -5398,6 +5459,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             r matches Some(error) ==> old(self).detached_taken_matches(index, error),
+        no_unwind
     {
         if index >= self.qps.len() {
             return None;
@@ -5457,6 +5519,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         if index >= self.qps.len() {
             return;
@@ -5507,6 +5570,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         let ghost start = *self;
         proof {
@@ -5543,8 +5607,8 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
-        let mut wakes = WakeBatch::new();
         let ghost start = *self;
         let ghost t0 = self.token@;
         let ghost m0 = t0.nic();
@@ -5560,7 +5624,7 @@ impl<C, N: Device> Hw<C, N> {
                     abort(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                 }
                 // Nothing staged is posted: refused (their owners are gone too).
-                e.send.abort_with_wakes(&mut wakes);
+                e.send.abort_with_wakes(&mut self.panics);
                 let ghost e1 = *e;
                 let ghost t = self.token@;
                 let ghost n = t.nic();
@@ -5653,7 +5717,6 @@ impl<C, N: Device> Hw<C, N> {
             },
             None => false,
         };
-        wakes.finish();
         busy
     }
 
@@ -5662,6 +5725,7 @@ impl<C, N: Device> Hw<C, N> {
     pub fn draining(&self, index: usize) -> bool
         requires
             self.inv(),
+        no_unwind
     {
         if index >= self.qps.len() {
             return false;
@@ -5690,6 +5754,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             written ==> final(self).has_qp(index as int),
+        no_unwind
     {
         if index >= self.qps.len() {
             return false;
@@ -5721,7 +5786,7 @@ impl<C, N: Device> Hw<C, N> {
                     e.started = true;
                 }
                 let ghost w0 = self.token@.written(q);
-                let nothing: [Sge; 0] = [];
+                let nothing: Vec<Sge> = vec_new();
                 let none = nothing.as_slice();
                 post(&mut e.hw, wr_id(index as u16, false, wqe), true, &WrOp::Send, none, Ghost(q), Tracked(self.token.borrow_mut()));
                 let ghost wr = send_wr(spec_wr_id(index as u16, false, wqe), true, WrOp::Send, none@);
@@ -5768,6 +5833,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         let ghost start = *self;
         if self.stage_drain(index) {
@@ -5802,7 +5868,7 @@ impl<C, N: Device> Hw<C, N> {
             self.qps@[index] is None,
             start.qps@[index]->0.send.spec_wqe_retired() == start.qps@[index]->0.send.spec_wqe_committed(),
             start.qps@[index]->0.recv.spec_wqe_retired() == start.qps@[index]->0.recv.spec_wqe_committed(),
-            cq_of(self.cq) == cq_of(start.cq),
+            cq_of(self.cq@) == cq_of(start.cq@),
             self.caps == start.caps,
             self.cq_size == start.cq_size,
             self.next_name == start.next_name,
@@ -5882,6 +5948,8 @@ impl<C, N: Device> Hw<C, N> {
         ensures
             final(self).inv(),
             final(self).moved_from(old(self)),
+            !destroyed ==> *final(self) == *old(self),
+        no_unwind
     {
         if index >= self.qps.len() {
             return false;
@@ -5976,21 +6044,21 @@ impl<C, N: Device> Hw<C, N> {
     /// before: M's `destroy_cq` needs none attached). Otherwise hands the
     /// engine back: a QP the device never flushed keeps it, and the caller
     /// leaks it all (no memory the NIC may use is ever freed).
-    #[allow(clippy::result_large_err)] // Once, at the very end: nothing to save.
-    pub fn finish(self) -> (r: core::result::Result<(), Self>)
+    pub fn finish(&mut self) -> (finished: bool)
         requires
-            self.inv(),
+            old(self).inv(),
     {
         let mut i = 0;
         while i < self.qps.len()
             invariant
-                self.inv(),
+                *self == *old(self),
+                old(self).inv(),
                 0 <= i <= self.qps@.len(),
                 forall|j: int| 0 <= j < i ==> (#[trigger] self.qps@[j]) is None,
             decreases self.qps@.len() - i,
         {
             if self.qps[i].is_some() {
-                return Err(self);
+                return false;
             }
             i += 1;
         }
@@ -6005,9 +6073,8 @@ impl<C, N: Device> Hw<C, N> {
                 }
             }
         }
-        let Hw { cq: the_cq, token: the_token, .. } = self;
-        destroy_cq(the_cq, the_token);
-        Ok(())
+        destroy_cq(&mut self.cq, Tracked(self.token.borrow_mut()));
+        true
     }
 }
 
@@ -6022,6 +6089,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         if index >= self.qps.len() {
             return;
@@ -6032,7 +6100,7 @@ impl<C, N: Device> Hw<C, N> {
         }
         match &mut self.qps[index] {
             Some(e) => {
-                e.building.clear();
+                vec_clear(&mut e.building);
                 proof {
                     self.lemma_flags_only(&start, index as int);
                 }
@@ -6046,7 +6114,9 @@ impl<C, N: Device> Hw<C, N> {
     }
 
     /// The number of slots of the QP table: every QP's index is below it.
-    pub fn qp_slots(&self) -> usize {
+    pub fn qp_slots(&self) -> usize
+        no_unwind
+    {
         self.qps.len()
     }
 
@@ -6060,9 +6130,9 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+        no_unwind
     {
         if index >= self.qps.len() || self.qps[index].is_none() {
-            no_qp(index);
             return Err(Error::Invalid("no such QP"));
         }
         proof {
@@ -6083,6 +6153,7 @@ fn not_posted<C, N: Device>(ring: &mut Ring<Payload<C, N>>, error: Error) -> (r:
         final(ring).inv(),
         final(ring).same_but_free(old(ring)),
         r.ctx == old(ring).filled_view().leases.ctx,
+    no_unwind
 {
     match ring.unfill() {
         Some(payload) => Refusal { error, ctx: payload.ctx, leases: payload.leases },
@@ -6098,6 +6169,7 @@ fn implied_outcome(op: &WrOp, len: u32) -> (r: CompletionResult)
     ensures
         r is Ok,
         r matches Ok(done) ==> opcode_model(*op).allows_outcome(len as nat, done.model()),
+    no_unwind
 {
     match op {
         WrOp::Send | WrOp::SendImm(_) | WrOp::Write(_) | WrOp::WriteImm(..) => Ok(Completed::Sent),
@@ -6124,6 +6196,14 @@ pub open spec fn send_access(op: WrOp) -> safeverbs_spec::abs::Dir {
 impl<C, N: Device> Hw<C, N> {
     /// The bytes of a QP in the table.
     pub(crate) const QP_BYTES: usize = core::mem::size_of::<HwQp<C, N>>();
+
+    /// A QP the device never flushed stays: nothing of it is freed, and the device stays open for
+    /// it. Verus sees no drop, so this is what says so, at the one place a QP's entry could go
+    /// without [`Hw::destroy`].
+    pub(crate) fn leak(&mut self) {
+        core::mem::forget(core::mem::take(&mut self.qps));
+        core::mem::forget(self.ctx.clone());
+    }
 
     /// The send ring of QP `index`, as tests shape it.
     #[cfg(test)]

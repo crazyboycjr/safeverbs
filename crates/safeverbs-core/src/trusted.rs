@@ -41,6 +41,8 @@ use safeverbs_spec::share::*;
 use safeverbs_spec::types::{CqId, Key, PdId, QpId};
 use vstd::prelude::*;
 
+use core::mem::ManuallyDrop;
+
 use crate::buf::{BufError, Kept, Leases, Part};
 use crate::error::{Error, Result};
 // The device trait as `Device`: `Nic` names M's state machine here.
@@ -469,20 +471,53 @@ pub fn create_cq<N: Device>(ctx: &Context<N>, entries: u32) -> (r: Result<
 {
     let nic = ctx.nic();
     let caps = nic.caps();
-    let cq = nic.create_cq(entries, true)?;
+    // SAFETY: the engine holds a handle to the device as long as its CQ, and destroys its QPs first.
+    let cq = unsafe { nic.create_cq(entries, true) }?;
     Ok((cq, caps, Tracked::assume_new()))
+}
+
+/// Another handle to the device (no meaning in M: an engine's token says what the device is).
+#[verifier::external_body]
+pub fn clone_context<N: Device>(ctx: &Context<N>) -> Context<N> {
+    ctx.clone()
+}
+
+/// The thread domain of an engine, where the device has them (no meaning in M: which locks the
+/// driver takes for the QPs on it).
+#[verifier::external_body]
+pub fn alloc_td<N: Device>(ctx: &Context<N>) -> Option<N::Td> {
+    // SAFETY: the engine keeps `ctx` open as long as the domain (`Engine`'s fields).
+    unsafe { ctx.nic().alloc_td() }
+}
+
+/// The protection domain a parent domain is over.
+pub uninterp spec fn domain_over<D>(domain: D) -> u64;
+
+/// A parent domain over `pd` and `td` (no meaning in M, as a thread domain).
+#[verifier::external_body]
+pub fn alloc_domain<N: Device>(pd: &Pd<N>, td: &N::Td) -> (domain: Option<N::Domain>)
+    ensures
+        domain matches Some(d) ==> domain_over(d) == pd_id(*pd),
+{
+    // SAFETY: the engine keeps `pd` with the domain, which goes before it and `td`, and after the
+    // QPs created on it (`Engine`'s fields and `drop`).
+    unsafe { pd.context().nic().alloc_domain(pd.raw(), td) }
 }
 
 /// The QP number the device gave a hardware QP (no meaning in M).
 #[verifier::external_body]
-pub fn qp_num_of<Q: NicQp>(qp: &Q) -> u32 {
+pub fn qp_num_of<Q: NicQp>(qp: &Q) -> u32
+    no_unwind
+{
     qp.qp_num()
 }
 
 /// Whether a hardware QP was created without the driver's locks (no
 /// meaning in M).
 #[verifier::external_body]
-pub fn qp_lock_free<Q: NicQp>(qp: &Q) -> bool {
+pub fn qp_lock_free<Q: NicQp>(qp: &Q) -> bool
+    no_unwind
+{
     qp.is_lock_free()
 }
 
@@ -496,20 +531,31 @@ pub fn no_qp(index: usize)
     panic!("no QP {index} in this engine")
 }
 
+/// Panics: a request refused whose context the program took out of what it handed back
+/// (`Engine::post_unposted`), so that there is none to give back. Never returns.
+#[verifier::external_body]
+pub fn no_context()
+    ensures
+        false,
+{
+    panic!("a request refused, without the context it was given")
+}
+
 /// `ibv_create_qp_ex` on the engine's CQ and protection domain (on its
 /// thread domain if any): M's `create_qp` of `q`, or nothing on error.
 #[verifier::external_body]
 pub fn create_qp<N: Device>(
     pd: &Pd<N>,
     domain: Option<&N::Domain>,
-    cq: &N::Cq,
+    cq: &ManuallyDrop<N::Cq>,
     qp_type: QpType,
     caps: &QpCaps,
     Ghost(q): Ghost<QpId>,
     Tracked(token): Tracked<&mut NicToken>,
 ) -> (r: Result<N::Qp>)
     requires
-        cq_of(*cq) == old(token).share().cq,
+        cq_of(cq@) == old(token).share().cq,
+        domain matches Some(d) ==> domain_over(*d) == pd_id(*pd),
         nic_inv(old(token).nic()),
         share_wf(old(token).nic(), old(token).share()),
         old(token).share().owns.contains(q),
@@ -536,8 +582,11 @@ pub fn create_qp<N: Device>(
             old(token).nic(),
             final(token).nic(),
         ),
+    no_unwind
 {
-    pd.context().nic().create_qp(pd.raw(), domain, cq, cq, qp_type, caps)
+    // SAFETY: the engine keeps what the QP depends on (its `Pd` in the QP's entry, its domain, the
+    // CQ) until it is destroyed, and `domain` is over `pd` (the precondition).
+    unsafe { pd.context().nic().create_qp(pd.raw(), domain, cq, cq, qp_type, caps) }
 }
 
 /// `ibv_modify_qp` to INIT, RTR and RTS: M's three `modify_qp` steps, or on
@@ -578,6 +627,7 @@ pub fn connect<Q: NicQp>(
                 q,
                 connect_states().take(k),
             ),
+    no_unwind
 {
     qp.connect(attr, remote)
 }
@@ -606,6 +656,7 @@ pub fn to_error<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tra
             old(token).nic(),
             final(token).nic(),
         ),
+    no_unwind
 {
     qp.to_error()
 }
@@ -628,21 +679,24 @@ pub fn destroy_qp<Q: NicQp>(qp: Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
                 final(token).nic(),
                 Nic::Step::destroy_qp(q),
             ),
+    no_unwind
 {
     drop(qp)
 }
 
 /// `ibv_destroy_cq` of the engine's CQ: M's `destroy_cq`, which needs no QP
-/// attached. The token goes with it.
+/// attached. Its one caller, `Hw::finish`, is the end of the engine: neither is used again.
 #[verifier::external_body]
-pub fn destroy_cq<C: NicCq>(cq: C, Tracked(token): Tracked<NicToken>)
+pub fn destroy_cq<C: NicCq>(cq: &mut ManuallyDrop<C>, Tracked(token): Tracked<&mut NicToken>)
     requires
-        cq_of(cq) == token.share().cq,
-        nic_inv(token.nic()),
-        share_wf(token.nic(), token.share()),
-        nic_enabled(token.nic(), Nic::Step::destroy_cq(token.share().cq)),
+        cq_of(old(cq)@) == old(token).share().cq,
+        nic_inv(old(token).nic()),
+        share_wf(old(token).nic(), old(token).share()),
+        nic_enabled(old(token).nic(), Nic::Step::destroy_cq(old(token).share().cq)),
+    no_unwind
 {
-    drop(cq)
+    // SAFETY: dropped once, as the precondition says of the one caller.
+    unsafe { ManuallyDrop::drop(cq) }
 }
 
 // =============================================================================
@@ -653,6 +707,7 @@ pub fn destroy_cq<C: NicCq>(cq: C, Tracked(token): Tracked<NicToken>)
 pub fn pd_id_of<N: Device>(pd: &Pd<N>) -> (id: u64)
     ensures
         id == pd_id(*pd),
+    no_unwind
 {
     pd.id()
 }
@@ -662,6 +717,7 @@ pub fn pd_id_of<N: Device>(pd: &Pd<N>) -> (id: u64)
 pub fn part_sge_of<N: Device>(part: &Part<N>) -> (sge: Sge)
     ensures
         sge == part_sge(*part),
+    no_unwind
 {
     proof { part.lemma_fields(); }
     part.sge
@@ -672,6 +728,7 @@ pub fn part_sge_of<N: Device>(part: &Part<N>) -> (sge: Sge)
 pub fn part_pd_of<N: Device>(part: &Part<N>) -> (pd: u64)
     ensures
         pd == part_pd(*part),
+    no_unwind
 {
     proof { part.lemma_fields(); }
     part.pd
@@ -682,6 +739,7 @@ pub fn part_pd_of<N: Device>(part: &Part<N>) -> (pd: u64)
 pub fn part_writable_of<N: Device>(part: &Part<N>) -> (writable: bool)
     ensures
         writable == part_writable(*part),
+    no_unwind
 {
     proof { part.lemma_fields(); }
     part.is_writable()
@@ -695,6 +753,7 @@ pub uninterp spec fn pd_of_device<N: Device>(ctx: Context<N>, pd: Pd<N>) -> bool
 pub fn same_device<N: Device>(ctx: &Context<N>, pd: &Pd<N>) -> (same: bool)
     ensures
         same == pd_of_device(*ctx, *pd),
+    no_unwind
 {
     ctx.same_device(pd.context())
 }
@@ -715,6 +774,7 @@ pub fn clone_pd<N: Device>(pd: &Pd<N>) -> (clone: Pd<N>)
     ensures
         pd_of(clone) == pd_of(*pd),
         pd_id(clone) == pd_id(*pd),
+    no_unwind
 {
     pd.clone()
 }
@@ -730,6 +790,7 @@ pub fn pd_alive<N: Device>(_ctx: &Context<N>, _pd: &Pd<N>, Tracked(token): Track
         final(token).same_writings(old(token)),
         rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
         final(token).nic().pds.contains(pd_of(*_pd)),
+    no_unwind
 {
 }
 
@@ -752,6 +813,7 @@ pub fn registered<N: Device>(_part: &Part<N>, _pd: &Pd<N>, Tracked(token): Track
             sge_model(part_sge(*_part)),
             part_writable(*_part),
         ),
+    no_unwind
 {
 }
 
@@ -772,6 +834,7 @@ pub(crate) fn registered_all<N: Device>(_kept: &Kept<N>, _pd: &Pd<N>, Tracked(to
                 sge_model(part_sge((#[trigger] _kept.loans()[j]).part)),
                 part_writable(_kept.loans()[j].part),
             ),
+    no_unwind
 {
 }
 
@@ -780,8 +843,126 @@ pub(crate) fn registered_all<N: Device>(_kept: &Kept<N>, _pd: &Pd<N>, Tracked(to
 pub fn no_leases<N: Device>() -> (r: Leases<N>)
     ensures r.inv(), r.view().len() == 0, r.loans().len() == 0, r.wqes().len() == 0,
         r.fully_recorded(), !r.spec_many(),
+    no_unwind
 {
     Leases::new()
+}
+
+// =============================================================================
+// Standard-library calls that do not unwind
+//
+// vstd does not say so of these. Nothing here unwinds: running out of memory aborts, and a `Vec` of
+// more than `isize::MAX` bytes would need more memory than there is. What goes with `vec_clear`'s
+// elements are the program's buffers, whose release a backend does not unwind (`Nic`).
+
+/// `Vec::new`, which allocates nothing.
+#[verifier::external_body]
+#[inline(always)]
+pub fn vec_new<T>() -> (v: Vec<T>)
+    ensures
+        v@ == Seq::<T>::empty(),
+    no_unwind
+{
+    Vec::new()
+}
+
+/// `Vec::with_capacity`.
+#[verifier::external_body]
+pub fn vec_with_capacity<T>(capacity: usize) -> (v: Vec<T>)
+    ensures
+        v@ == Seq::<T>::empty(),
+    no_unwind
+{
+    Vec::with_capacity(capacity)
+}
+
+/// `Vec::push`.
+#[verifier::external_body]
+#[inline(always)]
+pub fn vec_push<T>(v: &mut Vec<T>, value: T)
+    ensures
+        final(v)@ == old(v)@.push(value),
+    no_unwind
+{
+    v.push(value)
+}
+
+/// `Vec::pop`.
+#[verifier::external_body]
+#[inline(always)]
+pub fn vec_pop<T>(v: &mut Vec<T>) -> (value: Option<T>)
+    ensures
+        old(v)@.len() > 0 ==> value == Some(old(v)@[old(v)@.len() - 1]) && final(v)@ == old(v)@.drop_last(),
+        old(v)@.len() == 0 ==> value == None::<T> && final(v)@ == old(v)@,
+    no_unwind
+{
+    v.pop()
+}
+
+/// `Vec::clear`.
+#[verifier::external_body]
+#[inline(always)]
+pub fn vec_clear<T>(v: &mut Vec<T>)
+    ensures
+        final(v)@ == Seq::<T>::empty(),
+    no_unwind
+{
+    v.clear()
+}
+
+/// `Vec::truncate`.
+#[verifier::external_body]
+#[inline(always)]
+pub fn vec_truncate<T>(v: &mut Vec<T>, len: usize)
+    ensures
+        len <= old(v)@.len() ==> final(v)@ == old(v)@.take(len as int),
+        len > old(v)@.len() ==> final(v)@ == old(v)@,
+    no_unwind
+{
+    v.truncate(len)
+}
+
+/// `get_unchecked`, for an `i` in bounds.
+#[verifier::external_body]
+#[inline(always)]
+pub fn element<T>(list: &[T], i: usize) -> (e: &T)
+    requires
+        i < list@.len(),
+    ensures
+        *e == list@[i as int],
+    no_unwind
+{
+    // SAFETY: `i` is below the length (the precondition).
+    unsafe { list.get_unchecked(i) }
+}
+
+/// `get_unchecked_mut`, for an `i` in bounds.
+#[verifier::external_body]
+#[inline(always)]
+pub fn element_mut<T>(list: &mut [T], i: usize) -> (e: &mut T)
+    requires
+        i < old(list)@.len(),
+    ensures
+        *e == old(list)@[i as int],
+        final(list)@ == old(list)@.update(i as int, *final(e)),
+    no_unwind
+{
+    // SAFETY: `i` is below the length (the precondition).
+    unsafe { list.get_unchecked_mut(i) }
+}
+
+/// `get_unchecked` of a range in bounds.
+#[verifier::external_body]
+#[inline(always)]
+pub fn sub_slice<T>(list: &[T], from: usize, to: usize) -> (sub: &[T])
+    requires
+        from <= to <= list@.len(),
+    ensures
+        sub@ == list@.subrange(from as int, to as int),
+    no_unwind
+{
+    // SAFETY: the range is in bounds (the precondition).
+    unsafe { list.get_unchecked(from..to) }
 }
 
 // =============================================================================
@@ -801,6 +982,7 @@ pub fn start<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
         final(token).started(q),
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
+    no_unwind
 {
     // SAFETY: not started (the precondition).
     unsafe { qp.start() }
@@ -828,6 +1010,7 @@ pub fn post<Q: NicQp>(
         final(token).started(q),
         final(token).written(q) == old(token).written(q).push(send_wr(wr_id, signaled, *op, sges@)),
         final(token).same_writing_but(old(token), q),
+    no_unwind
 {
     // SAFETY: started (the precondition). The memory stays valid until the
     // WR completes: the doorbell's precondition says it is registered, and
@@ -869,6 +1052,7 @@ pub fn doorbell<Q: NicQp>(
             old(token).nic(),
             final(token).nic(),
         ),
+    no_unwind
 {
     // SAFETY: started (the precondition).
     unsafe { qp.complete() }
@@ -887,6 +1071,7 @@ pub fn abort<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tracke
         final(token).written(q) == Seq::<SendWr>::empty(),
         final(token).same_writing_but(old(token), q),
         rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), final(token).nic()),
+    no_unwind
 {
     // SAFETY: started (the precondition).
     unsafe { qp.abort() }
@@ -930,6 +1115,7 @@ pub fn post_recv<Q: NicQp>(
             old(token).nic(),
             final(token).nic(),
         ),
+    no_unwind
 {
     // SAFETY: the memory stays valid until the receive completes: the
     // precondition says it is registered, and the ring keeps its lease until
@@ -941,13 +1127,13 @@ pub fn post_recv<Q: NicQp>(
 /// each popped by M's `poll_cq` and reported in `out`, in order.
 #[verifier::external_body]
 #[inline(always)]
-pub fn poll<C: NicCq>(cq: &mut C, out: &mut [Wc], limit: usize, Tracked(token): Tracked<&mut NicToken>) -> (n:
+pub fn poll<C: NicCq>(cq: &mut ManuallyDrop<C>, out: &mut [Wc], limit: usize, Tracked(token): Tracked<&mut NicToken>) -> (n:
     usize)
     requires
-        cq_of(*old(cq)) == old(token).share().cq,
+        cq_of(old(cq)@) == old(token).share().cq,
         limit <= old(out)@.len(),
     ensures
-        cq_of(*final(cq)) == cq_of(*old(cq)),
+        cq_of(final(cq)@) == cq_of(old(cq)@),
         n <= limit,
         final(out)@.len() == old(out)@.len(),
         final(token).same_engine(old(token)),
@@ -959,6 +1145,7 @@ pub fn poll<C: NicCq>(cq: &mut C, out: &mut [Wc], limit: usize, Tracked(token): 
             final(token).nic(),
             final(out)@.take(n as int),
         ),
+    no_unwind
 {
     cq.poll(&mut out[..limit])
 }

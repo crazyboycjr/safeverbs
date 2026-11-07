@@ -120,6 +120,7 @@ impl OwnedRange {
     #[inline]
     pub(super) fn ptr(&self) -> (r: *mut u8)
         ensures r == self.pointer(),
+        no_unwind
     { self.ptr }
 
     #[inline]
@@ -131,6 +132,7 @@ impl OwnedRange {
     #[inline]
     pub(super) fn len(&self) -> (r: usize)
         ensures r == self.spec_len(),
+        no_unwind
     { self.len }
 
     /// Retyping must check the absolute pointer alignment, not a relative offset.
@@ -267,11 +269,13 @@ impl<N: Nic> RawMut<N> {
     #[inline]
     pub(super) fn ptr(&self) -> (r: *mut u8)
         ensures r == self.pointer(),
+        no_unwind
     { self.range.ptr() }
 
     #[inline]
     pub(super) fn len(&self) -> (r: usize)
         ensures r == self.byte_len(),
+        no_unwind
     { self.range.len() }
 
     /// Checked geometry for reconstructing a typed slice, including wide alignments.

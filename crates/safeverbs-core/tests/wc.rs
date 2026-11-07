@@ -16,7 +16,8 @@ fn zero_sge_notification<N: Nic>(ctx: Context<N>) {
     let mut src = vec![0xa5u8; LEN];
     let mut dst = vec![0x3cu8; LEN];
     let nic = ctx.nic();
-    let pd = nic.alloc_pd().unwrap();
+    // SAFETY: the test keeps the device, and drops what depends on what in order.
+    let pd = unsafe { nic.alloc_pd() }.unwrap();
     // SAFETY: these allocations stay registered until both completions
     // have been polled. Rust does not touch dst while the NIC may write it.
     let src_mr = unsafe { nic.reg_mr(&pd, src.as_mut_ptr(), LEN, Access::LOCAL_WRITE) }.unwrap();
@@ -30,7 +31,8 @@ fn zero_sge_notification<N: Nic>(ctx: Context<N>) {
         )
     }
     .unwrap();
-    let mut cq = nic.create_cq(4, true).unwrap();
+    // SAFETY: as above.
+    let mut cq = unsafe { nic.create_cq(4, true) }.unwrap();
     let caps = QpCaps {
         max_send_wr: 1,
         max_recv_wr: 1,
@@ -38,12 +40,10 @@ fn zero_sge_notification<N: Nic>(ctx: Context<N>) {
         max_recv_sge: 1,
         max_inline_data: 0,
     };
-    let mut a = nic
-        .create_qp(&pd, None, &cq, &cq, QpType::Rc, &caps)
-        .unwrap();
-    let mut b = nic
-        .create_qp(&pd, None, &cq, &cq, QpType::Rc, &caps)
-        .unwrap();
+    // SAFETY: as above.
+    let mut a = unsafe { nic.create_qp(&pd, None, &cq, &cq, QpType::Rc, &caps) }.unwrap();
+    // SAFETY: as above.
+    let mut b = unsafe { nic.create_qp(&pd, None, &cq, &cq, QpType::Rc, &caps) }.unwrap();
     let port = ctx.port(1).unwrap();
     let gid_index = if port.ethernet {
         std::env::var("SAFEVERBS_TEST_GID_INDEX")

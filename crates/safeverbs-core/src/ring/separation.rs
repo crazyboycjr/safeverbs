@@ -72,6 +72,7 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
         ensures
             *final(incoming) == *old(incoming),
             self.retained_apart(final(incoming).observation()),
+        no_unwind
     {
         let mut i = 0;
         while i < self.slots.len()

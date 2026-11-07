@@ -36,6 +36,7 @@ impl<C, N: Device> Hw<C, N> {
         requires self.inv(),
         ensures *final(incoming) == *old(incoming),
             self.table_apart(final(incoming).observation()),
+        no_unwind
     {
         let mut i = 0;
         while i < self.qps.len()

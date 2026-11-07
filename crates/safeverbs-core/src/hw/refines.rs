@@ -277,10 +277,14 @@ impl Refinement {
         assert forall|r: ReqId| #[trigger] older.ranges.dom().contains(r)
             implies self.ranges.dom().contains(r) && older.ranges[r] == self.ranges[r] by {
             assert(mid.ranges.dom().contains(r));
+            assert(self.ranges.dom().contains(r));
+            assert(older.ranges[r] == mid.ranges[r]);
         }
         assert forall|w: WqeRef| #[trigger] older.wrs.dom().contains(w)
             implies self.wrs.dom().contains(w) && older.wrs[w] == self.wrs[w] by {
             assert(mid.wrs.dom().contains(w));
+            assert(self.wrs.dom().contains(w));
+            assert(older.wrs[w] == mid.wrs[w]);
         }
     }
 }
@@ -3635,6 +3639,13 @@ impl<C, N: Device> Hw<C, N> {
         lemma_nic_reaches_refl(self.token@.nic());
     }
 
+    /// No change of the table is the same table.
+    pub proof fn lemma_same_table_refl(&self)
+        ensures
+            self.same_table(self),
+    {
+    }
+
     /// No step at all is a step of `moved_from`.
     pub proof fn lemma_moved_refl(&self)
         ensures
@@ -3821,6 +3832,39 @@ impl<C, N: Device> Hw<C, N> {
     }
 }
 
+/// The table of `older` is the table of `mid`'s older one.
+pub broadcast proof fn lemma_same_table_chain<C, N: Device>(last: &Hw<C, N>, mid: &Hw<C, N>, older: &Hw<C, N>)
+    requires
+        #[trigger] last.same_table(mid),
+        #[trigger] mid.same_table(older),
+    ensures
+        last.same_table(older),
+{
+    completion::lemma_same_qps_trans(last.qps@, mid.qps@, older.qps@);
+}
+
+/// With the same table, a QP is still there.
+pub broadcast proof fn lemma_kept_qp<C, N: Device>(now: &Hw<C, N>, older: &Hw<C, N>, index: int)
+    requires
+        #[trigger] now.same_table(older),
+        #[trigger] older.keeps_qp(index),
+    ensures
+        now.keeps_qp(index),
+{
+    assert(now.qps@[index] is Some == older.qps@[index] is Some);
+}
+
+/// `moved_from` is transitive: what lets an engine's type invariant follow its hardware side.
+pub broadcast proof fn lemma_moved_chain<C, N: Device>(last: &Hw<C, N>, mid: &Hw<C, N>, older: &Hw<C, N>)
+    requires
+        #[trigger] last.moved_from(mid),
+        #[trigger] mid.moved_from(older),
+    ensures
+        last.moved_from(older),
+{
+    last.lemma_moved_trans(mid, older);
+}
+
 /// An engine, as `Refines` asks of it: before it exists, the device just opened; then what its
 /// public methods make of it.
 #[verifier::reject_recursive_types(C)]
@@ -3936,6 +3980,41 @@ pub proof fn theorem_1_engine<C, N: Device>(run: Seq<EngineState<C, N>>)
     theorem_1(run);
 }
 
+/// **Theorem 1, of any engine a program holds, whatever it did with it.** An engine's type invariant
+/// keeps the state it was made in and that it came from there by `moved_from`, so its state now is the
+/// end of a run from the device just opened: A's and M's invariants hold, it stands for what they
+/// reach, every verb met its precondition, and A and M are coupled. What the NIC may touch beyond the
+/// engine's queues stays the premise it is ([`Hw::outside_ok`]).
+pub proof fn theorem_1_held<C, N: Device>(first: Hw<C, N>, now: Hw<C, N>)
+    requires
+        first.born(),
+        now.inv(),
+        now.moved_from(&first),
+        first.outside_ok(),
+        now.outside_ok(),
+    ensures
+        abs_reaches(abs_start(), now.refinement().abs),
+        abs_inv(now.refinement().abs),
+        exists|m0: Nic::State| nic_init(m0) && nic_reaches(m0, now.nic()),
+        nic_inv(now.nic()),
+        coupled(now.refinement().abs, now.nic(), now.refinement().ranges, now.refinement().wrs),
+{
+    let m0 = choose|m0: Nic::State| nic_init(m0) && #[trigger] first.born_from(m0);
+    let run = seq![
+        EngineState::<C, N>::Start { nic: m0 },
+        EngineState::Running { hw: first },
+        EngineState::Running { hw: now },
+    ];
+    assert forall|i: int| 0 <= i < run.len() - 1 implies (#[trigger] run[i]).step(&run[i + 1]) by {
+        assert(run[0] == EngineState::<C, N>::Start { nic: m0 });
+        assert(run[1] == EngineState::<C, N>::Running { hw: first });
+        assert(run[2] == EngineState::<C, N>::Running { hw: now });
+    }
+    theorem_1_engine(run);
+    assert(run[2] == EngineState::<C, N>::Running { hw: now });
+    assert(run[0] == EngineState::<C, N>::Start { nic: m0 });
+}
+
 /// Theorem 1 through the public operations of [`Engine`](crate::engine::Engine) on typed buffers:
 /// what they ensure is a step of [`EngineState`], so a run of them from the device just opened stands
 /// for runs of A and M, coupled at every point. Until a buffer is lent it is one A would give the
@@ -3945,33 +4024,28 @@ pub proof fn theorem_1_engine<C, N: Device>(run: Seq<EngineState<C, N>>)
 #[allow(dead_code)]
 fn example_run<C, N: Device, T: crate::transport::Transport>(
     ctx: Context<N>,
-    td: Option<N::Td>,
     qp: crate::engine::QpKey<T>,
     received: crate::buf::BufMut<u8, N>,
     sent: crate::buf::Buf<u8, N>,
     context: (C, C),
 ) {
-    let hw = match Hw::<C, N>::new(ctx, 16) {
-        Ok(hw) => hw,
+    let mut engine = match crate::engine::Engine::<C, N>::new(&ctx, 16) {
+        Ok(engine) => engine,
         Err(_) => return,
     };
-    let ghost h1 = hw;
-    let ghost m0 = choose|m0: Nic::State| nic_init(m0) && #[trigger] h1.born_from(m0);
-    let mut engine = crate::engine::Engine::of(hw, td);
     let received = received.apart_from_nic(engine.hw());
     sent.apart_from_nic(engine.hw());
-    let (first, second) = context;
-    let _ = engine.post_recv(qp, received.part(), first);
-    let ghost h2 = engine.state();
+    let (one, two) = context;
+    let _ = engine.post_recv(qp, received.part(), one);
     if let Ok(part) = sent.try_part() {
-        let _ = engine.stage(qp, WrOp::Send, part, second, true);
+        let _ = engine.stage(qp, WrOp::Send, part, two, true);
     }
-    let ghost h3 = engine.state();
     let _ = engine.commit(qp);
-    let ghost h4 = engine.state();
     let _ = engine.progress();
     let ghost h5 = engine.state();
+    let _ = engine.stands();
     let handed_out = engine.next_completion();
+    let first = engine.stands();
     proof {
         // What the program gets is what A says of its request.
         if let Some(c) = handed_out {
@@ -3979,27 +4053,10 @@ fn example_run<C, N: Device, T: crate::transport::Transport>(
                 h5.lemma_hands_out_in_a(c);
             }
         }
-        if h1.outside_ok() && h2.outside_ok() && h3.outside_ok() && h4.outside_ok() && h5.outside_ok() {
-            let run = seq![
-                EngineState::<C, N>::Start { nic: m0 },
-                EngineState::Running { hw: h1 },
-                EngineState::Running { hw: h2 },
-                EngineState::Running { hw: h3 },
-                EngineState::Running { hw: h4 },
-                EngineState::Running { hw: h5 },
-            ];
-            assert forall|i: int| 0 <= i < run.len() - 1 implies (#[trigger] run[i]).step(&run[i + 1]) by {
-                assert(run[0] == EngineState::<C, N>::Start { nic: m0 });
-                assert(run[1] == EngineState::<C, N>::Running { hw: h1 });
-                assert(run[2] == EngineState::<C, N>::Running { hw: h2 });
-                assert(run[3] == EngineState::<C, N>::Running { hw: h3 });
-                assert(run[4] == EngineState::<C, N>::Running { hw: h4 });
-                assert(run[5] == EngineState::<C, N>::Running { hw: h5 });
-            }
-            theorem_1_engine(run);
-            assert(run[5] == EngineState::<C, N>::Running { hw: h5 });
-            assert(run[5].abs() == h5.refinement().abs);
-            assert(coupled(h5.refinement().abs, h5.nic(), h5.refinement().ranges, h5.refinement().wrs));
+        // And wherever it stops, the state it left is the end of a run.
+        let last = engine.state();
+        if first@.outside_ok() && last.outside_ok() {
+            theorem_1_held(first@, last);
         }
     }
 }

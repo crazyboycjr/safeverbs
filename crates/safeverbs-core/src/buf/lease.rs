@@ -7,7 +7,7 @@
 //! builds alone (`cfg(verus_keep_ghost)`); plain builds have no such code.
 //
 // The code keeps the plain forms the proofs reason about (explicit matches, a `Vec`'s view).
-#![allow(clippy::single_match, clippy::ptr_arg)]
+#![allow(clippy::single_match, clippy::ptr_arg, clippy::len_zero)]
 
 use safeverbs_spec::abs::Dir;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use vstd::prelude::*;
 
 use super::{Frozen, RawMut};
 use crate::nic::{Nic, Sge};
+use crate::trusted::{element, vec_new, vec_pop, vec_push, vec_truncate};
 use crate::verbs::Verbs;
 
 verus! {
@@ -308,6 +309,7 @@ pub open spec fn covers_inputs(wqes: Seq<WqeLoans>, frontier: int) -> bool {
 #[verifier::external_body]
 pub(crate) fn same_frozen_arc<N: Nic>(a: &Arc<Frozen<N>>, b: &Arc<Frozen<N>>) -> (same: bool)
     ensures same ==> **a == **b,
+    no_unwind
 {
     Arc::ptr_eq(a, b)
 }
@@ -319,6 +321,7 @@ pub(crate) fn replace_value<T>(dest: &mut T, value: T) -> (before: T)
     ensures
         before == *old(dest),
         *final(dest) == value,
+    no_unwind
 {
     core::mem::replace(dest, value)
 }
@@ -330,6 +333,7 @@ pub(crate) fn replace_value<T>(dest: &mut T, value: T) -> (before: T)
 pub(crate) fn forget_free<T>(free: T, Ghost(nothing): Ghost<bool>)
     requires
         nothing,
+    no_unwind
 {
     core::mem::forget(free);
 }
@@ -340,6 +344,7 @@ pub(crate) fn forget_free<T>(free: T, Ghost(nothing): Ghost<bool>)
 pub(crate) fn capacity_of<T>(v: &Vec<T>) -> (capacity: usize)
     ensures
         v@.len() <= capacity,
+    no_unwind
 {
     v.capacity()
 }
@@ -352,6 +357,7 @@ fn swap_in<T>(v: &mut Vec<T>, a: usize, b: usize)
         b < old(v)@.len(),
     ensures
         final(v)@ == old(v)@.update(a as int, old(v)@[b as int]).update(b as int, old(v)@[a as int]),
+    no_unwind
 {
     v.swap(a, b);
 }
@@ -373,6 +379,7 @@ impl<N: Nic> Part<N> {
                 Some(f) => self.lease == Lease::Shared(*f),
                 None => self.lease is Unique,
             },
+        no_unwind
     {
         match &self.lease {
             Lease::Shared(frozen) => Some(frozen),
@@ -388,6 +395,7 @@ impl<N: Nic> Part<N> {
                 Ok(f) => self.lease == Lease::Shared(f),
                 Err(lease) => lease == self.lease && self.lease is Unique,
             },
+        no_unwind
     {
         match self.lease {
             Lease::Shared(frozen) => Ok(frozen),
@@ -404,6 +412,7 @@ impl<N: Nic> Part<N> {
         ensures
             same == self,
             hw.table_apart(self.resource()),
+        no_unwind
     {
         proof { use_type_invariant(&self); }
         let Part { sge, pd, lease } = self;
@@ -457,6 +466,7 @@ impl<N: Nic> Part<N> {
                 addr: raw.pointer().addr() as u64, length: raw.byte_len() as u32, lkey: (*raw.region).lkey,
             }),
             r.spec_writable(),
+        no_unwind
     {
         proof { use_type_invariant(&raw); raw.lemma_domain(); }
         let length = raw.len() as u32;
@@ -475,6 +485,7 @@ impl<N: Nic> Part<N> {
                 addr: (frozen.pointer().addr() + offset) as u64, length: len as u32, lkey: (*frozen.raw.region).lkey,
             }),
             !r.spec_writable(),
+        no_unwind
     {
         proof {
             use_type_invariant(&*frozen);
@@ -525,16 +536,19 @@ impl<N: Nic> Part<N> {
     /// Its byte length.
     pub fn len(&self) -> (len: u64)
         ensures len == self.spec_sge().length,
+        no_unwind
     { self.sge.length as u64 }
 
     /// Whether it has no bytes.
     pub fn is_empty(&self) -> (empty: bool)
         ensures empty <==> self.spec_sge().length == 0,
+        no_unwind
     { self.sge.length == 0 }
 
     /// Whether the NIC may write it (an exclusive buffer).
     pub fn is_writable(&self) -> (writable: bool)
         ensures writable == self.spec_writable(),
+        no_unwind
     { matches!(self.lease, Lease::Unique(_)) }
 }
 
@@ -854,6 +868,7 @@ impl<N: Nic> Leases<N> {
         ensures
             *final(incoming) == *old(incoming),
             self.apart_from(final(incoming).observation()),
+        no_unwind
     {
         match &self.held {
             Held::Nothing => {},
@@ -1037,6 +1052,7 @@ impl<N: Nic> Leases<N> {
     pub fn new() -> (r: Self)
         ensures r.inv(), r.view().len() == 0, r.loans().len() == 0, r.wqes().len() == 0,
             r.fully_recorded(), !r.spec_many(),
+        no_unwind
     { Leases { held: Held::Nothing, loans: Ghost(Seq::empty()), wqes: Ghost(Seq::empty()) } }
 
     /// The lease of one input part, as a request of one WQE holds it, with no allocation.
@@ -1049,6 +1065,7 @@ impl<N: Nic> Leases<N> {
             r.loans() == seq![Loan { part, access: Some(access) }],
             r.wqes().len() == 0,
             !r.spec_many(),
+        no_unwind
     {
         proof { use_type_invariant(&part); }
         let ghost loans = seq![Loan { part, access: Some(access) }];
@@ -1085,6 +1102,7 @@ impl<N: Nic> Leases<N> {
             final(self).wqes() == old(self).wqes().push(wqe),
             covers_inputs(old(self).wqes(), wqe.first) && wqe.end() == old(self).loans().len()
                 ==> final(self).fully_recorded(),
+        no_unwind
     {
         let ghost before = *self;
         self.wqes = Ghost(self.wqes().push(wqe));
@@ -1149,11 +1167,12 @@ impl<N: Nic> Leases<N> {
                     && old(self).view().last().same_frozen(lease.observation())
                     && final(self).view() == old(self).view()),
             final(spare)@.len() == 0,
+        no_unwind
     {
         let last = match &self.held {
             Held::Nothing => None,
             Held::One(first) => Some(first),
-            Held::Many(rest) => rest.last(),
+            Held::Many(rest) => if rest.len() > 0 { Some(element(rest.as_slice(), rest.len() - 1)) } else { None },
         };
         if let (Some(Lease::Shared(a)), Lease::Shared(b)) = (last, &lease) {
             if same_frozen_arc(a, b) {
@@ -1189,16 +1208,17 @@ impl<N: Nic> Leases<N> {
             final(self).loans == old(self).loans,
             final(self).wqes == old(self).wqes,
             final(spare)@.len() == 0,
+        no_unwind
     {
         let ghost before = *self;
         match &mut self.held {
-            Held::Many(rest) => rest.push(lease),
+            Held::Many(rest) => vec_push(rest, lease),
             held => {
-                let mut rest = replace_value(spare, Vec::new());
+                let mut rest = replace_value(spare, vec_new());
                 if let Held::One(first) = replace_value(held, Held::Nothing) {
-                    rest.push(first);
+                    vec_push(&mut rest, first);
                 }
-                rest.push(lease);
+                vec_push(&mut rest, lease);
                 *held = Held::Many(rest);
             },
         }
@@ -1213,13 +1233,15 @@ impl<N: Nic> Leases<N> {
         ensures old(self).inv() ==> final(self).inv(),
             final(self).loans() == old(self).loans().push(Loan { part, access: None }),
             final(self).wqes() == old(self).wqes(),
-    { self.push_loan(part, Ghost(None), &mut Vec::new()); }
+        no_unwind
+    { self.push_loan(part, Ghost(None), &mut vec_new()); }
 
     /// Whether one more resource takes no allocation: it holds none, or a list with room.
     #[inline(always)]
     fn has_room(&self) -> (room: bool)
         ensures
             room ==> !(self.held is One),
+        no_unwind
     {
         match &self.held {
             Held::Nothing => true,
@@ -1237,10 +1259,11 @@ impl<N: Nic> Leases<N> {
             final(self).raw_view() == old(self).raw_view().push(lease),
             final(self).loans == old(self).loans,
             final(self).wqes == old(self).wqes,
+        no_unwind
     {
         let ghost before = *self;
         match &mut self.held {
-            Held::Many(rest) => rest.push(lease),
+            Held::Many(rest) => vec_push(rest, lease),
             held => {
                 let free = replace_value(held, Held::One(lease));
                 forget_free(free, Ghost(free is Nothing));
@@ -1256,6 +1279,7 @@ impl<N: Nic> Leases<N> {
     pub fn is_many(&self) -> (many: bool)
         ensures
             many == self.spec_many(),
+        no_unwind
     {
         matches!(self.held, Held::Many(_))
     }
@@ -1277,14 +1301,14 @@ impl<N: Nic> Leases<N> {
     #[inline(never)]
     pub(crate) fn hand_back_many(&mut self, spare: &mut Vec<Lease<N>>)
         requires
-            old(self).inv(),
             old(spare)@.len() == 0,
         ensures
-            final(self).inv(),
+            old(self).inv() ==> final(self).inv(),
             old(self).fully_recorded() ==> final(self).fully_recorded(),
             final(self).uniques() == old(self).uniques(),
             !old(self).spec_many() ==> *final(self) == *old(self),
             final(spare)@.len() == 0,
+        no_unwind
     {
         let ghost before = *self;
         let ghost held = before.raw_view();
@@ -1319,7 +1343,7 @@ impl<N: Nic> Leases<N> {
             }
             i += 1;
         }
-        rest.truncate(kept);
+        vec_truncate(&mut rest, kept);
         proof {
             assert(held.take(i as int) =~= held);
         }
@@ -1331,7 +1355,7 @@ impl<N: Nic> Leases<N> {
             return;
         }
         let ghost filtered = rest@;
-        if let Some(unique) = rest.pop() {
+        if let Some(unique) = vec_pop(&mut rest) {
             self.held = Held::One(unique);
         }
         if capacity_of(spare) < capacity_of(&rest) {
@@ -1371,6 +1395,7 @@ impl<N: Nic> Leases<N> {
             old(self).inv() ==> final(self).inv(),
             final(self).loans() == old(self).loans().push(Loan { part, access }),
             final(self).wqes() == old(self).wqes(),
+        no_unwind
     {
         proof { use_type_invariant(&part); }
         let ghost before = *self;
@@ -1409,6 +1434,7 @@ impl<N: Nic> Leases<N> {
     /// The number of retained resources.
     pub fn len(&self) -> (len: usize)
         ensures len == self.view().len(),
+        no_unwind
     {
         match &self.held {
             Held::Nothing => 0,
@@ -1421,6 +1447,7 @@ impl<N: Nic> Leases<N> {
     pub fn is_empty(&self) -> (empty: bool)
         ensures empty == self.spec_holds_nothing(),
             empty ==> self.view().len() == 0,
+        no_unwind
     { matches!(self.held, Held::Nothing) }
 
     /// [`Leases::is_empty`], as a specification.
@@ -1550,6 +1577,7 @@ impl<'a, N: Nic> Peek<'a, N> {
     pub(super) fn new(frozen: &'a Arc<Frozen<N>>, offset: usize, bytes: usize) -> (p: Self)
         requires
             offset + bytes <= (**frozen).byte_len(),
+        no_unwind
     {
         proof { use_type_invariant(&**frozen); }
         Peek { frozen, offset, bytes, lkey: frozen.raw.region.lkey }
@@ -1594,6 +1622,7 @@ impl<'a, N: Nic> Peek<'a, N> {
         ensures
             sge == self.spec_sge(),
             sge.length == self.bytes,
+        no_unwind
     {
         proof {
             use_type_invariant(self);
@@ -1670,6 +1699,7 @@ impl<N: Nic> Kept<N> {
             final(self).same_contents(*old(self)),
             forall|i: int| 0 <= i < final(self).loans().len()
                 ==> #[trigger] hw.table_apart(final(self).loans()[i].part.resource()),
+        no_unwind
     {
         let ghost before = *self;
         let taken = self.last.take();
@@ -1762,6 +1792,7 @@ impl<N: Nic> Kept<N> {
         ensures
             kept.inv(),
             kept.loans().len() == 0,
+        no_unwind
     {
         Kept { last: None, leases: Leases::new(), loans: Ghost(Seq::empty()) }
     }
@@ -1779,6 +1810,7 @@ impl<N: Nic> Kept<N> {
                 Ok(()) => final(self).loans() == old(self).loans().push(Loan { part, access: Some(access) }),
                 Err(back) => back == part && final(self).loans() == old(self).loans(),
             },
+        no_unwind
     {
         proof {
             use_type_invariant(&part);
@@ -1884,6 +1916,7 @@ impl<N: Nic> Kept<N> {
             final(self).inv(),
             final(self).loans() == old(self).loans().push(Loan { part, access: Some(access) }),
             final(spare)@.len() == 0,
+        no_unwind
     {
         proof {
             use_type_invariant(&part);
@@ -1972,6 +2005,7 @@ impl<N: Nic> Kept<N> {
     pub(crate) fn keeps_peek(&self, peek: &Peek<'_, N>) -> (keeps: bool)
         ensures
             keeps ==> self.keeps_frozen(**peek.frozen),
+        no_unwind
     {
         match &self.last {
             Some(frozen) => same_frozen_arc(frozen, peek.frozen),
@@ -2011,6 +2045,7 @@ impl<N: Nic> Kept<N> {
             final(self).inv(),
             final(self).loans() == old(self).loans().push(Loan { part: peek.part(pd), access: Some(Dir::Out) }),
             pd == peek.pd_id(),
+        no_unwind
     {
         let ghost before = *self;
         proof {
@@ -2098,6 +2133,7 @@ impl<N: Nic> Kept<N> {
             leases.inv(),
             leases.loans() == old(self).loans(),
             leases.wqes() == wqes,
+        no_unwind
     {
         let ghost before = *self;
         let mut last = None;

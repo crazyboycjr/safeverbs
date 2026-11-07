@@ -271,6 +271,7 @@ impl<C, N: Device> HwQp<C, N> {
             ring_of(*final(self), e.queue).walked(&ring_of(*old(self), e.queue), e.queue is Recv, e.seq as u64, *wc, true),
             ring_of(*final(self), e.queue).completed_with(&ring_of(*old(self), e.queue), e.queue is Recv, e.seq as u64, *wc, true),
             ring_of(*final(self), other_queue(e.queue)) == ring_of(*old(self), other_queue(e.queue)),
+        no_unwind
     {
         let recv = is_recv(wc.wr_id);
         let ring = if recv { &mut self.recv } else { &mut self.send };
@@ -1522,7 +1523,7 @@ impl<C, N: Device> Hw<C, N> {
 
     /// The fields of the engine a walk leaves as they were.
     pub(super) open spec fn same_engine_fields(&self, pre: &Self) -> bool {
-        &&& cq_of(self.cq) == cq_of(pre.cq)
+        &&& cq_of(self.cq@) == cq_of(pre.cq@)
         &&& self.caps == pre.caps
         &&& self.cq_size == pre.cq_size
         &&& self.reserved == pre.reserved

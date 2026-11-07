@@ -856,7 +856,7 @@ unsafe impl Nic for Model {
         Vec::new()
     }
 
-    fn alloc_pd(&self) -> Result<ModelPd> {
+    unsafe fn alloc_pd(&self) -> Result<ModelPd> {
         Ok(ModelPd {
             id: self.lock().id(),
         })
@@ -915,7 +915,7 @@ unsafe impl Nic for Model {
         Ok(())
     }
 
-    fn create_cq(&self, entries: u32, _single_threaded: bool) -> Result<ModelCq> {
+    unsafe fn create_cq(&self, entries: u32, _single_threaded: bool) -> Result<ModelCq> {
         let mut f = self.lock();
         let id = f.id();
         f.cqs.insert(
@@ -931,15 +931,15 @@ unsafe impl Nic for Model {
         })
     }
 
-    fn alloc_td(&self) -> Option<ModelTd> {
+    unsafe fn alloc_td(&self) -> Option<ModelTd> {
         Some(ModelTd)
     }
 
-    fn alloc_domain(&self, _pd: &ModelPd, _td: &ModelTd) -> Option<ModelDomain> {
+    unsafe fn alloc_domain(&self, _pd: &ModelPd, _td: &ModelTd) -> Option<ModelDomain> {
         Some(ModelDomain)
     }
 
-    fn create_qp(
+    unsafe fn create_qp(
         &self,
         pd: &ModelPd,
         _domain: Option<&ModelDomain>,
@@ -984,7 +984,7 @@ mod mr_tests {
     #[test]
     fn refused_close_retains_registration_for_retry() {
         let model = Model::new(7);
-        let pd = model.alloc_pd().unwrap();
+        let pd = unsafe { model.alloc_pd() }.unwrap();
         let mut bytes = [0u8; 16];
         let addr = bytes.as_mut_ptr();
         // SAFETY: the memory, PD and model outlive the MR; no work is posted.
@@ -1040,7 +1040,7 @@ mod mr_tests {
     #[test]
     fn drop_retries_a_previously_refused_close() {
         let model = Model::new(9);
-        let pd = model.alloc_pd().unwrap();
+        let pd = unsafe { model.alloc_pd() }.unwrap();
         let mut bytes = [0u8; 16];
         // SAFETY: the memory, PD and model outlive the MR; no work is posted.
         let mut mr =

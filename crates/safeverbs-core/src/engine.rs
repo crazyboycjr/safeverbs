@@ -9,10 +9,11 @@
 //! hardware queues and rings, its share of M) lives in the internal `Hw`,
 //! which is verified: every call into the NIC meets M's precondition, the
 //! rings stay coupled to M's queues, completions are routed to the WQEs they
-//! name, and QPs are destroyed only drained. The data path here is inside `verus!` too: each of its
-//! methods keeps the engine's invariant and is a step of Theorem 1. What Verus cannot read is
-//! an unverified shell around them: thread domains, the drain's timing, callbacks and [`Request`],
-//! which only call methods whose preconditions are invariants.
+//! name, and QPs are destroyed only drained. An engine's invariant is a type invariant: no program
+//! has to promise anything, and Verus checks that each method keeps it and that nothing unwinds
+//! while it does not hold. So each method here is a step of Theorem 1, and any engine a program
+//! holds, whatever it did with it, is the end of a run of the theorem. What stays outside `verus!`
+//! is what calls these methods and no more: there is nothing for it to get wrong.
 //!
 //! The efficient way to use RDMA is one CQ per thread, shared by all of that
 //! thread's QPs, and a loop that polls it, dispatches each completion and
@@ -123,23 +124,31 @@
 //! not drained then is leaked with its buffers, and so are the CQ and the
 //! thread domain it is attached to.
 
+// The code keeps the plain forms the proofs reason about (explicit matches).
+#![allow(clippy::question_mark, clippy::manual_ok_err)]
+
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
 use core::task::Waker;
 use std::time::{Duration, Instant};
 
 use vstd::prelude::*;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::buf::{Buf, BufError, BufMut, Leases, Part};
+use crate::buf::{Buf, BufError, BufMut, Leases, Part, release};
 use crate::error::{Error, Result};
 use crate::hw::{Hw, Refusal};
 pub use crate::hw::{LetGo, OpenRequest, Unposted};
-use crate::nic::{ConnectAttr, Endpoint, Nic, QpCaps, RemoteBuf, WrOp};
+use crate::nic::{ConnectAttr, Endpoint, Nic, QpCaps, QpType, RemoteBuf, WrOp};
 use crate::pd::{Context, Pd};
+use crate::ring::wake::WakeBatch;
 use crate::ring::{Payload, Ring, Seq};
 use crate::transport::{Reliable, Transport};
-use crate::trusted::no_qp;
+use crate::trusted::{
+    alloc_domain, alloc_td, clone_context, clone_pd, no_context, no_qp, pd_id_of, same_device,
+    vec_push,
+};
+#[cfg(verus_keep_ghost)]
+use crate::trusted::{domain_over, pd_id};
 use crate::verbs::Verbs;
 #[cfg(doc)]
 use crate::wc::CompletionError;
@@ -156,6 +165,12 @@ const DRAIN_SPINS: u32 = 1024;
 
 verus! {
 
+broadcast use {
+    crate::hw::refines::lemma_moved_chain,
+    crate::hw::refines::lemma_same_table_chain,
+    crate::hw::refines::lemma_kept_qp,
+};
+
 /// [`Transport`], without specifications of its own: an engine reads no more of a key than its
 /// index.
 #[cfg(verus_keep_ghost)]
@@ -165,15 +180,67 @@ pub trait ExTransport: Send + Sync + 'static {
     type ExternalTraitSpecificationFor: Transport;
 }
 
-/// `ManuallyDrop::deref_mut`, which vstd does not specify.
+/// The QP type of a transport, which must complete in order (a build error otherwise). No meaning
+/// in M beyond the type itself, and what a WQE asks of its QP is compared against it at run time.
 #[verifier::external_body]
 #[inline(always)]
-fn hw_mut<C, N: Nic>(hw: &mut ManuallyDrop<Hw<C, N>>) -> (r: &mut Hw<C, N>)
+fn transport_of<T: Transport>() -> QpType {
+    const {
+        assert!(
+            T::IN_ORDER_COMPLETION,
+            "only in-order transports are supported"
+        );
+    }
+    T::QP_TYPE
+}
+
+/// The hardware side of an engine about to go: this is the last use of it (`Engine::drop`), so the
+/// engine's invariant need not hold of what it leaves.
+#[verifier::external_body]
+fn hw_at_end<C, N: Nic>(engine: &mut Engine<C, N>) -> (hw: &mut Hw<C, N>)
     ensures
-        *r == old(hw)@,
-        final(hw)@ == *final(r),
+        *hw == old(engine).state(),
 {
-    &mut *hw
+    &mut engine.hw
+}
+
+/// A drain's clock. The time means nothing in M: whatever it says, a QP is destroyed only with
+/// nothing in flight.
+#[verifier::external_body]
+struct DrainClock {
+    deadline: Instant,
+    idle: u32,
+}
+
+/// A clock with [`DRAIN_TIMEOUT`] to go.
+#[verifier::external_body]
+fn clock_start() -> DrainClock {
+    DrainClock {
+        deadline: Instant::now() + DRAIN_TIMEOUT,
+        idle: 0,
+    }
+}
+
+/// A completion came: [`DRAIN_TIMEOUT`] to go again.
+#[verifier::external_body]
+fn clock_renew(clock: &mut DrainClock) {
+    clock.deadline = Instant::now() + DRAIN_TIMEOUT;
+    clock.idle = 0;
+}
+
+/// No completion came: yields now and then, and says whether the time is up.
+#[verifier::external_body]
+fn clock_idle(clock: &mut DrainClock) -> bool {
+    clock.idle = clock.idle.wrapping_add(1);
+    if clock.idle.is_multiple_of(DRAIN_SPINS) {
+        if Instant::now() > clock.deadline {
+            return true;
+        }
+        std::thread::yield_now();
+    } else {
+        core::hint::spin_loop();
+    }
+    false
 }
 
 /// A QP of an engine: its index there, typed by its transport. Cheap to copy.
@@ -199,6 +266,7 @@ impl<T: Transport> QpKey<T> {
     pub fn index(self) -> (index: usize)
         ensures
             index == self.spec_index(),
+            index < MAX_QPS,
     {
         self.index as usize
     }
@@ -254,48 +322,65 @@ struct Domain<N: Nic> {
 /// a context of type `C` kept with each request (see the module documentation).
 ///
 /// Dropping it drains its QPs (as [`Engine::remove_qp`] does, all at once),
-/// drops the contexts of the requests not delivered, destroys the QPs, releases
-/// the buffers their requests held, then destroys the CQ and the thread domain.
+/// destroys the QPs, releases the buffers their requests held, destroys the CQ
+/// and the thread domain, then drops the contexts of the requests not delivered.
 /// A QP the device never flushes is leaked with its buffers, and so are the CQ
 /// and the domain.
 #[verifier::reject_recursive_types(C)]
 #[verifier::reject_recursive_types(N)]
 pub struct Engine<C = (), N: Nic = Verbs> {
-    /// The verified hardware side; dropped by hand, in `drop`.
-    hw: ManuallyDrop<Hw<C, N>>,
-    /// The parent domains its QPs are created on, one per protection domain; dropped by hand.
-    domains: ManuallyDrop<Vec<Domain<N>>>,
-    /// The thread domain of its QPs, where the device has them; dropped by hand, last.
-    td: ManuallyDrop<Option<N::Td>>,
+    /// The parent domains its QPs are created on, one per protection domain. The QPs go first, by
+    /// hand, in `drop`, and these before the thread domain.
+    domains: Vec<Domain<N>>,
+    /// The thread domain of its QPs, where the device has them: it goes before the device, which
+    /// `hw` keeps open.
+    td: Option<N::Td>,
+    /// The verified hardware side; its QPs and CQ go by hand, in `drop`.
+    hw: Hw<C, N>,
+    /// What `hw` was when the engine was made (erased).
+    #[allow(dead_code)]
+    first: Ghost<Hw<C, N>>,
 }
 
 impl<C, N: Nic> Engine<C, N> {
+    /// **What every engine a program holds is, whatever it did with it:** its hardware side keeps
+    /// [`Hw::inv`], and it came from the first state by what [`Hw::moved_from`] says, which is a
+    /// step of Theorem 1 (`hw::refines`). Verus checks this after every change of `hw`, and that no
+    /// such change can unwind halfway; so the program never has to promise anything, even after
+    /// catching a panic.
+    #[verifier::type_invariant]
+    closed spec fn inv(self) -> bool {
+        &&& self.hw.inv()
+        &&& self.hw.moved_from(&self.first@)
+        &&& self.first@.born()
+        &&& forall|i: int| 0 <= i < self.domains@.len()
+            ==> domain_over(#[trigger] self.domains@[i].domain) == pd_id(self.domains@[i].pd)
+    }
+
     /// What it stands for in Theorem 1: its hardware side, a state of `EngineState`.
     pub closed spec fn state(&self) -> Hw<C, N> {
-        self.hw@
+        self.hw
     }
 
-    /// Its invariant: only [`Engine::of`] makes one, its fields are private, and every method keeps it.
-    pub open spec fn inv(&self) -> bool {
-        self.state().inv()
-    }
-
-    /// `self` is `older` after calls of the engine: it keeps its invariant, and its hardware side
-    /// moved as [`Hw::moved_from`] says, which is a step of Theorem 1.
+    /// `self` is `older` after calls of the engine: its hardware side moved as [`Hw::moved_from`]
+    /// says, which is a step of Theorem 1.
     pub open spec fn moved_from(&self, older: &Self) -> bool {
-        &&& self.inv()
-        &&& self.state().moved_from(&older.state())
+        self.state().moved_from(&older.state())
     }
 
-    /// `moved_from` is transitive.
-    proof fn lemma_moved_trans(&self, mid: &Self, older: &Self)
-        requires
-            self.moved_from(mid),
-            mid.moved_from(older),
+    /// What a program's engine is, for the proofs: the type invariant, said of its state, with the
+    /// first state it came from.
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn stands(&self) -> (first: Ghost<Hw<C, N>>)
         ensures
-            self.moved_from(older),
+            self.state().inv(),
+            self.state().moved_from(&first@),
+            first@.born(),
     {
-        self.hw@.lemma_moved_trans(&mid.hw@, &older.hw@);
+        proof {
+            use_type_invariant(self);
+        }
+        self.first
     }
 
     /// Its hardware side, as Theorem 1 reads it.
@@ -303,30 +388,365 @@ impl<C, N: Nic> Engine<C, N> {
     pub(crate) fn hw(&self) -> (hw: &Hw<C, N>)
         ensures
             *hw == self.state(),
+            hw.inv(),
     {
-        &*self.hw
+        proof {
+            use_type_invariant(self);
+        }
+        &self.hw
     }
 
-    /// An engine over a hardware side and a thread domain, with no parent domain yet.
-    pub(crate) fn of(hw: Hw<C, N>, td: Option<N::Td>) -> (engine: Self)
-        requires
-            hw.inv(),
+    /// An engine on the device of `ctx` with a CQ of `cq_size` entries, on a thread domain of
+    /// its own where the device has them.
+    pub fn new(ctx: &Context<N>, cq_size: u32) -> (r: Result<Engine<C, N>>)
         ensures
-            engine.inv(),
-            engine.state() == hw,
+            r matches Ok(engine) ==> engine.state().spec_reserved() == 0 && engine.state().spec_cq_size() == cq_size,
     {
-        Engine {
-            hw: ManuallyDrop::new(hw),
-            domains: ManuallyDrop::new(Vec::new()),
-            td: ManuallyDrop::new(td),
+        let hw = match Hw::new(clone_context(ctx), cq_size) {
+            Ok(hw) => hw,
+            Err(e) => return Err(e),
+        };
+        let ghost first = hw;
+        proof {
+            first.lemma_moved_refl();
+        }
+        Ok(Engine { domains: Vec::new(), td: alloc_td(ctx), hw, first: Ghost(first) })
+    }
+
+    /// The device of its QPs.
+    pub fn context(&self) -> &Context<N> {
+        self.hw.context()
+    }
+
+    /// Whether its QPs are created on a thread domain (so the driver takes
+    /// no locks for them); not every device has thread domains.
+    pub fn is_lock_free(&self) -> bool {
+        self.td.is_some()
+    }
+
+    /// The entries of its CQ.
+    pub fn cq_size(&self) -> u32 {
+        self.hw.cq_size()
+    }
+
+    /// The CQ entries its QPs reserve (the sum of their queue depths).
+    pub fn reserved(&self) -> u32 {
+        self.hw.reserved()
+    }
+
+    /// The parent domain to create a QP of `pd` on: the engine's for that protection domain,
+    /// made the first time; `None` where the device has no thread domains.
+    fn domain_index(&mut self, pd: &Pd<N>) -> (i: Option<usize>)
+        ensures
+            final(self).state() == old(self).state(),
+            i matches Some(k) ==> k < final(self).domains@.len() && domain_over(final(self).domains@[k as int].domain) == pd_id(*pd),
+    {
+        proof {
+            use_type_invariant(&*self);
+        }
+        let td = match &self.td {
+            Some(td) => td,
+            None => return None,
+        };
+        let id = pd_id_of(pd);
+        let mut i = 0;
+        while i < self.domains.len()
+            invariant
+                i <= self.domains@.len(),
+                id == pd_id(*pd),
+                forall|k: int| 0 <= k < self.domains@.len()
+                    ==> domain_over(#[trigger] self.domains@[k].domain) == pd_id(self.domains@[k].pd),
+            decreases self.domains@.len() - i,
+        {
+            if pd_id_of(&self.domains[i].pd) == id {
+                return Some(i);
+            }
+            i += 1;
+        }
+        let domain = match alloc_domain(pd, td) {
+            Some(domain) => domain,
+            None => return None,
+        };
+        let ghost before = self.domains@;
+        vec_push(&mut self.domains, Domain { domain, pd: clone_pd(pd) });
+        proof {
+            use_type_invariant(&*self);
+            assert(self.domains@[before.len() as int].domain == domain);
+        }
+        Some(self.domains.len() - 1)
+    }
+
+    /// Creates a QP (in the RESET state) in `pd` with queues of `caps` and requests of at most
+    /// `max_batch` WQEs, attached to the engine's CQ.
+    ///
+    /// `pd` must be of the engine's device. The sizes are checked against what the device
+    /// supports, and the QP's depths must fit in what the CQ has not reserved yet. M has one
+    /// limit of scatter/gather elements per QP: every WQE is held to the smaller of
+    /// `max_send_sge` and `max_recv_sge`.
+    pub fn create_qp<T: Transport>(&mut self, pd: &Pd<N>, caps: QpCaps, max_batch: u32) -> (r: Result<QpKey<T>>)
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        proof {
+            use_type_invariant(&*self);
+        }
+        let qp_type = transport_of::<T>();
+        if !same_device(self.hw.context(), pd) {
+            proof {
+                self.hw.lemma_moved_refl();
+            }
+            return Err(Error::Invalid("a protection domain of another device"));
+        }
+        let at = self.domain_index(pd);
+        proof {
+            use_type_invariant(&*self);
+        }
+        let domain = match at {
+            Some(i) => Some(&self.domains[i].domain),
+            None => None,
+        };
+        match self.hw.create_qp(pd, domain, qp_type, caps, max_batch) {
+            Ok(index) => Ok(QpKey { index: index as u16, _t: PhantomData }),
+            Err(e) => Err(e),
         }
     }
 
-    /// Panics unless `index` names a QP of the engine.
-    fn check(&self, index: usize)
-        requires
-            self.inv(),
+    /// Removes a QP: drops the contexts of its requests not delivered, drains
+    /// it, destroys it, then releases the buffers its requests still hold (none
+    /// is handed out) and its share of the CQ.
+    ///
+    /// The NIC may still use the buffers of the WQEs in flight, so the QP is
+    /// drained first (see the module documentation): moved to the error
+    /// state, given a signaled drain WQE, and the CQ polled until nothing of
+    /// it is in flight, the other QPs' completions going to their rings as
+    /// [`Engine::progress`] sends them. No completion of the QP is left in
+    /// the CQ then, so another QP may take its index and its share at once.
+    ///
+    /// If the device does not flush (no completion for [`DRAIN_TIMEOUT`]),
+    /// the QP is kept with its buffers, index and share, never destroyed or
+    /// freed, and this fails with [`Error::NotFlushed`]; dropping the
+    /// engine tries again. Either way the key names no QP afterwards.
+    pub fn remove_qp<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Result<()>)
+        ensures
+            final(self).moved_from(old(self)),
+            r is Err ==> final(self).state().keeps_qp(qp.spec_index() as int),
     {
+        proof {
+            use_type_invariant(&*self);
+            self.hw.lemma_moved_refl();
+        }
+        let index = qp.index();
+        if !self.hw.is_qp(index) {
+            return Ok(());
+        }
+        self.hw.start_drain(index);
+        let let_go = self.hw.take_let_go();
+        release(let_go);
+        let r = self.drain_and_destroy(index);
+        self.resume_panics();
+        r
+    }
+
+    /// [`Engine::remove_qp`] for a caller that holds the engine behind a borrow or a lock: nothing
+    /// whose destructor is the program's is dropped here. What it let go of comes back, for the
+    /// caller to drop once it has let go of the engine, since a `wr_id` may hold a handle to a QP.
+    pub fn remove_qp_later<T: Transport>(&mut self, qp: QpKey<T>) -> (r: (Result<()>, LetGo<C>))
+        ensures
+            final(self).moved_from(old(self)),
+            r.0 is Err ==> final(self).state().keeps_qp(qp.spec_index() as int),
+    {
+        proof {
+            use_type_invariant(&*self);
+            self.hw.lemma_moved_refl();
+        }
+        let index = qp.index();
+        if !self.hw.is_qp(index) {
+            return (Ok(()), LetGo::new());
+        }
+        self.hw.start_drain(index);
+        let let_go = self.hw.take_let_go();
+        (self.drain_and_destroy(index), let_go)
+    }
+
+    /// The rest of a removal: drained, then destroyed, or kept (see [`Engine::remove_qp`]).
+    fn drain_and_destroy(&mut self, index: usize) -> (r: Result<()>)
+        requires
+            index < MAX_QPS,
+            old(self).state().keeps_qp(index as int),
+        ensures
+            final(self).moved_from(old(self)),
+            r is Err ==> final(self).state().keeps_qp(index as int),
+    {
+        proof {
+            use_type_invariant(&*self);
+        }
+        let drained = self.drain(index, index + 1);
+        proof {
+            use_type_invariant(&*self);
+        }
+        if drained && self.hw.destroy(index) {
+            Ok(())
+        } else {
+            proof {
+                assert(self.state().keeps_qp(index as int));
+            }
+            Err(Error::NotFlushed)
+        }
+    }
+
+    /// Polls the CQ until the QPs being removed among those from `from` up to `to` have nothing in
+    /// flight; `false` if no completion came for [`DRAIN_TIMEOUT`] while some still had. Neither
+    /// answer frees anything: what frees a QP is [`Hw::destroy`], which looks at its rings itself.
+    #[verifier::exec_allows_no_decreases_clause]
+    fn drain(&mut self, from: usize, to: usize) -> (drained: bool)
+        ensures
+            final(self).moved_from(old(self)),
+            final(self).state().same_table(&old(self).state()),
+    {
+        let ghost start = self.state();
+        proof {
+            use_type_invariant(&*self);
+            start.lemma_moved_refl();
+            start.lemma_same_table_refl();
+        }
+        let mut clock = clock_start();
+        loop
+            invariant
+                self.state().moved_from(&start),
+                self.state().same_table(&start),
+                start == old(self).state(),
+        {
+            let mut busy = false;
+            let mut index = from;
+            while index < to
+                invariant
+                    self.state().moved_from(&start),
+                    self.state().same_table(&start),
+                    start == old(self).state(),
+                decreases to - index,
+            {
+                proof {
+                    use_type_invariant(&*self);
+                }
+                self.hw.post_drain(index);
+                proof {
+                    use_type_invariant(&*self);
+                }
+                if self.hw.draining(index) {
+                    busy = true;
+                }
+                index += 1;
+            }
+            if !busy {
+                return true;
+            }
+            proof {
+                use_type_invariant(&*self);
+            }
+            if self.hw.progress() > 0 {
+                clock_renew(&mut clock);
+            } else if clock_idle(&mut clock) {
+                return false;
+            }
+        }
+    }
+
+    /// Everything an engine does as it goes, but for its CQ: gives up every request and drains every
+    /// QP, destroys the drained ones and releases their buffers. What the program must get rid of
+    /// comes back: the contexts and wakers given up, and the panics of the wakers run.
+    fn end(&mut self) -> (r: (LetGo<C>, WakeBatch))
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        proof {
+            use_type_invariant(&*self);
+            self.hw.lemma_moved_refl();
+        }
+        let slots = self.hw.qp_slots();
+        let mut index = 0;
+        while index < slots
+            invariant
+                self.state().moved_from(&old(self).state()),
+            decreases slots - index,
+        {
+            proof {
+                use_type_invariant(&*self);
+            }
+            self.hw.start_drain(index);
+            index += 1;
+        }
+        proof {
+            use_type_invariant(&*self);
+        }
+        let let_go = self.hw.take_let_go();
+        let _ = self.drain(0, slots);
+        let mut index = 0;
+        while index < slots
+            invariant
+                self.state().moved_from(&old(self).state()),
+            decreases slots - index,
+        {
+            proof {
+                use_type_invariant(&*self);
+            }
+            if !self.hw.draining(index) {
+                let _ = self.hw.destroy(index);
+            }
+            index += 1;
+        }
+        proof {
+            use_type_invariant(&*self);
+        }
+        (let_go, self.hw.take_panics())
+    }
+
+    /// Destroys its CQ if no QP is left; `false`, and the CQ stays, if some QP the device never
+    /// flushed is.
+    fn close(&mut self) -> (closed: bool) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        hw_at_end(self).finish()
+    }
+
+    /// Resumes the first panic of a waker it ran. Here, and not in the hardware side: nothing can
+    /// unwind while the engine's invariant is being restored.
+    #[inline(always)]
+    fn resume_panics(&mut self)
+        ensures
+            final(self).moved_from(old(self)),
+            final(self).state().same_table(&old(self).state()),
+    {
+        proof {
+            use_type_invariant(&*self);
+            self.hw.lemma_moved_refl();
+            self.hw.lemma_same_table_refl();
+        }
+        if self.hw.panicked() {
+            self.resume_taken();
+        }
+    }
+
+    /// [`Engine::resume_panics`], when there is one.
+    #[cold]
+    #[inline(never)]
+    fn resume_taken(&mut self)
+        ensures
+            final(self).moved_from(old(self)),
+            final(self).state().same_table(&old(self).state()),
+    {
+        proof {
+            use_type_invariant(&*self);
+        }
+        let panics = self.hw.take_panics();
+        panics.finish();
+    }
+
+    /// Panics unless `index` names a QP of the engine.
+    fn check(&self, index: usize) {
+        proof {
+            use_type_invariant(self);
+        }
         if !self.hw.is_qp(index) {
             no_qp(index);
         }
@@ -345,38 +765,81 @@ impl<C, N: Nic> Engine<C, N> {
     /// panic resumes. Catching that panic does not lose those results.
     #[inline]
     pub fn progress(&mut self) -> (n: usize)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        hw_mut(&mut self.hw).progress()
+        proof {
+            use_type_invariant(&*self);
+        }
+        let n = self.hw.progress();
+        self.resume_panics();
+        n
     }
 
     /// The first half of [`Engine::poll`], for a caller who cannot lend the engine to a callback:
     /// reads at most `n` CQEs and updates the CQ's consumer index, unless some read before are not
-    /// routed yet. Returns how many it read.
+    /// routed yet. Returns how many it read. A panic of a waker the last CQEs ran resumes here, with
+    /// nothing lost.
     #[inline(always)]
     pub fn read_completions(&mut self, n: usize) -> (read: usize)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        hw_mut(&mut self.hw).read_completions(n)
+        self.resume_panics();
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.read_completions(n)
     }
 
     /// The second half of [`Engine::poll`]: the next request that completed with an owner, `None`
     /// when nothing is left of what was read.
     #[inline(always)]
     pub fn next_completion(&mut self) -> (r: Option<Completion<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             r matches Some(c) ==> old(self).state().hands_out(c),
     {
-        hw_mut(&mut self.hw).next_completion()
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.next_completion()
+    }
+
+    /// The event loop's poll: reads at most `n` CQEs ([`POLL_MAX`] at most), updates the CQ's
+    /// consumer index, and then hands every request they complete with an owner (and that was not
+    /// taken otherwise) to `f`, with the engine, in each queue's order, and every request refused
+    /// with its doorbell at once; returns the number of requests handed out. `f` may post new work
+    /// on any QP, take or detach requests, even poll or remove QPs. Nothing is allocated.
+    ///
+    /// Requests without an owner (detached) release their buffers when they
+    /// complete; their first error is reported by [`Engine::take_send_error`].
+    /// An unsignaled request completes with the next signaled one of its
+    /// queue: a loop that posts unsignaled requests also posts signaled
+    /// ones.
+    ///
+    /// That every `F` may be called is what a program's closure is: only Verus can write one that
+    /// asks more.
+    #[inline]
+    #[verifier::exec_allows_no_decreases_clause]
+    pub fn poll<F: FnMut(&mut Engine<C, N>, Completion<C, N>)>(&mut self, n: usize, mut f: F) -> usize
+        requires
+            forall|any: F, e: &mut Engine<C, N>, c: Completion<C, N>| any.requires((e, c)),
+    {
+        let _ = self.read_completions(n);
+        let mut handed = 0usize;
+        loop
+            invariant
+                forall|any: F, e: &mut Engine<C, N>, c: Completion<C, N>| any.requires((e, c)),
+        {
+            match self.next_completion() {
+                Some(done) => {
+                    f(self, done);
+                    handed = handed.wrapping_add(1);
+                },
+                None => return handed,
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -393,26 +856,28 @@ impl<C, N: Nic> Engine<C, N> {
         attr: &ConnectAttr,
         remote: &Endpoint,
     ) -> (r: Result<()>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
         self.check(qp.index());
-        hw_mut(&mut self.hw).connect(qp.index(), attr, remote)
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.connect(qp.index(), attr, remote)
     }
 
     /// Moves the QP to the error state: every request in flight completes
     /// with a flush error and hands its buffers back. Work posted from then
     /// on is flushed too.
     pub fn to_error<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Result<()>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
         self.check(qp.index());
-        hw_mut(&mut self.hw).set_error(qp.index())
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.set_error(qp.index())
     }
 
     /// A request to write on the QP, as a value of its own: no borrow of the engine is held while
@@ -422,13 +887,13 @@ impl<C, N: Nic> Engine<C, N> {
     /// at the QP's queue then: they say there is no room, or wait for some.
     #[inline(always)]
     pub fn open_request<T: Transport>(&mut self, qp: QpKey<T>) -> (open: OpenRequest<N>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
-            open.inv(),
     {
-        hw_mut(&mut self.hw).open_request(qp.index())
+        proof {
+            use_type_invariant(&*self);
+        }
+        OpenRequest::of(self.hw.open_request(qp.index()))
     }
 
     /// Adds a WQE to `open`, whatever it takes: what [`OpenRequest::try_push`] could not tell is
@@ -442,24 +907,26 @@ impl<C, N: Nic> Engine<C, N> {
         op: WrOp,
         part: Part<N>,
     ) -> (r: Result<(), BufError<Part<N>>>)
-        requires
-            old(self).inv(),
-            old(open).inv(),
         ensures
             final(self).moved_from(old(self)),
-            final(open).inv(),
             r matches Err(e) ==> e.buf == part,
     {
-        hw_mut(&mut self.hw).push_other(qp.index(), open, op, part)
+        self.check(qp.index());
+        proof {
+            use_type_invariant(&*self);
+            use_type_invariant(&*open);
+        }
+        self.hw.push_other(qp.index(), &mut open.writing, op, part)
     }
 
     /// Whether `open`'s WQEs fit in the QP's queue now.
     #[inline(always)]
-    pub fn open_fits<T: Transport>(&self, qp: QpKey<T>, open: &OpenRequest<N>) -> bool
-        requires
-            self.inv(),
-    {
-        self.hw.open_fits(qp.index(), open)
+    pub fn open_fits<T: Transport>(&self, qp: QpKey<T>, open: &OpenRequest<N>) -> bool {
+        proof {
+            use_type_invariant(self);
+            use_type_invariant(open);
+        }
+        self.hw.open_fits(qp.index(), &open.writing)
     }
 
     /// Writes `open`'s WQEs as a request, signaled if `signal` (else only if the ring needs it),
@@ -475,20 +942,15 @@ impl<C, N: Nic> Engine<C, N> {
         signal: bool,
         ctx: Option<C>,
     ) -> (r: core::result::Result<Seq, Option<C>>)
-        requires
-            old(self).inv(),
-            old(open).inv(),
         ensures
             final(self).moved_from(old(self)),
-            final(open).inv(),
             r matches Err(back) ==> back == ctx,
     {
-        let ghost before = *old(open);
-        let r = hw_mut(&mut self.hw).close(qp.index(), open, signal, ctx);
         proof {
-            open.lemma_same_fields(&before);
+            use_type_invariant(&*self);
+            use_type_invariant(&*open);
         }
-        r
+        self.hw.close(qp.index(), &mut open.writing, signal, ctx)
     }
 
     /// `open` as a request with `ctx`, and the doorbell; what it keeps from the QP goes back. If the
@@ -502,15 +964,15 @@ impl<C, N: Nic> Engine<C, N> {
         signal: bool,
         ctx: C,
     ) -> (r: Result<Seq, PostError<C, N>>)
-        requires
-            old(self).inv(),
-            old(open).inv(),
         ensures
             final(self).moved_from(old(self)),
-            final(open).inv(),
             r matches Err(e) ==> e.wr_id == ctx,
     {
-        match hw_mut(&mut self.hw).submit_open(qp.index(), open, signal, ctx) {
+        proof {
+            use_type_invariant(&*self);
+            use_type_invariant(&*open);
+        }
+        match self.hw.submit_open(qp.index(), &mut open.writing, signal, ctx) {
             Ok(seq) => Ok(seq),
             Err(refused) => Err(owned(refused)),
         }
@@ -523,33 +985,30 @@ impl<C, N: Nic> Engine<C, N> {
         qp: QpKey<T>,
         open: &mut OpenRequest<N>,
     ) -> (r: Result<()>)
-        requires
-            old(self).inv(),
-            old(open).inv(),
         ensures
             final(self).moved_from(old(self)),
-            final(open).inv(),
     {
-        let ghost start = *self;
         proof {
-            start.hw@.lemma_moved_refl();
+            use_type_invariant(&*self);
+            use_type_invariant(&*open);
+            self.hw.lemma_moved_refl();
         }
         let index = qp.index();
         if !open.is_empty() {
-            match hw_mut(&mut self.hw).close_waiting(index, open, true, None) {
+            match self.hw.close_waiting(index, &mut open.writing, true, None) {
                 Ok(_) => {},
                 Err(_) => return Err(Error::QueueFull),
             }
         }
-        let ghost closed = *self;
-        hw_mut(&mut self.hw).give_back(index, open);
-        let ghost back = *self;
-        let r = hw_mut(&mut self.hw).commit(index, None);
         proof {
-            back.lemma_moved_trans(&closed, &start);
-            (*self).lemma_moved_trans(&back, &start);
+            use_type_invariant(&*self);
+            use_type_invariant(&*open);
         }
-        match r {
+        self.hw.give_back(index, &mut open.writing);
+        proof {
+            use_type_invariant(&*self);
+        }
+        match self.hw.commit(index, None) {
             Ok(()) => Ok(()),
             Err((e, _)) => Err(e),
         }
@@ -559,27 +1018,26 @@ impl<C, N: Nic> Engine<C, N> {
     /// are released here, and a list of several goes back to the QP for the next such request, so
     /// that it allocates nothing.
     pub fn hand_back_leases<T: Transport>(&mut self, qp: QpKey<T>, leases: &mut Leases<N>)
-        requires
-            old(self).inv(),
-            old(leases).inv(),
         ensures
             final(self).moved_from(old(self)),
-            final(leases).inv(),
     {
-        hw_mut(&mut self.hw).hand_back_leases(qp.index(), leases);
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.hand_back_leases(qp.index(), leases);
     }
 
     /// What `open` keeps from the QP goes back there, for the next request, if it has no WQE: the
     /// WQEs it has stay in it.
     pub fn give_back<T: Transport>(&mut self, qp: QpKey<T>, open: &mut OpenRequest<N>)
-        requires
-            old(self).inv(),
-            old(open).inv(),
         ensures
             final(self).moved_from(old(self)),
-            final(open).inv(),
     {
-        hw_mut(&mut self.hw).give_back(qp.index(), open);
+        proof {
+            use_type_invariant(&*self);
+            use_type_invariant(&*open);
+        }
+        self.hw.give_back(qp.index(), &mut open.writing);
     }
 
     /// One WQE as a request of its own, signaled, and the doorbell; if the queue is full it waits
@@ -592,24 +1050,17 @@ impl<C, N: Nic> Engine<C, N> {
         part: Part<N>,
         ctx: C,
     ) -> (r: Result<Seq, PostError<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             r matches Err(e) ==> e.wr_id == ctx,
     {
-        let ghost start = *self;
-        match hw_mut(&mut self.hw).post_one(qp.index(), op, part, Some(ctx), true, true) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        match self.hw.post_one(qp.index(), op, part, Some(ctx), true, true) {
             Ok(Ok(seq)) => Ok(seq),
             Ok(Err(refused)) => Err(owned(refused)),
-            Err(unposted) => {
-                let ghost mid = *self;
-                let r = self.post_slow(qp.index(), unposted, true, true);
-                proof {
-                    (*self).lemma_moved_trans(&mid, &start);
-                }
-                r
-            },
+            Err(unposted) => self.post_slow(qp.index(), unposted, true, true),
         }
     }
 
@@ -624,13 +1075,16 @@ impl<C, N: Nic> Engine<C, N> {
         ring: bool,
     ) -> (r: Result<Seq, PostError<C, N>>)
         requires
-            old(self).inv(),
             unposted.ctx is Some,
         ensures
             final(self).moved_from(old(self)),
             r matches Err(e) ==> e.wr_id == unposted.ctx->0,
     {
-        match hw_mut(&mut self.hw).post_one_slow(index, unposted, signal, ring) {
+        self.check(index);
+        proof {
+            use_type_invariant(&*self);
+        }
+        match self.hw.post_one_slow(index, unposted, signal, ring) {
             Ok(seq) => Ok(seq),
             Err(refused) => Err(owned(refused)),
         }
@@ -648,14 +1102,15 @@ impl<C, N: Nic> Engine<C, N> {
         part: Part<N>,
         ctx: C,
     ) -> (r: Result<Result<Seq, PostError<C, N>>, Unposted<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             r matches Ok(Err(e)) ==> e.wr_id == ctx,
             r matches Err(back) ==> back.op == op && back.part == part && back.ctx == Some(ctx),
     {
-        match hw_mut(&mut self.hw).post_one(qp.index(), op, part, Some(ctx), true, true) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        match self.hw.post_one(qp.index(), op, part, Some(ctx), true, true) {
             Ok(Ok(seq)) => Ok(Ok(seq)),
             Ok(Err(refused)) => Ok(Err(owned(refused))),
             Err(unposted) => Err(unposted),
@@ -673,14 +1128,15 @@ impl<C, N: Nic> Engine<C, N> {
         ctx: C,
         signal: bool,
     ) -> (r: Result<Result<Seq, PostError<C, N>>, Unposted<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             r matches Ok(Err(e)) ==> e.wr_id == ctx,
             r matches Err(back) ==> back.op == op && back.part == part && back.ctx == Some(ctx),
     {
-        match hw_mut(&mut self.hw).post_one(qp.index(), op, part, Some(ctx), signal, false) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        match self.hw.post_one(qp.index(), op, part, Some(ctx), signal, false) {
             Ok(Ok(seq)) => Ok(Ok(seq)),
             Ok(Err(refused)) => Ok(Err(owned(refused))),
             Err(unposted) => Err(unposted),
@@ -690,6 +1146,11 @@ impl<C, N: Nic> Engine<C, N> {
     /// What [`Engine::try_post`] or [`Engine::try_stage`] handed back, as a request of the general
     /// kind, signaled if `signal`, and the doorbell if `ring`: it waits for room if it must,
     /// polling the CQ.
+    ///
+    /// # Panics
+    ///
+    /// If it is refused and the program took the context out of `unposted`, so that there is none
+    /// to give back.
     pub fn post_unposted<T: Transport>(
         &mut self,
         qp: QpKey<T>,
@@ -697,14 +1158,22 @@ impl<C, N: Nic> Engine<C, N> {
         signal: bool,
         ring: bool,
     ) -> (r: Result<Seq, PostError<C, N>>)
-        requires
-            old(self).inv(),
-            unposted.ctx is Some,
         ensures
             final(self).moved_from(old(self)),
-            r matches Err(e) ==> e.wr_id == unposted.ctx->0,
     {
-        self.post_slow(qp.index(), unposted, signal, ring)
+        self.check(qp.index());
+        proof {
+            use_type_invariant(&*self);
+        }
+        match self.hw.post_one_slow(qp.index(), unposted, signal, ring) {
+            Ok(seq) => Ok(seq),
+            Err(refused) => {
+                if refused.ctx.is_none() {
+                    no_context();
+                }
+                Err(owned(refused))
+            },
+        }
     }
 
     /// Writes one WQE doing `op` on `part` as a request of its own, with `ctx` to come back with
@@ -719,24 +1188,17 @@ impl<C, N: Nic> Engine<C, N> {
         ctx: C,
         signal: bool,
     ) -> (r: Result<Seq, PostError<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             r matches Err(e) ==> e.wr_id == ctx,
     {
-        let ghost start = *self;
-        match hw_mut(&mut self.hw).post_one(qp.index(), op, part, Some(ctx), signal, false) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        match self.hw.post_one(qp.index(), op, part, Some(ctx), signal, false) {
             Ok(Ok(seq)) => Ok(seq),
             Ok(Err(refused)) => Err(owned(refused)),
-            Err(unposted) => {
-                let ghost mid = *self;
-                let r = self.post_slow(qp.index(), unposted, signal, false);
-                proof {
-                    (*self).lemma_moved_trans(&mid, &start);
-                }
-                r
-            },
+            Err(unposted) => self.post_slow(qp.index(), unposted, signal, false),
         }
     }
 
@@ -751,21 +1213,20 @@ impl<C, N: Nic> Engine<C, N> {
         part: Part<N>,
         signal: bool,
     ) -> (r: Result<Seq, BufError<Leases<N>>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        let ghost start = *self;
-        let done = match hw_mut(&mut self.hw).post_one(qp.index(), op, part, None, signal, false) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        let done = match self.hw.post_one(qp.index(), op, part, None, signal, false) {
             Ok(done) => done,
             Err(unposted) => {
-                let ghost mid = *self;
-                let done = hw_mut(&mut self.hw).post_one_slow(qp.index(), unposted, signal, false);
+                self.check(qp.index());
                 proof {
-                    (*self).lemma_moved_trans(&mid, &start);
+                    use_type_invariant(&*self);
                 }
-                done
+                self.hw.post_one_slow(qp.index(), unposted, signal, false)
             },
         };
         match done {
@@ -786,15 +1247,29 @@ impl<C, N: Nic> Engine<C, N> {
     /// requests have their refusal result and notifications are attempted.
     #[inline]
     pub fn commit<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Result<()>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        match hw_mut(&mut self.hw).commit(qp.index(), None) {
-            Ok(()) => Ok(()),
-            Err((e, _)) => Err(e),
+        proof {
+            use_type_invariant(&*self);
         }
+        match self.hw.commit(qp.index(), None) {
+            Ok(()) => Ok(()),
+            Err((e, _)) => self.refused(qp.index(), e),
+        }
+    }
+
+    /// A doorbell was refused: what `commit` says of it, the program's own error if the key names
+    /// no QP. A waker's panic resumes now.
+    #[cold]
+    #[inline(never)]
+    fn refused(&mut self, index: usize, error: Error) -> (r: Result<()>)
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        self.check(index);
+        self.resume_panics();
+        Err(error)
     }
 
     /// Takes the context, result and buffers of completed (or refused) request `seq` of `queue`.
@@ -805,65 +1280,70 @@ impl<C, N: Nic> Engine<C, N> {
         queue: Queue,
         seq: Seq,
     ) -> (r: Option<Completion<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             old(self).state().takeable(qp.spec_index(), queue, seq) ==> r is Some,
             queue is Recv ==> (r matches Some(c) ==> old(self).state().recv_taken_matches(qp.spec_index(), seq, c)),
             queue is Send ==> (r matches Some(c) ==> old(self).state().send_taken_matches(qp.spec_index(), seq, c)),
     {
-        hw_mut(&mut self.hw).take(qp.index(), queue, seq)
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.take(qp.index(), queue, seq)
     }
 
     /// Takes the context, result and buffers of completed (or refused) send
     /// request `seq`.
     #[inline]
     pub fn take_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> (r: Option<Completion<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             old(self).state().takeable(qp.spec_index(), Queue::Send, seq) ==> r is Some,
             r matches Some(c) ==> old(self).state().send_taken_matches(qp.spec_index(), seq, c),
     {
-        hw_mut(&mut self.hw).take(qp.index(), Queue::Send, seq)
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.take(qp.index(), Queue::Send, seq)
     }
 
     /// Takes the context, result and buffer of completed receive `seq`.
     #[inline]
     pub fn take_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> (r: Option<Completion<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             old(self).state().takeable(qp.spec_index(), Queue::Recv, seq) ==> r is Some,
             r matches Some(c) ==> old(self).state().recv_taken_matches(qp.spec_index(), seq, c),
     {
-        hw_mut(&mut self.hw).take(qp.index(), Queue::Recv, seq)
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.take(qp.index(), Queue::Recv, seq)
     }
 
     /// Gives up send request `seq`: its buffers are released when it completes
     /// (now, if it has), and its context comes back, if it has one still.
     pub fn detach_send<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> (ctx: Option<C>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        let (ctx, _waker) = hw_mut(&mut self.hw).detach(qp.index(), Queue::Send, seq);
+        proof {
+            use_type_invariant(&*self);
+        }
+        let (ctx, _waker) = self.hw.detach(qp.index(), Queue::Send, seq);
         ctx
     }
 
     /// Gives up receive `seq`: its buffer is released when it completes (now, if
     /// it has), and its context comes back, if it has one still.
     pub fn detach_recv<T: Transport>(&mut self, qp: QpKey<T>, seq: Seq) -> (ctx: Option<C>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        let (ctx, _waker) = hw_mut(&mut self.hw).detach(qp.index(), Queue::Recv, seq);
+        proof {
+            use_type_invariant(&*self);
+        }
+        let (ctx, _waker) = self.hw.detach(qp.index(), Queue::Recv, seq);
         ctx
     }
 
@@ -876,24 +1356,26 @@ impl<C, N: Nic> Engine<C, N> {
         queue: Queue,
         seq: Seq,
     ) -> (given_up: (Option<C>, Option<Waker>))
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        hw_mut(&mut self.hw).detach(qp.index(), queue, seq)
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.detach(qp.index(), queue, seq)
     }
 
     /// The first error of a send request without an owner (a dropped future's,
     /// a sink's, a split batch's part), once.
     pub fn take_send_error<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Option<DetachedError>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             r matches Some(error) ==> old(self).state().detached_taken_matches(qp.spec_index(), error),
     {
-        hw_mut(&mut self.hw).take_send_error(qp.index())
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.take_send_error(qp.index())
     }
 
     /// Wakes `waker` when send request `seq` completes; the waker it replaces comes back.
@@ -903,12 +1385,13 @@ impl<C, N: Nic> Engine<C, N> {
         seq: Seq,
         waker: &Waker,
     ) -> (replaced: Option<Waker>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        hw_mut(&mut self.hw).set_waker(qp.index(), Queue::Send, seq, waker)
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.set_waker(qp.index(), Queue::Send, seq, waker)
     }
 
     /// Wakes `waker` when receive `seq` completes; the waker it replaces comes back.
@@ -918,24 +1401,29 @@ impl<C, N: Nic> Engine<C, N> {
         seq: Seq,
         waker: &Waker,
     ) -> (replaced: Option<Waker>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        hw_mut(&mut self.hw).set_waker(qp.index(), Queue::Recv, seq, waker)
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.set_waker(qp.index(), Queue::Recv, seq, waker)
     }
 
     /// Waits until a new send request of at least one WQE fits on the QP:
     /// rings its doorbell for what is written and polls the CQ until a slot
     /// and a WQE are free. Fails if every slot holds a result nobody took.
     pub fn make_send_room<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Result<()>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        hw_mut(&mut self.hw).make_room(qp.index())
+        self.check(qp.index());
+        proof {
+            use_type_invariant(&*self);
+        }
+        let r = self.hw.make_room(qp.index());
+        self.resume_panics();
+        r
     }
 
     /// Posts a receive into `part`, a unique buffer, on the QP, with `ctx` for
@@ -948,23 +1436,13 @@ impl<C, N: Nic> Engine<C, N> {
         part: Part<N>,
         ctx: C,
     ) -> (r: Result<Seq, PostError<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             r matches Err(e) ==> e.wr_id == ctx,
     {
-        let ghost start = *self;
         match self.try_post_recv(qp, part, ctx) {
             Ok(posted) => posted,
-            Err((part, ctx)) => {
-                let ghost mid = *self;
-                let e = self.recv_error(qp, part, ctx);
-                proof {
-                    (*self).lemma_moved_trans(&mid, &start);
-                }
-                Err(e)
-            },
+            Err((part, ctx)) => Err(self.recv_error(qp, part, ctx)),
         }
     }
 
@@ -978,14 +1456,15 @@ impl<C, N: Nic> Engine<C, N> {
         part: Part<N>,
         ctx: C,
     ) -> (r: Result<Result<Seq, PostError<C, N>>, ReceiveBack<C, N>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             r matches Ok(Err(e)) ==> e.wr_id == ctx,
             r matches Err((back, c)) ==> back == part && c == ctx,
     {
-        match hw_mut(&mut self.hw).post_recv(qp.index(), part, Some(ctx)) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        match self.hw.post_recv(qp.index(), part, Some(ctx)) {
             Ok(Ok(seq)) => Ok(Ok(seq)),
             Ok(Err(refused)) => Ok(Err(owned(refused))),
             Err((part, ctx)) => Err((part, ctx.expect("the context it was given"))),
@@ -1001,15 +1480,17 @@ impl<C, N: Nic> Engine<C, N> {
         part: Part<N>,
         ctx: C,
     ) -> (e: PostError<C, N>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
             e.wr_id == ctx,
     {
-        let refused = hw_mut(&mut self.hw).recv_refused(qp.index(), part, Some(ctx));
+        self.check(qp.index());
         proof {
-            self.hw@.lemma_moved_refl();
+            use_type_invariant(&*self);
+        }
+        let refused = self.hw.recv_refused(qp.index(), part, Some(ctx));
+        proof {
+            self.hw.lemma_moved_refl();
         }
         owned(refused)
     }
@@ -1021,17 +1502,260 @@ impl<C, N: Nic> Engine<C, N> {
         qp: QpKey<T>,
         part: Part<N>,
     ) -> (r: Result<Seq, BufError<Leases<N>>>)
-        requires
-            old(self).inv(),
         ensures
             final(self).moved_from(old(self)),
     {
-        let refused = match hw_mut(&mut self.hw).post_recv(qp.index(), part, None) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        let refused = match self.hw.post_recv(qp.index(), part, None) {
             Ok(Ok(seq)) => return Ok(seq),
             Ok(Err(refused)) => refused,
-            Err((part, ctx)) => hw_mut(&mut self.hw).recv_refused(qp.index(), part, ctx),
+            Err((part, ctx)) => {
+                self.check(qp.index());
+                proof {
+                    use_type_invariant(&*self);
+                }
+                self.hw.recv_refused(qp.index(), part, ctx)
+            },
         };
         Err(BufError { error: refused.error, buf: refused.leases })
+    }
+
+    /// The QP number.
+    pub fn qp_num<T: Transport>(&self, qp: QpKey<T>) -> u32 {
+        self.check(qp.index());
+        proof {
+            use_type_invariant(self);
+        }
+        match self.hw.qp_num(qp.index()) {
+            Some((num, _)) => num,
+            None => 0,
+        }
+    }
+
+    /// The protection domain of the QP.
+    pub fn pd<T: Transport>(&self, qp: QpKey<T>) -> &Pd<N> {
+        match self.hw.qp_pd(qp.index()) {
+            Some(pd) => pd,
+            None => {
+                no_qp(qp.index());
+                vstd::pervasive::unreached()
+            },
+        }
+    }
+
+    /// The queues' sizes.
+    pub fn caps<T: Transport>(&self, qp: QpKey<T>) -> QpCaps {
+        proof {
+            use_type_invariant(self);
+        }
+        match self.hw.qp_caps(qp.index()) {
+            Some(caps) => caps,
+            None => {
+                no_qp(qp.index());
+                vstd::pervasive::unreached()
+            },
+        }
+    }
+
+    /// Whether the QP was created without the driver's locks (on the
+    /// engine's thread domain).
+    pub fn qp_is_lock_free<T: Transport>(&self, qp: QpKey<T>) -> bool {
+        self.check(qp.index());
+        proof {
+            use_type_invariant(self);
+        }
+        match self.hw.qp_num(qp.index()) {
+            Some((_, free)) => free,
+            None => false,
+        }
+    }
+
+    /// The send queue's ring.
+    #[inline]
+    pub fn send_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Payload<C, N>> {
+        proof {
+            use_type_invariant(self);
+        }
+        match self.hw.ring(qp.index(), Queue::Send) {
+            Some(ring) => ring,
+            None => {
+                no_qp(qp.index());
+                vstd::pervasive::unreached()
+            },
+        }
+    }
+
+    /// The receive queue's ring.
+    #[inline]
+    pub fn recv_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Payload<C, N>> {
+        proof {
+            use_type_invariant(self);
+        }
+        match self.hw.ring(qp.index(), Queue::Recv) {
+            Some(ring) => ring,
+            None => {
+                no_qp(qp.index());
+                vstd::pervasive::unreached()
+            },
+        }
+    }
+
+    /// Starts a request on the QP's send queue: add its WQEs, then give it its
+    /// context when it is finished ([`Request::submit`], [`Request::finish`]).
+    /// Nothing reaches the hardware until then; its WQEs go out at the next
+    /// [`Engine::commit`] of the QP.
+    #[inline]
+    pub fn request<T: Transport>(&mut self, qp: QpKey<T>) -> (r: Request<'_, T, C, N>) {
+        let open = self.open_request(qp);
+        Request { w: self, qp, open }
+    }
+}
+
+/// A request being written on a QP of an engine: one or more WQEs that
+/// complete together.
+///
+/// Nothing reaches the hardware or the ring until it is finished, when its signaling is known: its
+/// WQEs and their buffers are a value of its own ([`OpenRequest`]), in storage that comes from the
+/// QP and goes back to it. A request longer than the QP's `max_batch` WQEs is split: the part so
+/// far goes out as a request of its own (signaled, without an owner) and the rest continues once
+/// there is room. A full send queue shows when it is finished. Dropping an unfinished request
+/// finishes it without an owner.
+#[verifier::reject_recursive_types(C)]
+#[verifier::reject_recursive_types(N)]
+pub struct Request<'w, T: Transport, C = (), N: Nic = Verbs> {
+    w: &'w mut Engine<C, N>,
+    qp: QpKey<T>,
+    open: OpenRequest<N>,
+}
+
+impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
+    /// Adds a WQE doing `op` on `part`; on error nothing is added and the
+    /// part is handed back.
+    #[inline]
+    pub fn push(&mut self, op: WrOp, part: Part<N>) -> (r: Result<(), BufError<Part<N>>>) {
+        match self.open.try_push(op, part) {
+            Ok(()) => Ok(()),
+            Err(part) => self.w.push_open(self.qp, &mut self.open, op, part),
+        }
+    }
+
+    /// Whether no WQE was added.
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+
+    /// Finishes the request, signaled if `signal` (else only if the ring needs
+    /// it), with `ctx` to come back with its completion. Returns its sequence
+    /// number, or `ctx` if it has no WQE. It goes out at the next commit; if the
+    /// device refuses that doorbell, it completes as
+    /// [`CompletionError::Refused`] (see [`Engine::commit`]).
+    #[inline]
+    pub fn finish(mut self, signal: bool, ctx: C) -> (r: core::result::Result<Seq, C>)
+        ensures
+            r matches Err(back) ==> back == ctx,
+    {
+        match self.w.close_waiting(self.qp, &mut self.open, signal, Some(ctx)) {
+            Ok(seq) => Ok(seq),
+            Err(back) => Err(back.expect("the context it was given")),
+        }
+    }
+
+    /// Finishes the request without an owner: nobody will take it back, and its
+    /// buffers are released when it completes. Returns its sequence number,
+    /// `None` if it has no WQE.
+    pub fn finish_detached(mut self, signal: bool) -> Option<Seq> {
+        match self.w.close_waiting(self.qp, &mut self.open, signal, None) {
+            Ok(seq) => Some(seq),
+            Err(_) => None,
+        }
+    }
+
+    /// Finishes the request with `ctx`, as [`Request::finish`], and rings the
+    /// doorbell. If the device refuses, or it has no WQE, its context and
+    /// buffers come back with the error.
+    #[inline]
+    pub fn submit(mut self, signal: bool, ctx: C) -> (r: Result<Seq, PostError<C, N>>)
+        ensures
+            r matches Err(e) ==> e.wr_id == ctx,
+    {
+        self.w.submit_open(self.qp, &mut self.open, signal, ctx)
+    }
+
+    /// Finishes the request without an owner and rings the doorbell.
+    pub fn submit_detached(mut self) -> Result<()> {
+        let _ = self.w.close_waiting(self.qp, &mut self.open, true, None);
+        self.w.commit(self.qp)
+    }
+
+    /// What `drop` does: an unfinished request goes out without an owner.
+    #[inline]
+    fn finish_dropped(&mut self) {
+        if !self.open.is_empty() {
+            let _ = self.w.close_waiting(self.qp, &mut self.open, true, None);
+        }
+        if self.open.holds_storage() {
+            self.w.give_back(self.qp, &mut self.open);
+        }
+    }
+}
+
+impl<C, N: Nic> Engine<C, N> {
+    /// `open`, once there is room for it, as a request (this polls the CQ).
+    #[inline]
+    fn close_waiting<T: Transport>(
+        &mut self,
+        qp: QpKey<T>,
+        open: &mut OpenRequest<N>,
+        signal: bool,
+        ctx: Option<C>,
+    ) -> (r: core::result::Result<Seq, Option<C>>)
+        ensures
+            final(self).moved_from(old(self)),
+            r matches Err(back) ==> back == ctx,
+    {
+        proof {
+            use_type_invariant(&*self);
+            use_type_invariant(&*open);
+        }
+        self.hw.close_waiting(qp.index(), &mut open.writing, signal, ctx)
+    }
+
+    /// One more part for the WQE being gathered on the QP.
+    fn gather<T: Transport>(&mut self, qp: QpKey<T>, part: Part<N>) -> (r: Result<(), BufError<Part<N>>>)
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        self.check(qp.index());
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.gather(qp.index(), part)
+    }
+
+    /// Drops what was being gathered on the QP.
+    fn drop_gathered<T: Transport>(&mut self, qp: QpKey<T>)
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        proof {
+            use_type_invariant(&*self);
+        }
+        self.hw.drop_gathered(qp.index());
+    }
+
+    /// The WQE gathered on the QP, in `open`.
+    fn push_gathered<T: Transport>(&mut self, qp: QpKey<T>, open: &mut OpenRequest<N>, op: WrOp) -> (r: Result<()>)
+        ensures
+            final(self).moved_from(old(self)),
+    {
+        self.check(qp.index());
+        proof {
+            use_type_invariant(&*self);
+            use_type_invariant(&*open);
+        }
+        self.hw.push_gathered(qp.index(), &mut open.writing, op)
     }
 }
 
@@ -1115,238 +1839,6 @@ impl<C, N: Nic> Engine<C, N> {
     #[doc(hidden)]
     pub const QP_BYTES: usize = Hw::<C, N>::QP_BYTES;
 
-    /// An engine on the device of `ctx` with a CQ of `cq_size` entries, on a thread domain of
-    /// its own where the device has them.
-    pub fn new(ctx: &Context<N>, cq_size: u32) -> Result<Engine<C, N>> {
-        let hw = Hw::new(ctx.clone(), cq_size)?;
-        Ok(Engine::of(hw, ctx.nic().alloc_td()))
-    }
-
-    /// The device of its QPs.
-    pub fn context(&self) -> &Context<N> {
-        self.hw.context()
-    }
-
-    /// Whether its QPs are created on a thread domain (so the driver takes
-    /// no locks for them); not every device has thread domains.
-    pub fn is_lock_free(&self) -> bool {
-        self.td.is_some()
-    }
-
-    /// The entries of its CQ.
-    pub fn cq_size(&self) -> u32 {
-        self.hw.cq_size()
-    }
-
-    /// The CQ entries its QPs reserve (the sum of their queue depths).
-    pub fn reserved(&self) -> u32 {
-        self.hw.reserved()
-    }
-
-    /// The parent domain to create a QP of `pd` on: the engine's for that protection domain,
-    /// made the first time; `None` where the device has no thread domains.
-    fn domain_index(&mut self, pd: &Pd<N>) -> Option<usize> {
-        let td = (*self.td).as_ref()?;
-        if let Some(i) = self.domains.iter().position(|d| d.pd.id() == pd.id()) {
-            return Some(i);
-        }
-        let domain = pd.context().nic().alloc_domain(pd.raw(), td)?;
-        self.domains.push(Domain {
-            domain,
-            pd: pd.clone(),
-        });
-        Some(self.domains.len() - 1)
-    }
-
-    /// Creates a QP (in the RESET state) in `pd` with queues of `caps` and requests of at most
-    /// `max_batch` WQEs, attached to the engine's CQ.
-    ///
-    /// `pd` must be of the engine's device. The sizes are checked against what the device
-    /// supports, and the QP's depths must fit in what the CQ has not reserved yet. M has one
-    /// limit of scatter/gather elements per QP: every WQE is held to the smaller of
-    /// `max_send_sge` and `max_recv_sge`.
-    pub fn create_qp<T: Transport>(
-        &mut self,
-        pd: &Pd<N>,
-        caps: QpCaps,
-        max_batch: u32,
-    ) -> Result<QpKey<T>> {
-        const {
-            assert!(
-                T::IN_ORDER_COMPLETION,
-                "only in-order transports are supported"
-            );
-        }
-        if !self.context().same_device(pd.context()) {
-            return Err(Error::Invalid("a protection domain of another device"));
-        }
-        let domain = self.domain_index(pd);
-        let domain = domain.map(|i| &self.domains[i].domain);
-        let index = self.hw.create_qp(pd, domain, T::QP_TYPE, caps, max_batch)?;
-        Ok(QpKey {
-            index: index as u16,
-            _t: PhantomData,
-        })
-    }
-
-    /// Removes a QP: drops the contexts of its requests not delivered, drains
-    /// it, destroys it, then releases the buffers its requests still hold (none
-    /// is handed out) and its share of the CQ.
-    ///
-    /// The NIC may still use the buffers of the WQEs in flight, so the QP is
-    /// drained first (see the module documentation): moved to the error
-    /// state, given a signaled drain WQE, and the CQ polled until nothing of
-    /// it is in flight, the other QPs' completions going to their rings as
-    /// [`Engine::progress`] sends them. No completion of the QP is left in
-    /// the CQ then, so another QP may take its index and its share at once.
-    ///
-    /// If the device does not flush (no completion for [`DRAIN_TIMEOUT`]),
-    /// the QP is kept with its buffers, index and share, never destroyed or
-    /// freed, and this fails with [`Error::NotFlushed`]; dropping the
-    /// engine tries again. Either way the key names no QP afterwards.
-    pub fn remove_qp<T: Transport>(&mut self, qp: QpKey<T>) -> Result<()> {
-        let index = qp.index();
-        if !self.hw.is_qp(index) {
-            return Ok(());
-        }
-        self.hw.start_drain(index);
-        drop(self.hw.take_let_go());
-        self.drain_and_destroy(index)
-    }
-
-    /// [`Engine::remove_qp`] for a caller that holds the engine behind a borrow or a lock: nothing
-    /// whose destructor is the program's is dropped here. What it let go of comes back, for the
-    /// caller to drop once it has let go of the engine, since a `wr_id` may hold a handle to a QP.
-    pub fn remove_qp_later<T: Transport>(&mut self, qp: QpKey<T>) -> (Result<()>, LetGo<C>) {
-        let index = qp.index();
-        if !self.hw.is_qp(index) {
-            return (Ok(()), LetGo::new());
-        }
-        self.hw.start_drain(index);
-        let let_go = self.hw.take_let_go();
-        (self.drain_and_destroy(index), let_go)
-    }
-
-    /// The rest of a removal: drained, then destroyed, or kept (see [`Engine::remove_qp`]).
-    fn drain_and_destroy(&mut self, index: usize) -> Result<()> {
-        if self.drain(Some(index)) && self.hw.destroy(index) {
-            Ok(())
-        } else {
-            Err(Error::NotFlushed)
-        }
-    }
-
-    /// Polls the CQ until the QPs being removed (`only` that one, or all)
-    /// have nothing in flight; `false` if no completion came for
-    /// [`DRAIN_TIMEOUT`] while some still had.
-    fn drain(&mut self, only: Option<usize>) -> bool {
-        let (from, to) = match only {
-            Some(index) => (index, index + 1),
-            None => (0, self.hw.qp_slots()),
-        };
-        let mut deadline = Instant::now() + DRAIN_TIMEOUT;
-        let mut idle = 0u32;
-        loop {
-            let mut busy = false;
-            for index in from..to {
-                self.hw.post_drain(index);
-                busy |= self.hw.draining(index);
-            }
-            if !busy {
-                return true;
-            }
-            if self.hw.progress() > 0 {
-                deadline = Instant::now() + DRAIN_TIMEOUT;
-                idle = 0;
-                continue;
-            }
-            idle += 1;
-            if idle.is_multiple_of(DRAIN_SPINS) {
-                if Instant::now() > deadline {
-                    return false;
-                }
-                std::thread::yield_now();
-            } else {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Polling
-
-    /// The event loop's poll: reads at most `n` CQEs ([`POLL_MAX`] at most), updates the CQ's
-    /// consumer index, and then hands every request they complete with an owner (and that was not
-    /// taken otherwise) to `f`, with the engine, in each queue's order, and every request refused
-    /// with its doorbell at once; returns the number of requests handed out. `f` may post new work
-    /// on any QP, take or detach requests, even poll or remove QPs. Nothing is allocated.
-    ///
-    /// Requests without an owner (detached) release their buffers when they
-    /// complete; their first error is reported by [`Engine::take_send_error`].
-    /// An unsignaled request completes with the next signaled one of its
-    /// queue: a loop that posts unsignaled requests also posts signaled
-    /// ones.
-    #[inline]
-    pub fn poll<F: FnMut(&mut Engine<C, N>, Completion<C, N>)>(
-        &mut self,
-        n: usize,
-        mut f: F,
-    ) -> usize {
-        self.hw.read_completions(n);
-        let mut handed = 0;
-        while let Some(done) = self.hw.next_completion() {
-            f(self, done);
-            handed += 1;
-        }
-        handed
-    }
-
-    // -------------------------------------------------------------------------
-    // One QP
-
-    /// The QP number.
-    pub fn qp_num<T: Transport>(&self, qp: QpKey<T>) -> u32 {
-        self.check(qp.index());
-        self.hw.qp_num(qp.index()).map_or(0, |(num, _)| num)
-    }
-
-    /// The protection domain of the QP.
-    pub fn pd<T: Transport>(&self, qp: QpKey<T>) -> &Pd<N> {
-        self.check(qp.index());
-        self.hw.qp_pd(qp.index()).expect("a QP of this engine")
-    }
-
-    /// The queues' sizes.
-    pub fn caps<T: Transport>(&self, qp: QpKey<T>) -> QpCaps {
-        self.check(qp.index());
-        self.hw.qp_caps(qp.index()).expect("a QP of this engine")
-    }
-
-    /// Whether the QP was created without the driver's locks (on the
-    /// engine's thread domain).
-    pub fn qp_is_lock_free<T: Transport>(&self, qp: QpKey<T>) -> bool {
-        self.check(qp.index());
-        self.hw.qp_num(qp.index()).is_some_and(|(_, free)| free)
-    }
-
-    /// The send queue's ring.
-    #[inline]
-    pub fn send_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Payload<C, N>> {
-        match self.hw.ring(qp.index(), Queue::Send) {
-            Some(ring) => ring,
-            None => panic!("no QP {} in this engine", qp.index()),
-        }
-    }
-
-    /// The receive queue's ring.
-    #[inline]
-    pub fn recv_ring<T: Transport>(&self, qp: QpKey<T>) -> &Ring<Payload<C, N>> {
-        match self.hw.ring(qp.index(), Queue::Recv) {
-            Some(ring) => ring,
-            None => panic!("no QP {} in this engine", qp.index()),
-        }
-    }
-
     /// How peers reach the QP through `port`, by GID `gid_index` if given.
     pub fn endpoint<T: Transport>(
         &self,
@@ -1373,21 +1865,6 @@ impl<C, N: Nic> Engine<C, N> {
             lid: info.lid,
             gid,
         })
-    }
-
-    /// Starts a request on the QP's send queue: add its WQEs, then give it its
-    /// context when it is finished ([`Request::submit`], [`Request::finish`]).
-    /// Nothing reaches the hardware until then; its WQEs go out at the next
-    /// [`Engine::commit`] of the QP.
-    #[inline]
-    pub fn request<T: Transport>(&mut self, qp: QpKey<T>) -> Request<'_, T, C, N> {
-        let open = self.hw.open_request(qp.index());
-        Request {
-            w: self,
-            index: qp.index(),
-            open,
-            _t: PhantomData,
-        }
     }
 
     /// SENDs `buf` into the peer's next receive, as a signaled request of its
@@ -1469,70 +1946,25 @@ impl<C, N: Nic> Engine<C, N> {
 }
 
 impl<C, N: Nic> Drop for Engine<C, N> {
-    /// Drops the contexts of the requests not delivered and drains every QP
-    /// (all at once, as [`Engine::remove_qp`] does one), destroys the drained
-    /// ones and releases their buffers, then destroys the CQ and the thread
-    /// domain. If the device does not flush some QP,
-    /// that QP is leaked with its buffers, and so are the CQ and the domain
-    /// (destroying them would need the QP gone).
+    /// Gives up every request and drains every QP (all at once, as [`Engine::remove_qp`] does one),
+    /// destroys the drained ones and releases their buffers, then destroys the CQ and, as the fields
+    /// go, the parent domains, the thread domain and the device. If the device does not flush some
+    /// QP, that QP is leaked with its buffers, and so are the CQ and the domains (destroying them
+    /// would need the QP gone). The contexts and wakers given up go last, and a waker's panic: what
+    /// they run is the program's, and if it unwinds, the fields are all there is left.
     fn drop(&mut self) {
-        let slots = self.hw.qp_slots();
-        for index in 0..slots {
-            self.hw.start_drain(index);
+        let (let_go, panics) = self.end();
+        if !self.close() {
+            self.hw.leak();
+            core::mem::forget(core::mem::take(&mut self.domains));
+            core::mem::forget(self.td.take());
         }
-        drop(self.hw.take_let_go());
-        self.drain(None);
-        for index in 0..slots {
-            if !self.hw.draining(index) {
-                self.hw.destroy(index);
-            }
-        }
-        // SAFETY: taken once, here; the fields are not used again.
-        let (hw, domains, td) = unsafe {
-            (
-                ManuallyDrop::take(&mut self.hw),
-                ManuallyDrop::take(&mut self.domains),
-                ManuallyDrop::take(&mut self.td),
-            )
-        };
-        match hw.finish() {
-            Ok(()) => {
-                drop(domains);
-                drop(td);
-            }
-            // A QP the NIC may still use: nothing of it is ever freed.
-            Err(hw) => core::mem::forget((hw, domains, td)),
-        }
+        drop(let_go);
+        panics.finish();
     }
-}
-
-/// A request being written on a QP of an engine: one or more WQEs that
-/// complete together.
-///
-/// Nothing reaches the hardware or the ring until it is finished, when its signaling is known: its
-/// WQEs and their buffers are a value of its own ([`OpenRequest`]), in storage that comes from the
-/// QP and goes back to it. A request longer than the QP's `max_batch` WQEs is split: the part so
-/// far goes out as a request of its own (signaled, without an owner) and the rest continues once
-/// there is room. A full send queue shows when it is finished. Dropping an unfinished request
-/// finishes it without an owner.
-pub struct Request<'w, T: Transport, C = (), N: Nic = Verbs> {
-    w: &'w mut Engine<C, N>,
-    index: usize,
-    open: OpenRequest<N>,
-    _t: PhantomData<fn() -> T>,
 }
 
 impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
-    /// Adds a WQE doing `op` on `part`; on error nothing is added and the
-    /// part is handed back.
-    #[inline]
-    pub fn push(&mut self, op: WrOp, part: Part<N>) -> Result<(), BufError<Part<N>>> {
-        match self.open.try_push(op, part) {
-            Ok(()) => Ok(()),
-            Err(part) => self.w.hw.push_other(self.index, &mut self.open, op, part),
-        }
-    }
-
     /// Adds a WQE doing `op` on the concatenation of `parts` (a gather
     /// list of at most the QP's `max_send_sge` parts). On error nothing is added and the parts
     /// are dropped.
@@ -1540,10 +1972,12 @@ impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
     where
         I: IntoIterator<Item = Part<N>>,
     {
+        // What an iterator that panicked left behind is not part of this WQE.
+        self.w.drop_gathered(self.qp);
         for (i, part) in parts.into_iter().enumerate() {
             let n = i + 1;
-            if let Err(e) = self.w.hw.gather(self.index, part) {
-                self.w.hw.drop_gathered(self.index);
+            if let Err(e) = self.w.gather(self.qp, part) {
+                self.w.drop_gathered(self.qp);
                 let max = match e.error {
                     Error::TooManySges { max, .. } => max,
                     _ => MAX_SGES,
@@ -1551,75 +1985,14 @@ impl<T: Transport, C, N: Nic> Request<'_, T, C, N> {
                 return Err(Error::TooManySges { got: n, max });
             }
         }
-        self.w.hw.push_gathered(self.index, &mut self.open, op)
-    }
-
-    /// Whether no WQE was added.
-    pub fn is_empty(&self) -> bool {
-        self.open.is_empty()
-    }
-
-    /// Finishes the request, signaled if `signal` (else only if the ring needs
-    /// it), with `ctx` to come back with its completion. Returns its sequence
-    /// number, or `ctx` if it has no WQE. It goes out at the next commit; if the
-    /// device refuses that doorbell, it completes as
-    /// [`CompletionError::Refused`] (see [`Engine::commit`]).
-    #[inline]
-    pub fn finish(mut self, signal: bool, ctx: C) -> core::result::Result<Seq, C> {
-        self.w
-            .hw
-            .close_waiting(self.index, &mut self.open, signal, Some(ctx))
-            .map_err(|ctx| ctx.expect("the context it was given"))
-    }
-
-    /// Finishes the request without an owner: nobody will take it back, and its
-    /// buffers are released when it completes. Returns its sequence number,
-    /// `None` if it has no WQE.
-    pub fn finish_detached(mut self, signal: bool) -> Option<Seq> {
-        self.w
-            .hw
-            .close_waiting(self.index, &mut self.open, signal, None)
-            .ok()
-    }
-
-    /// Finishes the request with `ctx`, as [`Request::finish`], and rings the
-    /// doorbell. If the device refuses, or it has no WQE, its context and
-    /// buffers come back with the error.
-    #[inline]
-    pub fn submit(mut self, signal: bool, ctx: C) -> Result<Seq, PostError<C, N>> {
-        match self
-            .w
-            .hw
-            .submit_open(self.index, &mut self.open, signal, ctx)
-        {
-            Ok(seq) => Ok(seq),
-            Err(refused) => Err(owned(refused)),
-        }
-    }
-
-    /// Finishes the request without an owner and rings the doorbell.
-    pub fn submit_detached(mut self) -> Result<()> {
-        let _ = self
-            .w
-            .hw
-            .close_waiting(self.index, &mut self.open, true, None);
-        self.w.hw.commit(self.index, None).map_err(|(e, _)| e)
+        self.w.push_gathered(self.qp, &mut self.open, op)
     }
 }
 
 impl<T: Transport, C, N: Nic> Drop for Request<'_, T, C, N> {
     #[inline]
     fn drop(&mut self) {
-        // An unfinished request goes out without an owner.
-        if !self.open.is_empty() {
-            let _ = self
-                .w
-                .hw
-                .close_waiting(self.index, &mut self.open, true, None);
-        }
-        if self.open.holds_storage() {
-            self.w.hw.give_back(self.index, &mut self.open);
-        }
+        self.finish_dropped();
     }
 }
 

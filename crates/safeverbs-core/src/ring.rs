@@ -131,6 +131,7 @@ pub(crate) mod wake;
 
 pub use payload::Payload;
 
+use crate::trusted::{element, element_mut, vec_new, vec_push, vec_with_capacity};
 use wake::WakeBatch;
 
 verus! {
@@ -155,6 +156,7 @@ pub uninterp spec fn waker_id(waker: Waker) -> WakerId;
 fn will_wake(a: &Waker, b: &Waker) -> (same: bool)
     ensures
         same ==> waker_id(*a) == waker_id(*b),
+    no_unwind
 {
     a.will_wake(b)
 }
@@ -170,9 +172,9 @@ fn slot_of<L>(slots: &Vec<Slot<L>>, i: usize) -> (slot: &Slot<L>)
         i < slots@.len(),
     ensures
         *slot == slots@[i as int],
+    no_unwind
 {
-    // SAFETY: `i` is below the length (the precondition).
-    unsafe { slots.as_slice().get_unchecked(i) }
+    element(slots.as_slice(), i)
 }
 
 /// Slot `i` of `slots`, for an `i` from [`Ring::index`], with no bounds check: the data path holds
@@ -184,9 +186,9 @@ fn slot_in<L>(slots: &mut Vec<Slot<L>>, i: usize) -> (slot: &mut Slot<L>)
     ensures
         *slot == old(slots)@[i as int],
         final(slots)@ == old(slots)@.update(i as int, *final(slot)),
+    no_unwind
 {
-    // SAFETY: `i` is below the length (the precondition).
-    unsafe { slots.as_mut_slice().get_unchecked_mut(i) }
+    element_mut(slots.as_mut_slice(), i)
 }
 
 /// Another handle to the task `waker` belongs to.
@@ -194,6 +196,7 @@ fn slot_in<L>(slots: &mut Vec<Slot<L>>, i: usize) -> (slot: &mut Slot<L>)
 fn clone_waker(waker: &Waker) -> (clone: Waker)
     ensures
         waker_id(clone) == waker_id(*waker),
+    no_unwind
 {
     waker.clone()
 }
@@ -323,6 +326,7 @@ impl<L> Slot<L> {
     pub(crate) fn end_is(&self, end: u64) -> (is: bool)
         ensures
             is == (self.end_wqe == end),
+        no_unwind
     {
         self.end_wqe == end
     }
@@ -338,6 +342,7 @@ impl<L> Slot<L> {
         ensures
             leases == old(self).leases,
             *final(self) == old(self).emptied(),
+        no_unwind
     {
         self.leases.take()
     }
@@ -351,6 +356,7 @@ impl<L> Slot<L> {
     fn free() -> (slot: Slot<L>)
         ensures
             slot.leases is None,
+        no_unwind
     {
         Slot {
             end_wqe: 0,
@@ -1101,6 +1107,7 @@ impl<L> Ring<L> {
             forall|s: int, w: int| #[trigger] ring.dma(s, w) is None,
             ring.woken() == vstd::seq::Seq::<WakerId>::empty(),
             ring.spec_detached_error() is None,
+        no_unwind
     {
         assert!(slots >= 1, "a ring needs a slot");
         assert!(slots <= 0x100_0000_0000, "a ring of at most 2^40 slots");
@@ -1134,7 +1141,7 @@ impl<L> Ring<L> {
                 bits = bits + 1;
             }
         }
-        let mut v: Vec<Slot<L>> = Vec::with_capacity(n);
+        let mut v: Vec<Slot<L>> = vec_with_capacity(n);
         let mut i = 0;
         while i < n
             invariant
@@ -1143,7 +1150,7 @@ impl<L> Ring<L> {
                 forall|j: int| 0 <= j < i ==> (#[trigger] v@[j]).leases is None,
             decreases n - i,
         {
-            v.push(Slot::free());
+            vec_push(&mut v, Slot::free());
             i += 1;
         }
         let ring = Ring {
@@ -1164,7 +1171,7 @@ impl<L> Ring<L> {
             failed: false,
             refused: false,
             detached_error: None,
-            wakers: Vec::new(),
+            wakers: vec_new(),
             woken: Ghost(vstd::seq::Seq::empty()),
             routed: Ghost(0),
         };
@@ -1189,6 +1196,7 @@ impl<L> Ring<L> {
         ensures
             i == seq as int % self.n(),
             i < self.slots@.len(),
+        no_unwind
     {
         proof {
             lemma_mask(seq, self.mask, self.n(), self.bits@);
@@ -1202,6 +1210,7 @@ impl<L> Ring<L> {
             self.inv(),
         ensures
             depth == self.spec_depth(),
+        no_unwind
     {
         self.depth as u32
     }
@@ -1212,6 +1221,7 @@ impl<L> Ring<L> {
             self.inv(),
         ensures
             max == self.spec_max_wqes(),
+        no_unwind
     {
         self.max_wqes as u32
     }
@@ -1222,6 +1232,7 @@ impl<L> Ring<L> {
     pub fn head(&self) -> (seq: Seq)
         ensures
             seq == self.spec_head(),
+        no_unwind
     {
         self.head
     }
@@ -1236,6 +1247,7 @@ impl<L> Ring<L> {
     pub fn posted(&self) -> (seq: Seq)
         ensures
             seq == self.spec_posted(),
+        no_unwind
     {
         self.posted
     }
@@ -1250,6 +1262,7 @@ impl<L> Ring<L> {
     pub fn retired(&self) -> (seq: Seq)
         ensures
             seq == self.spec_retired(),
+        no_unwind
     {
         self.retired
     }
@@ -1264,6 +1277,7 @@ impl<L> Ring<L> {
     pub fn committed(&self) -> (seq: Seq)
         ensures
             seq == self.spec_committed(),
+        no_unwind
     {
         self.committed
     }
@@ -1335,12 +1349,15 @@ impl<L> Ring<L> {
             self.inv(),
         ensures
             n == self.spec_wqe_posted() - self.spec_wqe_retired(),
+        no_unwind
     {
         (self.wqe_posted - self.wqe_retired) as u32
     }
 
     /// Whether some request is staged (written but not committed).
-    pub fn has_staged(&self) -> bool {
+    pub fn has_staged(&self) -> bool
+        no_unwind
+    {
         self.committed < self.posted
     }
 
@@ -1356,6 +1373,7 @@ impl<L> Ring<L> {
             self.inv(),
         ensures
             free == self.spec_has_free_slot(),
+        no_unwind
     {
         self.posted - self.head <= self.mask && (self.wqe_posted | self.posted) < COUNTERS_END
     }
@@ -1372,6 +1390,7 @@ impl<L> Ring<L> {
     pub fn wqe_retired(&self) -> (wqe: u64)
         ensures
             wqe == self.spec_wqe_retired(),
+        no_unwind
     {
         self.wqe_retired
     }
@@ -1385,6 +1404,7 @@ impl<L> Ring<L> {
         ensures
             can == (self.spec_has_free_slot() && self.spec_wqe_posted() - self.spec_wqe_retired()
                 < self.spec_depth()),
+        no_unwind
     {
         self.has_free_slot() && self.wqe_posted - self.wqe_retired < self.depth
     }
@@ -1410,12 +1430,15 @@ impl<L> Ring<L> {
     pub fn is_clogged(&self) -> bool
         requires
             self.inv(),
+        no_unwind
     {
         !self.has_free_slot() && self.head < self.retired
     }
 
     /// Whether an error completion has retired a request.
-    pub fn failed(&self) -> bool {
+    pub fn failed(&self) -> bool
+        no_unwind
+    {
         self.failed
     }
 
@@ -1475,6 +1498,7 @@ impl<L> Ring<L> {
             final(self).spec_posted() == old(self).spec_posted(),
             error == old(self).spec_detached_error(),
             final(self).spec_detached_error() is None,
+        no_unwind
     {
         let error = self.detached_error.take();
         proof {
@@ -1489,6 +1513,7 @@ impl<L> Ring<L> {
             self.inv(),
         ensures
             state == self.state_of(seq as int),
+        no_unwind
     {
         if seq < self.head || seq >= self.posted {
             return State::Free;
@@ -1520,6 +1545,7 @@ impl<L> Ring<L> {
             self.inv(),
         ensures
             room == self.spec_depth() - (self.spec_wqe_posted() - self.spec_wqe_retired()),
+        no_unwind
     {
         (self.depth - (self.wqe_posted - self.wqe_retired)) as u32
     }
@@ -1529,6 +1555,7 @@ impl<L> Ring<L> {
     pub fn next_wqe(&self) -> (id: u64)
         ensures
             id == self.spec_wqe_posted(),
+        no_unwind
     {
         self.wqe_posted
     }
@@ -1542,6 +1569,7 @@ impl<L> Ring<L> {
             wqes <= u32::MAX,
         ensures
             must == self.spec_must_signal(wqes),
+        no_unwind
     {
         let base = if self.sig_end > self.wqe_retired {
             self.sig_end
@@ -1580,6 +1608,7 @@ impl<L> Ring<L> {
         ensures
             seq == old(self).spec_posted(),
             final(self).just_staged(old(self), wqes, ReqView::new(detached, leases), implied),
+        no_unwind
     {
         let ghost pre = *self;
         self.fill(wqes, detached, implied, leases);
@@ -1707,6 +1736,7 @@ impl<L> Ring<L> {
                 end: (old(self).spec_wqe_posted() + wqes) as u64,
                 outcome: implied,
             }),
+        no_unwind
     {
         proof {
             reveal(Ring::inv_slots_but);
@@ -1797,6 +1827,7 @@ impl<L> Ring<L> {
         ensures
             final(self).inv(),
             final(self).same_but_free(old(self)),
+        no_unwind
     {
         let i = self.index(seq);
         self.slots[i].general = true;
@@ -1819,6 +1850,7 @@ impl<L> Ring<L> {
         ensures
             seq == old(self).spec_posted(),
             final(self).just_staged(old(self), wqes, old(self).filled_view(), old(self).filled_meta().outcome),
+        no_unwind
     {
         let seq = self.posted;
         let end_wqe = self.wqe_posted + wqes;
@@ -1843,6 +1875,7 @@ impl<L> Ring<L> {
             leases == Some(old(self).filled_view().leases),
             final(self).inv(),
             final(self).same_but_free(old(self)),
+        no_unwind
     {
         let i = self.index(self.posted);
         let leases = self.slots[i].leases.take();
@@ -2058,6 +2091,7 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).just_committed(old(self)),
+        no_unwind
     {
         self.committed = self.posted;
         self.wqe_committed = self.wqe_posted;
@@ -2171,6 +2205,7 @@ impl<L> Ring<L> {
             old(self).inv(),
         ensures
             final(self).just_aborted(old(self), old(self).spec_posted() as int),
+        no_unwind
     {
         let dropped = self.posted - self.committed;
         // No request is staged at `posted`: none is handed back.
@@ -2212,6 +2247,7 @@ impl<L> Ring<L> {
                 Some(r) => Some(r.leases),
                 None => None,
             },
+        no_unwind
     {
         let ghost pre = *self;
         let wqe = self.wqe_committed;
@@ -2494,6 +2530,7 @@ impl<L> Ring<L> {
             final(self).committed_sig_end == old(self).committed_sig_end,
             final(self).same_view(old(self)),
             forall|s: int| old(self).retired <= s < final(self).retired ==> #[trigger] old(self).is_void(s),
+        no_unwind
     {
         let ghost pre = *self;
         while self.retired < self.committed && self.slots[self.index(self.retired)].end_wqe == self.wqe_retired
@@ -2898,6 +2935,7 @@ impl<L> Ring<L> {
         ensures
             final(self).completed_with(old(self), recv, wqe, *wc, true),
             known == (wqe < old(self).spec_wqe_committed()),
+        no_unwind
     {
         if wqe >= self.wqe_committed {
             proof {
@@ -3058,6 +3096,7 @@ impl<L> Ring<L> {
             self.inv(),
         ensures
             in_flight == (self.spec_wqe_retired() <= wqe < self.spec_wqe_committed()),
+        no_unwind
     {
         wqe.wrapping_sub(self.wqe_retired) < self.wqe_committed - self.wqe_retired
     }
@@ -3209,6 +3248,7 @@ impl<L> Ring<L> {
             r is Some ==> old(self).spec_retired() < final(self).spec_retired(),
             r == Some(true) ==> final(self).spec_wqe_retired() == wqe + 1,
             r == Some(false) ==> final(self).spec_wqe_retired() <= wqe,
+        no_unwind
     {
         let ghost pre = *self;
         proof {
@@ -3320,6 +3360,7 @@ impl<L> Ring<L> {
                 &&& *final(slot) == slot.emptied() ==> final(self).spec_routed()
                     == if slot.end_wqe == wqe + 1 { wqe + 1 } else { old(self).spec_routed() as int }
             },
+        no_unwind
     {
         let ghost pre = *self;
         let seq = self.retired;
@@ -3623,6 +3664,7 @@ impl<L> Ring<L> {
             } else {
                 *old(detached_error)
             },
+        no_unwind
     {
         let end = slot.end_wqe;
         if let Err(error) = slot.outcome {
@@ -3664,6 +3706,7 @@ impl<L> Ring<L> {
             final(self).refused == old(self).refused,
             final(self).failed == old(self).failed,
             final(self).routed == old(self).routed,
+        no_unwind
     {
         if self.wakers.is_empty() {
             None
@@ -4024,6 +4067,7 @@ impl<L> Ring<L> {
             final(self).detached_error == old(self).detached_error,
             final(self).routed == old(self).routed,
             final(self).same_view(old(self)),
+        no_unwind
     {
         let ghost pre = *self;
         while self.head < self.retired && self.slots[self.index(self.head)].leases.is_none()
@@ -4162,6 +4206,7 @@ impl<L> Ring<L> {
                 )->0.phase is Complete) && old(self).refused(seq as int) is None,
             },
             final(self).left_by_take(old(self), seq as int, taken is Some),
+        no_unwind
     {
         let ghost pre = *self;
         if seq < self.head || seq >= self.committed {
@@ -4230,6 +4275,7 @@ impl<L> Ring<L> {
                 )->0.phase is Complete) && old(self).refused(seq as int) is None,
             },
             final(self).left_by_take(old(self), seq as int, taken is Some),
+        no_unwind
     {
         if self.refused && self.head <= seq && seq < self.retired {
             let i = self.index(seq);
@@ -4256,6 +4302,7 @@ impl<L> Ring<L> {
                 )->0.phase is Complete) && old(self).refused(seq as int) is None,
             },
             final(self).left_by_take(old(self), seq as int, taken is Some),
+        no_unwind
     {
         let ghost pre = *self;
         let slot = &mut self.slots[i];
@@ -4597,6 +4644,7 @@ impl<L> Ring<L> {
                 old(self).meta(s)
             },
             final(self).spec_detached_error() == old(self).spec_detached_error(),
+        no_unwind
     {
         let ghost pre = *self;
         if seq < self.head || seq >= self.posted {
@@ -4807,6 +4855,7 @@ impl<L> Ring<L> {
             final(self).same_dma(old(self)),
             final(self).same_meta(old(self)),
             final(self).spec_detached_error() == old(self).spec_detached_error(),
+        no_unwind
     {
         let ghost pre = *self;
         proof {
@@ -4824,7 +4873,7 @@ impl<L> Ring<L> {
             return None;
         }
         if self.wakers.is_empty() {
-            let mut wakers = Vec::with_capacity(self.slots.len());
+            let mut wakers = vec_with_capacity(self.slots.len());
             let mut k = 0;
             while k < self.slots.len()
                 invariant
@@ -4833,7 +4882,7 @@ impl<L> Ring<L> {
                     forall|j: int| 0 <= j < k ==> (#[trigger] wakers@[j]) is None,
                 decreases self.slots@.len() - k,
             {
-                wakers.push(None);
+                vec_push(&mut wakers, None);
                 k += 1;
             }
             self.wakers = wakers;
@@ -4990,6 +5039,7 @@ impl<L> Ring<L> {
             final(self).spec_depth() == old(self).spec_depth(),
             final(self).keeps_dma(old(self)),
             forall|s: int| #[trigger] final(self).meta(s) is None,
+        no_unwind
     {
         let ghost pre = *self;
         let mut i = 0;
