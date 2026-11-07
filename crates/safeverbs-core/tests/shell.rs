@@ -303,3 +303,42 @@ fn a_key_that_names_no_qp_panics() {
     engine.give_back(b, &mut open);
     assert_eq!(engine.remove_qp(b), Ok(()));
 }
+
+/// A message whose `fill` panicked took its bytes with it: the ring takes no more, and what it handed
+/// out stays what it is.
+#[test]
+fn a_ring_takes_no_more_after_a_fill_panicked() {
+    let pd = Context::new(Model::new(66)).alloc_pd().unwrap();
+    let mut ring = pd.ring_buf(64).unwrap();
+    let before = ring.push(b"before").unwrap();
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        ring.write_with(8, |_| panic!("the program's"))
+    }));
+    assert!(panicked.is_err());
+    assert!(ring.push(b"after").is_none());
+    assert_eq!(&*before, b"before");
+    assert_eq!(ring.capacity(), 64);
+    assert_eq!(ring.in_use(), 6);
+}
+
+/// Chunks wrap around a ring, and a chunk's bytes come back only when nothing holds it.
+#[test]
+fn a_ring_reuses_what_nothing_holds_any_more() {
+    let pd = Context::new(Model::new(67)).alloc_pd().unwrap();
+    let mut ring = pd.ring_buf(32).unwrap();
+    let a = ring.push(&[1; 12]).unwrap();
+    let b = ring.push(&[2; 12]).unwrap();
+    assert!(ring.push(&[3; 12]).is_none(), "8 bytes are left at the end");
+    drop(a);
+    assert_eq!(ring.in_use(), 12);
+    let c = ring.push(&[3; 11]).unwrap();
+    assert!(
+        ring.push(&[4; 2]).is_none(),
+        "a wrapped head never reaches the tail"
+    );
+    assert_eq!(&*b, &[2; 12]);
+    assert_eq!(&*c, &[3; 11]);
+    drop((b, c));
+    assert_eq!(ring.in_use(), 0);
+    assert!(ring.push(&[5; 32]).is_some());
+}

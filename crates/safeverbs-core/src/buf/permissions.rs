@@ -159,6 +159,40 @@ impl BytePermission {
         self
     }
 
+    /// [`BytePermission::split`], leaving the rest where it was.
+    pub(crate) proof fn take(tracked &mut self, keys: Set<int>) -> (tracked part: Self)
+        requires
+            old(self).inv(),
+            keys.subset_of(old(self).dom()),
+        ensures
+            part.inv(), final(self).inv(),
+            part.provenance() == old(self).provenance(),
+            final(self).provenance() == old(self).provenance(),
+            part.dom() == keys,
+            final(self).dom() == old(self).dom().difference(keys),
+    {
+        let ghost original = *self;
+        let tracked selected = self.bytes.tracked_remove_keys(keys);
+        let tracked part = Self { bytes: selected, source: self.source };
+        assert(part.dom() =~= keys);
+        assert(self.dom() =~= original.dom().difference(keys));
+        part
+    }
+
+    /// [`BytePermission::join`], in place.
+    pub(crate) proof fn put_back(tracked &mut self, tracked part: Self)
+        requires
+            old(self).inv(), part.inv(),
+            old(self).provenance() == part.provenance(),
+            old(self).dom().disjoint(part.dom()),
+        ensures
+            final(self).inv(),
+            final(self).provenance() == old(self).provenance(),
+            final(self).dom() == old(self).dom().union(part.dom()),
+    {
+        self.bytes.tracked_union_prefer_right(part.bytes);
+    }
+
     /// Distinct borrowed permissions cannot own the same byte address.
     /// A shared frozen permission is borrowed without extracting its contents.
     pub(crate) proof fn disjoint(tracked &mut self, tracked other: &Self)

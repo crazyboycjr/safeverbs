@@ -1960,7 +1960,10 @@ impl<C, N: Nic> Drop for Engine<C, N> {
             core::mem::forget(self.td.take());
         }
         drop(let_go);
-        panics.finish();
+        // A second panic while one unwinds would abort: what a waker's says goes with it then.
+        if !std::thread::panicking() {
+            panics.finish();
+        }
     }
 }
 

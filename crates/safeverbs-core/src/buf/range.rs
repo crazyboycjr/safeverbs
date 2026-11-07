@@ -82,11 +82,13 @@ impl ByteRange {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(super) fn offset(&self) -> (r: usize)
         ensures r == self.spec_offset(),
     { self.offset }
 
     #[inline]
+    #[cfg(test)]
     pub(super) fn len(&self) -> (r: usize)
         ensures r == self.spec_len(),
     { self.len }

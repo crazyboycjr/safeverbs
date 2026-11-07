@@ -94,8 +94,8 @@ if [ -n "$outside" ]; then
 fi
 
 # What a program calls has no precondition: a safe function that relies on being called correctly
-# is a bug. So no `pub fn` of the public types' files has `requires`, but for `Engine::poll`, whose
-# says that its closure takes anything, as a program's does.
+# is a bug. So no `pub fn` of the public types' files has `requires`, but for `Engine::poll` and
+# `RingBuf::write_with`, whose say that their closures take anything, as a program's do.
 preconditions="$(
     cd "$root"
     awk '
@@ -106,7 +106,7 @@ preconditions="$(
             open_item = 1
             next
         }
-        open_item && /^[[:space:]]*requires/ && item != "poll" {
+        open_item && /^[[:space:]]*requires/ && item != "poll" && item != "write_with" {
             print FILENAME " " item
             open_item = 0
         }

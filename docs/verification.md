@@ -55,8 +55,8 @@ peer are leases of A in the NIC's hands. For an engine alone on its device with 
 peer, there is nothing to say (`theorem_1_alone`). It is stated of each state, in `Refines::inv` and
 `Refines::step`.
 
-**So what the theorem does not cover yet:** one device history shared by several engines, exposure,
-`RingBuf`'s placement and liveness (see "Remaining"). The handles of the `safeverbs` crate are covered
+**So what the theorem does not cover yet:** one device history shared by several engines, exposure
+and liveness (see "Remaining"). The handles of the `safeverbs` crate are covered
 by an argument, not by a theorem ("The public API").
 
 `scripts/verify.sh` checks everything below that is called proved. The specification
@@ -66,8 +66,8 @@ only the items of `scripts/trusted.txt` (see "Trusted computing base"). It also 
 function of the core's public types with a precondition: a safe function that relies on being called
 correctly is a bug. The rest is ordinary Rust, not trusted by the proofs and not verified either:
 `pd.rs`, `verbs.rs`, `model.rs`, the `safeverbs` crate, and what is left outside `verus!` in `buf.rs`
-and `engine.rs`: the methods with zerocopy's bounds, `Region::whole`'s layout, `Exposed` and `RingBuf`,
-an iterator's loop in `Request::push_gather`, and the `Drop`s. They have no proof obligations to get
+and `engine.rs`: the methods with zerocopy's bounds, `Region::whole`'s layout, `Exposed`, an iterator's
+loop in `Request::push_gather`, and the `Drop`s. They have no proof obligations to get
 wrong: they reach verified code only by calling it, and what they call asks nothing of them.
 
 ## The properties
@@ -265,12 +265,11 @@ behaviour and never misuses the NIC**, as far as M and the trusted items go, exc
    writes are read only through `copy_to_slice`, but `expose` and `try_reclaim` are not in the proof,
    and an exposed region is the other thing `outside_covered` stands for. S1's one exception
    (`volatile_copy`) is here too.
-3. **`RingBuf`'s placement** is trusted (`ring_chunk`) and tested.
-4. **What Verus does not see:** an implicit drop ("What is assumed"), and what the references of `Deref`
+3. **What Verus does not see:** an implicit drop ("What is assumed"), and what the references of `Deref`
    and `DerefMut` do with the bytes (rustc and zerocopy's contracts, in the table below).
-5. **Liveness is not claimed:** F1-live and R1-live. A device that never flushes keeps its QP and
+4. **Liveness is not claimed:** F1-live and R1-live. A device that never flushes keeps its QP and
    buffers; nothing wrong happens, and nothing more does.
-6. **The handles' own behaviour** is tested, not proved: that the right future gets the right result,
+5. **The handles' own behaviour** is tested, not proved: that the right future gets the right result,
    that no wakeup is lost at their level, a sink's item number.
 
 ### The handles: an argument, not a theorem
@@ -299,12 +298,12 @@ is about, and the zerocopy bound on many of them is what the last rows of the ta
 | `Part`: `len`, `is_empty`, `is_writable` (3); `Leases`: `new`, `is_many`, `len`, `is_empty` (4); `BufMut`: `len`, `is_empty`, `pd_id` (3); `Buf`: `len`, `is_empty`, `try_thaw`, `pd_id` (4) | proved |
 | `Ring`: `depth`, `max_wqes`, `head`, `posted`, `retired`, `committed`, `in_flight_wqes`, `has_staged`, `has_free_slot`, `wqe_retired`, `can_post`, `is_clogged`, `failed`, `state`, `wqe_room`, `next_wqe` (16) | proved, and they read and no more: a program can neither make nor change a `Ring` |
 | `Status::is_ok`, `CompletionError::status`, `Wc::result` (3) | proved |
+| `RingBuf`: `capacity`, `write_with` (2) | proved: a chunk is cut from its free permission, by where `place` says (`in_order`). `write_with`'s `requires` says that its closure takes anything, as a program's does. If it panics the ring takes no more |
 | `Drop` of `Engine` | proved but for its last lines: `Engine::end` (drains and destroys) and `Engine::close` (the CQ) are verified, through `hw_at_end`, trusted; `Hw::leak` is by reading ("What is assumed") |
 | `Engine`: `endpoint`, `send`, `send_imm`, `write`, `write_imm`, `read`, `recv` (7); `Request::push_gather` and its `Drop` (2); `PostError::buf_mut`, `Completion::qp_num`, `Completion::buf_mut` (3) | composed |
-| `Pd::alloc`; `BufMut`: `split_at`, `chunks`, `freeze`, `into_part`; `Chunks::next`; `Buf`: `slice`, `view`, `is_unique`, `into_part`, `try_into_part`, `clone`; `Lend` of `Buf`, `&Buf` and `BufView`; `Leases`: `into_buf_mut`, `take_buf_mut`, `from`, `default`; `Part::into_buf_mut` (23, with `Lend`'s 6) | composed |
+| `Pd::alloc`; `BufMut`: `split_at`, `chunks`, `freeze`, `into_part`; `Chunks::next`; `Buf`: `slice`, `view`, `is_unique`, `into_part`, `try_into_part`, `clone`; `Lend` of `Buf`, `&Buf` and `BufView`; `Leases`: `into_buf_mut`, `take_buf_mut`, `from`, `default`; `Part::into_buf_mut`; `Pd::ring_buf`, `RingBuf::in_use`, `RingBuf::push` (26, with `Lend`'s 6) | composed |
 | `BufMut`: `deref`, `deref_mut`, `as_bytes`, `try_ref`; `Buf`: `deref`, `as_bytes`, `try_ref` (7) | trusted: "references to buffers", `from_raw_parts` in the shell |
 | `Exposed::copy_to_slice` (1) | trusted: `volatile_copy` |
-| `Pd::ring_buf`; `RingBuf`: `capacity`, `in_use`, `write_with`, `push` (5) | trusted: `ring_chunk` |
 | `verbs::devices`, `Verbs::open`, `Context::open` (3), and `Verbs`'s methods | trusted: rdma-core and the provider, as M's other side |
 | `BufMut::expose`; `Exposed`: `remote`, `len`, `is_empty`, `try_reclaim`, `reclaim`, its `Drop` (7) | not covered: exposure, the premise; tested |
 | `Context`: `new`, `nic`, `same_device`, `name`, `port`, `gids`, `default_gid_index`, `alloc_pd`; `Pd`: `context`, `id` (10) | not covered: the control path, ordinary Rust. What an engine learns of it is trusted (`pd_alive`, `same_device`) |
@@ -316,7 +315,7 @@ is about, and the zerocopy bound on many of them is what the last rows of the ta
 | --- | --- |
 | `LocalCq` (6), `LocalQp` (22), `AsyncCq` (4), `AsyncQp` (23) and `SharedQp` (21), most from one macro, `QpState` (2), `Op` and `Flush` with their `Future`s, `Batch` (6), `WriteOp` (2), `WriteSink` and its `Sink`, `Receiver` (2) and its `Stream`, `QueuePairBuilder` (23), `PreparedQp` (2), `Context` (5), `Pd` (2) | not covered by the theorem: the argument above says they cannot break it, and their own behaviour is tested |
 
-In numbers, of the core's public functions: 99 proved, 35 composed, 16 trusted (by the four things
+In numbers, of the core's public functions: 101 proved, 38 composed, 11 trusted (by the three things
 named), 37 not covered. Of `safeverbs`, 121 functions and their `Future`, `Stream` and `Sink`: none in
 the proof, and none able to get past it.
 
@@ -348,7 +347,6 @@ the proof, and none able to get past it.
   the model and rxe). A remote WRITE with immediate is read with the safe copy, the same rkey
   still valid after it (`tests/rxe.rs`).
 - A sink's item number, in unverified code (`sink.rs`), tested on the model and rxe.
-- `RingBuf`'s placement and the reuse of its chunks.
 - The simulated NIC (`model.rs`) checks some of M's rules at run time: no queue pair
   destroyed with WQEs not retired, no CQ destroyed with a queue pair attached, no work
   posted in `Reset`. That it behaves within M is neither tested systematically nor proved.
@@ -423,7 +421,9 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `hw/open.rs` `one_of` | `core::slice::from_ref` is a list of that one element |
 | `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
 | `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExContext`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
-| `buf.rs` `bytes_back` | when a region goes, the permissions split from it are its own again: each lives in a `RawMut`, which holds an `Arc` of the region its range belongs to (a type invariant), so none is left when the last `Arc` goes. The rest of freeing it is verified (`Region::free_memory`, vstd's `deallocate` with the allocation's `Dealloc`) |
+| `buf.rs` `bytes_back` | when a region goes, the permissions split from it are its own again: each lives in a `RawMut` or a `RingBuf`, which hold an `Arc` of the region its range belongs to (a type invariant), so none is left when the last `Arc` goes. The rest of freeing it is verified (`Region::free_memory`, vstd's `deallocate` with the allocation's `Dealloc`) |
+| `buf.rs` `chunk_held` | whether anything but its ring holds a chunk, with no contract: what frees one is `thaw` |
+| `buf.rs` `bytes_to_fill` | the reference to a unique buffer's bytes that `DerefMut` makes (the row "references to buffers"), and that filling them changes nothing the proofs read |
 | `buf.rs` `sge_too_long` | a panic never returns |
 | `engine.rs` `ExTransport` | the transport trait may bound a key's generics (declared without specifications) |
 | `engine.rs` `hw_at_end` | the hardware side of an engine going, in `drop`, without its invariant coming back: nothing uses it again, and what it leaves is what `Hw::finish` verifies |
@@ -433,7 +433,6 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `trusted.rs` `element`, `element_mut`, `sub_slice` | `get_unchecked` in bounds is what vstd says, and does not unwind |
 | `buf/memory.rs` `allocate_zeroed_raw` | the fallible zeroed allocator returns the address, layout, provenance and linear permissions vstd expects, or nothing; no claim about initialized contents |
 | `buf/memory.rs` `arc_try_unwrap` | `Arc::try_unwrap` returns the exact contents, or an `Arc` to the same contents |
-| `buf/memory.rs` `ring_chunk` | a `RingBuf` chunk comes with the byte permission for exactly its bytes: the ring's placement, which is not verified, keeps its chunks apart |
 | `buf/memory.rs` `volatile_copy` | volatile reads of memory a device may write concurrently are defined and yield arbitrary bytes; its one caller, `Exposed::copy_to_slice`, passes a range it owns and copies into a type that accepts any bytes (S1's one exception) |
 | `buf/lease.rs` `same_frozen_arc` | `Arc::ptr_eq` means both hold the same frozen allocation |
 | `buf/lease.rs` `frozen_apart` | a frozen allocation and another real buffer are that one allocation or own different bytes. Linear permissions make it so, but vstd shows two permissions disjoint only with one of them borrowed exclusively, and a frozen allocation's is behind its `Arc`. An exclusive one needs no trust (`Lease::separate_input`) |
@@ -479,8 +478,7 @@ data, so M sees a queue pair's inline limit as zero.
   posted WQE as their premise.
 - **Buffers.** A region's final cleanup trusts that the permissions split from it are back
   (`bytes_back`). A deposit in a `RawMut`'s `Drop` would not remove that: Verus's `Drop` opens no
-  invariant, and the last step would still be to trust that no `Arc` is left. `RingBuf`'s placement
-  and the permissions of its chunks (`ring_chunk`) are not verified, nor exposure and revocation.
+  invariant, and the last step would still be to trust that no `Arc` is left.
   The registration lifetime is trusted (`registered`, `registered_all`): saying more needs the
   control path in one device history, as below.
 - **Several engines.** Each engine's view of M is proved under rely, and each engine's
@@ -526,7 +524,7 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 163 verified, 0 errors
-safeverbs-core: verification results:: 800 verified, 0 errors
+safeverbs-core: verification results:: 812 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

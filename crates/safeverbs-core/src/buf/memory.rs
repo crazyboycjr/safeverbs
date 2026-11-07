@@ -1,9 +1,8 @@
 //! Linear raw-byte permissions carried by the buffer ranges.
 //!
 //! The allocator is one primitive boundary; splitting is checked bookkeeping. These
-//! tokens describe domains and provenance, not initialized typed contents. Two steps are trusted:
-//! a region's permissions coming back when its last `Arc` goes (`bytes_back` in `buf.rs`), and a
-//! streaming ring's chunks, whose placement is not verified (`OwnedRange::ring_chunk`).
+//! tokens describe domains and provenance, not initialized typed contents. One step is trusted:
+//! a region's permissions coming back when its last `Arc` goes (`bytes_back` in `buf.rs`).
 #![allow(unused_imports)]
 
 use core::alloc::Layout;
@@ -183,19 +182,38 @@ impl OwnedRange {
         )
     }
 
-    /// The chunk `geometry` of a streaming ring's region at `base`, with the byte permission
-    /// for exactly its bytes. `RingBuf` places its chunks without a proof that they are
-    /// disjoint, so this permission is taken on trust (`scripts/trusted.txt`).
-    #[verifier::external_body]
-    pub(super) fn ring_chunk(base: *mut u8, geometry: ByteRange) -> (r: Self)
-        ensures r.inv(), r.base() == base, r.geometry() == geometry,
+    /// The bytes `at..at + len` of the allocation at `base`, whose permission this is.
+    pub(super) fn of_permission(base: *mut u8, at: usize, len: usize, capacity: usize, Tracked(permission): Tracked<BytePermission>) -> (r: Self)
+        requires
+            at + len <= capacity,
+            capacity <= isize::MAX,
+            base.addr() != 0,
+            base.addr() as int + capacity <= usize::MAX,
+            permission.inv(),
+            permission.dom() == Set::range(base.addr() + at, base.addr() + at + len),
+            permission.provenance() == base@.provenance,
+        ensures
+            r.inv(),
+            r.base() == base,
+            r.geometry().spec_offset() == at,
+            r.geometry().spec_len() == len,
+            r.geometry().spec_capacity() == capacity,
     {
+        let _geometry = match ByteRange::new(at, len, capacity) {
+            Some(geometry) => geometry,
+            None => {
+                proof {
+                    assert(false);
+                }
+                vstd::pervasive::unreached()
+            },
+        };
         OwnedRange {
-            ptr: base.with_addr(base.addr() + geometry.offset()),
-            len: geometry.len(),
-            geometry: Ghost(geometry),
+            ptr: base.with_addr(base.addr() + at),
+            len,
+            geometry: Ghost(_geometry),
             base: Ghost(base),
-            permission: Tracked::assume_new(),
+            permission: Tracked(permission),
         }
     }
 }
@@ -222,27 +240,38 @@ impl<N: Nic> RawMut<N> {
         RawMut { region, range }
     }
 
-    /// The `len` bytes `at` bytes into `region`, for a streaming ring, if they are in it.
-    pub(super) fn ring_chunk(region: Arc<Region<N>>, at: usize, len: usize) -> (r: Option<Self>) {
-        match ByteRange::new(at, len, region.size) {
-            Some(geometry) => {
-                let range = OwnedRange::ring_chunk(region.ptr, geometry);
-                Some(RawMut::new(region, range))
-            },
-            None => None,
-        }
-    }
-
     /// Where it starts in its region.
-    pub(super) fn offset(&self) -> usize {
+    pub(super) fn offset(&self) -> (r: usize)
+        ensures r == self.range.geometry().spec_offset(),
+    {
         proof { use_type_invariant(self); }
         self.range.offset(self.region.ptr)
     }
 
     /// Where it ends in its region.
-    pub(super) fn end(&self) -> usize {
+    pub(super) fn end(&self) -> (r: usize)
+        ensures r == self.range.geometry().spec_offset() + self.range.geometry().spec_len(),
+    {
         proof { use_type_invariant(self); }
         self.range.end(self.region.ptr)
+    }
+
+    /// What it is said of it: its range is one of its region, with its permission for its bytes.
+    pub(super) proof fn lemma_in_region(&self)
+        requires self.inv(),
+        ensures
+            self.range.inv(),
+            self.range.base() == (*self.region).ptr,
+            self.range.geometry().spec_capacity() == (*self.region).size,
+    {}
+
+    /// Its region and its permission, for what keeps them apart.
+    pub(super) fn into_parts(self) -> (r: (Arc<Region<N>>, Tracked<BytePermission>))
+        ensures
+            r.0 == self.region,
+            r.1@ == self.range.permission(),
+    {
+        (self.region, self.range.permission)
     }
 
     /// Its range is a range of its region.

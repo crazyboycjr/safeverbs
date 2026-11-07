@@ -637,7 +637,7 @@ async style of the API carry over.
 
 - Theorem 1 beyond one engine: each engine's share of M is settled by rely and guarantee
   (`safeverbs-spec/src/share.rs`), and the refinement is proved for an engine and the buffers it is
-  lent (`verification.md` says where that stands, with its premise). Open: `RingBuf` and exposure,
+  lent (`verification.md` says where that stands, with its premise). Open: exposure,
   and how several engines compose. Undefined SEND/WRITE lengths are already projected out of outcomes; READ and
   receive metadata have operation-specific contracts (section 8).
 - A thread-safe `Cq` and `Qp` in the same shape as the local ones. A whole `LocalCq` with all its

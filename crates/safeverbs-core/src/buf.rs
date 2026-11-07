@@ -20,6 +20,9 @@
 //! outside `verus!`, and the references [`Deref`] makes (`docs/verification.md`, trusted computing
 //! base).
 
+// The code keeps the plain forms the proofs reason about (explicit matches, lengths).
+#![allow(clippy::question_mark, clippy::len_zero)]
+
 use core::alloc::Layout;
 use core::fmt;
 use core::marker::PhantomData;
@@ -37,6 +40,8 @@ use crate::nic::{Access, Nic, RemoteBuf};
 use crate::pd::Pd;
 use crate::trusted::{clone_pd, pd_id_of, register_region};
 use crate::verbs::Verbs;
+use memory::OwnedRange;
+use permissions::BytePermission;
 
 mod memory;
 mod permissions;
@@ -56,10 +61,10 @@ pub use lease::{Leases, Part, Peek};
 #[cfg(verus_keep_ghost)]
 pub(crate) use lease::{covers_inputs, input_is_covered};
 
+verus! {
+
 /// The alignment of every region: a cache line.
 const REGION_ALIGN: usize = 64;
-
-verus! {
 
 /// Linux's `ENOMEM`.
 const ENOMEM: i32 = 12;
@@ -97,7 +102,14 @@ impl<N: Nic> Region<N> {
 
     /// Allocates `size` zeroed bytes aligned to `align` and registers them in `pd` for local writes,
     /// or frees them.
-    fn allocated(pd: &Pd<N>, size: usize, align: usize) -> (r: Result<RawMut<N>>) {
+    fn allocated(pd: &Pd<N>, size: usize, align: usize) -> (r: Result<RawMut<N>>)
+        ensures
+            r matches Ok(whole) ==> {
+                &&& whole.range.geometry().spec_offset() == 0
+                &&& whole.range.geometry().spec_len() == size
+                &&& (*whole.region).size == size
+            },
+    {
         let (address, range, deallocation) = match memory::allocate(size, align) {
             Some(allocation) => allocation,
             None => return Err(Error::Os(ENOMEM)),
@@ -353,7 +365,10 @@ impl<T, N: Nic> BufMut<T, N> {
 
     /// Frozen, a shared [`Buf`] over all of it.
     #[inline]
-    pub(crate) fn frozen(self) -> (r: Buf<T, N>)
+    fn frozen(self) -> (r: Buf<T, N>)
+        ensures
+            (*r.frozen).inv(),
+            (*r.frozen).raw == self.raw,
     {
         proof {
             use_type_invariant(&self);
@@ -496,14 +511,7 @@ impl<N: Nic> Pd<N> {
 
     /// A ring of `capacity` registered bytes for streaming messages.
     pub fn ring_buf(&self, capacity: usize) -> Result<RingBuf<N>> {
-        // Chunks are cut from the region where `RingBuf::place` puts them, not split off
-        // this range.
-        let RawMut { region, .. } = Region::whole(self, capacity, 1)?;
-        Ok(RingBuf {
-            region,
-            capacity,
-            chunks: VecDeque::new(),
-        })
+        RingBuf::in_pd(self, capacity)
     }
 }
 
@@ -1025,23 +1033,526 @@ impl<N: Nic> Part<N> {
     }
 }
 
+verus! {
+
+/// The bytes `.0..1` of a ring that a chunk holds.
+spec fn span_of<N: Nic>(chunk: Arc<Frozen<N>>) -> (int, int) {
+    let g = chunk.raw.range.geometry();
+    (g.spec_offset() as int, g.spec_offset() + g.spec_len())
+}
+
+/// The chunks of a ring, oldest first, lie in its order: each part in increasing order, the ones
+/// before `wrap` above the others. A head that wrapped never reaches the tail, and `wrap` is 0 if it
+/// did not wrap.
+spec fn in_order(s: Seq<(int, int)>, wrap: int, size: int) -> bool {
+    &&& wrap == 0 || 0 < wrap < s.len()
+    &&& forall|i: int| 0 <= i < s.len() ==> 0 <= (#[trigger] s[i]).0 <= s[i].1 <= size
+    &&& forall|i: int, j: int| #![trigger s[i], s[j]] 0 <= i < j < wrap ==> s[i].1 <= s[j].0
+    &&& forall|i: int, j: int| #![trigger s[i], s[j]] wrap <= i < j < s.len() ==> s[i].1 <= s[j].0
+    &&& forall|i: int, j: int| #![trigger s[i], s[j]] 0 <= i < wrap <= j < s.len() ==> s[j].1 <= s[i].0
+    &&& wrap != 0 ==> s[s.len() - 1].1 < s[0].0
+}
+
+/// The oldest chunk gone, the others are in order.
+proof fn lemma_older_gone(s: Seq<(int, int)>, wrap: int, size: int)
+    requires
+        in_order(s, wrap, size),
+        s.len() > 0,
+    ensures
+        in_order(s.drop_first(), if wrap == 0 { 0 } else { wrap - 1 }, size),
+{
+    let t = s.drop_first();
+    let w = if wrap == 0 { 0 } else { wrap - 1 };
+    assert forall|i: int| 0 <= i < t.len() implies 0 <= (#[trigger] t[i]).0 <= t[i].1 <= size by {
+        assert(t[i] == s[i + 1]);
+    }
+    assert forall|i: int, j: int| #![trigger t[i], t[j]] 0 <= i < j < w implies t[i].1 <= t[j].0 by {
+        assert(t[i] == s[i + 1] && t[j] == s[j + 1]);
+    }
+    assert forall|i: int, j: int| #![trigger t[i], t[j]] w <= i < j < t.len() implies t[i].1 <= t[j].0 by {
+        assert(t[i] == s[i + 1] && t[j] == s[j + 1]);
+    }
+    assert forall|i: int, j: int| #![trigger t[i], t[j]] 0 <= i < w <= j < t.len() implies t[j].1 <= t[i].0 by {
+        assert(t[i] == s[i + 1] && t[j] == s[j + 1]);
+    }
+    if w != 0 {
+        assert(t[t.len() - 1] == s[s.len() - 1]);
+        assert(t[0] == s[1]);
+        assert(s[0].1 <= s[1].0);
+    }
+}
+
+/// Two chunks in order hold different bytes, and each lies between the tail and the head as `place`
+/// reads them.
+proof fn lemma_positions(s: Seq<(int, int)>, wrap: int, size: int)
+    requires
+        in_order(s, wrap, size),
+        s.len() > 0,
+    ensures
+        forall|i: int, j: int| #![trigger s[i], s[j]] 0 <= i < s.len() && 0 <= j < s.len() && i != j
+            ==> s[i].1 <= s[j].0 || s[j].1 <= s[i].0,
+        wrap == 0 ==> s[0].0 <= s[s.len() - 1].1,
+        wrap == 0 ==> forall|i: int| 0 <= i < s.len() ==> s[0].0 <= #[trigger] s[i].0 && s[i].1 <= s[s.len() - 1].1,
+        wrap != 0 ==> forall|i: int| 0 <= i < wrap ==> s[0].0 <= #[trigger] s[i].0,
+        wrap != 0 ==> forall|i: int| wrap <= i < s.len() ==> #[trigger] s[i].1 <= s[s.len() - 1].1,
+{
+    assert forall|i: int, j: int| #![trigger s[i], s[j]] 0 <= i < s.len() && 0 <= j < s.len() && i != j
+        implies s[i].1 <= s[j].0 || s[j].1 <= s[i].0 by {
+        assert(s[i].0 <= s[i].1);
+        assert(s[j].0 <= s[j].1);
+    }
+    assert(s[0].0 <= s[0].1);
+    assert(s[s.len() - 1].0 <= s[s.len() - 1].1);
+    if wrap == 0 {
+        assert forall|i: int| 0 <= i < s.len() implies s[0].0 <= #[trigger] s[i].0 && s[i].1 <= s[s.len() - 1].1 by {
+            assert(s[i].0 <= s[i].1);
+            assert(s[s.len() - 1].0 <= s[s.len() - 1].1);
+            if i != 0 {
+                assert(s[0].1 <= s[i].0);
+            }
+            if i != s.len() - 1 {
+                assert(s[i].1 <= s[s.len() - 1].0);
+            }
+        }
+    } else {
+        assert forall|i: int| 0 <= i < wrap implies s[0].0 <= #[trigger] s[i].0 by {
+            assert(s[0].0 <= s[0].1);
+            if i != 0 {
+                assert(s[0].1 <= s[i].0);
+            }
+        }
+        assert forall|i: int| wrap <= i < s.len() implies #[trigger] s[i].1 <= s[s.len() - 1].1 by {
+            assert(s[s.len() - 1].0 <= s[s.len() - 1].1);
+            if i != s.len() - 1 {
+                assert(s[i].1 <= s[s.len() - 1].0);
+            }
+        }
+    }
+}
+
+/// A chunk after the others is in order, with `wrap` as [`RingBuf::place`] says.
+proof fn lemma_next(s: Seq<(int, int)>, wrap: int, size: int, next: (int, int), wrap2: int)
+    requires
+        in_order(s, wrap, size),
+        0 <= next.0 <= next.1 <= size,
+        wrap2 == wrap || (wrap == 0 && wrap2 == s.len() && s.len() > 0),
+        s.len() == 0 ==> wrap2 == 0,
+        wrap2 == wrap && s.len() > 0 ==> s[s.len() - 1].1 <= next.0,
+        wrap2 != 0 ==> next.1 < s[0].0,
+        wrap2 == s.len() && s.len() > 0 ==> next.0 == 0,
+        wrap != 0 ==> next.1 < s[0].0,
+    ensures
+        in_order(s.push(next), wrap2, size),
+{
+    let t = s.push(next);
+    if s.len() > 0 {
+        lemma_positions(s, wrap, size);
+    }
+    assert forall|i: int| 0 <= i < t.len() implies 0 <= (#[trigger] t[i]).0 <= t[i].1 <= size by {
+        if i < s.len() {
+            assert(t[i] == s[i]);
+        } else {
+            assert(t[i] == next);
+        }
+    }
+    assert forall|i: int, j: int| #![trigger t[i], t[j]] 0 <= i < j < wrap2 implies t[i].1 <= t[j].0 by {
+        assert(t[i] == s[i] && t[j] == s[j]);
+        if wrap == 0 {
+            assert(s[i].1 <= s[j].0);
+        }
+    }
+    assert forall|i: int, j: int| #![trigger t[i], t[j]] wrap2 <= i < j < t.len() implies t[i].1 <= t[j].0 by {
+        assert(t[i] == s[i]);
+        if j < s.len() {
+            assert(t[j] == s[j]);
+        } else {
+            assert(t[j] == next);
+        }
+    }
+    assert forall|i: int, j: int| #![trigger t[i], t[j]] 0 <= i < wrap2 <= j < t.len() implies t[j].1 <= t[i].0 by {
+        assert(t[i] == s[i]);
+        if j < s.len() {
+            assert(t[j] == s[j]);
+        } else {
+            assert(t[j] == next);
+        }
+    }
+    if wrap2 != 0 {
+        assert(t[t.len() - 1] == next);
+        assert(t[0] == s[0]);
+    }
+}
+
+/// Reads whether anything but the ring holds a chunk (no meaning in the proofs: what frees a chunk
+/// is [`thaw`](memory::thaw), which says for itself).
+#[verifier::external_body]
+#[inline(always)]
+fn chunk_held<N: Nic>(chunk: &Arc<Frozen<N>>) -> bool {
+    Arc::strong_count(chunk) != 1
+}
+
+/// A unique buffer's bytes, to fill: the reference `DerefMut` makes (`docs/verification.md`, trusted
+/// computing base). Filling them changes nothing the proofs read.
+#[verifier::external_body]
+#[inline(always)]
+fn bytes_to_fill<N: Nic>(buf: &mut BufMut<u8, N>) -> (bytes: &mut [u8])
+    ensures
+        *final(buf) == *old(buf),
+{
+    &mut *buf
+}
+
 /// A ring of registered bytes for streaming variable-size messages: each
 /// message is written at the head into a chunk of its own, frozen and sent;
 /// a chunk's space is reused once every `Buf` of it is gone (its requests
 /// completed and the caller dropped its copies), oldest first.
+#[verifier::reject_recursive_types(N)]
 pub struct RingBuf<N: Nic = Verbs> {
     region: Arc<Region<N>>,
-    capacity: usize,
+    /// Bytes it may place: all of them, or none while a message is filled, and so for good if the
+    /// program's `fill` panicked. It holds on to what it knows for no longer than that.
+    room: usize,
     /// The chunks handed out and not reclaimed, oldest first.
     chunks: VecDeque<Arc<Frozen<N>>>,
+    /// The permission of its bytes that no chunk holds.
+    #[allow(dead_code)]
+    free: Tracked<BytePermission>,
+    /// How many of its chunks lie above where the head wrapped (`in_order`).
+    #[allow(dead_code)]
+    wrap: Ghost<int>,
 }
 
 impl<N: Nic> RingBuf<N> {
-    /// Its capacity in bytes.
-    pub fn capacity(&self) -> usize {
-        self.capacity
+    /// Its chunks in order, and its free permission for its bytes that no chunk holds. So a chunk
+    /// cut from where `place` says takes a permission that exists.
+    #[verifier::type_invariant]
+    closed spec fn inv(self) -> bool {
+        let region = *self.region;
+        let chunks = self.chunks@;
+        &&& self.free@.inv()
+        &&& self.free@.provenance() == region.ptr@.provenance
+        &&& region.size <= isize::MAX
+        &&& region.ptr.addr() != 0
+        &&& region.ptr.addr() as int + region.size <= usize::MAX
+        &&& forall|i: int| 0 <= i < chunks.len() ==> {
+            &&& (*#[trigger] chunks[i]).inv()
+            &&& *chunks[i].raw.region == region
+        }
+        &&& self.room != 0 ==> {
+            &&& self.room == region.size
+            &&& in_order(chunks.map_values(|c: Arc<Frozen<N>>| span_of(c)), self.wrap@, region.size as int)
+            &&& forall|x: int| #[trigger] self.free@.dom().contains(x) <==> self.is_free(x)
+        }
     }
 
+    /// Byte `x` is one of its, and no chunk holds it.
+    closed spec fn is_free(self, x: int) -> bool {
+        let base = (*self.region).ptr.addr() as int;
+        let chunks = self.chunks@;
+        &&& base <= x < base + (*self.region).size
+        &&& forall|i: int| 0 <= i < chunks.len() ==> !(span_of(#[trigger] chunks[i]).0 <= x - base < span_of(chunks[i]).1)
+    }
+
+    /// A ring of `capacity` registered bytes in `pd`.
+    fn in_pd(pd: &Pd<N>, capacity: usize) -> (r: Result<RingBuf<N>>) {
+        if capacity == 0 {
+            return Err(Error::Invalid("an empty buffer"));
+        }
+        let whole = match Region::allocated(pd, capacity, REGION_ALIGN) {
+            Ok(whole) => whole,
+            Err(e) => return Err(e),
+        };
+        proof {
+            use_type_invariant(&whole);
+            whole.lemma_in_region();
+        }
+        let ghost geometry = whole.range.geometry();
+        let (region, free) = whole.into_parts();
+        let chunks = VecDeque::new();
+        let ghost wrap = 0int;
+        let ring = RingBuf { region, room: capacity, chunks, free, wrap: Ghost(wrap) };
+        Ok(ring)
+    }
+
+    /// Its capacity in bytes.
+    pub fn capacity(&self) -> (n: usize) {
+        self.region.size
+    }
+
+    /// Drops the oldest chunks nobody holds any more: their permissions are free again.
+    fn reclaim(&mut self) {
+        proof {
+            use_type_invariant(&*self);
+        }
+        let size = self.room;
+        if size == 0 {
+            return;
+        }
+        while self.chunks.len() > 0
+            invariant
+                size == self.room,
+                size != 0,
+            decreases self.chunks@.len(),
+        {
+            proof {
+                use_type_invariant(&*self);
+            }
+            if chunk_held(&self.chunks[0]) {
+                return;
+            }
+            let ghost before = *self;
+            let ghost spans = before.chunks@.map_values(|c: Arc<Frozen<N>>| span_of(c));
+            self.room = 0;
+            let mut chunks = replace_value(&mut self.chunks, VecDeque::new());
+            let front = match chunks.pop_front() {
+                Some(front) => front,
+                None => {
+                    self.chunks = chunks;
+                    self.room = size;
+                    proof {
+                        assert(false);
+                    }
+                    return;
+                },
+            };
+            match memory::thaw(front) {
+                Ok(raw) => {
+                    proof {
+                        use_type_invariant(&raw);
+                        raw.lemma_in_region();
+                    }
+                    let (_region, _freed) = raw.into_parts();
+                    proof {
+                        lemma_older_gone(spans, before.wrap@, size as int);
+                        lemma_positions(spans, before.wrap@, size as int);
+                        let base = (*before.region).ptr.addr() as int;
+                        let span = span_of(before.chunks@[0]);
+                        assert(spans[0] == span);
+                        assert(_freed@.dom() == Set::range(base + span.0, base + span.1));
+                        assert forall|x: int| #[trigger] _freed@.dom().contains(x) implies !self.free@.dom().contains(x) by {
+                            assert(!before.is_free(x));
+                        }
+                        assert(self.free@.dom().disjoint(_freed@.dom()));
+                        self.free.borrow_mut().put_back(_freed.get());
+                    }
+                    self.chunks = chunks;
+                    self.wrap = Ghost(if before.wrap@ == 0 { 0int } else { before.wrap@ - 1 });
+                    proof {
+                        let later = self.chunks@;
+                        assert(later =~= before.chunks@.drop_first());
+                        assert(later.map_values(|c: Arc<Frozen<N>>| span_of(c)) =~= spans.drop_first());
+                        assert forall|x: int| #[trigger] self.free@.dom().contains(x) <==> self.is_free(x) by {
+                            let base = (*before.region).ptr.addr() as int;
+                            assert forall|i: int| 0 <= i < later.len() implies #[trigger] later[i] == before.chunks@[i + 1] by {}
+                            let span = span_of(before.chunks@[0]);
+                            if self.is_free(x) && !before.is_free(x) {
+                                let i = choose|i: int| 0 <= i < before.chunks@.len() && span_of(#[trigger] before.chunks@[i]).0 <= x - base < span_of(before.chunks@[i]).1;
+                                if i != 0 {
+                                    assert(later[i - 1] == before.chunks@[i]);
+                                }
+                            }
+                            if before.is_free(x) {
+                                assert forall|i: int| 0 <= i < later.len() implies !(span_of(#[trigger] later[i]).0 <= x - base < span_of(later[i]).1) by {
+                                    assert(later[i] == before.chunks@[i + 1]);
+                                }
+                            }
+                            if span.0 <= x - base < span.1 {
+                                assert forall|i: int| 0 <= i < later.len() implies !(span_of(#[trigger] later[i]).0 <= x - base < span_of(later[i]).1) by {
+                                    assert(later[i] == before.chunks@[i + 1]);
+                                    assert(spans[i + 1] == span_of(later[i]));
+                                }
+                                assert(span_of(before.chunks@[0]) == span);
+                            }
+                        }
+                    }
+                    self.room = size;
+                },
+                Err(front) => {
+                    chunks.push_front(front);
+                    self.chunks = chunks;
+                    proof {
+                        assert(self.chunks@ =~= before.chunks@);
+                    }
+                    self.room = size;
+                    return;
+                },
+            }
+        }
+    }
+
+    /// Where `len` contiguous free bytes start, if anywhere, and the `wrap` of the chunks with a
+    /// chunk of them after the others.
+    fn place(&mut self, len: usize) -> (r: Option<(usize, Ghost<int>)>)
+        ensures
+            r matches Some((at, wrap)) ==> {
+                &&& final(self).room != 0
+                &&& at + len <= final(self).room
+                &&& in_order(
+                    final(self).chunks@.map_values(|c: Arc<Frozen<N>>| span_of(c)).push((at as int, at + len)),
+                    wrap@,
+                    final(self).room as int,
+                )
+            },
+    {
+        self.reclaim();
+        proof {
+            use_type_invariant(&*self);
+        }
+        let size = self.room;
+        if size == 0 {
+            return None;
+        }
+        let n = self.chunks.len();
+        let ghost spans = self.chunks@.map_values(|c: Arc<Frozen<N>>| span_of(c));
+        let ghost wrap = self.wrap@;
+        if n == 0 {
+            if len > size {
+                return None;
+            }
+            proof {
+                assert(spans =~= Seq::<(int, int)>::empty());
+                lemma_next(spans, wrap, size as int, (0, len as int), 0);
+            }
+            return Some((0, Ghost(0int)));
+        }
+        proof {
+            lemma_positions(spans, wrap, size as int);
+            assert(spans[0] == span_of(self.chunks@[0]));
+            assert(spans[n - 1] == span_of(self.chunks@[n - 1]));
+        }
+        // The ring owns its whole region: offsets are positions in the ring.
+        let tail = self.chunks[0].raw.offset();
+        let head = self.chunks[n - 1].raw.end();
+        // Chunks lie from `tail` to `head`, or wrapped from `tail` to the end
+        // and from the start to `head`. A wrapped head never reaches the
+        // tail (strict comparisons), so `head >= tail` means not wrapped.
+        if head >= tail {
+            if size - head >= len {
+                proof {
+                    lemma_next(spans, wrap, size as int, (head as int, head + len), wrap);
+                }
+                Some((head, Ghost(wrap)))
+            } else if tail > len {
+                proof {
+                    lemma_next(spans, wrap, size as int, (0, len as int), n as int);
+                }
+                Some((0, Ghost(n as int)))
+            } else {
+                None
+            }
+        } else if tail - head > len {
+            proof {
+                lemma_next(spans, wrap, size as int, (head as int, head + len), wrap);
+            }
+            Some((head, Ghost(wrap)))
+        } else {
+            None
+        }
+    }
+
+    /// Writes a message of `len` bytes, filled by `fill`, at the head and
+    /// returns it frozen; `None` while the ring has no room for it.
+    ///
+    /// If `fill` panics, the ring takes no more messages, and its chunks stay what they are: the
+    /// message's bytes went with its permission.
+    ///
+    /// That every `F` may be called is what a program's closure is: only Verus can write one that
+    /// asks more.
+    pub fn write_with<F: FnOnce(&mut [u8])>(&mut self, len: usize, fill: F) -> (r: Option<Buf<u8, N>>)
+        requires
+            forall|any: F, bytes: &mut [u8]| any.requires((bytes,)),
+    {
+        let (at, wrap) = match self.place(len) {
+            Some(placed) => placed,
+            None => return None,
+        };
+        proof {
+            use_type_invariant(&*self);
+        }
+        let size = self.room;
+        let ghost spans = self.chunks@.map_values(|c: Arc<Frozen<N>>| span_of(c));
+        let ghost base_addr = self.region.ptr.addr() as int;
+        proof {
+            // The bytes are free: no chunk holds them.
+            let next = (at as int, at + len);
+            let more = spans.push(next);
+            assert(more[spans.len() as int] == next);
+            if more.len() > 0 {
+                lemma_positions(more, wrap@, size as int);
+            }
+            assert forall|x: int| Set::range(base_addr + at, base_addr + at + len).contains(x) implies #[trigger] self.free@.dom().contains(x) by {
+                assert forall|i: int| 0 <= i < self.chunks@.len() implies !(span_of(#[trigger] self.chunks@[i]).0 <= x - base_addr < span_of(self.chunks@[i]).1) by {
+                    assert(more[i] == spans[i]);
+                    assert(spans[i] == span_of(self.chunks@[i]));
+                    assert(more[i].1 <= more[spans.len() as int].0 || more[spans.len() as int].1 <= more[i].0);
+                }
+                assert(self.is_free(x));
+            }
+        }
+        let ghost keys = Set::range(base_addr + at, base_addr + at + len);
+        let ghost start = *self;
+        self.room = 0;
+        let tracked part = self.free.borrow_mut().take(keys);
+        let region = self.region.clone();
+        proof {
+            use_type_invariant(&region);
+        }
+        let range = OwnedRange::of_permission(region.ptr, at, len, size, Tracked(part));
+        let raw = RawMut::new(region, range);
+        let mut buf = BufMut::of_bytes(raw);
+        fill(bytes_to_fill(&mut buf));
+        let frozen = buf.frozen();
+        let ghost before_chunks = self.chunks@;
+        let mut chunks = replace_value(&mut self.chunks, VecDeque::new());
+        chunks.push_back(frozen.frozen.clone());
+        proof {
+            assert forall|i: int| 0 <= i < chunks@.len() implies {
+                &&& (*#[trigger] chunks@[i]).inv()
+                &&& *chunks@[i].raw.region == *self.region
+            } by {
+                if i < before_chunks.len() {
+                    assert(chunks@[i] == before_chunks[i]);
+                }
+            }
+        }
+        self.chunks = chunks;
+        self.wrap = wrap;
+        proof {
+            let later = self.chunks@;
+            let n = before_chunks.len() as int;
+            assert forall|i: int| 0 <= i < n implies #[trigger] later[i] == before_chunks[i] by {}
+            assert(span_of(later[n]) == (at as int, at + len));
+            assert(later.map_values(|c: Arc<Frozen<N>>| span_of(c)) =~= spans.push((at as int, at + len)));
+            assert forall|x: int| #[trigger] self.free@.dom().contains(x) <==> self.is_free(x) by {
+                if self.free@.dom().contains(x) {
+                    assert(start.free@.dom().contains(x));
+                    assert(start.is_free(x));
+                    assert(!keys.contains(x));
+                    assert forall|i: int| 0 <= i < later.len() implies !(span_of(#[trigger] later[i]).0 <= x - base_addr < span_of(later[i]).1) by {
+                        if i < n {
+                            assert(later[i] == before_chunks[i]);
+                        }
+                    }
+                }
+                if self.is_free(x) {
+                    assert forall|i: int| 0 <= i < n implies !(span_of(#[trigger] before_chunks[i]).0 <= x - base_addr < span_of(before_chunks[i]).1) by {
+                        assert(later[i] == before_chunks[i]);
+                    }
+                    assert(start.is_free(x));
+                    assert(start.free@.dom().contains(x));
+                    assert(!(span_of(later[n]).0 <= x - base_addr < span_of(later[n]).1));
+                    assert(!keys.contains(x));
+                }
+            }
+        }
+        self.room = size;
+        Some(frozen)
+    }
+}
+
+} // verus!
+
+impl<N: Nic> RingBuf<N> {
     /// Bytes in chunks not reclaimed yet.
     pub fn in_use(&mut self) -> usize {
         self.reclaim();
@@ -1050,62 +1561,6 @@ impl<N: Nic> RingBuf<N> {
             n += c.raw.len();
         }
         n
-    }
-
-    /// Drops the oldest chunks nobody holds any more.
-    fn reclaim(&mut self) {
-        while let Some(front) = self.chunks.front() {
-            if Arc::strong_count(front) != 1 {
-                break;
-            }
-            let chunk = self.chunks.pop_front().expect("the front chunk exists");
-            match memory::thaw(chunk) {
-                Ok(_free) => {}
-                Err(chunk) => {
-                    self.chunks.push_front(chunk);
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Where `len` contiguous free bytes start, if anywhere.
-    fn place(&mut self, len: usize) -> Option<usize> {
-        self.reclaim();
-        let (Some(front), Some(back)) = (self.chunks.front(), self.chunks.back()) else {
-            return (len <= self.capacity).then_some(0);
-        };
-        // The ring owns its whole region: offsets are positions in the ring.
-        let tail = front.raw.offset();
-        let head = back.raw.end();
-        // Chunks lie from `tail` to `head`, or wrapped from `tail` to the end
-        // and from the start to `head`. A wrapped head never reaches the
-        // tail (strict comparisons), so `head >= tail` means not wrapped.
-        if head >= tail {
-            if self.capacity - head >= len {
-                Some(head)
-            } else if tail > len {
-                Some(0)
-            } else {
-                None
-            }
-        } else if tail - head > len {
-            Some(head)
-        } else {
-            None
-        }
-    }
-
-    /// Writes a message of `len` bytes, filled by `fill`, at the head and
-    /// returns it frozen; `None` while the ring has no room for it.
-    pub fn write_with(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Buf<u8, N>> {
-        let at = self.place(len)?;
-        let chunk = RawMut::ring_chunk(self.region.clone(), at, len);
-        let mut buf: BufMut<u8, N> = BufMut::of_bytes(chunk.expect("a chunk fits the ring"));
-        fill(&mut buf);
-        let buf = buf.freeze();
-        self.chunks.push_back(buf.frozen.clone());
-        Some(buf)
     }
 
     /// Copies `message` in at the head and returns it frozen; `None` while
