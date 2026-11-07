@@ -175,7 +175,9 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
   completion, no CQ destroyed with a QP attached, no work posted in RESET.
   Also on the simulated NIC (`crates/safeverbs-core/tests/`): an error
   stays within its own request's WQE interval (`outcome.rs`), a batch of
-  READs reports its last READ's length (`read_batch.rs`), and a waker's
+  READs reports its last READ's length (`read_batch.rs`), the order an engine's
+  resources go in, what a panicking closure or iterator leaves and keys that name no
+  QP (`shell.rs`), and a waker's
   panic keeps every polled completion and resumes only after the poll's
   bookkeeping (`waker_unwind.rs`); `wc.rs` checks, on the simulated NIC and
   on a device, that a WRITE with immediate fills no receive buffer and that

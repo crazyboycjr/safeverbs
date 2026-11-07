@@ -488,10 +488,12 @@ locks and gives the engine's queue pairs a doorbell page of their own, which the
 fails (rxe) they are plain queue pairs. An engine's queue pairs may be of several protection domains
 of one device: as in verbs, a CQ belongs to a device.
 
-**Verified hardware side.** Everything of an engine that M sees (the CQ, the queue pairs' hardware
-handles and rings, the CQEs read, the engine's share of M) lives in `hw::Hw`, inside `verus!`, and
-so does `Engine`'s data path over it; what Verus cannot read is an unverified shell around them
-(thread domains, the drain's clock, callbacks). `verification.md` says what is proved.
+**Verified.** Everything of an engine that M sees (the CQ, the queue pairs' hardware handles and
+rings, the CQEs read, the engine's share of M) lives in `hw::Hw`, and `Engine` over it, all inside
+`verus!`. An engine's invariant is a type invariant, so a program promises nothing, and nothing unwinds
+while it is open: `Hw` keeps a waker's panic and `Engine` resumes it. What Verus cannot read is what
+means nothing in M, behind trusted items without contracts (thread domains, the drain's clock).
+`verification.md` says what is proved, and of every public item.
 
 **The data path.** A single operation has its own path: the checks (one comparison each: the buffer
 is of the QP's protection domain, fits, the queue has room), then the slot, so that it keeps the

@@ -14,10 +14,25 @@ obligations of the `Refines` trait.
 
 **One engine and its buffers discharge them** (`EngineState`, `theorem_1_engine` in
 `crates/safeverbs-core/src/hw/refines.rs`). Its state is the `Hw` inside an `Engine`: its CQ, its
-queue pairs, their rings, and the requests in them. Each method of `Engine` on the data path keeps
-the invariant, is zero or more steps of A, and moves the NIC only by legal steps of M, and A and M
-are coupled at every point (`coupled`). `example_run` there drives `Engine`'s public methods, on
-typed buffers, through the theorem.
+queue pairs, their rings, and the requests in them. Each method of `Engine` keeps the invariant, is
+zero or more steps of A, and moves the NIC only by legal steps of M, and A and M are coupled at every
+point (`coupled`).
+
+**Every engine a program holds is the end of such a run.** An engine's invariant is a Verus type
+invariant (`Engine::inv`): its hardware side keeps `Hw::inv`, and it came, by `Hw::moved_from`, from
+the state `Engine::new` made it in. So no method of `Engine` asks anything of the program, and Verus
+checks that each keeps the invariant whatever it is given. `theorem_1_held` turns that into the
+theorem for whatever the program did with its engine: A's and M's invariants hold, the state stands
+for what they reach from their start, every verb met its precondition, and they are coupled.
+
+**Nothing unwinds while the invariant is open.** Verus allows a mutable borrow of a field under a type
+invariant only for a call marked `no_unwind`, and checks that mark all the way down. So all of `Hw`
+and what it calls is `no_unwind`. What can unwind happens in `Engine` itself, between two such calls,
+with the invariant closed: a program's closure, iterator or destructor, a waker's panic (caught, kept
+in `Hw::panics`, resumed once the bookkeeping is done) and the panic of a key that names no QP. So an
+engine after a caught panic is an engine like any other, and the theorem says so. Two things are not
+what `no_unwind` checks, and are said below: an implicit drop, which Verus does not see, and what a
+backend does (`Nic`'s contract says that it does not unwind).
 
 **A buffer needs no lease until it meets an engine.** Until then its linear byte permission is all
 there is to it, so what the program does with its buffers (allocating, splitting, freezing, sharing,
@@ -37,21 +52,23 @@ by the same permissions, and what they owe each other is the one premise left.
 **The premise left: what the NIC may touch beyond the engine's queues, A gives it**
 (`outside_covered` in `share.rs`): the WQEs of other engines' queue pairs and the regions open to a
 peer are leases of A in the NIC's hands. For an engine alone on its device with no region open to a
-peer, there is nothing to say. It is stated of each state, in `Refines::inv` and `Refines::step`.
+peer, there is nothing to say (`theorem_1_alone`). It is stated of each state, in `Refines::inv` and
+`Refines::step`.
 
-**So what the theorem does not cover yet:** the handles of the `safeverbs` crate, one device history
-shared by several engines, exposure, `RingBuf`'s placement and liveness (see "Remaining").
+**So what the theorem does not cover yet:** one device history shared by several engines, exposure,
+`RingBuf`'s placement and liveness (see "Remaining"). The handles of the `safeverbs` crate are covered
+by an argument, not by a theorem ("The public API").
 
 `scripts/verify.sh` checks everything below that is called proved. The specification
 crate uses no `assume`, `admit`, `external_body` or assumed specification; the code of
 `crates/safeverbs-core` written inside `verus!` uses no `assume` or `admit` and trusts
-only the items of `scripts/trusted.txt` (see "Trusted computing base"). The rest is ordinary Rust,
-not trusted by the proofs and not verified either: `pd.rs`, `verbs.rs`, `model.rs`, the `safeverbs`
-crate, and the shells of `buf.rs` and `engine.rs`. A shell is what Verus cannot read: the methods
-with zerocopy's bounds, `Region::whole`'s layout, `Exposed` and `RingBuf`; an engine's callbacks
-(`poll`), clocks (`drain`), parent domains (`create_qp`), and `Request`, whose `Drop` writes. They
-have no proof obligations to get wrong: they reach verified code only by calling it, and every
-method they call needs no more than the invariants below ("What is assumed").
+only the items of `scripts/trusted.txt` (see "Trusted computing base"). It also refuses a public
+function of the core's public types with a precondition: a safe function that relies on being called
+correctly is a bug. The rest is ordinary Rust, not trusted by the proofs and not verified either:
+`pd.rs`, `verbs.rs`, `model.rs`, the `safeverbs` crate, and what is left outside `verus!` in `buf.rs`
+and `engine.rs`: the methods with zerocopy's bounds, `Region::whole`'s layout, `Exposed` and `RingBuf`,
+an iterator's loop in `Request::push_gather`, and the `Drop`s. They have no proof obligations to get
+wrong: they reach verified code only by calling it, and what they call asks nothing of them.
 
 ## The properties
 
@@ -194,18 +211,23 @@ moment, moves only along the allowed transitions, and is released once, after th
   operation on a request is a move of its leases in A, and destroying a queue pair is A's `detach`
   of what its rings still hold and `drop_qp`, with no outcome made up (`lemma_linked_destroyed`).
 - *A device that does not flush.* The engine keeps the queue pair and its buffers and reports
-  `Error::NotFlushed`: their leases stay in flight, and nothing the NIC may still use is freed.
-  This retention is tested, not proved.
+  `Error::NotFlushed`: its entry stays in the table (`Hw::keeps_qp`, which `Engine::remove_qp` says of
+  its error), with its leases in flight, and `Hw::destroy` frees nothing unless both rings have nothing
+  in flight, whatever a drain's clock said. An engine that goes with such a queue pair forgets it
+  (`Hw::leak`), with the CQ and the domains: Verus sees no drop, so that this is what happens there is
+  by reading those few lines.
 
 **L1, no lost wakeup.** Once a request is complete, any waker its future registered has
 been invoked.
 - *Spec.* A complete request holds no waker, and completing one invokes the waker it holds
   (`lemma_l1_no_waker_left`, `lemma_l1_completion_wakes`).
 - *Ring.* `complete` wakes exactly the wakers of the requests it retires.
-- *Engine.* A waker that panics is caught; the engine finishes the poll's bookkeeping, then
-  resumes the panic. Verus checks the normal path; the panicking one is tested. In A a request
-  completes when M pops its last WQE, so A's waker runs ahead of the ring's: L1 of the real wakers
-  stays the ring's statement above, and a waker registered after M's pop is no step of A.
+- *Engine.* A waker that panics is caught (`try_wake`) and its panic kept in `Hw::panics`; the
+  bookkeeping goes on, and `Engine` resumes the panic once it has let go of the hardware side, so
+  that the invariant is closed when it unwinds. That it never unwinds with the invariant open is what
+  `no_unwind` checks; that nothing is lost is tested too. In A a request completes when M pops its
+  last WQE, so A's waker runs ahead of the ring's: L1 of the real wakers stays the ring's statement
+  above, and a waker registered after M's pop is no step of A.
 
 **Liveness is stated, not proved.** F1-live (every request gets exactly one outcome) and R1-live
 (nothing stays in flight after its queue pair is dropped, and every buffer is returned or
@@ -215,6 +237,89 @@ Waking a future also needs the executor to poll woken tasks. One step of it is p
 makes room, so that premise is all its end rests on; and it fails rather than wait when no completion
 could give it a slot.
 
+## The public API
+
+### The claim
+
+Take a program that uses safeverbs and contains no `unsafe`, on a device that behaves as M says, with
+the trusted computing base below correct. Then, for every `Engine` it holds (directly, or under a
+`LocalCq`, an `AsyncCq` or a `SharedQp`), at every moment, whatever it did with it, a panic it caught
+included:
+
+- `Hw::inv` holds, and the engine's state is the end of a run of Theorem 1 from the device just opened
+  (the type invariant). Every verb it called met M's precondition, and every request's outcome, lease
+  and waker are what A says.
+- If what the NIC may touch beyond this engine's queues is A's to give (`outside_covered`), then A and
+  M are coupled there, so S1, F1 and R1 hold against M, of the buffers the program holds too. For an
+  engine alone on its device with nothing exposed, nothing beyond its queues exists to give
+  (`theorem_1_alone`).
+
+Stated with its exceptions, **a program that uses safeverbs and contains no `unsafe` has no undefined
+behaviour and never misuses the NIC**, as far as M and the trusted items go, except that:
+
+1. **Several engines on one device.** A safe program can make them, and each is covered by the theorem
+   above with `outside_covered` as a premise that nothing discharges. Their WQEs are apart by the
+   buffers' permissions, and each engine's verbs are foreign steps for the others (`share.rs`), but one
+   device history for all of them is not built.
+2. **Exposure.** A safe program can expose a buffer. No reference to it is ever formed, and a peer's
+   writes are read only through `copy_to_slice`, but `expose` and `try_reclaim` are not in the proof,
+   and an exposed region is the other thing `outside_covered` stands for. S1's one exception
+   (`volatile_copy`) is here too.
+3. **`RingBuf`'s placement** is trusted (`ring_chunk`) and tested.
+4. **What Verus does not see:** an implicit drop ("What is assumed"), and what the references of `Deref`
+   and `DerefMut` do with the bytes (rustc and zerocopy's contracts, in the table below).
+5. **Liveness is not claimed:** F1-live and R1-live. A device that never flushes keeps its QP and
+   buffers; nothing wrong happens, and nothing more does.
+6. **The handles' own behaviour** is tested, not proved: that the right future gets the right result,
+   that no wakeup is lost at their level, a sink's item number.
+
+### The handles: an argument, not a theorem
+
+`crates/safeverbs` is `#![forbid(unsafe_code)]`, and so is whatever a program adds to it. Safe Rust
+cannot cause undefined behaviour except through a safe function that has it. Its only way to the NIC
+and to registered memory is the core's public API, and no safe function there has a precondition
+(`scripts/verify.sh` checks that of the proved ones, and what stays outside `verus!` calls only
+those). So whatever the handles do, in whatever order, with whatever `Rc`, `RefCell`, future or closure
+is a sequence of calls of an engine's methods, or a panic between them. That is the first half of the
+claim for them, and it is an argument: Verus has not read them, and `Rc`, `RefCell` and futures have
+little support in vstd. Their tests say the rest (`docs/dev-setup.md`).
+
+### Every public item
+
+**Proved** means inside `verus!`, with no precondition. **Composed** means outside `verus!`, with no
+`unsafe`, calling only proved functions that ask nothing: nothing there can be wrong in a way the claim
+is about, and the zerocopy bound on many of them is what the last rows of the table below say.
+**Trusted** names the item. **Not covered** says why.
+
+| Public item of `safeverbs-core` | Status |
+| --- | --- |
+| `Engine`: `new`, `context`, `is_lock_free`, `cq_size`, `reserved`, `create_qp`, `remove_qp`, `remove_qp_later`, `progress`, `read_completions`, `next_completion`, `poll`, `connect`, `to_error`, `open_request`, `push_open`, `open_fits`, `close_open`, `submit_open`, `submit_open_detached`, `hand_back_leases`, `give_back`, `try_post`, `try_stage`, `post_unposted`, `stage`, `stage_detached`, `commit`, `take`, `take_send`, `take_recv`, `detach_send`, `detach_recv`, `give_up`, `take_send_error`, `set_send_waker`, `set_recv_waker`, `make_send_room`, `post_recv`, `try_post_recv`, `recv_error`, `post_recv_detached`, `qp_num`, `pd`, `caps`, `qp_is_lock_free`, `send_ring`, `recv_ring`, `request` (49) | proved. Each that changes the engine ensures `moved_from`, a step of Theorem 1, except `poll`, whose closure may do anything to the engine: what comes back is an engine, by its type invariant, and the steps are the calls it made. `poll`'s `requires` says that its closure takes anything, as a program's does |
+| `Request`: `push`, `is_empty`, `finish`, `finish_detached`, `submit`, `submit_detached` (6); `QpKey::index` (1) | proved |
+| `OpenRequest`: `closed`, `len`, `is_empty`, `has_room`, `stop`, `take_leases`, `try_push`, `try_push_lent`, `try_push_write` (9) | proved |
+| `Part`: `len`, `is_empty`, `is_writable` (3); `Leases`: `new`, `is_many`, `len`, `is_empty` (4); `BufMut`: `len`, `is_empty`, `pd_id` (3); `Buf`: `len`, `is_empty`, `try_thaw`, `pd_id` (4) | proved |
+| `Ring`: `depth`, `max_wqes`, `head`, `posted`, `retired`, `committed`, `in_flight_wqes`, `has_staged`, `has_free_slot`, `wqe_retired`, `can_post`, `is_clogged`, `failed`, `state`, `wqe_room`, `next_wqe` (16) | proved, and they read and no more: a program can neither make nor change a `Ring` |
+| `Status::is_ok`, `CompletionError::status`, `Wc::result` (3) | proved |
+| `Drop` of `Engine` | proved but for its last lines: `Engine::end` (drains and destroys) and `Engine::close` (the CQ) are verified, through `hw_at_end`, trusted; `Hw::leak` is by reading ("What is assumed") |
+| `Engine`: `endpoint`, `send`, `send_imm`, `write`, `write_imm`, `read`, `recv` (7); `Request::push_gather` and its `Drop` (2); `PostError::buf_mut`, `Completion::qp_num`, `Completion::buf_mut` (3) | composed |
+| `Pd::alloc`; `BufMut`: `split_at`, `chunks`, `freeze`, `into_part`; `Chunks::next`; `Buf`: `slice`, `view`, `is_unique`, `into_part`, `try_into_part`, `clone`; `Lend` of `Buf`, `&Buf` and `BufView`; `Leases`: `into_buf_mut`, `take_buf_mut`, `from`, `default`; `Part::into_buf_mut` (23, with `Lend`'s 6) | composed |
+| `BufMut`: `deref`, `deref_mut`, `as_bytes`, `try_ref`; `Buf`: `deref`, `as_bytes`, `try_ref` (7) | trusted: "references to buffers", `from_raw_parts` in the shell |
+| `Exposed::copy_to_slice` (1) | trusted: `volatile_copy` |
+| `Pd::ring_buf`; `RingBuf`: `capacity`, `in_use`, `write_with`, `push` (5) | trusted: `ring_chunk` |
+| `verbs::devices`, `Verbs::open`, `Context::open` (3), and `Verbs`'s methods | trusted: rdma-core and the provider, as M's other side |
+| `BufMut::expose`; `Exposed`: `remote`, `len`, `is_empty`, `try_reclaim`, `reclaim`, its `Drop` (7) | not covered: exposure, the premise; tested |
+| `Context`: `new`, `nic`, `same_device`, `name`, `port`, `gids`, `default_gid_index`, `alloc_pd`; `Pd`: `context`, `id` (10) | not covered: the control path, ordinary Rust. What an engine learns of it is trusted (`pd_alive`, `same_device`) |
+| `Model`: `new`, `set_pace`, `halt`, `inject_error`, `refuse_doorbells`, `refuse_next_mr_registration`, `refuse_mr_closes`, `force_error`, `run`, `pending`, `registered` (11) | not covered: a backend for tests, whose fidelity to M is neither proved nor tested systematically |
+| `RemoteBuf`: `offset`, `slice`; `Access::contains`; `Gid::ipv4`; `Error`: `status`, `last_os_error`; `Status::name`; `Wc::probe_wr_id`; `Ring::invariant` (9) | not covered: plain values and debug helpers. They touch no NIC and no buffer |
+| `Nic`, `NicQp`, `NicCq`, `Transport`, `Reliable`, `RC`, `UC`, `Lend` and the data types of `nic.rs`, `wc.rs`, `error.rs` | nothing to prove of their own. `Nic` is `unsafe` to implement, and what makes a resource of it is `unsafe` to call |
+
+| Public item of `safeverbs` | Status |
+| --- | --- |
+| `LocalCq` (6), `LocalQp` (22), `AsyncCq` (4), `AsyncQp` (23) and `SharedQp` (21), most from one macro, `QpState` (2), `Op` and `Flush` with their `Future`s, `Batch` (6), `WriteOp` (2), `WriteSink` and its `Sink`, `Receiver` (2) and its `Stream`, `QueuePairBuilder` (23), `PreparedQp` (2), `Context` (5), `Pd` (2) | not covered by the theorem: the argument above says they cannot break it, and their own behaviour is tested |
+
+In numbers, of the core's public functions: 99 proved, 35 composed, 16 trusted (by the four things
+named), 37 not covered. Of `safeverbs`, 121 functions and their `Future`, `Stream` and `Sink`: none in
+the proof, and none able to get past it.
+
 ## Tested, not proved
 
 - Failed memory-region revocation: a refused close keeps its handle,
@@ -223,8 +328,9 @@ could give it a slot.
   (`buf.rs` unit tests).
 - Wake panics: a caught panic keeps every polled completion and its leases, the poll's
   bookkeeping finishes before it resumes, across queue pairs on one CQ and across refused
-  doorbells (`crates/safeverbs-core/tests/waker_unwind.rs`). Unwinding through other
-  callbacks and destructors is not covered.
+  doorbells (`crates/safeverbs-core/tests/waker_unwind.rs`). What other panics of the program leave
+  (a closure's in a poll, an iterator's in a gather), the order an engine's resources go in and keys
+  that name no QP are in `crates/safeverbs-core/tests/shell.rs`.
 - Memory: a refused registration frees its memory; split, frozen, exposed and streamed
   buffers free theirs once (`crates/safeverbs/tests/allocation.rs`).
 - Batches on the model and on rxe, through `Engine` and evidence that rxe
@@ -269,19 +375,30 @@ completions and registration deserve a note:
 Errors report their status only: their opcode, length and immediate are undefined. Evidence
 that real NICs conform to M will come from differential testing on hardware and soft-RoCE.
 
-Where a shell calls a verified function, that function's precondition is assumed, not proved. Few
-are left, and each is an invariant only verified code can change:
+Nothing outside `verus!` is assumed by the proofs. What it calls has no precondition, and what would
+be one is said by the types:
 
-- `Engine::inv` and `Hw::inv`: the fields are private, only `Hw::new` makes a `Hw`, which ensures it,
-  and each method keeps it;
-- `OpenRequest::inv` and `Leases::inv`, of what `Engine`'s methods take: the fields are private, each
-  maker ensures it and each method keeps it. They are no type invariants because a request's fields
-  change one at a time on the data path;
-- `Region::inv`, which a region's `Drop` relies on to free it: only `Region::allocated` makes one,
-  which ensures it, and the fields are private.
+- `Engine`: its invariant is a type invariant, and each method keeps it.
+- `OpenRequest`: its invariant is a type invariant over what it is written with (`Writing`, whose
+  fields change one at a time on the data path, and which the program never sees).
+- `Region`: a type invariant says that its `Dealloc` is the one of its allocation, until it was freed,
+  which leaves it no bytes. A region's `Drop` frees it through `Region::free_memory`.
+- `Leases`: nothing asks anything of one the program holds. `Engine::hand_back_leases` works with any.
+- A `Ring` is what `Engine::send_ring` lends: a program cannot make one or change one, and what reads
+  one asks nothing of it.
+- A `BufMut`, a `Buf`, a `Part` and a `Peek`: what they say is a type invariant, and a post takes them
+  as they are.
 
-A `BufMut`, a `Buf`, a `Part` and a `Peek` need no such word: what they say is a type invariant, and
-a post takes them as they are.
+Verus does not see an implicit drop, so `no_unwind` does not cover one. Three kinds matter:
+
+- A context's or a waker's destructor is the program's and may unwind. None runs under `Hw`: a request
+  given up hands them to `LetGo` (`Engine::remove_qp_later`) or back to the caller, and an engine drops
+  them last, in `drop`, when nothing of it is left to unwind through. This is by reading, and tested.
+- Buffers released under `Hw` (`Hw::destroy`, a completed request's frozen buffers) may run
+  `Region::drop`, which closes a registration and frees memory. A backend's release does not unwind
+  (`Nic`'s contract).
+- A QP's entry dropped without `Hw::destroy`: nothing does, but Verus would not see it either. The one
+  place is `Engine`'s `Drop`, whose fields hold nothing by then, or nothing that goes (`Hw::leak`).
 
 ### Trusted computing base
 
@@ -297,8 +414,8 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `ring/wake.rs` `ExWakePanic` | std's boxed panic payload is opaque |
 | `ring/wake.rs` `try_wake` | `catch_unwind` catches an unwind from `Waker::wake` and does not unwind itself |
 | `ring/wake.rs` `resume` | `resume_unwind` never returns |
-| `ring.rs` `will_wake` | when `Waker::will_wake` says two wakers wake the same task, they have one name in A |
-| `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name |
+| `ring.rs` `will_wake` | when `Waker::will_wake` says two wakers wake the same task, they have one name in A. It compares two pointers and does not unwind |
+| `ring.rs` `clone_waker` | `Waker::clone` gives a waker of the same task, with the same name, and does not unwind: a waker a program makes without `unsafe` comes from `Wake`, whose clone counts an `Arc` |
 | `buf/lease.rs` `forget_free` | forgetting a value the caller proved holds nothing releases nothing: it writes a free slot with no drop glue, which would be a landing pad on the data path |
 | `buf/lease.rs` `replace_value` | `core::mem::replace` leaves the new value and returns the old one |
 | `buf/lease.rs` `capacity_of` | `Vec::capacity` is at least its length |
@@ -309,7 +426,11 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `buf.rs` `bytes_back` | when a region goes, the permissions split from it are its own again: each lives in a `RawMut`, which holds an `Arc` of the region its range belongs to (a type invariant), so none is left when the last `Arc` goes. The rest of freeing it is verified (`Region::free_memory`, vstd's `deallocate` with the allocation's `Dealloc`) |
 | `buf.rs` `sge_too_long` | a panic never returns |
 | `engine.rs` `ExTransport` | the transport trait may bound a key's generics (declared without specifications) |
-| `engine.rs` `hw_mut` | `ManuallyDrop::deref_mut` is a reference to its contents |
+| `engine.rs` `hw_at_end` | the hardware side of an engine going, in `drop`, without its invariant coming back: nothing uses it again, and what it leaves is what `Hw::finish` verifies |
+| `engine.rs` `transport_of` | a transport's QP type, and that it completes in order (a build error otherwise) |
+| `engine.rs` `DrainClock`, `clock_start`, `clock_renew`, `clock_idle` | a drain's clock, opaque and with no contract: the time means nothing in M, and whatever it says a QP goes only with nothing in flight |
+| `trusted.rs` `vec_new`, `vec_with_capacity`, `vec_push`, `vec_pop`, `vec_clear`, `vec_truncate` | what vstd says of them, and that they do not unwind: out of memory aborts, a `Vec` of more than `isize::MAX` bytes would need more memory than there is, and what they drop is the program's buffers, whose release does not unwind (`Nic`'s contract) |
+| `trusted.rs` `element`, `element_mut`, `sub_slice` | `get_unchecked` in bounds is what vstd says, and does not unwind |
 | `buf/memory.rs` `allocate_zeroed_raw` | the fallible zeroed allocator returns the address, layout, provenance and linear permissions vstd expects, or nothing; no claim about initialized contents |
 | `buf/memory.rs` `arc_try_unwrap` | `Arc::try_unwrap` returns the exact contents, or an `Arc` to the same contents |
 | `buf/memory.rs` `ring_chunk` | a `RingBuf` chunk comes with the byte permission for exactly its bytes: the ring's placement, which is not verified, keeps its chunks apart |
@@ -319,9 +440,10 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's |
 | `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a fresh name, in a state M reaches from a start state (the device just opened), of which its invariants follow; the new engine's share is that CQ and queue pair names nobody uses (this is where tokens come from) |
-| `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these are M's `create_qp`, three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or nothing on error, after rely steps; a queue pair's thread domain changes which locks the driver takes, not what the NIC does |
+| `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these are M's `create_qp`, three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or nothing on error, after rely steps; a queue pair's thread domain changes which locks the driver takes, not what the NIC does; `destroy_cq` is called once, by the end of the engine |
 | `trusted.rs` `qp_num_of`, `qp_lock_free` | facts that mean nothing in M (no contract) |
-| `trusted.rs` `no_qp` | a key that names no queue pair panics and never returns |
+| `trusted.rs` `clone_context`, `alloc_td`, `alloc_domain` | handles and domains that mean nothing in M: which locks the driver takes. A parent domain is over the protection domain it was made for (`domain_over`), which `create_qp` asks of it |
+| `trusted.rs` `no_qp`, `no_context` | a key that names no queue pair, or a refused request whose context the program took out of what it was handed back, panics and never returns |
 | `trusted.rs` `pd_id_of` | the protection domain's run-time identity is its identity in the model |
 | `trusted.rs` `same_device` | `Context::same_device` says whether a protection domain is of the device an engine's M models |
 | `trusted.rs` `clone_pd` | a clone of a handle is a handle of the same protection domain |
@@ -335,6 +457,7 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | Not an item: initialized contents | memory comes zeroed from the allocator, which nothing here states (`allocate_zeroed_raw` claims no contents), and `T: FromBytes` makes zeroes and any other bytes a valid `T`. A says of a lease that it accepts any bytes (`any_bytes`), true of every lease an engine adopts for that reason: a `BufMut<T>` exists only for such a `T`, a bound of `Pd::alloc` and of `BufMut`'s other makers in the shell, which the proofs take as given |
 | Not an item: `IntoBytes` | a `T` has no padding, so sending one reads only initialized bytes: a bound of `into_part` and the `Lend` impls |
 | Not an item: `Immutable` | a `T` has no interior mutability, so a frozen buffer's bytes do not change while the NIC reads them: a bound of `freeze` |
+| Not an item: `Nic`, what it promises | no method of a backend or its resources unwinds, and the safety contract of the trait, which only `Verbs` and the test backend implement, and which a program without `unsafe` cannot implement. The wrappers' `no_unwind` rests on it. (The test backend panics when M's rules are broken, which the proofs exclude.) |
 | Not an item: references to buffers | `Deref` and `DerefMut` make a `&[T]` or `&mut [T]` with `from_raw_parts`, which the proofs do not see: they stand on the permission's being unique or frozen, on the fit of `T` (`fits_type`, a type invariant) and on the rows above |
 
 The proofs read bytes and permissions, never a value of `T`: M and A say which bytes the NIC may
@@ -366,13 +489,18 @@ data, so M sees a queue pair's inline limit as zero.
   `next_id`. `outside_covered`, a premise for one engine, is what they would owe each other.
   Engine creation and destruction, and moving buffers between engines, are part of this. This will
   be designed with the tokens.
+- **Exposure.** `BufMut::expose`, `Exposed` and `try_reclaim` are not in the proof, and they are what
+  `outside_covered` would be about for one engine. What keeps them out is not their code: A's lease of
+  an exposed buffer would have to be in the state of A an engine stands for, whatever the program does
+  away from the engine. `Hw::adopt` can reach such a state for a given buffer, but saying that M's
+  regions open to a peer are those of the `Exposed` values the program holds needs a shared record of
+  them, opened by a `Drop`, which is the shared authority Verus does not allow above.
 - **The WR of a request's last WQE.** `Refines::wrs` keeps every send WQE's WR from M's history
   (`wr_log`); the rings still keep each request's last one as well, from when it is written
   (`send_tails`), for what a result reports. One record could serve both.
-- **The public API.** Connect the futures, sinks and streams of `safeverbs` to the
-  verified engine, and state exactly which public operations the theorem covers, including
-  reuse after a caught panic. Of `Engine`'s shell, `Request` could come inside `verus!` first, as far
-  as what it does in `Drop` allows. Keep conditional release distinct from leak freedom.
+- **The handles.** What `LocalCq`, `AsyncCq`, the futures, sinks and streams add (the right future gets
+  the right result, no lost wakeup at their level) stays tested ("The public API"). Keep conditional
+  release distinct from leak freedom.
 - **Theorem 2**, for two endpoints that both run SafeVerbs, is stated in `refinement.rs`
   and `design.md` only.
 - **M.** Gather evidence that real NICs conform (differential tests on hardware and
@@ -398,7 +526,7 @@ $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
 safeverbs-spec: verification results:: 163 verified, 0 errors
-safeverbs-core: verification results:: 753 verified, 0 errors
+safeverbs-core: verification results:: 800 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

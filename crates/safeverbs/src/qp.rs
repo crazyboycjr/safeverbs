@@ -772,6 +772,7 @@ macro_rules! qp_api {
             /// Polls the CQ once, completing what finished on any of its QPs (and waking the
             /// futures waiting on it), and posts this QP's waiting work that now fits; returns the
             /// number of completions.
+            #[inline]
             pub fn poll(&self) -> usize {
                 self.with_state(|s| {
                     let n = s.engine().progress();
