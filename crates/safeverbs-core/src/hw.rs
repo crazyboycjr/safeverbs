@@ -474,39 +474,6 @@ pub(crate) open spec fn byte_backed<N: Device>(leases: Leases<N>, a: int) -> boo
         && (#[trigger] leases.view()[g]).byte_domain().contains(a)
 }
 
-proof fn lemma_retained_permission<N: Device>(leases: Leases<N>, dir: safeverbs_spec::abs::Dir, a: int)
-    requires retained_byte(leases, dir, a),
-    ensures byte_backed(leases, a),
-{
-    let sge = choose|sge: safeverbs_spec::nic::Sge| retained_sge(leases, dir, sge)
-        && sge.span().contains(a);
-    let (l, g) = choose|l: int, g: int| 0 <= l < leases.loans().len() && 0 <= g < leases.view().len() && {
-        let loan = #[trigger] leases.loans()[l];
-        &&& sge_model(loan.part.spec_sge()) == sge
-        &&& loan.access == Some(dir)
-        &&& loan.part.inv()
-        &&& (#[trigger] leases.view()[g]).same_backing(loan.part.resource())
-        &&& loan.part.byte_domain().subset_of(leases.view()[g].byte_domain())
-        &&& dir is In ==> loan.part.spec_writable()
-    };
-    leases.loans()[l].part.lemma_byte_backing();
-    assert(leases.loans()[l].part.byte_domain().contains(a));
-    assert(leases.view()[g].byte_domain().contains(a));
-}
-
-proof fn lemma_covered_guard<N: Device>(
-    leases: Leases<N>, dir: safeverbs_spec::abs::Dir,
-    sges: Seq<safeverbs_spec::nic::Sge>, a: int,
-)
-    requires covers(sges, a), forall|i: int| 0 <= i < sges.len()
-        ==> retained_sge(leases, dir, #[trigger] sges[i]),
-    ensures retained_byte(leases, dir, a), byte_backed(leases, a),
-{
-    let i = choose|i: int| 0 <= i < sges.len() && sges[i].span().contains(a);
-    assert(retained_sge(leases, dir, sges[i]));
-    lemma_retained_permission(leases, dir, a);
-}
-
 /// Every SGE of an exact ledger entry has its operation's source/destination
 /// keeper, including logical shared inputs deduplicated by the native collector.
 pub(crate) proof fn lemma_ledger_guards<N: Device>(
@@ -1305,100 +1272,6 @@ impl<C, N: Device> Hw<C, N> {
     {
         lemma_rely_frame(t.share(), pinned(t), m, n);
         lemma_table_rely(self.qps@, self.next_name@, t, m, n, self.pending@);
-    }
-}
-
-impl<C, N: Device> Hw<C, N> {
-    /// A local WQE in this engine's M state can access byte `a`.
-    /// Remote-rkey access belongs to the separate registration authority.
-    pub(crate) closed spec fn local_access(&self, index: int, recv: bool, k: int, a: int) -> bool {
-        self.has_qp(index) && {
-            let e = self.qps@[index]->0;
-            let qp = self.nic().qps[e.id()];
-            if recv { 0 <= k < qp.rq.len() && covers(qp.rq[k].wr.sges, a) }
-            else { 0 <= k < qp.sq.len() && covers(qp.sq[k].wr.sges, a) }
-        }
-    }
-
-    /// The live request `s`, its retained keeper and the operation's
-    /// local role back this byte of the WQE in M.
-    pub(crate) closed spec fn local_guarded(&self, index: int, recv: bool, k: int, a: int, s: int) -> bool {
-        let e = self.qps@[index]->0;
-        let qp = self.nic().qps[e.id()];
-        let r = if recv { e.recv } else { e.send };
-        let w = if recv { qp.rq_head + k } else { qp.sq_head + k };
-        let dir = if recv { local_role(None) } else { local_role(Some(qp.sq[k].wr.opcode)) };
-        &&& r.dma(s, w) is Some
-        &&& r.req(s) is Some && r.req(s)->0.phase is InFlight
-        &&& r.req(s)->0.leases == r.dma(s, w)->0
-        &&& r.refused(s) is None
-        &&& retained_byte(r.dma(s, w)->0.leases, dir, a)
-        &&& byte_backed(r.dma(s, w)->0.leases, a)
-    }
-
-    /// Every NIC access through this engine's SQ/RQ WQEs has a
-    /// retained source/destination guard in its unique live request interval.
-    pub(crate) proof fn lemma_local_guard(&self, index: int, recv: bool, k: int, a: int) -> (s: int)
-        requires self.inv(), self.local_access(index, recv, k, a),
-        ensures self.local_guarded(index, recv, k, a, s),
-    {
-        assert(self.entry_ok(index, self.token@, self.nic()));
-        let e = self.qps@[index]->0;
-        let qp = self.nic().qps[e.id()];
-        if recv {
-            let wr = qp.rq[k].wr;
-            let w = qp.rq_head + k;
-            let s = lemma_ring_guards(e.recv, w, wr.wr_id, None, wr.sges);
-            e.recv.lemma_dma(s, w);
-            lemma_covered_guard(e.recv.dma(s, w)->0.leases, local_role(None), wr.sges, a);
-            s
-        } else {
-            let wr = qp.sq[k].wr;
-            let w = qp.sq_head + k;
-            let s = lemma_ring_guards(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
-            e.send.lemma_dma(s, w);
-            lemma_covered_guard(e.send.dma(s, w)->0.leases, local_role(Some(wr.opcode)), wr.sges, a);
-            s
-        }
-    }
-
-    /// A WR already written to the provider, with local bytes in its SGEs.
-    pub(crate) closed spec fn written_access(&self, index: int, j: int, a: int) -> bool {
-        self.has_qp(index) && {
-            let e = self.qps@[index]->0;
-            let written = self.token@.written(e.id());
-            0 <= j < written.len() && covers(written[j].sges, a)
-        }
-    }
-
-    /// A written WR retains its byte in a staged native request.
-    pub(crate) closed spec fn written_guarded(&self, index: int, j: int, a: int, s: int) -> bool {
-        let e = self.qps@[index]->0;
-        let wr = self.token@.written(e.id())[j];
-        let w = e.send.spec_wqe_committed() + j;
-        let dir = local_role(Some(wr.opcode));
-        &&& e.send.dma(s, w) is Some
-        &&& e.send.staged(s) is Some
-        &&& e.send.staged(s)->0.leases == e.send.dma(s, w)->0
-        &&& retained_byte(e.send.dma(s, w)->0.leases, dir, a)
-        &&& byte_backed(e.send.dma(s, w)->0.leases, a)
-    }
-
-    /// Staging before a doorbell retains exactly the same native-byte guards
-    /// as posting. No request or byte authority is synthesized here.
-    pub(crate) proof fn lemma_written_guard(&self, index: int, j: int, a: int) -> (s: int)
-        requires self.inv(), self.written_access(index, j, a),
-        ensures self.written_guarded(index, j, a, s),
-    {
-        assert(self.entry_ok(index, self.token@, self.nic()));
-        let e = self.qps@[index]->0;
-        let wr = self.token@.written(e.id())[j];
-        let w = e.send.spec_wqe_committed() + j;
-        assert(written_backed(e, w, wr));
-        let s = lemma_ring_guards(e.send, w, wr.wr_id, Some(wr.opcode), wr.sges);
-        e.send.lemma_dma(s, w);
-        lemma_covered_guard(e.send.dma(s, w)->0.leases, local_role(Some(wr.opcode)), wr.sges, a);
-        s
     }
 }
 
@@ -3953,7 +3826,7 @@ impl<C, N: Device> Hw<C, N> {
     /// back. It goes out at the next doorbell.
     #[verifier::spinoff_prover]
     #[verifier::rlimit(30)]
-    pub fn close(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
+    pub(crate) fn close(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4126,7 +3999,7 @@ impl<C, N: Device> Hw<C, N> {
     /// has its WQEs say so one by one: they are collected too, and the doorbell is refused.
     #[inline(always)]
     #[verifier::spinoff_prover]
-    pub fn open_request(&mut self, index: usize) -> (open: Writing<N>)
+    pub(crate) fn open_request(&mut self, index: usize) -> (open: Writing<N>)
         requires
             old(self).inv(),
         ensures
@@ -4233,7 +4106,7 @@ impl<C, N: Device> Hw<C, N> {
     /// the WQEs it has stay where they are, to go out or to be dropped with it.
     #[inline(always)]
     #[verifier::spinoff_prover]
-    pub fn give_back(&mut self, index: usize, open: &mut Writing<N>)
+    pub(crate) fn give_back(&mut self, index: usize, open: &mut Writing<N>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4275,7 +4148,7 @@ impl<C, N: Device> Hw<C, N> {
 
     /// [`Hw::close`], first waiting for room (this polls the CQ).
     #[verifier::spinoff_prover]
-    pub fn close_waiting(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
+    pub(crate) fn close_waiting(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: Option<C>) -> (r: core::result::Result<RingSeq, Option<C>>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4309,7 +4182,7 @@ impl<C, N: Device> Hw<C, N> {
     /// its buffers come back.
     #[inline]
     #[verifier::spinoff_prover]
-    pub fn submit_open(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: C) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
+    pub(crate) fn submit_open(&mut self, index: usize, open: &mut Writing<N>, signal: bool, ctx: C) -> (r: core::result::Result<RingSeq, Refusal<C, N>>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -4468,7 +4341,7 @@ impl<C, N: Device> Hw<C, N> {
 
     /// Whether `open` can be closed now on QP `index`: its WQEs fit in the queue.
     #[inline(always)]
-    pub fn open_fits(&self, index: usize, open: &Writing<N>) -> (fits: bool)
+    pub(crate) fn open_fits(&self, index: usize, open: &Writing<N>) -> (fits: bool)
         requires
             self.inv(),
         no_unwind
@@ -4895,7 +4768,7 @@ impl<C, N: Device> Hw<C, N> {
     /// nothing is added and the part is handed back.
     #[verifier::spinoff_prover]
     #[inline(never)]
-    pub fn push_other(&mut self, index: usize, open: &mut Writing<N>, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
+    pub(crate) fn push_other(&mut self, index: usize, open: &mut Writing<N>, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), BufError<Part<N>>>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -5001,7 +4874,7 @@ impl<C, N: Device> Hw<C, N> {
     /// Finishes the WQE gathered on QP `index` with operation `op`, as [`Hw::push_other`] does a WQE
     /// of one part. On error nothing is added and the parts are dropped.
     #[verifier::spinoff_prover]
-    pub fn push_gathered(&mut self, index: usize, open: &mut Writing<N>, op: WrOp) -> (r: Result<()>)
+    pub(crate) fn push_gathered(&mut self, index: usize, open: &mut Writing<N>, op: WrOp) -> (r: Result<()>)
         requires
             old(self).inv(),
             old(open).inv(),
@@ -6180,15 +6053,6 @@ fn implied_outcome(op: &WrOp, len: u32) -> (r: CompletionResult)
 /// Whether the NIC writes the local buffer of `op`.
 spec fn op_writes_local(op: WrOp) -> bool {
     opcode_model(op).writes_local()
-}
-
-/// The way the NIC touches the local buffer of `op`.
-pub open spec fn send_access(op: WrOp) -> safeverbs_spec::abs::Dir {
-    if opcode_model(op).writes_local() {
-        safeverbs_spec::abs::Dir::In
-    } else {
-        safeverbs_spec::abs::Dir::Out
-    }
 }
 
 } // verus!

@@ -99,7 +99,7 @@
 //! 5. Leases are released exactly once, only when their slot retires
 //!    (detached), is taken, is detached after retiring or being refused, is
 //!    refused without an owner, or the QP is destroyed
-//!    ([`Ring::release_all`]); [`Ring::abort_keeping`] hands one request's
+//!    ([`Ring::release_all`]); [`Ring::abort_keeping_with_wakes`] hands one request's
 //!    back. Every staged, in-flight, refused or retired-but-not-taken slot
 //!    holds its leases (`Some`), every free slot holds none.
 //! 6. A retired, refused or free slot holds no waker: the waker registered
@@ -369,7 +369,7 @@ impl<L> Slot<L> {
     }
 }
 
-/// A staged slot after a refused doorbell ([`Ring::abort_keeping`]): its WQEs gone (an empty range
+/// A staged slot after a refused doorbell ([`Ring::abort_keeping_with_wakes`]): its WQEs gone (an empty range
 /// at `wqe`); freed if `keep` or detached, else holding its refusal and its leases for the owner.
 spec fn refuse<L>(slot: Slot<L>, keep: bool, wqe: u64) -> Slot<L> {
     if keep {
@@ -899,26 +899,6 @@ impl<L> Ring<L> {
         self.lemma_ordered(s, t);
     }
 
-    /// Two live requests cannot authorize the same WQE number. This is
-    /// independent of wr_id encoding and excludes historical refused ledgers.
-    pub proof fn lemma_dma_unique(&self, s: int, t: int, w: int)
-        requires
-            self.inv(),
-            self.dma(s, w) is Some,
-            self.dma(t, w) is Some,
-        ensures
-            s == t,
-    {
-        self.lemma_dma(s, w);
-        self.lemma_dma(t, w);
-        if s < t {
-            self.lemma_ordered(s, t);
-        }
-        if t < s {
-            self.lemma_ordered(t, s);
-        }
-    }
-
     /// The names of the wakers the ring has woken, in order.
     pub closed spec fn woken(&self) -> vstd::seq::Seq<WakerId> {
         self.woken@
@@ -1088,7 +1068,7 @@ impl<L> Ring<L> {
     ///
     /// Unless `slots >= 1` and `1 <= max_wqes <= depth` (checked at run
     /// time too, for callers outside the proofs).
-    pub fn new(slots: usize, depth: u32, max_wqes: u32) -> (ring: Ring<L>)
+    pub(crate) fn new(slots: usize, depth: u32, max_wqes: u32) -> (ring: Ring<L>)
         requires
             1 <= slots <= 0x100_0000_0000usize,
             1 <= max_wqes <= depth,
@@ -1206,10 +1186,8 @@ impl<L> Ring<L> {
 
     /// The queue's depth in WQEs.
     pub fn depth(&self) -> (depth: u32)
-        requires
-            self.inv(),
         ensures
-            depth == self.spec_depth(),
+            self.inv() ==> depth == self.spec_depth(),
         no_unwind
     {
         self.depth as u32
@@ -1217,10 +1195,8 @@ impl<L> Ring<L> {
 
     /// The most WQEs of one request.
     pub fn max_wqes(&self) -> (max: u32)
-        requires
-            self.inv(),
         ensures
-            max == self.spec_max_wqes(),
+            self.inv() ==> max == self.spec_max_wqes(),
         no_unwind
     {
         self.max_wqes as u32
@@ -1345,13 +1321,11 @@ impl<L> Ring<L> {
 
     /// WQEs posted and not retired.
     pub fn in_flight_wqes(&self) -> (n: u32)
-        requires
-            self.inv(),
         ensures
-            n == self.spec_wqe_posted() - self.spec_wqe_retired(),
+            self.inv() ==> n == self.spec_wqe_posted() - self.spec_wqe_retired(),
         no_unwind
     {
-        (self.wqe_posted - self.wqe_retired) as u32
+        self.wqe_posted.wrapping_sub(self.wqe_retired) as u32
     }
 
     /// Whether some request is staged (written but not committed).
@@ -1369,13 +1343,11 @@ impl<L> Ring<L> {
     /// covers both: neither number exceeds their bitwise or.
     #[inline(always)]
     pub fn has_free_slot(&self) -> (free: bool)
-        requires
-            self.inv(),
         ensures
-            free == self.spec_has_free_slot(),
+            self.inv() ==> free == self.spec_has_free_slot(),
         no_unwind
     {
-        self.posted - self.head <= self.mask && (self.wqe_posted | self.posted) < COUNTERS_END
+        self.posted.wrapping_sub(self.head) <= self.mask && (self.wqe_posted | self.posted) < COUNTERS_END
     }
 
     /// [`Ring::has_free_slot`], as a specification.
@@ -1399,14 +1371,12 @@ impl<L> Ring<L> {
     /// room for a WQE.
     #[inline(always)]
     pub fn can_post(&self) -> (can: bool)
-        requires
-            self.inv(),
         ensures
-            can == (self.spec_has_free_slot() && self.spec_wqe_posted() - self.spec_wqe_retired()
+            self.inv() ==> can == (self.spec_has_free_slot() && self.spec_wqe_posted() - self.spec_wqe_retired()
                 < self.spec_depth()),
         no_unwind
     {
-        self.has_free_slot() && self.wqe_posted - self.wqe_retired < self.depth
+        self.has_free_slot() && self.wqe_posted.wrapping_sub(self.wqe_retired) < self.depth
     }
 
     /// A signaled WQE is out: written, and not retired.
@@ -1428,8 +1398,6 @@ impl<L> Ring<L> {
     /// Whether every slot is taken by a retired request whose owner has not
     /// taken it: waiting for completions would not free one.
     pub fn is_clogged(&self) -> bool
-        requires
-            self.inv(),
         no_unwind
     {
         !self.has_free_slot() && self.head < self.retired
@@ -1488,7 +1456,7 @@ impl<L> Ring<L> {
     }
 
     /// The first error completion of a detached request, once.
-    pub fn take_detached_error(&mut self) -> (error: Option<DetachedRecord>)
+    pub(crate) fn take_detached_error(&mut self) -> (error: Option<DetachedRecord>)
         requires
             old(self).inv(),
         ensures
@@ -1509,16 +1477,23 @@ impl<L> Ring<L> {
 
     /// The state of request `seq`: `Free` once it was taken, freed or never posted.
     pub fn state(&self, seq: Seq) -> (state: State)
-        requires
-            self.inv(),
         ensures
-            state == self.state_of(seq as int),
+            self.inv() ==> state == self.state_of(seq as int),
         no_unwind
     {
         if seq < self.head || seq >= self.posted {
             return State::Free;
         }
-        let slot = &self.slots[self.index(seq)];
+        let i = (seq & self.mask) as usize;
+        proof {
+            if self.inv() {
+                lemma_mask(seq, self.mask, self.n(), self.bits@);
+            }
+        }
+        if i >= self.slots.len() {
+            return State::Free;
+        }
+        let slot = &self.slots[i];
         if slot.leases.is_none() {
             return State::Free;
         }
@@ -1541,13 +1516,11 @@ impl<L> Ring<L> {
     /// How many more WQEs the queue may take now.
     #[inline]
     pub fn wqe_room(&self) -> (room: u32)
-        requires
-            self.inv(),
         ensures
-            room == self.spec_depth() - (self.spec_wqe_posted() - self.spec_wqe_retired()),
+            self.inv() ==> room == self.spec_depth() - (self.spec_wqe_posted() - self.spec_wqe_retired()),
         no_unwind
     {
-        (self.depth - (self.wqe_posted - self.wqe_retired)) as u32
+        self.depth.wrapping_sub(self.wqe_posted.wrapping_sub(self.wqe_retired)) as u32
     }
 
     /// The WQE sequence number the next WQE written takes (its `wr_id`).
@@ -1563,7 +1536,7 @@ impl<L> Ring<L> {
     /// Whether a new request of `wqes` WQEs must be signaled: with them, the unsignaled tail
     /// would exceed `depth - max_wqes`.
     #[inline]
-    pub fn must_signal(&self, wqes: u64) -> (must: bool)
+    pub(crate) fn must_signal(&self, wqes: u64) -> (must: bool)
         requires
             self.inv(),
             wqes <= u32::MAX,
@@ -1599,7 +1572,7 @@ impl<L> Ring<L> {
     ///
     /// Returns its sequence number.
     #[inline(always)]
-    pub fn stage(&mut self, wqes: u64, signaled: bool, detached: bool, implied: CompletionResult, leases: L) -> (seq: Seq)
+    pub(crate) fn stage(&mut self, wqes: u64, signaled: bool, detached: bool, implied: CompletionResult, leases: L) -> (seq: Seq)
         requires
             old(self).inv(),
             old(self).fits(wqes),
@@ -1720,7 +1693,7 @@ impl<L> Ring<L> {
     /// what keeps their memory alive: the next request's slot gets it all. Then
     /// [`Ring::stage_filled`] stages it, or [`Ring::unfill`] takes it back.
     #[inline(always)]
-    pub fn fill(&mut self, wqes: u64, detached: bool, implied: CompletionResult, leases: L)
+    pub(crate) fn fill(&mut self, wqes: u64, detached: bool, implied: CompletionResult, leases: L)
         requires
             old(self).inv(),
             old(self).fits(wqes),
@@ -1842,7 +1815,7 @@ impl<L> Ring<L> {
 
     /// The second half of [`Ring::stage`]: the request of the slot just filled is staged.
     #[inline(always)]
-    pub fn stage_filled(&mut self, wqes: u64, signaled: bool) -> (seq: Seq)
+    pub(crate) fn stage_filled(&mut self, wqes: u64, signaled: bool) -> (seq: Seq)
         requires
             old(self).is_filled(),
             old(self).filled_end() == old(self).spec_wqe_posted() + wqes,
@@ -1868,7 +1841,7 @@ impl<L> Ring<L> {
     /// Takes back what [`Ring::fill`] put in the next request's slot: the request was not posted.
     #[cold]
     #[inline(never)]
-    pub fn unfill(&mut self) -> (leases: Option<L>)
+    pub(crate) fn unfill(&mut self) -> (leases: Option<L>)
         requires
             old(self).is_filled(),
         ensures
@@ -2086,7 +2059,7 @@ impl<L> Ring<L> {
 
     /// The doorbell rang: every staged request is in flight.
     #[inline(always)]
-    pub fn commit(&mut self)
+    pub(crate) fn commit(&mut self)
         requires
             old(self).inv(),
         ensures
@@ -2183,11 +2156,12 @@ impl<L> Ring<L> {
     /// A refused request keeps its sequence number, which is never reused:
     /// one with an owner retires at once with its refusal, which its owner
     /// takes with its leases ([`Ring::take`]); one without an owner releases
-    /// its leases (see [`Ring::abort_keeping`]). The WQEs of the refused
+    /// its leases (see [`Ring::abort_keeping_with_wakes`]). The WQEs of the refused
     /// requests were never seen by the NIC: they leave the WQE accounting,
     /// and their numbers go to the next requests. Wakers registered on the
     /// staged requests are woken.
-    pub fn abort(&mut self) -> (dropped: u64)
+    #[cfg_attr(not(test), allow(dead_code))] // Used by the tests of the module.
+    pub(crate) fn abort(&mut self) -> (dropped: u64)
         requires
             old(self).inv(),
         ensures
@@ -2220,24 +2194,7 @@ impl<L> Ring<L> {
     /// A request without an owner learns of nothing but through the
     /// detached error: if one is dropped, and no detached error waits, it
     /// becomes the refusal of that request, so that
-    /// the loss is reported, not taken for success.
-    pub fn abort_keeping(&mut self, keep: Seq) -> (kept: Option<L>)
-        requires
-            old(self).inv(),
-        ensures
-            final(self).just_aborted(old(self), keep as int),
-            kept == match old(self).staged(keep as int) {
-                Some(r) => Some(r.leases),
-                None => None,
-            },
-    {
-        let mut wakes = WakeBatch::new();
-        let result = self.abort_keeping_with_wakes(keep, &mut wakes);
-        wakes.finish();
-        result
-    }
-
-    /// [`Ring::abort_keeping`], its wakers' panics kept in `wakes`.
+    /// the loss is reported, not taken for success. Its wakers' panics are kept in `wakes`.
     pub(crate) fn abort_keeping_with_wakes(&mut self, keep: Seq, wakes: &mut WakeBatch) -> (kept: Option<L>)
         requires
             old(self).inv(),
@@ -2846,7 +2803,8 @@ impl<L> Ring<L> {
 
     /// Records the completion of WQE `wqe` of a send queue: retires every committed request whose
     /// WQEs all lie at or before it. Wakes the wakers of the requests that retire.
-    pub fn complete(&mut self, wqe: u64, wc: Wc) -> (known: bool)
+    #[cfg_attr(not(test), allow(dead_code))] // Used by the tests of the module.
+    pub(crate) fn complete(&mut self, wqe: u64, wc: Wc) -> (known: bool)
         requires
             old(self).inv(),
         ensures
@@ -4194,7 +4152,7 @@ impl<L> Ring<L> {
     /// Takes the outcome and leases of retired or refused request `seq`, freeing its slot; `None`
     /// unless it is retired or refused and not taken yet.
     #[inline(always)]
-    pub fn take(&mut self, seq: Seq) -> (taken: Option<Taken<L>>)
+    pub(crate) fn take(&mut self, seq: Seq) -> (taken: Option<Taken<L>>)
         requires
             old(self).inv(),
         ensures
@@ -4605,7 +4563,7 @@ impl<L> Ring<L> {
     /// freed and its leases released now, a staged or in-flight one when it
     /// retires. Hands back its waker, whose destructor is the program's: the future it would wake
     /// is gone.
-    pub fn detach(&mut self, seq: Seq) -> (waker: Option<Waker>)
+    pub(crate) fn detach(&mut self, seq: Seq) -> (waker: Option<Waker>)
         requires
             old(self).inv(),
         ensures
@@ -4828,7 +4786,7 @@ impl<L> Ring<L> {
     /// Registers `waker` to be woken when request `seq` retires (a staged or
     /// in-flight request with an owner); replaces the one before unless it
     /// would wake the same task. Hands back the one it replaced, whose destructor is the program's.
-    pub fn set_waker(&mut self, seq: Seq, waker: &Waker) -> (replaced: Option<Waker>)
+    pub(crate) fn set_waker(&mut self, seq: Seq, waker: &Waker) -> (replaced: Option<Waker>)
         requires
             old(self).inv(),
         ensures
@@ -5024,7 +4982,8 @@ impl<L> Ring<L> {
     /// The QP is destroyed: the NIC will not touch any memory again, so
     /// every slot releases its leases and the ring is empty. Wakers are
     /// dropped (nobody can wait on a destroyed QP).
-    pub fn release_all(&mut self)
+    #[cfg_attr(not(test), allow(dead_code))] // Used by the tests of the module.
+    pub(crate) fn release_all(&mut self)
         requires
             old(self).inv(),
         ensures

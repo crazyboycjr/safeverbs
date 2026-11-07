@@ -38,7 +38,7 @@ pub(super) const EMPTY_WQE: OpenWqe = OpenWqe {
 
 /// What a request being written is ([`OpenRequest`]), its fields changing one at a time.
 #[verifier::reject_recursive_types(N)]
-pub struct Writing<N: Device> {
+pub(crate) struct Writing<N: Device> {
     /// Its WQEs, the first `n` of them; as long as its QP's requests may be.
     pub(super) wqes: Vec<OpenWqe>,
     /// How many it has.
@@ -268,7 +268,7 @@ impl<N: Device> Writing<N> {
     }
 
     /// One that holds nothing and takes nothing.
-    pub fn closed() -> (r: Self)
+    pub(crate) fn closed() -> (r: Self)
         ensures
             r.inv(),
             r.has_no_wqe(),
@@ -290,7 +290,7 @@ impl<N: Device> Writing<N> {
 
     /// How many WQEs it has.
     #[inline(always)]
-    pub fn len(&self) -> (n: usize)
+    pub(crate) fn len(&self) -> (n: usize)
         no_unwind
     {
         self.n
@@ -298,7 +298,7 @@ impl<N: Device> Writing<N> {
 
     /// Whether it has no WQE.
     #[inline(always)]
-    pub fn is_empty(&self) -> (empty: bool)
+    pub(crate) fn is_empty(&self) -> (empty: bool)
         ensures
             empty == self.has_no_wqe(),
         no_unwind
@@ -337,14 +337,14 @@ impl<N: Device> Writing<N> {
 
     /// Whether the next WQE goes in without its QP being asked.
     #[inline(always)]
-    pub fn has_room(&self) -> (room: bool)
+    pub(crate) fn has_room(&self) -> (room: bool)
         no_unwind
     {
         self.n < self.limit
     }
 
     /// From now on every WQE goes to its QP.
-    pub fn stop(&mut self)
+    pub(crate) fn stop(&mut self)
         requires
             old(self).inv(),
         ensures
@@ -527,7 +527,7 @@ impl<N: Device> Writing<N> {
     }
 
     /// Its buffers, leaving it none (of a request that is not going out).
-    pub fn take_leases(&mut self) -> (leases: Leases<N>)
+    pub(crate) fn take_leases(&mut self) -> (leases: Leases<N>)
         requires
             old(self).inv(),
         ensures
@@ -541,7 +541,7 @@ impl<N: Device> Writing<N> {
     /// room, and keeping `part` takes no allocation. Otherwise `part` comes back and nothing
     /// changed, for its QP to say (`Engine::push_open`).
     #[inline(always)]
-    pub fn try_push(&mut self, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), Part<N>>)
+    pub(crate) fn try_push(&mut self, op: WrOp, part: Part<N>) -> (r: core::result::Result<(), Part<N>>)
         requires
             old(self).inv(),
         ensures
@@ -591,15 +591,6 @@ impl<N: Device> Writing<N> {
         &&& self.reads == pre.reads
         &&& self.max_sges == pre.max_sges
         &&& self.wqes@.len() == pre.wqes@.len()
-    }
-
-    /// `same_fields` keeps the invariant.
-    pub(crate) proof fn lemma_same_fields(&self, pre: &Self)
-        requires
-            self.same_fields(pre),
-        ensures
-            self.inv(),
-    {
     }
 
     /// The WR of WQE `k`, whose number is `first + k`.

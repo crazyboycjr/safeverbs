@@ -3673,6 +3673,22 @@ impl<C, N: Device> Hw<C, N> {
         outside_covered(self.refined@.abs, self.token@.nic(), self.token@.share())
     }
 
+    /// M has no QP but the engine's, and no region a peer may touch.
+    pub open(super) spec fn alone(&self) -> bool {
+        let m = self.token@.nic();
+        &&& forall|q: QpId| #[trigger] m.qps.contains_key(q) ==> self.token@.share().owns.contains(q)
+        &&& forall|key: Key| #[trigger] m.mrs.contains_key(key) ==> !m.mrs[key].remote_read && !m.mrs[key].remote_write
+    }
+
+    /// Alone, the premise of the theorem says nothing.
+    pub proof fn lemma_alone_covered(&self)
+        requires
+            self.alone(),
+        ensures
+            self.outside_ok(),
+    {
+    }
+
     /// `coupled`, of an engine.
     pub proof fn lemma_coupled(&self)
         requires
@@ -4015,6 +4031,28 @@ pub proof fn theorem_1_held<C, N: Device>(first: Hw<C, N>, now: Hw<C, N>)
     assert(run[0] == EngineState::<C, N>::Start { nic: m0 });
 }
 
+/// **For an engine alone on its device, with no region open to a peer,** there is nothing the
+/// premise of [`theorem_1_held`] could be about: M has no WQE but those of the engine's queues, and no
+/// region a peer may touch.
+pub proof fn theorem_1_alone<C, N: Device>(first: Hw<C, N>, now: Hw<C, N>)
+    requires
+        first.born(),
+        now.inv(),
+        now.moved_from(&first),
+        first.alone(),
+        now.alone(),
+    ensures
+        abs_reaches(abs_start(), now.refinement().abs),
+        abs_inv(now.refinement().abs),
+        exists|m0: Nic::State| nic_init(m0) && nic_reaches(m0, now.nic()),
+        nic_inv(now.nic()),
+        coupled(now.refinement().abs, now.nic(), now.refinement().ranges, now.refinement().wrs),
+{
+    first.lemma_alone_covered();
+    now.lemma_alone_covered();
+    theorem_1_held(first, now);
+}
+
 /// Theorem 1 through the public operations of [`Engine`](crate::engine::Engine) on typed buffers:
 /// what they ensure is a step of [`EngineState`], so a run of them from the device just opened stands
 /// for runs of A and M, coupled at every point. Until a buffer is lent it is one A would give the
@@ -4055,8 +4093,8 @@ fn example_run<C, N: Device, T: crate::transport::Transport>(
         }
         // And wherever it stops, the state it left is the end of a run.
         let last = engine.state();
-        if first@.outside_ok() && last.outside_ok() {
-            theorem_1_held(first@, last);
+        if first@.alone() && last.alone() {
+            theorem_1_alone(first@, last);
         }
     }
 }

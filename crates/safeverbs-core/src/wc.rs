@@ -513,14 +513,6 @@ impl Wc {
         self.status
     }
 
-    /// Internal proofs may connect the public observation to the private representation.
-    pub(crate) proof fn lemma_spec_status(&self)
-        ensures
-            self.spec_status() == self.status,
-            self.outcome().status == self.status.model(),
-    {
-    }
-
     /// The outcome as the formal model sees it (`safeverbs_spec::types::Outcome`).
     pub closed spec fn outcome(&self) -> safeverbs_spec::types::Outcome {
         let kind = if !self.spec_ok() {

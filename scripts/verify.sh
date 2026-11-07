@@ -93,6 +93,36 @@ if [ -n "$outside" ]; then
     exit 1
 fi
 
+# What a program calls has no precondition: a safe function that relies on being called correctly
+# is a bug. So no `pub fn` of the public types' files has `requires`, but for `Engine::poll`, whose
+# says that its closure takes anything, as a program's does.
+preconditions="$(
+    cd "$root"
+    awk '
+        /^[[:space:]]*\/\// { next }
+        match($0, /^[[:space:]]*pub fn [A-Za-z_][A-Za-z0-9_]*/) {
+            item = substr($0, RSTART, RLENGTH)
+            sub(/^.*pub fn /, "", item)
+            open_item = 1
+            next
+        }
+        open_item && /^[[:space:]]*requires/ && item != "poll" {
+            print FILENAME " " item
+            open_item = 0
+        }
+        open_item && (/^[[:space:]]*\{/ || /[[:space:]]\{$/ || /^[[:space:]]*\}/) {
+            open_item = 0
+        }
+    ' crates/safeverbs-core/src/engine.rs crates/safeverbs-core/src/buf.rs \
+        crates/safeverbs-core/src/buf/view.rs crates/safeverbs-core/src/buf/lease.rs \
+        crates/safeverbs-core/src/hw/open.rs crates/safeverbs-core/src/ring.rs \
+        crates/safeverbs-core/src/ring/payload.rs crates/safeverbs-core/src/wc.rs
+)"
+if [ -n "$preconditions" ]; then
+    printf 'verify.sh: public functions with a precondition:\n%s\n' "$preconditions" >&2
+    exit 1
+fi
+
 # Verus runs cargo with its own toolchain, whatever rust-toolchain.toml pins.
 toolchain="$(verus --version 2>/dev/null | sed -n 's/^ *Toolchain: \([^ ]*\).*/\1/p')"
 if [ -z "$toolchain" ]; then

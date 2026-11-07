@@ -281,12 +281,6 @@ pub open spec fn part_pd<N: Device>(part: Part<N>) -> u64 { part.spec_pd() }
 /// specification.
 pub open spec fn part_writable<N: Device>(part: Part<N>) -> bool { part.spec_writable() }
 
-/// Access to the local bytes, as opposed to the operation's remote effects.
-pub open spec fn send_access(op: WrOp) -> safeverbs_spec::abs::Dir {
-    if opcode_model(op).writes_local() { safeverbs_spec::abs::Dir::In }
-    else { safeverbs_spec::abs::Dir::Out }
-}
-
 // =============================================================================
 // The token
 
@@ -340,12 +334,6 @@ impl NicToken {
         } else {
             Seq::empty()
         }
-    }
-
-    /// `self` and `other` agree on queue pair `q`'s writing.
-    pub open spec fn same_writing(&self, other: &NicToken, q: QpId) -> bool {
-        &&& self.started(q) == other.started(q)
-        &&& self.written(q) == other.written(q)
     }
 
     /// `self` and `other` agree on the writing of every queue pair but `q`.
