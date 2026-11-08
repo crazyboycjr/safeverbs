@@ -435,6 +435,12 @@ pub struct Ring<L> {
     sig_end: u64,
     /// `sig_end` as of the last commit, for [`Ring::abort`].
     committed_sig_end: u64,
+    /// The request that ends at `sig_end` (ghost).
+    #[allow(dead_code)]
+    sig_seq: Ghost<int>,
+    /// The request that ends at `committed_sig_end` (ghost).
+    #[allow(dead_code)]
+    committed_sig_seq: Ghost<int>,
     /// Whether an error completion has retired a request.
     failed: bool,
     /// Whether refused requests may be left among the committed ones, so that retiring has more
@@ -688,6 +694,18 @@ impl<L> Ring<L> {
         &&& self.wqe_posted - self.tail_start(self.sig_end) <= self.depth - self.max_wqes
         &&& self.wqe_committed - self.tail_start(self.committed_sig_end) <= self.depth
             - self.max_wqes
+        &&& self.signal_at(self.sig_end, self.sig_seq@, self.posted as int)
+        &&& self.signal_at(self.committed_sig_end, self.committed_sig_seq@, self.committed as int)
+    }
+
+    /// While WQEs of the signaled request `seq` ending at `sig_end` are not retired, it is one of
+    /// those before `end`, and the one that ends there.
+    closed spec fn signal_at(&self, sig_end: u64, seq: int, end: int) -> bool {
+        sig_end > self.wqe_retired ==> {
+            &&& self.retired <= seq < end
+            &&& !self.is_void(seq)
+            &&& self.slot(seq).end_wqe == sig_end
+        }
     }
 
     /// The head is advanced past the free slots at the front of the window.
@@ -996,6 +1014,8 @@ impl<L> Ring<L> {
         &&& self.wqe_posted == other.wqe_posted
         &&& self.sig_end == other.sig_end
         &&& self.committed_sig_end == other.committed_sig_end
+        &&& self.sig_seq == other.sig_seq
+        &&& self.committed_sig_seq == other.committed_sig_seq
     }
 
     /// The slot invariants depend on the slots, the wakers and the window counters only.
@@ -1087,6 +1107,8 @@ impl<L> Ring<L> {
             forall|s: int, w: int| #[trigger] ring.dma(s, w) is None,
             ring.woken() == vstd::seq::Seq::<WakerId>::empty(),
             ring.spec_detached_error() is None,
+            ring.spec_sig_end() == 0,
+            ring.spec_committed_sig_end() == 0,
         no_unwind
     {
         assert!(slots >= 1, "a ring needs a slot");
@@ -1148,6 +1170,8 @@ impl<L> Ring<L> {
             wqe_posted: 0,
             sig_end: 0,
             committed_sig_end: 0,
+            sig_seq: Ghost(0),
+            committed_sig_seq: Ghost(0),
             failed: false,
             refused: false,
             detached_error: None,
@@ -1303,6 +1327,7 @@ impl<L> Ring<L> {
         &&& self.spec_depth() == other.spec_depth()
         &&& self.spec_max_wqes() == other.spec_max_wqes()
         &&& self.spec_routed() == other.spec_routed()
+        &&& self.same_signals(other)
     }
 
     /// The WQE accounting (invariant 2): the WQEs retired, committed and
@@ -1393,6 +1418,66 @@ impl<L> Ring<L> {
         ensures
             self.spec_signal_out() || self.spec_max_wqes() <= self.spec_depth() - (self.spec_wqe_posted() - self.spec_wqe_retired()),
     {
+    }
+
+    /// One past the last WQE of the last signaled request written.
+    pub closed spec fn spec_sig_end(&self) -> u64 {
+        self.sig_end
+    }
+
+    /// The last signaled request written, while its WQEs are not all retired.
+    pub closed spec fn spec_sig_seq(&self) -> int {
+        self.sig_seq@
+    }
+
+    /// [`Ring::spec_sig_end`] as of the last commit, which a refused doorbell goes back to.
+    pub closed spec fn spec_committed_sig_end(&self) -> u64 {
+        self.committed_sig_end
+    }
+
+    /// [`Ring::spec_sig_seq`] as of the last commit.
+    pub closed spec fn spec_committed_sig_seq(&self) -> int {
+        self.committed_sig_seq@
+    }
+
+    /// The same last signaled requests.
+    pub open spec fn same_signals(&self, other: &Self) -> bool {
+        &&& self.spec_sig_end() == other.spec_sig_end()
+        &&& self.spec_sig_seq() == other.spec_sig_seq()
+        &&& self.spec_committed_sig_end() == other.spec_committed_sig_end()
+        &&& self.spec_committed_sig_seq() == other.spec_committed_sig_seq()
+    }
+
+    /// While a signaled WQE is out, the request it ends is in flight, or staged: so its WQEs are not
+    /// all retired, and the last of them is the WQE before `sig_end`. Of the last one committed, in
+    /// flight.
+    pub proof fn lemma_signal(&self)
+        requires
+            self.inv(),
+        ensures
+            self.spec_sig_end() <= self.spec_wqe_posted(),
+            self.spec_committed_sig_end() <= self.spec_wqe_committed(),
+            self.spec_sig_end() > self.spec_wqe_retired() ==> {
+                let s = self.spec_sig_seq();
+                &&& self.meta(s) is Some
+                &&& self.meta(s)->0.end == self.spec_sig_end()
+                &&& self.staged(s) is Some || (self.req(s) is Some && self.req(s)->0.phase is InFlight)
+            },
+            self.spec_committed_sig_end() > self.spec_wqe_retired() ==> {
+                let s = self.spec_committed_sig_seq();
+                &&& self.meta(s) is Some
+                &&& self.meta(s)->0.end == self.spec_committed_sig_end()
+                &&& self.req(s) is Some && self.req(s)->0.phase is InFlight
+            },
+    {
+        reveal(Ring::inv_slots_but);
+        self.lemma_view();
+        if self.sig_end > self.wqe_retired {
+            assert(self.live_ok(self.sig_seq@));
+        }
+        if self.committed_sig_end > self.wqe_retired {
+            assert(self.live_ok(self.committed_sig_seq@));
+        }
     }
 
     /// Whether every slot is taken by a retired request whose owner has not
@@ -1581,6 +1666,7 @@ impl<L> Ring<L> {
         ensures
             seq == old(self).spec_posted(),
             final(self).just_staged(old(self), wqes, ReqView::new(detached, leases), implied),
+            final(self).signaled_from(old(self), signaled),
         no_unwind
     {
         let ghost pre = *self;
@@ -1628,6 +1714,14 @@ impl<L> Ring<L> {
         } else {
             pre.meta(s)
         }
+    }
+
+    /// The last signaled request, after one was staged over `pre`: that one, if `signaled`.
+    pub open spec fn signaled_from(&self, pre: &Self, signaled: bool) -> bool {
+        &&& self.spec_sig_end() == if signaled { self.spec_wqe_posted() } else { pre.spec_sig_end() }
+        &&& self.spec_sig_seq() == if signaled { pre.spec_posted() as int } else { pre.spec_sig_seq() }
+        &&& self.spec_committed_sig_end() == pre.spec_committed_sig_end()
+        &&& self.spec_committed_sig_seq() == pre.spec_committed_sig_seq()
     }
 
     /// What is staged over a filled slot is staged over what was there before it was filled.
@@ -1823,6 +1917,7 @@ impl<L> Ring<L> {
         ensures
             seq == old(self).spec_posted(),
             final(self).just_staged(old(self), wqes, old(self).filled_view(), old(self).filled_meta().outcome),
+            final(self).signaled_from(old(self), signaled),
         no_unwind
     {
         let seq = self.posted;
@@ -1831,6 +1926,7 @@ impl<L> Ring<L> {
         self.wqe_posted = end_wqe;
         if signaled {
             self.sig_end = end_wqe;
+            self.sig_seq = Ghost(seq as int);
         }
         proof {
             self.lemma_staged(old(self));
@@ -1937,9 +2033,11 @@ impl<L> Ring<L> {
             self.wqe_retired == pre.wqe_retired,
             self.wqe_committed == pre.wqe_committed,
             self.wqe_posted == pre.filled_end(),
-            self.sig_end == pre.sig_end || self.sig_end == pre.filled_end(),
+            self.sig_end == pre.sig_end && self.sig_seq == pre.sig_seq
+                || self.sig_end == pre.filled_end() && self.sig_seq@ == pre.posted,
             self.sig_end == pre.sig_end ==> !pre.spec_must_signal((pre.filled_end() - pre.wqe_posted) as u64),
             self.committed_sig_end == pre.committed_sig_end,
+            self.committed_sig_seq == pre.committed_sig_seq,
             self.woken == pre.woken,
         ensures
             self.inv(),
@@ -2028,6 +2126,10 @@ impl<L> Ring<L> {
         &&& self.same_dma(pre)
         &&& self.same_meta(pre)
         &&& self.spec_detached_error() == pre.spec_detached_error()
+        &&& self.spec_sig_end() == pre.spec_sig_end()
+        &&& self.spec_sig_seq() == pre.spec_sig_seq()
+        &&& self.spec_committed_sig_end() == pre.spec_sig_end()
+        &&& self.spec_committed_sig_seq() == pre.spec_sig_seq()
     }
 
     /// The doorbell was refused over `pre`: every staged request is refused, but `keep`, which goes
@@ -2055,6 +2157,10 @@ impl<L> Ring<L> {
         &&& self.keeps_dma(pre)
         &&& forall|s: int| #[trigger] self.meta(s) == if pre.staged(s) is Some { None } else { pre.meta(s) }
         &&& self.detached_refused(pre)
+        &&& self.spec_sig_end() == pre.spec_committed_sig_end()
+        &&& self.spec_sig_seq() == pre.spec_committed_sig_seq()
+        &&& self.spec_committed_sig_end() == pre.spec_committed_sig_end()
+        &&& self.spec_committed_sig_seq() == pre.spec_committed_sig_seq()
     }
 
     /// The doorbell rang: every staged request is in flight.
@@ -2069,6 +2175,7 @@ impl<L> Ring<L> {
         self.committed = self.posted;
         self.wqe_committed = self.wqe_posted;
         self.committed_sig_end = self.sig_end;
+        self.committed_sig_seq = self.sig_seq;
         proof {
             self.lemma_commit(old(self));
         }
@@ -2092,6 +2199,8 @@ impl<L> Ring<L> {
             self.wqe_posted == pre.wqe_posted,
             self.sig_end == pre.sig_end,
             self.committed_sig_end == pre.sig_end,
+            self.sig_seq == pre.sig_seq,
+            self.committed_sig_seq == pre.sig_seq,
         ensures
             self.inv(),
             forall|s: int|
@@ -2107,6 +2216,9 @@ impl<L> Ring<L> {
     {
         reveal(Ring::inv_slots_but);
         reveal(Ring::inv_wqes);
+        if pre.sig_end > pre.wqe_retired {
+            assert(pre.live_ok(pre.sig_seq@));
+        }
         assert forall|s: int| self.head <= s < self.retired implies #[trigger] self.done_ok(s) by {
             assert(pre.done_ok(s));
         }
@@ -2323,6 +2435,7 @@ impl<L> Ring<L> {
         self.committed = self.posted;
         self.wqe_posted = self.wqe_committed;
         self.sig_end = self.committed_sig_end;
+        self.sig_seq = self.committed_sig_seq;
         proof {
             assert forall|s: int| pre.head <= s < pre.head + pre.n() implies #[trigger] self.slot(s)
                 == looped.slot(s) by {}
@@ -2375,6 +2488,8 @@ impl<L> Ring<L> {
             self.wqe_posted == pre.wqe_committed,
             self.sig_end == pre.committed_sig_end,
             self.committed_sig_end == pre.committed_sig_end,
+            self.sig_seq == pre.committed_sig_seq,
+            self.committed_sig_seq == pre.committed_sig_seq,
         ensures
             self.inv_body(),
             forall|s: int| #[trigger] self.req(s) == pre.req(s),
@@ -2485,6 +2600,8 @@ impl<L> Ring<L> {
             final(self).routed == old(self).routed,
             final(self).sig_end == old(self).sig_end,
             final(self).committed_sig_end == old(self).committed_sig_end,
+            final(self).sig_seq == old(self).sig_seq,
+            final(self).committed_sig_seq == old(self).committed_sig_seq,
             final(self).same_view(old(self)),
             forall|s: int| old(self).retired <= s < final(self).retired ==> #[trigger] old(self).is_void(s),
         no_unwind
@@ -2511,6 +2628,8 @@ impl<L> Ring<L> {
                 self.routed == pre.routed,
                 self.sig_end == pre.sig_end,
                 self.committed_sig_end == pre.committed_sig_end,
+                self.sig_seq == pre.sig_seq,
+                self.committed_sig_seq == pre.committed_sig_seq,
                 self.same_view(&pre),
                 forall|s: int| pre.retired <= s < self.retired ==> #[trigger] pre.is_void(s),
             decreases self.committed - self.retired,
@@ -2579,6 +2698,8 @@ impl<L> Ring<L> {
             self.wqe_posted == pre.wqe_posted,
             self.sig_end == pre.sig_end,
             self.committed_sig_end == pre.committed_sig_end,
+            self.sig_seq == pre.sig_seq,
+            self.committed_sig_seq == pre.committed_sig_seq,
         ensures
             self.inv_body(),
             pre.waker(pre.retired as int) is None,
@@ -2821,6 +2942,7 @@ impl<L> Ring<L> {
     /// retires.
     pub open spec fn completed_with(&self, pre: &Self, recv: bool, wqe: u64, wc: Wc, spent: bool) -> bool {
         &&& self.inv()
+        &&& self.same_signals(pre)
         &&& pre.spec_retired() <= self.spec_retired() <= pre.spec_committed()
         &&& self.spec_committed() == pre.spec_committed()
         &&& self.spec_posted() == pre.spec_posted()
@@ -3353,6 +3475,7 @@ impl<L> Ring<L> {
     /// each request still there, retired or not, is what that step makes of it.
     pub open spec fn walked(&self, pre: &Self, recv: bool, wqe: u64, wc: Wc, spent: bool) -> bool {
         &&& self.inv()
+        &&& self.same_signals(pre)
         &&& pre.spec_retired() <= self.spec_retired() <= pre.spec_committed()
         &&& self.spec_committed() == pre.spec_committed()
         &&& self.spec_posted() == pre.spec_posted()
@@ -3447,6 +3570,7 @@ impl<L> Ring<L> {
     pub closed spec fn retired_and_taken(&self, pre: &Self) -> bool {
         let r = pre.retired as int;
         &&& self.inv()
+        &&& self.same_signals(pre)
         &&& self.spec_retired() == pre.retired + 1
         &&& self.spec_head() == pre.retired + 1
         &&& self.spec_committed() == pre.committed
@@ -3604,6 +3728,8 @@ impl<L> Ring<L> {
         &&& self.wqe_posted == pre.wqe_posted
         &&& self.sig_end == pre.sig_end
         &&& self.committed_sig_end == pre.committed_sig_end
+        &&& self.sig_seq == pre.sig_seq
+        &&& self.committed_sig_seq == pre.committed_sig_seq
         &&& self.wakers@ == pre.wakers@
         &&& self.woken == pre.woken
         &&& self.detached_error == pre.detached_error
@@ -3765,6 +3891,8 @@ impl<L> Ring<L> {
             self.wqe_posted == pre.wqe_posted,
             self.sig_end == pre.sig_end,
             self.committed_sig_end == pre.committed_sig_end,
+            self.sig_seq == pre.sig_seq,
+            self.committed_sig_seq == pre.committed_sig_seq,
         ensures
             self.inv_body(),
             self.slot(pre.retired as int).leases is Some ==> self.head_ok(),
@@ -3927,6 +4055,7 @@ impl<L> Ring<L> {
             self.head >= pre.head,
             self.routed@ == if ended { (wqe + 1) as nat } else { pre.routed@ },
             forall|s: int| m.retired <= s < self.retired ==> #[trigger] m.is_void(s),
+            self.same_signals(pre),
         ensures
             self.completed_with(pre, recv, wqe, wc, ended),
             self.walk_left(pre),
@@ -4022,6 +4151,8 @@ impl<L> Ring<L> {
             final(self).bits == old(self).bits,
             final(self).sig_end == old(self).sig_end,
             final(self).committed_sig_end == old(self).committed_sig_end,
+            final(self).sig_seq == old(self).sig_seq,
+            final(self).committed_sig_seq == old(self).committed_sig_seq,
             final(self).detached_error == old(self).detached_error,
             final(self).routed == old(self).routed,
             final(self).same_view(old(self)),
@@ -4047,6 +4178,8 @@ impl<L> Ring<L> {
                 self.bits == pre.bits,
                 self.sig_end == pre.sig_end,
                 self.committed_sig_end == pre.committed_sig_end,
+                self.sig_seq == pre.sig_seq,
+                self.committed_sig_seq == pre.committed_sig_seq,
                 self.detached_error == pre.detached_error,
                 self.routed == pre.routed,
                 self.same_view(&pre),
@@ -4116,6 +4249,8 @@ impl<L> Ring<L> {
             self.wqe_posted == pre.wqe_posted,
             self.sig_end == pre.sig_end,
             self.committed_sig_end == pre.committed_sig_end,
+            self.sig_seq == pre.sig_seq,
+            self.committed_sig_seq == pre.committed_sig_seq,
         ensures
             self.inv_body(),
     {
@@ -4484,6 +4619,8 @@ impl<L> Ring<L> {
             self.wqe_posted == pre.wqe_posted,
             self.sig_end == pre.sig_end,
             self.committed_sig_end == pre.committed_sig_end,
+            self.sig_seq == pre.sig_seq,
+            self.committed_sig_seq == pre.committed_sig_seq,
             self.woken == pre.woken,
             self.routed == pre.routed,
             self.wakers@ == pre.wakers@,

@@ -831,6 +831,7 @@ impl<C, N: Device> HwQp<C, N> {
         &&& send_outcomes::send_results(self.send, m, self.id())
         &&& send_outcomes::send_implied(self.send, self.send_tails@)
         &&& send_outcomes::tail_bound(self.send, self.send_tails@, qp, written, m.retired, self.id())
+        &&& send_outcomes::signals_ok(self.send, self.send_tails@)
         &&& ring_resources_ok(self.send)
         &&& ring_resources_ok(self.recv)
         &&& queued_outcomes_ok(m, self.id@)
@@ -3129,6 +3130,7 @@ impl<C, N: Device> HwQp<C, N> {
             self.started,
             self.recv == pre.recv,
             self.send.just_staged(&pre.send, more.len() as u64, view, outcome),
+            self.send.signaled_from(&pre.send, more.last().signaled),
             self.send_tails@ == pre.send_tails@.insert(pre.send.spec_posted() as int, more.last()),
             1 <= more.len(),
             more.len() <= u32::MAX,
@@ -3156,6 +3158,15 @@ impl<C, N: Device> HwQp<C, N> {
         r0.lemma_meta(seq);
         r1.lemma_meta(seq);
         assert(r0.staged(seq) is None);
+        // The request staged is the one the ring signals last if its WR is signaled; the one before
+        // is not it.
+        r0.lemma_signal();
+        if r0.spec_sig_end() > r0.spec_wqe_retired() {
+            r0.lemma_meta(r0.spec_sig_seq());
+        }
+        if r0.spec_committed_sig_end() > r0.spec_wqe_retired() {
+            r0.lemma_meta(r0.spec_committed_sig_seq());
+        }
         lemma_resources_added(r0, r1, seq, view.leases, view.detached);
         assert(keeps_leases(r1, r0)) by {
             assert forall|s: int, w: int| r0.dma(s, w) is Some && r1.spec_wqe_retired() <= w < r1.spec_wqe_posted()
@@ -3622,6 +3633,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& e0.phase == Phase::Ready
                 &&& staged.recv == e0.recv
                 &&& staged.send.just_staged(&e0.send, 1, crate::ring::ReqView::new(detached, resource), implied)
+                &&& staged.send.signaled_from(&e0.send, wr.signaled)
                 &&& e.same_qp(staged)
                 &&& !e.started
                 &&& e.recv == staged.recv

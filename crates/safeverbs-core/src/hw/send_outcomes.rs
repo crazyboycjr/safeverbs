@@ -57,6 +57,15 @@ pub(super) open spec fn tail_bound<L>(
     }
 }
 
+/// The request the ring signaled last, while a WQE of it is not retired, was written signaled, and
+/// so was the last one committed, which a refused doorbell goes back to: the WQE before
+/// `sig_end`, which whoever waits for room waits for (`Ring::lemma_room_or_signal`), produces a
+/// CQE once it executes.
+pub(super) open spec fn signals_ok<L>(r: Ring<L>, tails: Map<int, SendWr>) -> bool {
+    &&& r.spec_sig_end() > r.spec_wqe_retired() ==> tails[r.spec_sig_seq()].signaled
+    &&& r.spec_committed_sig_end() > r.spec_wqe_retired() ==> tails[r.spec_committed_sig_seq()].signaled
+}
+
 pub(super) proof fn lemma_implied_empty<L>(r: Ring<L>)
     requires r.inv(), forall|s: int| #[trigger] r.meta(s) is None,
     ensures send_implied(r, Map::empty()),
