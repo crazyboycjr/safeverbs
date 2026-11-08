@@ -24,7 +24,8 @@
 
 use crate::abs::*;
 use crate::nic::*;
-use crate::nic_proofs::{history_ok, known, lemma_history_init, lemma_history_reaches, wr_log};
+#[cfg(verus_keep_ghost)]
+use crate::nic_proofs::{history_ok, known, lemma_history_init, lemma_history_reaches};
 use crate::refinement::*;
 use crate::types::*;
 use vstd::prelude::*;
