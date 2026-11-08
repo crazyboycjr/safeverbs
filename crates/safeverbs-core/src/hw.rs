@@ -772,10 +772,14 @@ spec fn lag_at(w: WqeRef, m: Nic::State, pending: Seq<Cqe>) -> bool {
         || exists|j: int| 0 <= j < pending.len() && cqe_wqe(#[trigger] pending[j]) == w
 }
 
-/// Every WQE of queue `queue` of QP `e` that M popped and its ring has not heard of is explained.
+/// Every WQE of queue `queue` of QP `e` that M popped and its ring has not heard of is explained,
+/// and the last of them by a CQE to come: M moves a queue's head only by popping a CQE.
 spec fn lag_ok<C, N: Device>(e: HwQp<C, N>, m: Nic::State, queue: Queue, pending: Seq<Cqe>) -> bool {
-    forall|s: nat| ring_of(e, queue).spec_routed() <= s < head_of(m.qps[e.id()], queue)
+    let head = head_of(m.qps[e.id()], queue);
+    &&& forall|s: nat| ring_of(e, queue).spec_routed() <= s < head
         ==> #[trigger] lag_at(WqeRef { qp: e.id(), queue, seq: s }, m, pending)
+    &&& ring_of(e, queue).spec_routed() < head ==> exists|j: int| 0 <= j < pending.len()
+        && cqe_wqe(#[trigger] pending[j]) == (WqeRef { qp: e.id(), queue, seq: (head - 1) as nat })
 }
 
 /// The CQEs read and not routed yet, oldest first, are all M popped that the rings have not heard

@@ -720,6 +720,20 @@ proof fn lemma_lag_walked<C, N: Device>(z: HwQp<C, N>, w: HwQp<C, N>, m: Nic::St
             }
         }
     }
+    // The CQE that names the last WQE M popped is still to come, unless it was this one.
+    let head = head_of(m.qps[w.id()], queue);
+    if ring_of(w, queue).spec_routed() < head {
+        let v = WqeRef { qp: w.id(), queue, seq: (head - 1) as nat };
+        assert(ring_of(z, queue).spec_routed() < head);
+        let j = choose|j: int| 0 <= j < pending.len() && cqe_wqe(#[trigger] pending[j]) == v;
+        if spent {
+            assert(j != 0);
+            assert(rest[j - 1] == pending[j]);
+            assert(cqe_wqe(rest[j - 1]) == v);
+        } else {
+            assert(cqe_wqe(rest[j]) == v);
+        }
+    }
 }
 
 /// What the table needs to stay coupled through a change of entry `i` alone that keeps its QP in M.
@@ -946,6 +960,24 @@ proof fn lemma_lag_popped<C, N: Device>(z: HwQp<C, N>, before: Nic::State, after
                 assert(v == (WqeRef { qp: e.qp, queue: Queue::Send, seq: (qp.sq_head + k) as nat }));
                 assert(!qp.sq[k].wr.signaled && after.retired.contains_key(v) && after.retired[v].status is Success);
             }
+        }
+    }
+    // The last WQE M popped is named by this CQE, or by one still to come.
+    let head = head_of(after.qps[q], queue);
+    if ring_of(z, queue).spec_routed() < head {
+        let v = WqeRef { qp: q, queue, seq: (head - 1) as nat };
+        if q == e.qp && queue == e.queue {
+            assert(head == e.seq + 1);
+            assert(more[pending.len() as int] == e);
+            assert(cqe_wqe(more[pending.len() as int]) == v);
+        } else {
+            if q == e.qp {
+                assert(queue == other_queue(e.queue));
+            }
+            assert(head == head_of(qp, queue));
+            let j = choose|j: int| 0 <= j < pending.len() && cqe_wqe(#[trigger] pending[j]) == v;
+            assert(more[j] == pending[j]);
+            assert(cqe_wqe(more[j]) == v);
         }
     }
 }
