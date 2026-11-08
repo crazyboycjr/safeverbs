@@ -790,12 +790,37 @@ impl<C, N: Device> Hw<C, N> {
             self.inv(),
             self.keeps_qp(index),
             self.removed_at(index),
-            self.drained_in(index, index + 1),
+            !self.drains_at(index),
         ensures
             self.destroyable(index),
     {
-        assert(!self.drains_at(index));
         assert(qp_ok(self.qps@[index], index, self.token@, self.token@.nic()));
+    }
+
+    /// Calls that keep the table keep its QPs, and no others.
+    pub proof fn lemma_same_qps(&self, older: &Self)
+        requires
+            self.same_table(older),
+        ensures
+            forall|i: int| #[trigger] self.keeps_qp(i) <==> older.keeps_qp(i),
+    {
+        assert forall|i: int| #[trigger] self.keeps_qp(i) <==> older.keeps_qp(i) by {
+            if 0 <= i < self.qps@.len() {
+                assert(self.qps@[i] is Some == older.qps@[i] is Some);
+            }
+        }
+    }
+
+    /// Calls on QP `index` that keep the other entries keep what they are.
+    pub proof fn lemma_others_kept(&self, older: &Self, index: int)
+        requires
+            self.others_kept(older, index),
+        ensures
+            forall|i: int| i != index ==> (#[trigger] self.keeps_qp(i) <==> older.keeps_qp(i)),
+            forall|i: int| i != index ==> (#[trigger] self.removed_at(i) <==> older.removed_at(i)),
+            forall|i: int| i != index ==> (#[trigger] self.drains_at(i) <==> older.drains_at(i)),
+    {
+        assert forall|i: int| i != index && 0 <= i < self.qps@.len() implies #[trigger] self.qps@[i] == older.qps@[i] by {}
     }
 
     /// A QP being removed stays so along calls that rank.
@@ -814,11 +839,6 @@ impl<C, N: Device> Hw<C, N> {
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// No QP from `from` up to `to` drains.
-    pub open(super) spec fn drained_in(&self, from: int, to: int) -> bool {
-        forall|i: int| from <= i < to ==> !#[trigger] self.drains_at(i)
-    }
-
     /// `self` is `older` after tries at the drain WQEs of the QPs from `from` up to `to`
     /// ([`Hw::post_drain`]): what is left of the engine's work did not rise, unless the device
     /// turned down a verb of a removal; and the CQEs read are as they were.
@@ -856,7 +876,6 @@ impl<C, N: Device> Hw<C, N> {
     pub proof fn lemma_tried_none(&self, from: int)
         ensures
             self.tried_from(self, from, from),
-            self.drained_in(from, from),
     {
         self.lemma_ranked_refl();
     }
@@ -868,7 +887,7 @@ impl<C, N: Device> Hw<C, N> {
             from <= index,
             mid.tried_from(older, from, index),
             busy ==> mid.drains(from, index),
-            !busy ==> mid.drained_in(from, index),
+            !busy ==> forall|i: int| from <= i < index ==> !#[trigger] mid.drains_at(i),
             self.drain_tried(index),
             self.others_kept(mid, index),
             self.turned_down_at(index) || self.ranked_from(mid),
@@ -876,7 +895,7 @@ impl<C, N: Device> Hw<C, N> {
         ensures
             self.tried_from(older, from, index + 1),
             busy || draining ==> self.drains(from, index + 1),
-            !(busy || draining) ==> self.drained_in(from, index + 1),
+            !(busy || draining) ==> forall|i: int| from <= i < index + 1 ==> !#[trigger] self.drains_at(i),
     {
         assert forall|i: int| from <= i < index + 1 implies #[trigger] self.drain_tried(i) by {
             if i < index {

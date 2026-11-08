@@ -615,7 +615,7 @@ impl<C, N: Nic> Engine<C, N> {
         ensures
             final(self).moved_from(old(self)),
             final(self).state().same_table(&old(self).state()),
-            drained ==> final(self).state().drained_in(from as int, to as int),
+            drained ==> forall|i: int| from <= i < to ==> !#[trigger] final(self).state().drains_at(i),
             forall|i: int| #[trigger] old(self).state().removed_at(i) ==> final(self).state().removed_at(i),
     {
         let ghost start = self.state();
@@ -651,7 +651,7 @@ impl<C, N: Nic> Engine<C, N> {
                     forall|i: int| #[trigger] start.removed_at(i) ==> self.state().removed_at(i),
                     self.state().tried_from(&polled, from as int, index as int),
                     busy ==> self.state().drains(from as int, index as int),
-                    !busy ==> self.state().drained_in(from as int, index as int),
+                    !busy ==> forall|i: int| from <= i < index ==> !#[trigger] self.state().drains_at(i),
                 decreases to - index,
             {
                 proof {
@@ -696,10 +696,12 @@ impl<C, N: Nic> Engine<C, N> {
 
     /// Everything an engine does as it goes, but for its CQ: gives up every request and drains every
     /// QP, destroys the drained ones and releases their buffers. What the program must get rid of
-    /// comes back: the contexts and wakers given up, and the panics of the wakers run.
+    /// comes back: the contexts and wakers given up, and the panics of the wakers run. A QP left
+    /// still drains: its drain ran out of time.
     fn end(&mut self) -> (r: (LetGo<C>, WakeBatch))
         ensures
             final(self).moved_from(old(self)),
+            forall|i: int| #[trigger] final(self).state().keeps_qp(i) ==> final(self).state().drains_at(i),
     {
         proof {
             use_type_invariant(&*self);
@@ -710,37 +712,73 @@ impl<C, N: Nic> Engine<C, N> {
         while index < slots
             invariant
                 self.state().moved_from(&old(self).state()),
+                forall|i: int| #[trigger] self.state().keeps_qp(i) ==> 0 <= i < slots,
+                forall|i: int| 0 <= i < index ==> #[trigger] self.state().removed_at(i),
             decreases slots - index,
         {
             proof {
                 use_type_invariant(&*self);
             }
+            let ghost before = self.state();
             self.hw.start_drain(index);
+            proof {
+                self.state().lemma_same_qps(&before);
+                self.state().lemma_others_kept(&before, index as int);
+            }
             index += 1;
         }
         proof {
             use_type_invariant(&*self);
         }
+        let ghost started = self.state();
         let let_go = self.hw.take_let_go();
+        let ghost taken = self.state();
         let _ = self.drain(0, slots);
+        proof {
+            taken.lemma_same_qps(&started);
+            self.state().lemma_same_qps(&taken);
+            assert forall|i: int| 0 <= i < slots implies #[trigger] self.state().removed_at(i) by {
+                assert(started.removed_at(i));
+                assert(taken.removed_at(i));
+            }
+        }
         let mut index = 0;
         while index < slots
             invariant
                 self.state().moved_from(&old(self).state()),
+                forall|i: int| #[trigger] self.state().keeps_qp(i) ==> 0 <= i < slots,
+                forall|i: int| index <= i < slots ==> #[trigger] self.state().removed_at(i),
+                forall|i: int| 0 <= i < index ==> (#[trigger] self.state().keeps_qp(i) ==> self.state().drains_at(i)),
             decreases slots - index,
         {
             proof {
                 use_type_invariant(&*self);
             }
+            let ghost before = self.state();
             if !self.hw.draining(index) {
+                proof {
+                    if self.state().keeps_qp(index as int) {
+                        self.hw.lemma_drained(index as int);
+                    }
+                }
                 let _ = self.hw.destroy(index);
+                proof {
+                    self.state().lemma_others_kept(&before, index as int);
+                }
             }
             index += 1;
         }
         proof {
             use_type_invariant(&*self);
         }
-        (let_go, self.hw.take_panics())
+        let ghost before = self.state();
+        let panics = self.hw.take_panics();
+        proof {
+            // Every entry as it was.
+            self.state().lemma_same_qps(&before);
+            self.state().lemma_others_kept(&before, -1);
+        }
+        (let_go, panics)
     }
 
     /// Destroys its CQ if no QP is left; `false`, and the CQ stays, if some QP the device never

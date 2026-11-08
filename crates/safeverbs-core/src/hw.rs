@@ -1963,6 +1963,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             r is Ok ==> final(self).in_error(index as int),
             old(self).unwritten(index as int) ==> final(self).unwritten(index as int),
+            final(self).others_kept(old(self), index as int),
         no_unwind
     {
         if index >= self.qps.len() {
@@ -3065,6 +3066,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            final(self).others_kept(old(self), -1),
         no_unwind
     {
         replace_value(&mut self.panics, WakeBatch::new())
@@ -5526,6 +5528,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(self).removed_at(index as int),
+            final(self).others_kept(old(self), index as int),
         no_unwind
     {
         if index >= self.qps.len() {
@@ -5578,6 +5581,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(self).removed_at(index as int),
+            final(self).others_kept(old(self), index as int),
         no_unwind
     {
         let ghost start = *self;
@@ -5620,6 +5624,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
             final(self).unwritten(index as int),
+            final(self).others_kept(old(self), index as int),
         no_unwind
     {
         let ghost start = *self;
@@ -6009,6 +6014,8 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             !destroyed ==> *final(self) == *old(self),
             old(self).destroyable(index as int) ==> destroyed,
+            destroyed ==> !final(self).keeps_qp(index as int),
+            final(self).others_kept(old(self), index as int),
         no_unwind
     {
         if index >= self.qps.len() {
@@ -6174,7 +6181,9 @@ impl<C, N: Device> Hw<C, N> {
     }
 
     /// The number of slots of the QP table: every QP's index is below it.
-    pub fn qp_slots(&self) -> usize
+    pub fn qp_slots(&self) -> (n: usize)
+        ensures
+            forall|i: int| #[trigger] self.keeps_qp(i) ==> 0 <= i < n,
         no_unwind
     {
         self.qps.len()
