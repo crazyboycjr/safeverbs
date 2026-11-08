@@ -374,7 +374,7 @@ pub proof fn lemma_assembled(s: Abs::State, bytes: ISet<int>)
 
 /// What an engine brings to the device: its state of A, the WQEs of each of its requests, and its
 /// share of M.
-pub struct Part {
+pub struct EnginePart {
     pub abs: Abs::State,
     pub ranges: Map<ReqId, WqeRange>,
     pub share: Share,
@@ -387,7 +387,7 @@ pub open spec fn lent(a: Abs::State, l: LeaseId) -> bool {
 
 /// What one engine's part says of itself, M being at `m`: A's invariants hold, it is coupled to M
 /// on its share, it has no lease open to a peer, and none of its complete requests was given up.
-pub open spec fn part_ok(p: Part, m: Nic::State) -> bool {
+pub open spec fn part_ok(p: EnginePart, m: Nic::State) -> bool {
     &&& abs_inv(p.abs)
     &&& coupled_on(p.abs, m, p.share, p.ranges)
     &&& forall|l: LeaseId| #[trigger] p.abs.leases.contains_key(l) ==> !(p.abs.leases[l].holder is Exposed)
@@ -397,7 +397,7 @@ pub open spec fn part_ok(p: Part, m: Nic::State) -> bool {
 
 /// The requests of two engines are apart: a unique lease one holds shares no byte with a lease the
 /// other holds. Their buffers' linear permissions say so.
-pub open spec fn parts_apart(p: Part, q: Part) -> bool {
+pub open spec fn parts_apart(p: EnginePart, q: EnginePart) -> bool {
     forall|k: LeaseId, l: LeaseId| #![trigger p.abs.leases[k], q.abs.leases[l]]
         lent(p.abs, k) && lent(q.abs, l) && (p.abs.leases[k].unique || q.abs.leases[l].unique)
             ==> p.abs.leases[k].mem.disjoint(q.abs.leases[l].mem)
@@ -405,7 +405,7 @@ pub open spec fn parts_apart(p: Part, q: Part) -> bool {
 
 /// The buffers exposed to a peer are apart from each other and from what the engines' requests
 /// hold.
-pub open spec fn exposed_apart(parts: Seq<Part>, exposed: Seq<ISet<int>>) -> bool {
+pub open spec fn exposed_apart(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>) -> bool {
     &&& forall|j: int, k: int| #![trigger exposed[j], exposed[k]]
         0 <= j < exposed.len() && 0 <= k < exposed.len() && j != k ==> exposed[j].disjoint(exposed[k])
     &&& forall|i: int, j: int, l: LeaseId| #![trigger parts[i].abs.leases[l], exposed[j]]
@@ -415,7 +415,7 @@ pub open spec fn exposed_apart(parts: Seq<Part>, exposed: Seq<ISet<int>>) -> boo
 
 /// M has nothing but what the engines and the exposed buffers account for: each queue pair is of an
 /// engine's share, and each region open to a peer lies within a buffer exposed.
-pub open spec fn accounted(parts: Seq<Part>, exposed: Seq<ISet<int>>, m: Nic::State) -> bool {
+pub open spec fn accounted(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, m: Nic::State) -> bool {
     &&& forall|q: QpId| #[trigger] m.qps.contains_key(q)
         ==> exists|i: int| 0 <= i < parts.len() && #[trigger] parts[i].share.owns.contains(q)
     &&& forall|key: Key| #[trigger] m.mrs.contains_key(key) && (m.mrs[key].remote_read || m.mrs[key].remote_write)
@@ -425,7 +425,7 @@ pub open spec fn accounted(parts: Seq<Part>, exposed: Seq<ISet<int>>, m: Nic::St
 /// What the engines of the device and its exposed buffers are, M being at `m`: each part is what it
 /// says of itself, their shares and requests are apart, the exposed buffers too, and M has nothing
 /// else.
-pub open spec fn device_ok(parts: Seq<Part>, exposed: Seq<ISet<int>>, m: Nic::State) -> bool {
+pub open spec fn device_ok(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, m: Nic::State) -> bool {
     &&& forall|i: int| 0 <= i < parts.len() ==> part_ok(#[trigger] parts[i], m)
     &&& forall|i: int, j: int| #![trigger parts[i], parts[j]] 0 <= i < parts.len() && 0 <= j < parts.len() && i != j
         ==> disjoint(parts[i].share, parts[j].share) && parts_apart(parts[i], parts[j])
@@ -437,7 +437,7 @@ pub open spec fn device_ok(parts: Seq<Part>, exposed: Seq<ISet<int>>, m: Nic::St
 // first, under their own names, then its requests'; the exposed buffers come after every part.
 
 /// A bound on every name a part gives.
-pub open spec fn bound(parts: Seq<Part>) -> nat
+pub open spec fn bound(parts: Seq<EnginePart>) -> nat
     decreases parts.len(),
 {
     if parts.len() == 0 {
@@ -453,42 +453,42 @@ pub open spec fn bound(parts: Seq<Part>) -> nat
 }
 
 /// The names one part takes.
-pub open spec fn width(parts: Seq<Part>) -> nat {
+pub open spec fn width(parts: Seq<EnginePart>) -> nat {
     2 * bound(parts)
 }
 
 /// The name of lease `l` of part `i`.
-pub open spec fn lease_name(parts: Seq<Part>, i: int, l: LeaseId) -> nat {
+pub open spec fn lease_name(parts: Seq<EnginePart>, i: int, l: LeaseId) -> nat {
     (1 + width(parts) * i + l) as nat
 }
 
 /// The name of request `r` of part `i`.
-pub open spec fn req_name(parts: Seq<Part>, i: int, r: ReqId) -> nat {
+pub open spec fn req_name(parts: Seq<EnginePart>, i: int, r: ReqId) -> nat {
     (1 + width(parts) * i + bound(parts) + r) as nat
 }
 
 /// The name of exposed buffer `j`.
-pub open spec fn exposed_name(parts: Seq<Part>, j: int) -> nat {
+pub open spec fn exposed_name(parts: Seq<EnginePart>, j: int) -> nat {
     (1 + width(parts) * parts.len() + j) as nat
 }
 
 /// The first name after the parts'.
-pub open spec fn parts_end(parts: Seq<Part>) -> int {
+pub open spec fn parts_end(parts: Seq<EnginePart>) -> int {
     1 + width(parts) * parts.len() as int
 }
 
 /// The part name `id` is of.
-pub open spec fn part_of(parts: Seq<Part>, id: nat) -> int {
+pub open spec fn part_of(parts: Seq<EnginePart>, id: nat) -> int {
     (id - 1) / (width(parts) as int)
 }
 
 /// Where name `id` is in its part.
-pub open spec fn offset_of(parts: Seq<Part>, id: nat) -> int {
+pub open spec fn offset_of(parts: Seq<EnginePart>, id: nat) -> int {
     (id - 1) % (width(parts) as int)
 }
 
 /// The bound bounds every part's names.
-proof fn lemma_bound(parts: Seq<Part>)
+proof fn lemma_bound(parts: Seq<EnginePart>)
     ensures
         bound(parts) >= 1,
         forall|i: int| 0 <= i < parts.len() ==> (#[trigger] parts[i]).abs.next_id < bound(parts),
@@ -506,7 +506,7 @@ proof fn lemma_bound(parts: Seq<Part>)
 }
 
 /// A name of a part says which part and where.
-proof fn lemma_named(parts: Seq<Part>, i: int, x: int)
+proof fn lemma_named(parts: Seq<EnginePart>, i: int, x: int)
     requires
         0 <= i < parts.len(),
         0 <= x < width(parts),
@@ -528,7 +528,7 @@ proof fn lemma_named(parts: Seq<Part>, i: int, x: int)
 }
 
 /// Every name of the parts is one, of a part and a place in it.
-proof fn lemma_name(parts: Seq<Part>, id: nat)
+proof fn lemma_name(parts: Seq<EnginePart>, id: nat)
     requires
         1 <= id < parts_end(parts),
     ensures
@@ -556,7 +556,7 @@ proof fn lemma_name(parts: Seq<Part>, id: nat)
 
 /// The lease of name `id` in the device's state of A, if any: a part's lease held by a request,
 /// under its request's new name, or an exposed buffer's.
-pub open spec fn device_lease(parts: Seq<Part>, exposed: Seq<ISet<int>>, id: nat) -> Option<Lease> {
+pub open spec fn device_lease(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, id: nat) -> Option<Lease> {
     if 1 <= id < parts_end(parts) {
         let i = part_of(parts, id);
         let l = offset_of(parts, id) as nat;
@@ -584,7 +584,7 @@ pub open spec fn device_lease(parts: Seq<Part>, exposed: Seq<ISet<int>>, id: nat
 }
 
 /// The part and request of name `id` in the device's state of A, if it names one.
-pub open spec fn device_req(parts: Seq<Part>, id: nat) -> Option<(int, ReqId)> {
+pub open spec fn device_req(parts: Seq<EnginePart>, id: nat) -> Option<(int, ReqId)> {
     if 1 <= id < parts_end(parts) {
         let i = part_of(parts, id);
         let o = offset_of(parts, id);
@@ -599,19 +599,19 @@ pub open spec fn device_req(parts: Seq<Part>, id: nat) -> Option<(int, ReqId)> {
 }
 
 /// The request of name `id` in the device's state of A: its part's own.
-pub open spec fn req_at(parts: Seq<Part>, id: nat) -> Req {
+pub open spec fn req_at(parts: Seq<EnginePart>, id: nat) -> Req {
     let (i, r) = device_req(parts, id)->0;
     parts[i].abs.requests[r]
 }
 
 /// The WQEs of the request of name `id`: its part's request's.
-pub open spec fn range_at(parts: Seq<Part>, id: nat) -> WqeRange {
+pub open spec fn range_at(parts: Seq<EnginePart>, id: nat) -> WqeRange {
     let (i, r) = device_req(parts, id)->0;
     parts[i].ranges[r]
 }
 
 /// The queue pairs of the parts' states of A.
-pub open spec fn device_qps(parts: Seq<Part>) -> Set<QpId>
+pub open spec fn device_qps(parts: Seq<EnginePart>) -> Set<QpId>
     decreases parts.len(),
 {
     if parts.len() == 0 {
@@ -622,12 +622,12 @@ pub open spec fn device_qps(parts: Seq<Part>) -> Set<QpId>
 }
 
 /// The names of the device's state of A.
-pub open spec fn device_names(parts: Seq<Part>, exposed: Seq<ISet<int>>) -> Set<nat> {
+pub open spec fn device_names(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>) -> Set<nat> {
     Set::<nat>::range(0, (parts_end(parts) + exposed.len()) as nat)
 }
 
 /// The device's state of A: every part's requests with their leases, and the exposed buffers.
-pub open spec fn device_abs(parts: Seq<Part>, exposed: Seq<ISet<int>>) -> Abs::State {
+pub open spec fn device_abs(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>) -> Abs::State {
     let names = device_names(parts, exposed);
     let reqs = names.filter(|id: nat| device_req(parts, id) is Some);
     Abs::State {
@@ -644,7 +644,7 @@ pub open spec fn device_abs(parts: Seq<Part>, exposed: Seq<ISet<int>>) -> Abs::S
 }
 
 /// The WQEs of each request of the device's state of A: those of its part's request.
-pub open spec fn device_ranges(parts: Seq<Part>, exposed: Seq<ISet<int>>) -> Map<ReqId, WqeRange> {
+pub open spec fn device_ranges(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>) -> Map<ReqId, WqeRange> {
     Map::new(
         device_names(parts, exposed).filter(|id: nat| device_req(parts, id) is Some),
         |id: nat| range_at(parts, id),
@@ -652,14 +652,14 @@ pub open spec fn device_ranges(parts: Seq<Part>, exposed: Seq<ISet<int>>) -> Map
 }
 
 /// The bytes the shared leases of every part lie in: the root they are cut from.
-pub open spec fn shared_bytes(parts: Seq<Part>) -> ISet<int> {
+pub open spec fn shared_bytes(parts: Seq<EnginePart>) -> ISet<int> {
     ISet::new(|x: int| exists|i: int, l: LeaseId| #![trigger parts[i].abs.leases[l]]
         0 <= i < parts.len() && lent(parts[i].abs, l) && !parts[i].abs.leases[l].unique
             && parts[i].abs.leases[l].mem.contains(x))
 }
 
 /// A queue pair of the parts' states of A is one of a part's.
-proof fn lemma_device_qps(parts: Seq<Part>, q: QpId)
+proof fn lemma_device_qps(parts: Seq<EnginePart>, q: QpId)
     ensures
         device_qps(parts).contains(q) <==> exists|i: int| 0 <= i < parts.len() && (#[trigger] parts[i]).abs.qps.contains(q),
     decreases parts.len(),
@@ -684,7 +684,7 @@ proof fn lemma_device_qps(parts: Seq<Part>, q: QpId)
 
 /// Name `lease_name(parts, i, l)` is the lease of `l`, and `req_name(parts, i, r)` the request `r`
 /// of part `i`.
-proof fn lemma_names_of(parts: Seq<Part>, exposed: Seq<ISet<int>>, i: int)
+proof fn lemma_names_of(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, i: int)
     requires
         0 <= i < parts.len(),
         abs_inv(parts[i].abs),
@@ -739,7 +739,7 @@ proof fn lemma_names_of(parts: Seq<Part>, exposed: Seq<ISet<int>>, i: int)
 
 /// What a lease of the device's state of A is: a part's lease held by a request, or an exposed
 /// buffer.
-proof fn lemma_lease_at(parts: Seq<Part>, exposed: Seq<ISet<int>>, id: nat)
+proof fn lemma_lease_at(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, id: nat)
     requires
         device_abs(parts, exposed).leases.contains_key(id),
     ensures
@@ -761,7 +761,7 @@ proof fn lemma_lease_at(parts: Seq<Part>, exposed: Seq<ISet<int>>, id: nat)
 }
 
 /// What a request of the device's state of A is: a part's own request.
-proof fn lemma_req_at(parts: Seq<Part>, exposed: Seq<ISet<int>>, id: nat)
+proof fn lemma_req_at(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, id: nat)
     requires
         device_abs(parts, exposed).requests.contains_key(id),
     ensures
@@ -778,7 +778,7 @@ proof fn lemma_req_at(parts: Seq<Part>, exposed: Seq<ISet<int>>, id: nat)
 }
 
 /// The device's state of A satisfies A's invariants and is as a composition builds it.
-proof fn lemma_device_assembled(parts: Seq<Part>, exposed: Seq<ISet<int>>, m: Nic::State)
+proof fn lemma_device_assembled(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, m: Nic::State)
     requires
         device_ok(parts, exposed, m),
     ensures
@@ -924,7 +924,7 @@ proof fn lemma_device_assembled(parts: Seq<Part>, exposed: Seq<ISet<int>>, m: Ni
 
 /// The device's state of A is coupled to M: every part's requests, on its share, and the exposed
 /// buffers for the regions open to a peer.
-proof fn lemma_device_coupled(parts: Seq<Part>, exposed: Seq<ISet<int>>, m: Nic::State, wrs: IMap<WqeRef, SendWr>)
+proof fn lemma_device_coupled(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, m: Nic::State, wrs: IMap<WqeRef, SendWr>)
     requires
         device_ok(parts, exposed, m),
         records_wrs(m, wrs),
@@ -1059,7 +1059,7 @@ proof fn lemma_device_coupled(parts: Seq<Part>, exposed: Seq<ISet<int>>, m: Nic:
 /// engine's requests are as its own A has them, each lease of theirs with its bytes, uniqueness and
 /// direction, and each exposed buffer is open to the peer. That state is coupled to M, so S1, F1
 /// and R1 hold against M for the whole device.
-pub proof fn theorem_1_device(parts: Seq<Part>, exposed: Seq<ISet<int>>, m: Nic::State, wrs: IMap<WqeRef, SendWr>)
+pub proof fn theorem_1_device(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, m: Nic::State, wrs: IMap<WqeRef, SendWr>)
     requires
         device_ok(parts, exposed, m),
         records_wrs(m, wrs),

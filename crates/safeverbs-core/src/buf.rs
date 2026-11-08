@@ -36,12 +36,16 @@ use vstd::raw_ptr::{Dealloc, PointsToRaw};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::error::{Error, Result};
-use crate::nic::{Access, Nic, RemoteBuf};
+use crate::nic::{Nic, RemoteBuf};
 use crate::pd::Pd;
-use crate::trusted::{clone_pd, pd_id_of, register_region};
+use crate::trusted::{clone_pd, close_exposure, pd_id_of, register_exposure, register_region};
 use crate::verbs::Verbs;
 use memory::OwnedRange;
 use permissions::BytePermission;
+#[cfg(verus_keep_ghost)]
+use safeverbs_spec::abs::LeaseId;
+#[cfg(verus_keep_ghost)]
+use safeverbs_spec::compose::*;
 
 mod memory;
 mod permissions;
@@ -218,12 +222,6 @@ fn close_registration<N: Nic>(mr: &mut ManuallyDrop<N::Mr>) -> Result<()> {
             Ok(())
         }
         Err(error) => Err(error),
-    }
-}
-
-impl<N: Nic> RawMut<N> {
-    fn pd(&self) -> &Pd<N> {
-        &self.region.pd
     }
 }
 
@@ -569,27 +567,7 @@ impl<T, N: Nic> BufMut<T, N> {
     where
         T: IntoBytes,
     {
-        let access = Access::LOCAL_WRITE
-            | Access::REMOTE_WRITE
-            | Access::REMOTE_READ
-            | Access::REMOTE_ATOMIC;
-        let pd = self.raw.pd().clone();
-        // SAFETY: the region stays allocated while `Exposed` holds it; the
-        // remote registration is revoked before `buf` lets go of it,
-        // and `Exposed` never gives out the bytes as Rust values.
-        let mr = unsafe {
-            pd.context()
-                .nic()
-                .reg_mr(pd.raw(), self.raw.ptr(), self.raw.len(), access)
-        };
-        match mr {
-            Ok(mr) => Ok(Exposed {
-                rkey: N::mr_keys(&mr).1,
-                mr: ManuallyDrop::new(mr),
-                buf: ManuallyDrop::new(self),
-            }),
-            Err(error) => Err(BufError { error, buf: self }),
-        }
+        self.exposed()
     }
 
     /// Lends it to the NIC as one scatter/gather element (for receives and
@@ -844,36 +822,178 @@ impl<T, N: Nic> fmt::Debug for Buf<T, N> {
     }
 }
 
+verus! {
+
 /// A buffer exposed to peers: they may RDMA WRITE, READ and run atomics on
 /// it with [`Exposed::remote`], at any moment, so no reference to its bytes
 /// ever exists. [`Exposed::copy_to_slice`] copies them out while it stays
 /// exposed; [`Exposed::reclaim`] revokes the peers' access and gives it back
 /// as a [`BufMut`].
+#[verifier::reject_recursive_types(N)]
 pub struct Exposed<T, N: Nic = Verbs> {
-    /// Kept together with `buf` if revocation fails.
-    mr: ManuallyDrop<N::Mr>,
-    buf: ManuallyDrop<BufMut<T, N>>,
+    /// The buffer and its registration for remote access. Only `try_reclaim` and `drop` take
+    /// them, from an `Exposed` they consume.
+    inner: Option<Exposure<T, N>>,
+}
+
+/// An exposed buffer and its registration.
+#[verifier::reject_recursive_types(N)]
+struct Exposure<T, N: Nic> {
+    /// Deregistered before the buffer goes, or kept with it if that fails.
+    mr: N::Mr,
+    buf: BufMut<T, N>,
     rkey: u32,
 }
 
 impl<T, N: Nic> Exposed<T, N> {
+    /// The buffer it holds for the peer.
+    pub closed spec fn held(self) -> Option<BufMut<T, N>> {
+        match self.inner {
+            Some(e) => Some(e.buf),
+            None => None,
+        }
+    }
+
+    /// The bytes it opens to the peer.
+    pub closed spec fn bytes(self) -> ISet<int> {
+        match self.inner {
+            Some(e) => e.buf.byte_domain().to_iset(),
+            None => ISet::empty(),
+        }
+    }
+
+    /// Revokes the peers' access and gives the buffer back: A's `unexpose`, the buffer the
+    /// program's again, as it was exposed. A refused revocation returns the exposed owner, whose
+    /// registration remains live, for retry.
+    pub fn try_reclaim(self) -> (r: Result<BufMut<T, N>, BufError<Self>>)
+        ensures
+            r matches Ok(buf) ==> self.held() == Some(buf),
+            r matches Err(e) ==> e.buf.held() == self.held(),
+    {
+        let mut this = self;
+        match this.inner.take() {
+            Some(exposure) => {
+                let Exposure { mr: registration, buf: owner, rkey: key } = exposure;
+                match close_exposure::<N>(registration) {
+                    Ok(()) => Ok(owner),
+                    Err((error, mr)) => {
+                        this.inner = Some(Exposure { mr, buf: owner, rkey: key });
+                        Err(BufError { error, buf: this })
+                    },
+                }
+            },
+            None => Err(BufError { error: Error::Invalid("an exposure already reclaimed"), buf: this }),
+        }
+    }
+}
+
+impl<T, N: Nic> Exposed<T, N> {
+    /// The exposed buffer is apart from every lease the requests of `engine` hold: its linear
+    /// permission, borrowed exclusively against the engine's rings. It changes nothing, and exists
+    /// in Verus builds alone.
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn separate_from<C>(&mut self, engine: &crate::hw::Hw<C, N>)
+        requires
+            engine.inv(),
+        ensures
+            *final(self) == *old(self),
+            forall|l: LeaseId| #[trigger] lent(engine.part().abs, l)
+                ==> engine.part().abs.leases[l].mem.disjoint(old(self).bytes()),
+    {
+        match self.inner.take() {
+            Some(exposure) => {
+                let Exposure { mr, buf, rkey } = exposure;
+                proof {
+                    use_type_invariant(&buf);
+                }
+                let BufMut { raw, _t } = buf;
+                let raw = lease::unique_apart_from_engine(raw, engine);
+                self.inner = Some(Exposure { mr, buf: BufMut { raw, _t }, rkey });
+            },
+            None => {},
+        }
+    }
+}
+
+/// Two exposed buffers own different bytes: their linear permissions. It changes nothing, and
+/// exists in Verus builds alone.
+#[cfg(verus_keep_ghost)]
+pub(crate) fn exposures_apart<T, U, N: Nic>(x: &mut Exposed<T, N>, y: &Exposed<U, N>)
+    ensures
+        *final(x) == *old(x),
+        old(x).bytes().disjoint(y.bytes()),
+{
+    match (x.inner.take(), &y.inner) {
+        (Some(exposure), Some(other)) => {
+            let Exposure { mr, buf, rkey } = exposure;
+            proof {
+                use_type_invariant(&buf);
+                use_type_invariant(&other.buf);
+            }
+            let BufMut { raw, _t } = buf;
+            let mut raw = raw;
+            proof {
+                use_type_invariant(&raw);
+                use_type_invariant(&other.buf.raw);
+            }
+            raw.disjoint(&other.buf.raw);
+            proof {
+                assert forall|b: int| !(raw.byte_domain().to_iset().contains(b) && other.buf.raw.byte_domain().to_iset().contains(b)) by {
+                    assert(!(raw.byte_domain().contains(b) && other.buf.raw.byte_domain().contains(b)));
+                }
+            }
+            x.inner = Some(Exposure { mr, buf: BufMut { raw, _t }, rkey });
+        },
+        (taken, _) => x.inner = taken,
+    }
+}
+
+impl<T, N: Nic> BufMut<T, N> {
+    /// Registers the buffer for remote access, all of its bytes and none other, and hands it to the
+    /// peer: A's `expose`. The program keeps no way to its bytes but the volatile copy.
+    pub(crate) fn exposed(self) -> (r: Result<Exposed<T, N>, BufError<BufMut<T, N>>>)
+        ensures
+            r matches Ok(x) ==> x.held() == Some(self),
+            r matches Err(e) ==> e.buf == self,
+    {
+        let registered = register_exposure(&self.raw.region.pd, self.raw.ptr(), self.raw.len());
+        match registered {
+            Ok((mr, rkey)) => Ok(Exposed { inner: Some(Exposure { mr, buf: self, rkey }) }),
+            Err(error) => Err(BufError { error, buf: self }),
+        }
+    }
+}
+
+} // verus!
+
+impl<T, N: Nic> Exposed<T, N> {
     /// What a peer needs to address it.
     pub fn remote(&self) -> RemoteBuf {
-        RemoteBuf {
-            addr: self.buf.raw.ptr() as u64,
-            len: self.buf.raw.len() as u64,
-            rkey: self.rkey,
+        match &self.inner {
+            Some(e) => RemoteBuf {
+                addr: e.buf.raw.ptr() as u64,
+                len: e.buf.raw.len() as u64,
+                rkey: e.rkey,
+            },
+            None => RemoteBuf {
+                addr: 0,
+                len: 0,
+                rkey: 0,
+            },
         }
     }
 
     /// The number of elements.
     pub fn len(&self) -> usize {
-        self.buf.len()
+        match &self.inner {
+            Some(e) => e.buf.len(),
+            None => 0,
+        }
     }
 
     /// Whether it has no elements.
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.len() == 0
     }
 
     /// Copies its first `out.len()` elements into `out` with volatile reads,
@@ -901,23 +1021,9 @@ impl<T, N: Nic> Exposed<T, N> {
             out.len(),
             self.len()
         );
-        memory::volatile_copy(self.buf.raw.ptr(), out.as_mut_bytes());
-    }
-
-    /// Revokes the peers' access and gives the buffer back. A refused revocation
-    /// returns the exposed owner, whose registration remains live, for retry.
-    pub fn try_reclaim(self) -> Result<BufMut<T, N>, BufError<Self>> {
-        // A backend panic must also retain the allocation and registration.
-        let mut this = ManuallyDrop::new(self);
-        if let Err(error) = close_registration::<N>(&mut this.mr) {
-            return Err(BufError {
-                error,
-                buf: ManuallyDrop::into_inner(this),
-            });
+        if let Some(e) = &self.inner {
+            memory::volatile_copy(e.buf.raw.ptr(), out.as_mut_bytes());
         }
-        // SAFETY: the registration was revoked and its handle destroyed above;
-        // `this` will not drop, and this is the only extraction of its owner.
-        Ok(unsafe { ManuallyDrop::take(&mut this.buf) })
     }
 
     /// Revokes the peers' access (invalidating the remote key) and gives the
@@ -937,10 +1043,12 @@ impl<T, N: Nic> Exposed<T, N> {
 
 impl<T, N: Nic> Drop for Exposed<T, N> {
     fn drop(&mut self) {
-        if close_registration::<N>(&mut self.mr).is_ok() {
-            // SAFETY: remote access has been revoked; the owner is dropped
-            // exactly once. On failure both ManuallyDrop fields stay retained.
-            unsafe { ManuallyDrop::drop(&mut self.buf) };
+        if let Some(exposure) = self.inner.take() {
+            match close_exposure::<N>(exposure.mr) {
+                Ok(()) => drop(exposure.buf),
+                // The peer may still reach the bytes: keep them, with the registration.
+                Err((_, mr)) => core::mem::forget((mr, exposure.buf)),
+            }
         }
     }
 }
@@ -1585,7 +1693,7 @@ mod revocation_tests {
         buf.copy_from_slice(b"reclaim on retry");
         let exposed = buf.expose().unwrap();
         let remote = exposed.remote();
-        let key = Model::mr_keys(&exposed.mr).0;
+        let key = Model::mr_keys(&exposed.inner.as_ref().unwrap().mr).0;
         model.refuse_mr_closes(key, 2);
         let mut owner = exposed;
         for _ in 0..2 {
@@ -1608,8 +1716,9 @@ mod revocation_tests {
         let ctx = Context::new(model.clone());
         let pd = ctx.alloc_pd().unwrap();
         let exposed = pd.alloc::<u8>(16).unwrap().expose().unwrap();
-        let backing = Arc::downgrade(&exposed.buf.raw.region);
-        model.refuse_mr_closes(Model::mr_keys(&exposed.mr).0, 1);
+        let inner = exposed.inner.as_ref().unwrap();
+        let backing = Arc::downgrade(&inner.buf.raw.region);
+        model.refuse_mr_closes(Model::mr_keys(&inner.mr).0, 1);
         drop(exposed);
         assert_eq!(model.registered(), 2);
         assert!(backing.upgrade().is_some());
@@ -1623,7 +1732,7 @@ mod revocation_tests {
         let ctx = Context::new(model.clone());
         let pd = ctx.alloc_pd().unwrap();
         let exposed = pd.alloc::<u8>(16).unwrap().expose().unwrap();
-        let backing = Arc::downgrade(&exposed.buf.raw.region);
+        let backing = Arc::downgrade(&exposed.inner.as_ref().unwrap().buf.raw.region);
         drop(exposed);
         assert_eq!(model.registered(), 0);
         assert!(backing.upgrade().is_none());

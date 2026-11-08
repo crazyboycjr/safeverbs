@@ -50,6 +50,8 @@ use safeverbs_spec::abs::{Abs, Dir, Holder, Lease, LeaseId, Req, ReqId, WakerId}
 #[cfg(verus_keep_ghost)]
 use safeverbs_spec::abs::{abs_inv, abs_step};
 #[cfg(verus_keep_ghost)]
+use safeverbs_spec::compose::*;
+#[cfg(verus_keep_ghost)]
 use safeverbs_spec::nic_proofs::{
     history_ok, known, lemma_history_init, lemma_history_reaches, lemma_pending_of_last,
     lemma_polled_wqes, lemma_request_reaches, lemma_request_step, wr_log,
@@ -506,6 +508,130 @@ proof fn lemma_table_hold_apart<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, m: N
         assert(p.leases.apart_from(incoming));
         assert(leases_of(v, lent_holds(), k) == p.holds@);
         lemma_hold_kept_apart(p.holds@, p.leases, incoming, l);
+    }
+}
+
+/// What keeps every request of the table alive is apart from what keeps `other`'s.
+pub(super) open spec fn table_kept_apart<C, D, N: Device>(qps: Seq<Option<HwQp<C, N>>>, other: Hw<D, N>) -> bool {
+    forall|i: int| #[trigger] has_entry(qps, i) ==> {
+        &&& qps[i]->0.send.kept_apart_from(other)
+        &&& qps[i]->0.recv.kept_apart_from(other)
+    }
+}
+
+/// What keeps alive a lease a request of the table holds or keeps: a keeper over the lease's
+/// allocation, unique exactly if the lease is not a share, and apart from `other`'s requests if the
+/// table's are.
+proof fn lemma_hold_keeper<C, D, N: Device>(qps: Seq<Option<HwQp<C, N>>>, m: Nic::State, other: Hw<D, N>, k: int, l: LeaseId) -> (x: Resource<N>)
+    requires
+        table_kept(qps),
+        table_kept_apart(qps, other),
+        leases_of(table_view(qps, m), lent_holds(), k).contains_key(l),
+    ensures
+        other.table_apart(x),
+        x.byte_domain().to_iset() == leases_of(table_view(qps, m), lent_holds(), k)[l].kept,
+        x.unique() == !leases_of(table_view(qps, m), lent_holds(), k)[l].shared,
+        leases_of(table_view(qps, m), lent_holds(), k)[l].mem.subset_of(leases_of(table_view(qps, m), lent_holds(), k)[l].kept),
+{
+    let v = table_view(qps, m);
+    let i = key_entry(k);
+    let queue = key_queue(k);
+    let s = key_seq(k);
+    assert(has_entry(qps, i));
+    let e = qps[i]->0;
+    let r = ring_of(e, queue);
+    assert(ring_resources_ok(r) && r.kept_apart_from(other)) by {
+        if queue is Send {
+            assert(r == e.send);
+        } else {
+            assert(r == e.recv);
+        }
+    }
+    if (v.req)(k) is Some {
+        assert(table_req(qps, m, k) == seen(r, m, e.id(), queue, s));
+        let rv = r.req(s)->0;
+        assert(r.req(s) is Some);
+        assert(payload_ok(rv.leases, rv.detached));
+        let h = rv.leases.holds@;
+        assert(leases_of(v, lent_holds(), k) == h);
+        let j = choose|j: int| 0 <= j < rv.leases.leases.view().len()
+            && (#[trigger] rv.leases.leases.view()[j]).byte_domain().to_iset() == h[l].kept
+            && rv.leases.leases.view()[j].unique() == !h[l].shared;
+        assert(other.table_apart(rv.leases.leases.view()[j]));
+        rv.leases.leases.view()[j]
+    } else if (v.staged)(k) is Some {
+        let rv = r.staged(s)->0;
+        assert(r.staged(s) is Some);
+        assert(payload_ok(rv.leases, rv.detached));
+        let h = rv.leases.holds@;
+        assert(leases_of(v, lent_holds(), k) == h);
+        let j = choose|j: int| 0 <= j < rv.leases.leases.view().len()
+            && (#[trigger] rv.leases.leases.view()[j]).byte_domain().to_iset() == h[l].kept
+            && rv.leases.leases.view()[j].unique() == !h[l].shared;
+        assert(other.table_apart(rv.leases.leases.view()[j]));
+        rv.leases.leases.view()[j]
+    } else {
+        let p = r.refused(s)->0;
+        assert(r.refused(s) is Some);
+        assert(payload_ok(p, false));
+        let h = p.holds@;
+        assert(leases_of(v, lent_holds(), k) == h);
+        let j = choose|j: int| 0 <= j < p.leases.view().len()
+            && (#[trigger] p.leases.view()[j]).byte_domain().to_iset() == h[l].kept
+            && p.leases.view()[j].unique() == !h[l].shared;
+        assert(other.table_apart(p.leases.view()[j]));
+        p.leases.view()[j]
+    }
+}
+
+/// A lease a request holds is one of the request's leases, with its bytes.
+proof fn lemma_lent_hold<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, m: Nic::State, g: Refinement, l: LeaseId) -> (k: int)
+    requires
+        linked(qps, m, g),
+        lent(g.abs, l),
+    ensures
+        leases_of(table_view(qps, m), lent_holds(), k).contains_key(l),
+        leases_of(table_view(qps, m), lent_holds(), k)[l].mem == g.abs.leases[l].mem,
+{
+    let v = table_view(qps, m);
+    let a = g.abs;
+    let r = a.leases[l].holder->req;
+    assert(a.requests.contains_key(r));
+    assert(names_request(v, g.reqs, r));
+    let k = choose|k: int| #[trigger] (v.req)(k) is Some && g.reqs[k] == r;
+    assert(sits(v, a, lent_qp(), g.reqs, lent_holds(), k));
+    k
+}
+
+/// A unique lease a request holds is not a share of a frozen allocation, unless it has no bytes: it
+/// would overlap the allocation's root, which the program keeps while a request shares it.
+proof fn lemma_unique_hold<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, m: Nic::State, g: Refinement, k: int, l: LeaseId)
+    requires
+        linked(qps, m, g),
+        leases_of(table_view(qps, m), lent_holds(), k).contains_key(l),
+        leases_of(table_view(qps, m), lent_holds(), k)[l].shared,
+        leases_of(table_view(qps, m), lent_holds(), k)[l].mem.subset_of(leases_of(table_view(qps, m), lent_holds(), k)[l].kept),
+        g.abs.leases.contains_key(l),
+        g.abs.leases[l].holder is Request,
+        g.abs.leases[l].unique,
+        g.abs.leases[l].mem == leases_of(table_view(qps, m), lent_holds(), k)[l].mem,
+    ensures
+        g.abs.leases[l].mem == ISet::<int>::empty(),
+{
+    let v = table_view(qps, m);
+    let a = g.abs;
+    let hold = leases_of(v, lent_holds(), k)[l];
+    assert(has_root(v, a, lent_holds(), hold.kept));
+    let root = choose|root: LeaseId| #[trigger] free_lease(v, a, lent_holds(), root) && !a.leases[root].unique
+        && a.leases[root].mem == hold.kept;
+    assert(root != l);
+    assert(a.leases[l].mem.disjoint(a.leases[root].mem));
+    assert(a.leases[l].mem =~= ISet::<int>::empty()) by {
+        assert forall|x: int| !a.leases[l].mem.contains(x) by {
+            if a.leases[l].mem.contains(x) {
+                assert(hold.kept.contains(x));
+            }
+        }
     }
 }
 
@@ -3522,6 +3648,66 @@ proof fn lemma_wqe_byte<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, name: nat, t
     l
 }
 
+/// The invariant couples A and M on the engine's own queues ([`coupled_on`]): every byte M lets the
+/// NIC touch for one of their WQEs is in a lease of the WQE's request, which A has in flight.
+pub(super) proof fn lemma_linked_on<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, name: nat, t: NicToken, m: Nic::State, pending: Seq<Cqe>, g: Refinement)
+    requires
+        linked(qps, m, g),
+        table_ok(qps, name, t, m, pending),
+    ensures
+        coupled_on(g.abs, m, t.share(), g.ranges),
+{
+    let a = g.abs;
+    let sh = t.share();
+    assert forall|r: ReqId| #[trigger] a.requests.contains_key(r) implies sh.owns.contains(g.ranges[r].qp) by {
+        let q = a.requests[r].qp;
+        assert(a.qps.contains(q));
+        let i = choose|i: int| has_entry(qps, i) && #[trigger] qps[i]->0.id() == q;
+        assert(qp_ok(qps[i], i, t, m));
+    }
+    assert forall|r: ReqId| #[trigger] a.in_flight(r) implies g.ranges[r].pending(m) by {
+        lemma_pending_of_last(g.ranges[r], m);
+    }
+    assert forall|x: int| #[trigger] inside_reads(m, sh, x) implies a.nic_reads(x) by {
+        let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+            && 0 <= k < m.qps[q].sq.len() && {
+            let wr = m.qps[q].sq[k].wr;
+            !wr.inline && !wr.opcode.writes_local() && covers(wr.sges, x)
+        };
+        let i = choose|i: int| 0 <= i < qps.len() && #[trigger] qps[i] is Some && qps[i]->0.id() == q;
+        let wr = m.qps[q].sq[k].wr;
+        assert(qp_ok(qps[i], i, t, m));
+        let l = lemma_wqe_byte(qps, name, t, m, pending, g, i, Queue::Send, m.qps[q].sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges, x);
+        assert(a.nic_reads_lease(l));
+    }
+    assert forall|x: int| #[trigger] inside_writes(m, sh, x) implies a.nic_writes(x) by {
+        if exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+            && 0 <= k < m.qps[q].sq.len() && {
+            let wr = m.qps[q].sq[k].wr;
+            wr.opcode.writes_local() && covers(wr.sges, x)
+        } {
+            let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+                && 0 <= k < m.qps[q].sq.len() && {
+                let wr = m.qps[q].sq[k].wr;
+                wr.opcode.writes_local() && covers(wr.sges, x)
+            };
+            let i = choose|i: int| 0 <= i < qps.len() && #[trigger] qps[i] is Some && qps[i]->0.id() == q;
+            let wr = m.qps[q].sq[k].wr;
+            assert(qp_ok(qps[i], i, t, m));
+            let l = lemma_wqe_byte(qps, name, t, m, pending, g, i, Queue::Send, m.qps[q].sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges, x);
+            assert(a.nic_writes_lease(l));
+        } else {
+            let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].rq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+                && 0 <= k < m.qps[q].rq.len() && covers(m.qps[q].rq[k].wr.sges, x);
+            let i = choose|i: int| 0 <= i < qps.len() && #[trigger] qps[i] is Some && qps[i]->0.id() == q;
+            let wr = m.qps[q].rq[k].wr;
+            assert(qp_ok(qps[i], i, t, m));
+            let l = lemma_wqe_byte(qps, name, t, m, pending, g, i, Queue::Recv, m.qps[q].rq_head + k, wr.wr_id, None, wr.sges, x);
+            assert(a.nic_writes_lease(l));
+        }
+    }
+}
+
 /// The invariant couples A and M, as far as the engine's own queues go; what the NIC may touch
 /// beyond them is the theorem's premise.
 pub(super) proof fn lemma_linked_coupled<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, name: nat, t: NicToken, m: Nic::State, pending: Seq<Cqe>, g: Refinement)
@@ -3532,56 +3718,8 @@ pub(super) proof fn lemma_linked_coupled<C, N: Device>(qps: Seq<Option<HwQp<C, N
     ensures
         coupled(g.abs, m, g.ranges, g.wrs),
 {
-    let a = g.abs;
-    let sh = t.share();
-    assert forall|r: ReqId| #[trigger] a.in_flight(r) implies g.ranges[r].pending(m) by {
-        lemma_pending_of_last(g.ranges[r], m);
-    }
-    assert forall|x: int| #[trigger] m.nic_may_read(x) implies a.nic_reads(x) by {
-        if !outside_reads(m, sh, x) {
-            let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
-                && 0 <= k < m.qps[q].sq.len() && {
-                let wr = m.qps[q].sq[k].wr;
-                !wr.inline && !wr.opcode.writes_local() && covers(wr.sges, x)
-            };
-            assert(sh.owns.contains(q));
-            let i = choose|i: int| 0 <= i < qps.len() && #[trigger] qps[i] is Some && qps[i]->0.id() == q;
-            let wr = m.qps[q].sq[k].wr;
-            assert(qp_ok(qps[i], i, t, m));
-            let l = lemma_wqe_byte(qps, name, t, m, pending, g, i, Queue::Send, m.qps[q].sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges, x);
-            assert(a.nic_reads_lease(l));
-        }
-    }
-    assert forall|x: int| #[trigger] m.nic_may_write(x) implies a.nic_writes(x) by {
-        if !outside_writes(m, sh, x) {
-            if exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
-                && 0 <= k < m.qps[q].sq.len() && {
-                let wr = m.qps[q].sq[k].wr;
-                wr.opcode.writes_local() && covers(wr.sges, x)
-            } {
-                let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
-                    && 0 <= k < m.qps[q].sq.len() && {
-                    let wr = m.qps[q].sq[k].wr;
-                    wr.opcode.writes_local() && covers(wr.sges, x)
-                };
-                assert(sh.owns.contains(q));
-                let i = choose|i: int| 0 <= i < qps.len() && #[trigger] qps[i] is Some && qps[i]->0.id() == q;
-                let wr = m.qps[q].sq[k].wr;
-                assert(qp_ok(qps[i], i, t, m));
-                let l = lemma_wqe_byte(qps, name, t, m, pending, g, i, Queue::Send, m.qps[q].sq_head + k, wr.wr_id, Some(wr.opcode), wr.sges, x);
-                assert(a.nic_writes_lease(l));
-            } else {
-                let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].rq[k]] m.qps.contains_key(q)
-                    && 0 <= k < m.qps[q].rq.len() && covers(m.qps[q].rq[k].wr.sges, x);
-                assert(sh.owns.contains(q));
-                let i = choose|i: int| 0 <= i < qps.len() && #[trigger] qps[i] is Some && qps[i]->0.id() == q;
-                let wr = m.qps[q].rq[k].wr;
-                assert(qp_ok(qps[i], i, t, m));
-                let l = lemma_wqe_byte(qps, name, t, m, pending, g, i, Queue::Recv, m.qps[q].rq_head + k, wr.wr_id, None, wr.sges, x);
-                assert(a.nic_writes_lease(l));
-            }
-        }
-    }
+    lemma_linked_on(qps, name, t, m, pending, g);
+    lemma_coupled_on(g.abs, m, t.share(), g.ranges, g.wrs);
 }
 
 // =============================================================================
@@ -3671,6 +3809,161 @@ impl<C, N: Device> Hw<C, N> {
     /// premise of each state of a run, about what the engine cannot see.
     pub open(super) spec fn outside_ok(&self) -> bool {
         outside_covered(self.refined@.abs, self.token@.nic(), self.token@.share())
+    }
+
+    /// What the engine brings to its device: its state of A, its requests' WQEs and its share of M.
+    pub closed spec fn part(&self) -> EnginePart {
+        EnginePart { abs: self.refined@.abs, ranges: self.refined@.ranges, share: self.token@.share() }
+    }
+
+    /// **The engine on its device.** Wherever the device went from the engine's view by steps its
+    /// engine did not take, the engine's part is what it says of itself there ([`part_ok`]): its
+    /// requests own their WQEs of its queue pairs, and what the NIC may touch for those is A's to
+    /// give. M is there by its own steps, with every send WQE's WR in `wrs`.
+    pub proof fn lemma_part(&self, m: Nic::State) -> (wrs: IMap<WqeRef, SendWr>)
+        requires
+            self.inv(),
+            interleaved(self.token().share(), self.nic(), m),
+        ensures
+            part_ok(self.part(), m),
+            nic_inv(m),
+            nic_reaches(self.nic(), m),
+            records_wrs(m, wrs),
+    {
+        let t = self.token@;
+        let sh = t.share();
+        let seen = t.nic();
+        let g = self.refined@;
+        let qps = self.qps@;
+        let a = g.abs;
+        lemma_interleaved(sh, seen, m);
+        lemma_rely_frame(sh, ISet::empty(), seen, m);
+        lemma_linked_on(qps, self.next_name@, t, seen, self.pending@, g);
+        let g2 = lemma_linked_rely(qps, self.next_name@, t, seen, m, self.pending@, ISet::empty(), g);
+        let v = table_view(qps, seen);
+        // Its requests, as where it saw M.
+        assert forall|r: ReqId| #[trigger] a.in_flight(r) implies g.ranges[r].pending(m) by {
+            lemma_pending_of_last(g.ranges[r], m);
+        }
+        // What the NIC may touch for its WQEs is what it could where it saw M.
+        assert forall|x: int| #[trigger] inside_reads(m, sh, x) implies a.nic_reads(x) by {
+            let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+                && 0 <= k < m.qps[q].sq.len() && {
+                let wr = m.qps[q].sq[k].wr;
+                !wr.inline && !wr.opcode.writes_local() && covers(wr.sges, x)
+            };
+            assert(qp_kept(seen.qps[q], m.qps[q]));
+            assert(seen.qps[q].sq[k].wr == m.qps[q].sq[k].wr);
+            assert(inside_reads(seen, sh, x));
+        }
+        assert forall|x: int| #[trigger] inside_writes(m, sh, x) implies a.nic_writes(x) by {
+            if exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+                && 0 <= k < m.qps[q].sq.len() && {
+                let wr = m.qps[q].sq[k].wr;
+                wr.opcode.writes_local() && covers(wr.sges, x)
+            } {
+                let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+                    && 0 <= k < m.qps[q].sq.len() && {
+                    let wr = m.qps[q].sq[k].wr;
+                    wr.opcode.writes_local() && covers(wr.sges, x)
+                };
+                assert(qp_kept(seen.qps[q], m.qps[q]));
+                assert(seen.qps[q].sq[k].wr == m.qps[q].sq[k].wr);
+            } else {
+                let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].rq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+                    && 0 <= k < m.qps[q].rq.len() && covers(m.qps[q].rq[k].wr.sges, x);
+                assert(qp_kept(seen.qps[q], m.qps[q]));
+                assert(seen.qps[q].rq[k].wr == m.qps[q].rq[k].wr);
+            }
+            assert(inside_writes(seen, sh, x));
+        }
+        // No lease open to a peer, and a complete request has its owner.
+        assert forall|r: ReqId| #[trigger] a.requests.contains_key(r) && a.requests[r].phase is Complete
+            implies !a.requests[r].detached by {
+            let k = choose|k: int| #[trigger] (v.req)(k) is Some && g.reqs[k] == r;
+            assert(sits(v, a, lent_qp(), g.reqs, lent_holds(), k));
+            assert(wf_at(v, k));
+        }
+        g2.wrs
+    }
+
+    /// **Two engines' requests are apart**: a unique lease one of them holds shares no byte with a
+    /// lease the other holds. What keeps their leases alive is apart, by the linear permissions of
+    /// `separate_from`; a lease lies in what keeps it; and a unique lease is no share of a frozen
+    /// allocation, unless it has no bytes.
+    pub(crate) proof fn lemma_parts_apart<D>(&self, other: Hw<D, N>)
+        requires
+            self.inv(),
+            other.inv(),
+            self.kept_apart_from(other),
+        ensures
+            parts_apart(self.part(), other.part()),
+            parts_apart(other.part(), self.part()),
+    {
+        let a = self.refined@.abs;
+        let b = other.refined@.abs;
+        let ma = self.token@.nic();
+        let mb = other.token@.nic();
+        self.lemma_table_kept();
+        other.lemma_table_kept();
+        assert forall|k: LeaseId, l: LeaseId| #![trigger a.leases[k], b.leases[l]]
+            lent(a, k) && lent(b, l) && (a.leases[k].unique || b.leases[l].unique)
+            implies a.leases[k].mem.disjoint(b.leases[l].mem) by {
+            let ka = lemma_lent_hold(self.qps@, ma, self.refined@, k);
+            let kb = lemma_lent_hold(other.qps@, mb, other.refined@, l);
+            let ha = leases_of(table_view(self.qps@, ma), lent_holds(), ka)[k];
+            let hb = leases_of(table_view(other.qps@, mb), lent_holds(), kb)[l];
+            let x = lemma_hold_keeper(self.qps@, ma, other, ka, k);
+            lemma_table_hold_apart(other.qps@, mb, x, kb, l);
+            assert(hold_apart(hb, x));
+            if !hb.kept.disjoint(ha.kept) {
+                // One frozen allocation, shared by both.
+                assert(hb.shared && ha.shared);
+                if a.leases[k].unique {
+                    lemma_unique_hold(self.qps@, ma, self.refined@, ka, k);
+                } else {
+                    lemma_unique_hold(other.qps@, mb, other.refined@, kb, l);
+                }
+            } else {
+                assert forall|y: int| !(a.leases[k].mem.contains(y) && b.leases[l].mem.contains(y)) by {
+                    if a.leases[k].mem.contains(y) && b.leases[l].mem.contains(y) {
+                        assert(ha.kept.contains(y) && hb.kept.contains(y));
+                    }
+                }
+            }
+        }
+        assert(self.part().abs == a && other.part().abs == b);
+        assert forall|l: LeaseId, k: LeaseId| #![trigger b.leases[l], a.leases[k]]
+            lent(b, l) && lent(a, k) && (b.leases[l].unique || a.leases[k].unique)
+            implies b.leases[l].mem.disjoint(a.leases[k].mem) by {
+            assert(a.leases[k].mem.disjoint(b.leases[l].mem));
+        }
+    }
+
+    /// A unique buffer apart from what keeps the engine's requests alive is apart from every lease
+    /// they hold.
+    pub(crate) proof fn lemma_unique_apart(&self, x: Resource<N>)
+        requires
+            self.inv(),
+            self.table_apart(x),
+            x.unique(),
+        ensures
+            forall|l: LeaseId| #[trigger] lent(self.part().abs, l)
+                ==> self.part().abs.leases[l].mem.disjoint(x.byte_domain().to_iset()),
+    {
+        let a = self.refined@.abs;
+        let m = self.token@.nic();
+        self.lemma_table_kept();
+        assert forall|l: LeaseId| #[trigger] lent(a, l) implies a.leases[l].mem.disjoint(x.byte_domain().to_iset()) by {
+            let k = lemma_lent_hold(self.qps@, m, self.refined@, l);
+            lemma_table_hold_apart(self.qps@, m, x, k, l);
+            let hold = leases_of(table_view(self.qps@, m), lent_holds(), k)[l];
+            assert forall|y: int| !(a.leases[l].mem.contains(y) && x.byte_domain().to_iset().contains(y)) by {
+                if a.leases[l].mem.contains(y) {
+                    assert(hold.kept.contains(y));
+                }
+            }
+        }
     }
 
     /// M has no QP but the engine's, and no region a peer may touch.
@@ -4051,6 +4344,66 @@ pub proof fn theorem_1_alone<C, N: Device>(first: Hw<C, N>, now: Hw<C, N>)
     first.lemma_alone_covered();
     now.lemma_alone_covered();
     theorem_1_held(first, now);
+}
+
+/// Which of two engines' views is the later: where the device is, as far as they saw it.
+pub open spec fn later<C, D, N: Device>(e: Hw<C, N>, f: Hw<D, N>) -> Nic::State {
+    if f.token().time() <= e.token().time() {
+        e.nic()
+    } else {
+        f.nic()
+    }
+}
+
+/// **Theorem 1, of two engines on one device and a buffer exposed to a peer.** The engines may have
+/// contexts of different types, as a program's do. What each says of itself (`Hw::lemma_part`),
+/// what their linear permissions and their device's one history say of the pair
+/// (`Hw::separate_engines`), and what the exposed buffer's permission says (`Exposed::separate_from`)
+/// are what [`theorem_1_device`] asks; that M has nothing else (`accounted`) is what only the program
+/// as a whole can say. So the device stands for one state of A, reached from its start, coupled to M,
+/// with both engines' requests as their own A has them. It exists in Verus builds alone.
+#[cfg(verus_keep_ghost)]
+#[allow(dead_code)]
+fn example_device<C, D, N: Device, T>(e: Hw<C, N>, f: Hw<D, N>, x: crate::buf::Exposed<T, N>)
+    requires
+        e.inv(),
+        f.inv(),
+        e.token().device() == f.token().device(),
+        accounted(seq![e.part(), f.part()], seq![x.bytes()], later(e, f)),
+{
+    let ghost (start_e, start_f, start_x) = (e, f, x);
+    let mut x = x;
+    x.separate_from(&e);
+    x.separate_from(&f);
+    let mut f = f;
+    f.separate_engines(&e);
+    proof {
+        let (e, f, x) = (start_e, start_f, start_x);
+        let h = later(e, f);
+        if f.token().time() <= e.token().time() {
+            lemma_interleaved_refl(e.token().share(), h);
+        } else {
+            lemma_interleaved_refl(f.token().share(), h);
+        }
+        let wrs = e.lemma_part(h);
+        f.lemma_part(h);
+        let parts = seq![e.part(), f.part()];
+        let exposed = seq![x.bytes()];
+        assert(disjoint(e.token().share(), f.token().share())) by {
+            assert forall|q: QpId| #[trigger] e.token().share().owns.contains(q)
+                implies !f.token().share().owns.contains(q) by {
+                if f.token().share().owns.contains(q) {
+                    assert(!e.token().share().owns.contains(q));
+                }
+            }
+        }
+        assert forall|i: int, j: int| #![trigger parts[i], parts[j]] 0 <= i < parts.len() && 0 <= j < parts.len() && i != j
+            implies disjoint(parts[i].share, parts[j].share) && parts_apart(parts[i], parts[j]) by {
+            assert(parts[0] == e.part() && parts[1] == f.part());
+        }
+        assert(device_ok(parts, exposed, h));
+        theorem_1_device(parts, exposed, h, wrs);
+    }
 }
 
 /// Theorem 1 through the public operations of [`Engine`](crate::engine::Engine) on typed buffers:

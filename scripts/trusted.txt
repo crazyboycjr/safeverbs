@@ -79,6 +79,8 @@ crates/safeverbs-core/src/trusted.rs ExNicCq
 # The control path, each with its contract from M (create_cq makes an engine's token).
 crates/safeverbs-core/src/trusted.rs device_caps
 crates/safeverbs-core/src/trusted.rs create_cq
+# Two engines' tokens are views of their device's one history.
+crates/safeverbs-core/src/trusted.rs one_history
 crates/safeverbs-core/src/trusted.rs create_qp
 crates/safeverbs-core/src/trusted.rs connect
 crates/safeverbs-core/src/trusted.rs to_error
@@ -98,6 +100,9 @@ crates/safeverbs-core/src/trusted.rs pd_id_of
 crates/safeverbs-core/src/trusted.rs same_device
 crates/safeverbs-core/src/trusted.rs clone_pd
 crates/safeverbs-core/src/trusted.rs register_region
+# Exposure: the one registration with remote access, and its end.
+crates/safeverbs-core/src/trusted.rs register_exposure
+crates/safeverbs-core/src/trusted.rs close_exposure
 crates/safeverbs-core/src/trusted.rs pd_alive
 crates/safeverbs-core/src/trusted.rs registered
 crates/safeverbs-core/src/trusted.rs registered_all

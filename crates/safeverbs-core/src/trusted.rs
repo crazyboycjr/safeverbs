@@ -286,7 +286,8 @@ pub open spec fn part_writable<N: Device>(part: Part<N>) -> bool { part.spec_wri
 
 /// What one engine knows of the NIC: M's state as it last saw it, its share
 /// of M, the names it gives new QPs, and
-/// for each of its queue pairs the send WRs written since its last start.
+/// for each of its queue pairs the send WRs written since its last start;
+/// and which device that is, and when it last saw it.
 /// Only the trusted wrappers make or change one: its fields are private, so
 /// no other code can forge one.
 // The fields are ghost: only the proofs read them.
@@ -297,6 +298,8 @@ pub tracked struct NicToken {
     ghost name: spec_fn(nat) -> QpId,
     ghost started: Set<QpId>,
     ghost written: Map<QpId, Seq<SendWr>>,
+    ghost device: nat,
+    ghost time: nat,
 }
 
 impl NicToken {
@@ -310,15 +313,27 @@ impl NicToken {
         self.share
     }
 
+    /// The device the engine is of: one history, its engines' and its NIC's.
+    pub closed spec fn device(&self) -> nat {
+        self.device
+    }
+
+    /// When the engine last saw the device: where its view is in the device's history. Nothing
+    /// but [`one_history`] says anything of it.
+    pub closed spec fn time(&self) -> nat {
+        self.time
+    }
+
     /// The name of the engine's `n`-th QP: names it owns, all different,
     /// none used before the engine was made.
     pub closed spec fn name(&self, n: nat) -> QpId {
         (self.name)(n)
     }
 
-    /// `self` is `other` after calls of the same engine: the same share and names.
+    /// `self` is `other` after calls of the same engine: the same device, share and names.
     pub open spec fn same_engine(&self, other: &NicToken) -> bool {
         &&& self.share() == other.share()
+        &&& self.device() == other.device()
         &&& forall|n: nat| #[trigger] self.name(n) == other.name(n)
     }
 
@@ -432,6 +447,9 @@ pub fn device_caps<N: Device>(ctx: &Context<N>) -> (caps: DeviceCaps)
     ctx.nic().caps()
 }
 
+/// The device an open context is of.
+pub uninterp spec fn device_of<N: Device>(ctx: Context<N>) -> nat;
+
 /// `ibv_create_cq_ex` (single-threaded) on the device of `ctx`: an engine's CQ
 /// of `entries` entries, and its token, with the device's limits as M has
 /// them. M's `create_cq` with a name never used, after whatever the device
@@ -448,6 +466,7 @@ pub fn create_cq<N: Device>(ctx: &Context<N>, entries: u32) -> (r: Result<
             let m = t@.nic();
             let sh = t@.share();
             &&& exists|m0: Nic::State| nic_init(m0) && nic_reaches(m0, m)
+            &&& t@.device() == device_of(*ctx)
             &&& share_wf(m, sh)
             &&& cq_of(cq) == sh.cq
             &&& m.cqs[sh.cq].cap == entries
@@ -462,6 +481,24 @@ pub fn create_cq<N: Device>(ctx: &Context<N>, entries: u32) -> (r: Result<
     // SAFETY: the engine holds a handle to the device as long as its CQ, and destroys its QPs first.
     let cq = unsafe { nic.create_cq(entries, true) }?;
     Ok((cq, caps, Tracked::assume_new()))
+}
+
+/// **One device history.** A device's history is the interleaving of its engines' verbs, each on
+/// the engine's own share, and of the steps of its NIC and of the control path (protection domains
+/// and memory regions); a token holds that history as of its engine's last verb, at the moment its
+/// `time` names. So of two tokens of one device, their shares are apart, and from the view of the
+/// one seen earlier the device went to the other's by steps the earlier one's engine did not take.
+/// (The exclusive borrow makes them two tokens: one engine has one.)
+#[verifier::external_body]
+pub proof fn one_history(tracked a: &mut NicToken, tracked b: &NicToken)
+    requires
+        old(a).device() == b.device(),
+    ensures
+        *final(a) == *old(a),
+        disjoint(final(a).share(), b.share()),
+        final(a).time() <= b.time() ==> interleaved(final(a).share(), final(a).nic(), b.nic()),
+        b.time() <= final(a).time() ==> interleaved(b.share(), b.nic(), final(a).nic()),
+{
 }
 
 /// Another handle to the device (no meaning in M: an engine's token says what the device is).
@@ -754,6 +791,38 @@ pub fn register_region<N: Device>(pd: &Pd<N>, address: *mut u8, bytes: usize) ->
     let mr = unsafe { pd.context().nic().reg_mr(pd.raw(), address, bytes, Access::LOCAL_WRITE) }?;
     let lkey = N::mr_keys(&mr).0;
     Ok((mr, lkey))
+}
+
+/// `ibv_reg_mr` of `bytes` bytes at `address` in `pd`, for remote reads, writes and atomics: the
+/// region a peer may reach by its key, its handle and remote key, or nothing. No contract of M's,
+/// as for [`register_region`]: this is the library's only registration with remote access, of an
+/// exposed buffer's bytes and no others, and [`close_exposure`] the only one of its ends. What a
+/// peer may reach in M is so the exposed buffers the program holds (`docs/verification.md`).
+#[verifier::external_body]
+pub fn register_exposure<N: Device>(pd: &Pd<N>, address: *mut u8, bytes: usize) -> (r: Result<(N::Mr, u32)>) {
+    let access = Access::LOCAL_WRITE | Access::REMOTE_WRITE | Access::REMOTE_READ | Access::REMOTE_ATOMIC;
+    // SAFETY: the memory stays allocated while the `Exposed` holding the region lives: it holds the
+    // buffer and deregisters the region before letting it go, and keeps both if that fails; the
+    // program forms no reference to the bytes meanwhile, only a volatile copy.
+    let mr = unsafe { pd.context().nic().reg_mr(pd.raw(), address, bytes, access) }?;
+    let rkey = N::mr_keys(&mr).1;
+    Ok((mr, rkey))
+}
+
+/// Deregisters an exposed region (`ibv_dereg_mr`): `Ok` once its remote key no longer works (M's
+/// `dereg_mr`), or the error and the handle, still registered, for retry.
+#[verifier::external_body]
+pub fn close_exposure<N: Device>(mr: N::Mr) -> (r: core::result::Result<(), (Error, N::Mr)>) {
+    let mut mr = mr;
+    match N::close_mr(&mut mr) {
+        // A closed handle's `Drop` does nothing more; a backend without an explicit close revokes
+        // in `Drop`, by `Nic`'s contract.
+        Ok(()) | Err(Error::Unsupported(_)) => {
+            drop(mr);
+            Ok(())
+        },
+        Err(error) => Err((error, mr)),
+    }
 }
 
 /// A handle to the same protection domain.

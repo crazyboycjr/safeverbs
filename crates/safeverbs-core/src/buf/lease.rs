@@ -168,6 +168,30 @@ pub(super) fn unique_apart_from_nic<C, N: Nic>(raw: RawMut<N>, hw: &crate::hw::H
     }
 }
 
+/// A unique buffer is apart from every lease the requests of `hw` hold: its linear permission,
+/// borrowed exclusively against the engine's rings.
+#[cfg(verus_keep_ghost)]
+pub(super) fn unique_apart_from_engine<C, N: Nic>(raw: RawMut<N>, hw: &crate::hw::Hw<C, N>) -> (same: RawMut<N>)
+    requires
+        hw.inv(),
+    ensures
+        same == raw,
+        forall|l: safeverbs_spec::abs::LeaseId| #[trigger] safeverbs_spec::compose::lent(hw.part().abs, l)
+            ==> hw.part().abs.leases[l].mem.disjoint(raw.byte_domain().to_iset()),
+{
+    let ghost whole = raw.byte_domain();
+    let mut lease = Lease::Unique(raw);
+    hw.separate_lease(&mut lease);
+    proof {
+        assert(lease.observation().unique() && lease.observation().byte_domain() == whole);
+        hw.lemma_unique_apart(lease.observation());
+    }
+    match lease {
+        Lease::Unique(same) => same,
+        Lease::Shared(_) => vstd::pervasive::unreached(),
+    }
+}
+
 /// **S1 of a frozen allocation:** while the program holds it, the NIC writes none of its bytes
 /// (`Hw::keeper_apart`).
 #[cfg(verus_keep_ghost)]
@@ -891,6 +915,48 @@ impl<N: Nic> Leases<N> {
             assert forall|j: int| 0 <= j < self.view().len()
                 implies (#[trigger] self.view()[j]).apart(incoming.observation()) by {
                 assert(self.view()[j] == self.raw_view()[j].observation());
+            }
+        }
+    }
+
+    /// Every keeper is apart from what keeps the requests of `engine` alive: each is borrowed
+    /// exclusively in turn against the engine's rings, so no other engine holds a buffer it holds.
+    /// It changes no keeper, and exists in Verus builds alone.
+    #[cfg(verus_keep_ghost)]
+    #[inline(always)]
+    pub(crate) fn separate_from<C>(&mut self, engine: &crate::hw::Hw<C, N>)
+        requires
+            engine.inv(),
+        ensures
+            forall|j: int| 0 <= j < old(self).view().len()
+                ==> engine.table_apart(#[trigger] old(self).view()[j]),
+        no_unwind
+    {
+        let ghost before = self.raw_view();
+        match &mut self.held {
+            Held::Nothing => {},
+            Held::One(first) => engine.separate_lease(first),
+            Held::Many(rest) => {
+                let mut i = 0;
+                while i < rest.len()
+                    invariant
+                        engine.inv(),
+                        rest@ == before,
+                        i <= rest@.len(),
+                        forall|j: int| 0 <= j < i ==> engine.table_apart((#[trigger] before[j]).observation()),
+                    decreases rest@.len() - i,
+                {
+                    let lease = crate::trusted::element_mut(rest.as_mut_slice(), i);
+                    engine.separate_lease(lease);
+                    proof { assert(rest@ =~= before); }
+                    i += 1;
+                }
+            },
+        }
+        proof {
+            assert forall|j: int| 0 <= j < old(self).view().len()
+                implies engine.table_apart(#[trigger] old(self).view()[j]) by {
+                assert(old(self).view()[j] == before[j].observation());
             }
         }
     }

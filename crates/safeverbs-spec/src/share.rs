@@ -667,17 +667,30 @@ pub open spec fn elsewhere(sh: Share, step: Nic::Step) -> bool {
     ||| step is alloc_pd || step is reg_mr || step is dereg_mr
 }
 
+/// `run` is an execution of M by steps the engine of share `sh` did not take.
+pub open spec fn interleaved_run(sh: Share, run: Seq<Nic::State>, steps: Seq<Nic::Step>) -> bool {
+    &&& run.len() > 0
+    &&& steps.len() == run.len() - 1
+    &&& forall|i: int| 0 <= i < steps.len()
+        ==> elsewhere(sh, #[trigger] steps[i]) && nic_step(run[i], run[i + 1], steps[i])
+}
+
 /// The device went from `m` to `n` by steps the engine of share `sh` did not take: the device's
 /// history between two moments, as that engine sees it.
 pub open spec fn interleaved(sh: Share, m: Nic::State, n: Nic::State) -> bool {
-    exists|run: Seq<Nic::State>, steps: Seq<Nic::Step>| {
-        &&& run.len() > 0
-        &&& run[0] == m
-        &&& run.last() == n
-        &&& steps.len() == run.len() - 1
-        &&& forall|i: int| 0 <= i < steps.len()
-            ==> elsewhere(sh, #[trigger] steps[i]) && nic_step(run[i], run[i + 1], steps[i])
-    }
+    exists|run: Seq<Nic::State>, steps: Seq<Nic::Step>| interleaved_run(sh, run, steps) && run[0] == m
+        && run.last() == n
+}
+
+/// No step at all is an interleaving.
+pub proof fn lemma_interleaved_refl(sh: Share, m: Nic::State)
+    ensures
+        interleaved(sh, m, m),
+{
+    let run = seq![m];
+    let steps = Seq::<Nic::Step>::empty();
+    assert(run.last() == m);
+    assert(interleaved_run(sh, run, steps));
 }
 
 /// **One device, one run of M.** The interleaving of other engines' verbs, each on its own share,
@@ -689,14 +702,8 @@ pub proof fn lemma_interleaved(sh: Share, m: Nic::State, n: Nic::State)
     ensures
         rely_reaches(sh, ISet::empty(), m, n),
 {
-    let (run, steps) = choose|run: Seq<Nic::State>, steps: Seq<Nic::Step>| {
-        &&& run.len() > 0
-        &&& run[0] == m
-        &&& run.last() == n
-        &&& steps.len() == run.len() - 1
-        &&& forall|i: int| 0 <= i < steps.len()
-            ==> elsewhere(sh, #[trigger] steps[i]) && nic_step(run[i], run[i + 1], steps[i])
-    };
+    let (run, steps) = choose|run: Seq<Nic::State>, steps: Seq<Nic::Step>| interleaved_run(sh, run, steps)
+        && run[0] == m && run.last() == n;
     assert forall|i: int| 0 <= i < steps.len()
         implies foreign(sh, ISet::empty(), #[trigger] steps[i]) && nic_step(run[i], run[i + 1], steps[i]) by {
         if exists|other: Share| #[trigger] disjoint(other, sh) && mine(other, ISet::full(), steps[i]) {

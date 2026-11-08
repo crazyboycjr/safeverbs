@@ -63,6 +63,73 @@ impl<C, N: Nic> Ring<Payload<C, N>> {
         }
     }
 
+    /// What keeps every request of the ring alive, those waiting after retirement or refusal too,
+    /// is apart from what keeps `engine`'s requests alive.
+    pub(crate) open spec fn kept_apart_from<D>(&self, engine: crate::hw::Hw<D, N>) -> bool {
+        &&& forall|s: int, j: int| #![trigger self.req(s), engine.table_apart(self.req(s)->0.leases.leases.view()[j])]
+            self.req(s) is Some && 0 <= j < self.req(s)->0.leases.leases.view().len()
+                ==> engine.table_apart(self.req(s)->0.leases.leases.view()[j])
+        &&& forall|s: int, j: int| #![trigger self.staged(s), engine.table_apart(self.staged(s)->0.leases.leases.view()[j])]
+            self.staged(s) is Some && 0 <= j < self.staged(s)->0.leases.leases.view().len()
+                ==> engine.table_apart(self.staged(s)->0.leases.leases.view()[j])
+        &&& forall|s: int, j: int| #![trigger self.refused(s), engine.table_apart(self.refused(s)->0.leases.view()[j])]
+            self.refused(s) is Some && 0 <= j < self.refused(s)->0.leases.view().len()
+                ==> engine.table_apart(self.refused(s)->0.leases.view()[j])
+    }
+
+    /// What keeps every request of the ring alive is apart from what keeps `engine`'s, each borrowed
+    /// exclusively in turn. It changes no keeper.
+    #[cfg(verus_keep_ghost)]
+    #[inline(always)]
+    pub(crate) fn separate_from<D>(&mut self, engine: &crate::hw::Hw<D, N>)
+        requires
+            old(self).inv(),
+            engine.inv(),
+        ensures
+            old(self).kept_apart_from(*engine),
+        no_unwind
+    {
+        let ghost before = self.slots@;
+        let mut i = 0;
+        while i < self.slots.len()
+            invariant
+                engine.inv(),
+                self.slots@.len() == before.len(),
+                i <= before.len(),
+                forall|j: int| i <= j < before.len() ==> #[trigger] self.slots@[j] == before[j],
+                forall|j: int, k: int| #![trigger before[j], engine.table_apart(before[j].leases->0.leases.view()[k])]
+                    0 <= j < i && before[j].leases is Some && 0 <= k < before[j].leases->0.leases.view().len()
+                    ==> engine.table_apart(before[j].leases->0.leases.view()[k]),
+            decreases before.len() - i,
+        {
+            let slot = slot_in(&mut self.slots, i);
+            match &mut slot.leases {
+                Some(payload) => payload.leases.separate_from(engine),
+                None => {},
+            }
+            i += 1;
+        }
+        proof {
+            let ring = *old(self);
+            assert(ring.slots@ == before);
+            assert forall|s: int, j: int| ring.req(s) is Some && 0 <= j < ring.req(s)->0.leases.leases.view().len()
+                implies engine.table_apart(ring.req(s)->0.leases.leases.view()[j]) by {
+                ring.lemma_payload_coverage(s);
+                assert(before[s % ring.n()] == ring.slots@[s % ring.n()]);
+            }
+            assert forall|s: int, j: int| ring.staged(s) is Some && 0 <= j < ring.staged(s)->0.leases.leases.view().len()
+                implies engine.table_apart(ring.staged(s)->0.leases.leases.view()[j]) by {
+                ring.lemma_payload_coverage(s);
+                assert(before[s % ring.n()] == ring.slots@[s % ring.n()]);
+            }
+            assert forall|s: int, j: int| ring.refused(s) is Some && 0 <= j < ring.refused(s)->0.leases.view().len()
+                implies engine.table_apart(ring.refused(s)->0.leases.view()[j]) by {
+                ring.lemma_payload_coverage(s);
+                assert(before[s % ring.n()] == ring.slots@[s % ring.n()]);
+            }
+        }
+    }
+
     /// Check an incoming buffer against all real payloads. The buffer and every ring snapshot stay
     /// exact.
     #[cfg(verus_keep_ghost)]
