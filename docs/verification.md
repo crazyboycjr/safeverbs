@@ -169,7 +169,8 @@ conflicting ways.
   stays valid whatever the NIC and the other engines do (`lemma_rely`). A request being written
   goes out only on a queue pair that takes what it was written for: its protection domain, its
   message length, its number of WQEs and, if a WQE of it needs them, a reliable connection and
-  its scatter/gather elements are compared when it closes (`HwQp::takes`). A queue pair's
+  its scatter/gather elements are compared when it closes, and a queue pair being removed takes
+  none (`HwQp::takes`). A queue pair's
   protection domain is its own, and of the engine's device (`same_device`).
 - *Not proved:* the control path that allocates protection domains and registers and
   deregisters regions (`register_region`, the region's `Drop`, `pd.rs`). The engine's rely assumes
@@ -290,8 +291,9 @@ the error state and the drain WQE's doorbell).
   (`lemma_stops`): the core's two waits use both.
 - *Engine* (`hw/live.rs`). One measure of what is left of the engine's work (`table_rank`): for each
   queue pair, twice the WQEs the NIC has not executed, with the send WQEs written and not rung, then
-  the WQEs its rings have not heard of, and four more while its drain WQE waits. No call raises it, a CQE
-  routed lowers it, and so does each WQE the NIC executes and a drain WQE posted (`Hw::ranked_from`).
+  the WQEs its rings have not heard of, and four more while its drain WQE waits. No pass of a wait
+  raises it: a CQE routed lowers it, and so does each WQE the NIC executes and a drain WQE posted
+  (`Hw::ranked_from`).
   The wait for room in `make_send_room` goes on only while the device owes it a step, a signaled WQE
   out that M holds signaled and has not executed or whose CQE waits in the CQ (`Hw::lemma_room_owed`),
   so it ends if the device executes its send WQEs and a poll returns a CQE when the CQ holds one

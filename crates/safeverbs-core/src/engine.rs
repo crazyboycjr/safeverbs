@@ -1015,7 +1015,8 @@ impl<C, N: Nic> Engine<C, N> {
     /// [`Engine::commit`]. `open` is empty then and takes more. Returns its sequence number; if it
     /// has no WQE, the queue no room ([`Engine::open_fits`] says) or the QP does not take what it
     /// was written for (another protection domain, more WQEs than its requests may have, a READ on
-    /// an unreliable connection), `ctx` back and `open` as it was.
+    /// an unreliable connection, or nothing at all once its removal started), `ctx` back and `open`
+    /// as it was.
     pub fn close_open<T: Transport>(
         &mut self,
         qp: QpKey<T>,
