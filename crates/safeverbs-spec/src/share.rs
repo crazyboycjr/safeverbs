@@ -26,7 +26,7 @@
 //! so the per-worker views compose into executions of M.
 #![allow(unused_imports)]
 
-use crate::abs::Abs;
+use crate::abs::*;
 use crate::nic::*;
 use crate::refinement::*;
 use crate::types::*;
@@ -75,6 +75,95 @@ pub open spec fn outside_writes(m: Nic::State, sh: Share, a: int) -> bool {
             && 0 <= k < m.qps[q].rq.len() && covers(m.qps[q].rq[k].wr.sges, a)
     ||| exists|key: Key| #[trigger] m.mrs.contains_key(key) && m.mrs[key].remote_write
             && m.mrs[key].span.contains(a)
+}
+
+/// The NIC may read byte `a` for a WQE of one of the queue pairs of share `sh`.
+pub open spec fn inside_reads(m: Nic::State, sh: Share, a: int) -> bool {
+    exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+        && 0 <= k < m.qps[q].sq.len() && {
+        let wr = m.qps[q].sq[k].wr;
+        !wr.inline && !wr.opcode.writes_local() && covers(wr.sges, a)
+    }
+}
+
+/// The NIC may write byte `a` for a WQE of one of the queue pairs of share `sh`.
+pub open spec fn inside_writes(m: Nic::State, sh: Share, a: int) -> bool {
+    ||| exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+            && 0 <= k < m.qps[q].sq.len() && {
+            let wr = m.qps[q].sq[k].wr;
+            wr.opcode.writes_local() && covers(wr.sges, a)
+        }
+    ||| exists|q: QpId, k: int| #![trigger m.qps[q].rq[k]] sh.owns.contains(q) && m.qps.contains_key(q)
+            && 0 <= k < m.qps[q].rq.len() && covers(m.qps[q].rq[k].wr.sges, a)
+}
+
+/// [`coupled`] on the queue pairs of share `sh`: what one engine's state of A says of M. Its
+/// requests own disjoint WQE intervals of those queue pairs, those in flight still posted, the
+/// complete ones with M's aggregate of what retired; and what the NIC may touch for a WQE of those
+/// queue pairs, A gives it. What it may touch beyond them is [`outside_covered`].
+pub open spec fn coupled_on(a: Abs::State, m: Nic::State, sh: Share, ranges: Map<ReqId, WqeRange>) -> bool {
+    &&& forall|r: ReqId| #[trigger] a.requests.contains_key(r) ==> {
+        &&& ranges.contains_key(r)
+        &&& ranges[r].qp == a.requests[r].qp
+        &&& sh.owns.contains(ranges[r].qp)
+    }
+    &&& forall|r: ReqId| #[trigger] a.outcomes.contains_key(r) ==> ranges.contains_key(r)
+    &&& forall|r: ReqId| #[trigger] ranges.contains_key(r) ==> ranges[r].wf()
+    &&& forall|r1: ReqId, r2: ReqId| #![trigger ranges[r1], ranges[r2]]
+        ranges.contains_key(r1) && ranges.contains_key(r2) && r1 != r2
+            ==> ranges[r1].disjoint(ranges[r2])
+    &&& forall|r: ReqId| #[trigger] a.in_flight(r) ==> ranges[r].pending(m)
+    &&& forall|r: ReqId| #[trigger] a.outcomes.contains_key(r) ==> {
+        &&& ranges[r].all_retired(m.retired)
+        &&& ranges[r].aggregate(m.retired) == a.outcomes[r]
+        &&& ranges[r].no_success_after_error(m.retired)
+    }
+    &&& forall|x: int| #[trigger] inside_reads(m, sh, x) ==> a.nic_reads(x)
+    &&& forall|x: int| #[trigger] inside_writes(m, sh, x) ==> a.nic_writes(x)
+}
+
+/// Coupled on its share, with what lies beyond it A's to give and every send WQE's WR remembered,
+/// an engine's state of A is [`coupled`] to M.
+pub proof fn lemma_coupled_on(a: Abs::State, m: Nic::State, sh: Share, ranges: Map<ReqId, WqeRange>, wrs: IMap<WqeRef, SendWr>)
+    requires
+        coupled_on(a, m, sh, ranges),
+        outside_covered(a, m, sh),
+        records_wrs(m, wrs),
+    ensures
+        coupled(a, m, ranges, wrs),
+{
+    assert forall|x: int| #[trigger] m.nic_may_read(x) implies a.nic_reads(x) by {
+        if !outside_reads(m, sh, x) {
+            let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
+                && 0 <= k < m.qps[q].sq.len() && {
+                let wr = m.qps[q].sq[k].wr;
+                !wr.inline && !wr.opcode.writes_local() && covers(wr.sges, x)
+            };
+            assert(sh.owns.contains(q));
+            assert(inside_reads(m, sh, x));
+        }
+    }
+    assert forall|x: int| #[trigger] m.nic_may_write(x) implies a.nic_writes(x) by {
+        if !outside_writes(m, sh, x) {
+            if exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
+                && 0 <= k < m.qps[q].sq.len() && {
+                let wr = m.qps[q].sq[k].wr;
+                wr.opcode.writes_local() && covers(wr.sges, x)
+            } {
+                let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
+                    && 0 <= k < m.qps[q].sq.len() && {
+                    let wr = m.qps[q].sq[k].wr;
+                    wr.opcode.writes_local() && covers(wr.sges, x)
+                };
+                assert(sh.owns.contains(q));
+            } else {
+                let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].rq[k]] m.qps.contains_key(q)
+                    && 0 <= k < m.qps[q].rq.len() && covers(m.qps[q].rq[k].wr.sges, x);
+                assert(sh.owns.contains(q));
+            }
+            assert(inside_writes(m, sh, x));
+        }
+    }
 }
 
 /// What the NIC may touch beyond the queues of share `sh`, A gives it: the regions open to a peer
@@ -564,6 +653,58 @@ pub proof fn lemma_rely_fewer_pins(sh: Share, pins: ISet<Key>, fewer: ISet<Key>,
         assert(foreign(sh, pins, steps[i]));
     }
     assert(rely_run(sh, fewer, run, steps));
+}
+
+// =========================================================================================
+// One device
+
+/// A step of the device the engine of share `sh` did not take: a verb of another engine on its own
+/// share, apart from `sh`, or a step of the NIC itself or of the control path (protection domains
+/// and memory regions).
+pub open spec fn elsewhere(sh: Share, step: Nic::Step) -> bool {
+    ||| exists|other: Share| #[trigger] disjoint(other, sh) && mine(other, ISet::full(), step)
+    ||| is_nic_step(step)
+    ||| step is alloc_pd || step is reg_mr || step is dereg_mr
+}
+
+/// The device went from `m` to `n` by steps the engine of share `sh` did not take: the device's
+/// history between two moments, as that engine sees it.
+pub open spec fn interleaved(sh: Share, m: Nic::State, n: Nic::State) -> bool {
+    exists|run: Seq<Nic::State>, steps: Seq<Nic::Step>| {
+        &&& run.len() > 0
+        &&& run[0] == m
+        &&& run.last() == n
+        &&& steps.len() == run.len() - 1
+        &&& forall|i: int| 0 <= i < steps.len()
+            ==> elsewhere(sh, #[trigger] steps[i]) && nic_step(run[i], run[i + 1], steps[i])
+    }
+}
+
+/// **One device, one run of M.** The interleaving of other engines' verbs, each on its own share,
+/// with the steps of the NIC and of the control path, is a run of M that touches none of the share
+/// of the engine that saw it: its rely, with no region it must keep.
+pub proof fn lemma_interleaved(sh: Share, m: Nic::State, n: Nic::State)
+    requires
+        interleaved(sh, m, n),
+    ensures
+        rely_reaches(sh, ISet::empty(), m, n),
+{
+    let (run, steps) = choose|run: Seq<Nic::State>, steps: Seq<Nic::Step>| {
+        &&& run.len() > 0
+        &&& run[0] == m
+        &&& run.last() == n
+        &&& steps.len() == run.len() - 1
+        &&& forall|i: int| 0 <= i < steps.len()
+            ==> elsewhere(sh, #[trigger] steps[i]) && nic_step(run[i], run[i + 1], steps[i])
+    };
+    assert forall|i: int| 0 <= i < steps.len()
+        implies foreign(sh, ISet::empty(), #[trigger] steps[i]) && nic_step(run[i], run[i + 1], steps[i]) by {
+        if exists|other: Share| #[trigger] disjoint(other, sh) && mine(other, ISet::full(), steps[i]) {
+            let other = choose|other: Share| #[trigger] disjoint(other, sh) && mine(other, ISet::full(), steps[i]);
+            lemma_mine_is_foreign(other, ISet::full(), sh, ISet::empty(), steps[i]);
+        }
+    }
+    assert(rely_run(sh, ISet::empty(), run, steps));
 }
 
 // =========================================================================================

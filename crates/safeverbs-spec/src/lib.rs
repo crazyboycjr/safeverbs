@@ -17,7 +17,9 @@
 //!    fit together.
 //! 5. [`share`]: each worker's share of M, and what the threads of one device rely on and
 //!    guarantee each other.
-//! 6. [`examples`]: concrete executions of A and M.
+//! 6. [`compose`]: several engines on one device, and the buffers exposed to a peer, as one state
+//!    of A coupled to M.
+//! 7. [`examples`]: concrete executions of A and M.
 //!
 //! [`types`] holds what A and M share; [`abs_proofs`] and [`nic_proofs`] hold the proofs
 //! that their invariants are inductive.
@@ -31,6 +33,7 @@
 
 pub mod abs;
 pub mod abs_proofs;
+pub mod compose;
 pub mod examples;
 pub mod guarantees;
 pub mod nic;
