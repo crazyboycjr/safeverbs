@@ -214,6 +214,35 @@ impl<T, N: Nic> Buf<T, N> {
         super::lease::frozen_apart_from_nic(&self.frozen, hw);
     }
 
+    /// A frozen buffer the program holds shares no byte with a unique lease an engine's requests
+    /// hold, on the device as a whole (`safeverbs_spec::compose::lemma_device_s1`).
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn apart_from_engine<C>(&self, hw: &crate::hw::Hw<C, N>)
+        requires
+            hw.inv(),
+        ensures
+            forall|l: safeverbs_spec::abs::LeaseId| #[trigger] safeverbs_spec::compose::lent(hw.part().abs, l)
+                && hw.part().abs.leases[l].unique
+                ==> hw.part().abs.leases[l].mem.disjoint(self.byte_domain().to_iset()),
+    {
+        proof {
+            use_type_invariant(self);
+            self.lemma_byte_backing();
+        }
+        super::lease::frozen_apart_from_engine(&self.frozen, hw);
+        proof {
+            assert forall|l: safeverbs_spec::abs::LeaseId| #[trigger] safeverbs_spec::compose::lent(hw.part().abs, l)
+                && hw.part().abs.leases[l].unique
+                implies hw.part().abs.leases[l].mem.disjoint(self.byte_domain().to_iset()) by {
+                assert forall|y: int| !(hw.part().abs.leases[l].mem.contains(y) && self.byte_domain().to_iset().contains(y)) by {
+                    if self.byte_domain().contains(y) {
+                        assert((*self.frozen).byte_domain().contains(y));
+                    }
+                }
+            }
+        }
+    }
+
     /// The elements `[start, end)` by reference, if they are within it.
     #[inline]
     pub(super) fn view_elements(&self, start: usize, end: usize) -> (r: Option<BufView<'_, T, N>>)

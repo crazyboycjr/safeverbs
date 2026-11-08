@@ -3940,28 +3940,33 @@ impl<C, N: Device> Hw<C, N> {
         }
     }
 
-    /// A unique buffer apart from what keeps the engine's requests alive is apart from every lease
-    /// they hold.
-    pub(crate) proof fn lemma_unique_apart(&self, x: Resource<N>)
+    /// A buffer apart from what keeps the engine's requests alive shares no byte with a lease they
+    /// hold where either is unique: what keeps the lease alive is apart from it, or is its frozen
+    /// allocation, in which a unique lease has no bytes.
+    pub(crate) proof fn lemma_keeper_apart(&self, x: Resource<N>)
         requires
             self.inv(),
             self.table_apart(x),
-            x.unique(),
         ensures
-            forall|l: LeaseId| #[trigger] lent(self.part().abs, l)
+            forall|l: LeaseId| #[trigger] lent(self.part().abs, l) && (x.unique() || self.part().abs.leases[l].unique)
                 ==> self.part().abs.leases[l].mem.disjoint(x.byte_domain().to_iset()),
     {
         let a = self.refined@.abs;
         let m = self.token@.nic();
         self.lemma_table_kept();
-        assert forall|l: LeaseId| #[trigger] lent(a, l) implies a.leases[l].mem.disjoint(x.byte_domain().to_iset()) by {
+        assert forall|l: LeaseId| #[trigger] lent(a, l) && (x.unique() || a.leases[l].unique)
+            implies a.leases[l].mem.disjoint(x.byte_domain().to_iset()) by {
             let k = lemma_lent_hold(self.qps@, m, self.refined@, l);
             lemma_table_hold_apart(self.qps@, m, x, k, l);
             let hold = leases_of(table_view(self.qps@, m), lent_holds(), k)[l];
-            assert forall|y: int| !(a.leases[l].mem.contains(y) && x.byte_domain().to_iset().contains(y)) by {
-                if a.leases[l].mem.contains(y) {
-                    assert(hold.kept.contains(y));
+            if hold.kept.disjoint(x.byte_domain().to_iset()) {
+                assert forall|y: int| !(a.leases[l].mem.contains(y) && x.byte_domain().to_iset().contains(y)) by {
+                    if a.leases[l].mem.contains(y) {
+                        assert(hold.kept.contains(y));
+                    }
                 }
+            } else {
+                lemma_unique_hold(self.qps@, m, self.refined@, k, l);
             }
         }
     }
@@ -4355,16 +4360,24 @@ pub open spec fn later<C, D, N: Device>(e: Hw<C, N>, f: Hw<D, N>) -> Nic::State 
     }
 }
 
-/// **Theorem 1, of two engines on one device and a buffer exposed to a peer.** The engines may have
-/// contexts of different types, as a program's do. What each says of itself (`Hw::lemma_part`),
-/// what their linear permissions and their device's one history say of the pair
-/// (`Hw::separate_engines`), and what the exposed buffer's permission says (`Exposed::separate_from`)
-/// are what [`theorem_1_device`] asks; that M has nothing else (`accounted`) is what only the program
-/// as a whole can say. So the device stands for one state of A, reached from its start, coupled to M,
-/// with both engines' requests as their own A has them. It exists in Verus builds alone.
+/// **Theorem 1, of two engines on one device, a buffer exposed to a peer and buffers the program
+/// holds.** The engines may have contexts of different types, as a program's do. What each says of
+/// itself (`Hw::lemma_part`), what their linear permissions and their device's one history say of the
+/// pair (`Hw::separate_engines`), and what the buffers' permissions say (`Exposed::separate_from`,
+/// `apart_from_engine`, `Exposed::separate_buf_mut`, `Exposed::separate_buf`) are what
+/// [`theorem_1_device`] and [`lemma_device_s1`] ask; that M has nothing else (`accounted`) is what
+/// only the program as a whole can say. So the device stands for one state of A, reached from its
+/// start, coupled to M, with both engines' requests as their own A has them, and the NIC touches no
+/// byte of the program's buffers in a conflicting way. It exists in Verus builds alone.
 #[cfg(verus_keep_ghost)]
 #[allow(dead_code)]
-fn example_device<C, D, N: Device, T>(e: Hw<C, N>, f: Hw<D, N>, x: crate::buf::Exposed<T, N>)
+fn example_device<C, D, N: Device, T, U, V>(
+    e: Hw<C, N>,
+    f: Hw<D, N>,
+    x: crate::buf::Exposed<T, N>,
+    unique: crate::buf::BufMut<U, N>,
+    frozen: crate::buf::Buf<V, N>,
+)
     requires
         e.inv(),
         f.inv(),
@@ -4375,6 +4388,12 @@ fn example_device<C, D, N: Device, T>(e: Hw<C, N>, f: Hw<D, N>, x: crate::buf::E
     let mut x = x;
     x.separate_from(&e);
     x.separate_from(&f);
+    x.separate_buf_mut(&unique);
+    x.separate_buf(&frozen);
+    let unique = unique.apart_from_engine(&e);
+    let unique = unique.apart_from_engine(&f);
+    frozen.apart_from_engine(&e);
+    frozen.apart_from_engine(&f);
     let mut f = f;
     f.separate_engines(&e);
     proof {
@@ -4403,6 +4422,10 @@ fn example_device<C, D, N: Device, T>(e: Hw<C, N>, f: Hw<D, N>, x: crate::buf::E
         }
         assert(device_ok(parts, exposed, h));
         theorem_1_device(parts, exposed, h, wrs);
+        // The buffers the program holds.
+        assert(parts[0] == e.part() && parts[1] == f.part() && exposed[0] == x.bytes());
+        lemma_device_s1(parts, exposed, h, unique.byte_domain().to_iset(), true);
+        lemma_device_s1(parts, exposed, h, frozen.byte_domain().to_iset(), false);
     }
 }
 

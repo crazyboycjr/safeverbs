@@ -407,6 +407,23 @@ impl<T, N: Nic> BufMut<T, N> {
         }
         BufMut { raw: lease::unique_apart_from_nic(self.raw, hw), _t: PhantomData }
     }
+
+    /// A unique buffer the program holds shares no byte with a lease an engine's requests hold, on
+    /// the device as a whole (`safeverbs_spec::compose::lemma_device_s1`).
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn apart_from_engine<C>(self, hw: &crate::hw::Hw<C, N>) -> (same: Self)
+        requires
+            hw.inv(),
+        ensures
+            same == self,
+            forall|l: LeaseId| #[trigger] lent(hw.part().abs, l)
+                ==> hw.part().abs.leases[l].mem.disjoint(self.byte_domain().to_iset()),
+    {
+        proof {
+            use_type_invariant(&self);
+        }
+        BufMut { raw: lease::unique_apart_from_engine(self.raw, hw), _t: PhantomData }
+    }
 }
 
 /// Releases what it is given.
@@ -915,36 +932,96 @@ impl<T, N: Nic> Exposed<T, N> {
     }
 }
 
-/// Two exposed buffers own different bytes: their linear permissions. It changes nothing, and
-/// exists in Verus builds alone.
-#[cfg(verus_keep_ghost)]
-pub(crate) fn exposures_apart<T, U, N: Nic>(x: &mut Exposed<T, N>, y: &Exposed<U, N>)
-    ensures
-        *final(x) == *old(x),
-        old(x).bytes().disjoint(y.bytes()),
-{
-    match (x.inner.take(), &y.inner) {
-        (Some(exposure), Some(other)) => {
-            let Exposure { mr, buf, rkey } = exposure;
-            proof {
-                use_type_invariant(&buf);
-                use_type_invariant(&other.buf);
-            }
-            let BufMut { raw, _t } = buf;
-            let mut raw = raw;
-            proof {
-                use_type_invariant(&raw);
-                use_type_invariant(&other.buf.raw);
-            }
-            raw.disjoint(&other.buf.raw);
-            proof {
-                assert forall|b: int| !(raw.byte_domain().to_iset().contains(b) && other.buf.raw.byte_domain().to_iset().contains(b)) by {
-                    assert(!(raw.byte_domain().contains(b) && other.buf.raw.byte_domain().contains(b)));
+impl<T, N: Nic> Exposed<T, N> {
+    /// The exposed buffer owns no byte that `other` owns: their linear permissions, its own borrowed
+    /// exclusively. It changes nothing, and exists in Verus builds alone.
+    #[cfg(verus_keep_ghost)]
+    fn separate_raw(&mut self, other: &RawMut<N>)
+        requires
+            other.inv(),
+        ensures
+            *final(self) == *old(self),
+            old(self).bytes().disjoint(other.byte_domain().to_iset()),
+    {
+        match self.inner.take() {
+            Some(exposure) => {
+                let Exposure { mr, buf, rkey } = exposure;
+                proof {
+                    use_type_invariant(&buf);
+                }
+                let BufMut { raw, _t } = buf;
+                let mut raw = raw;
+                proof {
+                    use_type_invariant(&raw);
+                }
+                raw.disjoint(other);
+                proof {
+                    assert forall|b: int| !(raw.byte_domain().to_iset().contains(b) && other.byte_domain().to_iset().contains(b)) by {
+                        assert(!(raw.byte_domain().contains(b) && other.byte_domain().contains(b)));
+                    }
+                }
+                self.inner = Some(Exposure { mr, buf: BufMut { raw, _t }, rkey });
+            },
+            None => {},
+        }
+    }
+
+    /// Two exposed buffers own different bytes. It changes nothing, and exists in Verus builds alone.
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn separate_exposed<U>(&mut self, other: &Exposed<U, N>)
+        ensures
+            *final(self) == *old(self),
+            old(self).bytes().disjoint(other.bytes()),
+    {
+        match &other.inner {
+            Some(e) => {
+                proof {
+                    use_type_invariant(&e.buf);
+                    use_type_invariant(&e.buf.raw);
+                }
+                self.separate_raw(&e.buf.raw);
+            },
+            None => {},
+        }
+    }
+
+    /// An exposed buffer owns no byte of a unique buffer the program holds. It changes nothing, and
+    /// exists in Verus builds alone.
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn separate_buf_mut<U>(&mut self, other: &BufMut<U, N>)
+        ensures
+            *final(self) == *old(self),
+            old(self).bytes().disjoint(other.byte_domain().to_iset()),
+    {
+        proof {
+            use_type_invariant(other);
+            use_type_invariant(&other.raw);
+        }
+        self.separate_raw(&other.raw);
+    }
+
+    /// An exposed buffer owns no byte of a frozen buffer the program holds. It changes nothing, and
+    /// exists in Verus builds alone.
+    #[cfg(verus_keep_ghost)]
+    pub(crate) fn separate_buf<U>(&mut self, other: &Buf<U, N>)
+        ensures
+            *final(self) == *old(self),
+            old(self).bytes().disjoint(other.byte_domain().to_iset()),
+    {
+        proof {
+            use_type_invariant(other);
+            other.lemma_byte_backing();
+            use_type_invariant(&*other.frozen);
+            other.frozen.lemma_contents();
+        }
+        self.separate_raw(&other.frozen.raw);
+        proof {
+            assert forall|b: int| !(old(self).bytes().contains(b) && other.byte_domain().to_iset().contains(b)) by {
+                if other.byte_domain().contains(b) {
+                    assert((*other.frozen).byte_domain().contains(b));
                 }
             }
-            x.inner = Some(Exposure { mr, buf: BufMut { raw, _t }, rkey });
-        },
-        (taken, _) => x.inner = taken,
+        }
     }
 }
 

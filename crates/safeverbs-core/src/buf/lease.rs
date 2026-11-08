@@ -184,11 +184,29 @@ pub(super) fn unique_apart_from_engine<C, N: Nic>(raw: RawMut<N>, hw: &crate::hw
     hw.separate_lease(&mut lease);
     proof {
         assert(lease.observation().unique() && lease.observation().byte_domain() == whole);
-        hw.lemma_unique_apart(lease.observation());
+        hw.lemma_keeper_apart(lease.observation());
     }
     match lease {
         Lease::Unique(same) => same,
         Lease::Shared(_) => vstd::pervasive::unreached(),
+    }
+}
+
+/// A frozen allocation shares no byte with a unique lease the requests of `hw` hold.
+#[cfg(verus_keep_ghost)]
+pub(super) fn frozen_apart_from_engine<C, N: Nic>(frozen: &Arc<Frozen<N>>, hw: &crate::hw::Hw<C, N>)
+    requires
+        hw.inv(),
+    ensures
+        forall|l: safeverbs_spec::abs::LeaseId| #[trigger] safeverbs_spec::compose::lent(hw.part().abs, l)
+            && hw.part().abs.leases[l].unique
+            ==> hw.part().abs.leases[l].mem.disjoint((**frozen).byte_domain().to_iset()),
+{
+    let mut lease = Lease::Shared(frozen.clone());
+    hw.separate_lease(&mut lease);
+    proof {
+        assert(lease.observation().byte_domain() == (**frozen).byte_domain());
+        hw.lemma_keeper_apart(lease.observation());
     }
 }
 

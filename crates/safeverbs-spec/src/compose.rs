@@ -1053,6 +1053,83 @@ proof fn lemma_device_coupled(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, m
     }
 }
 
+/// **S1 of a buffer the program holds, on the device.** A buffer that shares no byte with a unique
+/// lease of an engine's requests, nor with any of their leases if it is unique, nor with an exposed
+/// buffer: the NIC writes none of its bytes, and if it is unique, reads none either.
+pub proof fn lemma_device_s1(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>, m: Nic::State, bytes: ISet<int>, unique: bool)
+    requires
+        device_ok(parts, exposed, m),
+        forall|i: int, l: LeaseId| #![trigger parts[i].abs.leases[l]]
+            0 <= i < parts.len() && lent(parts[i].abs, l) && (unique || parts[i].abs.leases[l].unique)
+                ==> parts[i].abs.leases[l].mem.disjoint(bytes),
+        forall|j: int| 0 <= j < exposed.len() ==> (#[trigger] exposed[j]).disjoint(bytes),
+    ensures
+        forall|x: int| #[trigger] bytes.contains(x) ==> !m.nic_may_write(x) && (unique ==> !m.nic_may_read(x)),
+{
+    assert forall|x: int| #[trigger] bytes.contains(x) implies !m.nic_may_write(x) && (unique ==> !m.nic_may_read(x)) by {
+        if m.nic_may_write(x) {
+            let sq = exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
+                && 0 <= k < m.qps[q].sq.len() && {
+                let wr = m.qps[q].sq[k].wr;
+                wr.opcode.writes_local() && covers(wr.sges, x)
+            };
+            let rq = exists|q: QpId, k: int| #![trigger m.qps[q].rq[k]] m.qps.contains_key(q)
+                && 0 <= k < m.qps[q].rq.len() && covers(m.qps[q].rq[k].wr.sges, x);
+            if sq || rq {
+                let q = if sq {
+                    let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
+                        && 0 <= k < m.qps[q].sq.len() && {
+                        let wr = m.qps[q].sq[k].wr;
+                        wr.opcode.writes_local() && covers(wr.sges, x)
+                    };
+                    q
+                } else {
+                    let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].rq[k]] m.qps.contains_key(q)
+                        && 0 <= k < m.qps[q].rq.len() && covers(m.qps[q].rq[k].wr.sges, x);
+                    q
+                };
+                let i = choose|i: int| 0 <= i < parts.len() && #[trigger] parts[i].share.owns.contains(q);
+                assert(part_ok(parts[i], m));
+                assert(inside_writes(m, parts[i].share, x));
+                let pa = parts[i].abs;
+                let l = choose|l: LeaseId| #[trigger] pa.leases.contains_key(l) && pa.nic_writes_lease(l) && pa.leases[l].mem.contains(x);
+                assert(pa.leases[l].holder is Request && pa.leases[l].unique);
+                assert(pa.leases[l].mem.disjoint(bytes));
+            } else {
+                let key = choose|key: Key| #[trigger] m.mrs.contains_key(key) && m.mrs[key].remote_write
+                    && m.mrs[key].span.contains(x);
+                let j = choose|j: int| 0 <= j < exposed.len() && m.mrs[key].span.bytes().subset_of(#[trigger] exposed[j]);
+                assert(m.mrs[key].span.bytes().contains(x));
+            }
+        }
+        if unique && m.nic_may_read(x) {
+            if exists|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
+                && 0 <= k < m.qps[q].sq.len() && {
+                let wr = m.qps[q].sq[k].wr;
+                !wr.inline && !wr.opcode.writes_local() && covers(wr.sges, x)
+            } {
+                let (q, k) = choose|q: QpId, k: int| #![trigger m.qps[q].sq[k]] m.qps.contains_key(q)
+                    && 0 <= k < m.qps[q].sq.len() && {
+                    let wr = m.qps[q].sq[k].wr;
+                    !wr.inline && !wr.opcode.writes_local() && covers(wr.sges, x)
+                };
+                let i = choose|i: int| 0 <= i < parts.len() && #[trigger] parts[i].share.owns.contains(q);
+                assert(part_ok(parts[i], m));
+                assert(inside_reads(m, parts[i].share, x));
+                let pa = parts[i].abs;
+                let l = choose|l: LeaseId| #[trigger] pa.leases.contains_key(l) && pa.nic_reads_lease(l) && pa.leases[l].mem.contains(x);
+                assert(pa.leases[l].holder is Request);
+                assert(pa.leases[l].mem.disjoint(bytes));
+            } else {
+                let key = choose|key: Key| #[trigger] m.mrs.contains_key(key) && m.mrs[key].remote_read
+                    && m.mrs[key].span.contains(x);
+                let j = choose|j: int| 0 <= j < exposed.len() && m.mrs[key].span.bytes().subset_of(#[trigger] exposed[j]);
+                assert(m.mrs[key].span.bytes().contains(x));
+            }
+        }
+    }
+}
+
 /// **Theorem 1, of a device.** Engines coupled to M on disjoint shares, whose requests' buffers are
 /// apart where one is unique, and buffers exposed to a peer, apart from those and from each other,
 /// with nothing else in M: they stand for one state of A, reached from its start, in which each
