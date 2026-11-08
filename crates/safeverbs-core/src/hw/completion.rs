@@ -242,9 +242,9 @@ impl<C, N: Device> HwQp<C, N> {
         &&& self.send.spec_max_wqes() == pre.send.spec_max_wqes()
     }
 
-    /// The same QP as `pre`, as far as the coupling reads it, but for its rings and what was
-    /// written on it.
-    pub(super) open spec fn same_qp(&self, pre: Self) -> bool {
+    /// The same QP as `pre`, as far as the coupling reads it, but for its rings, what was written
+    /// on it and its removal.
+    pub(super) open spec fn same_core(&self, pre: Self) -> bool {
         &&& self.same_config(pre)
         &&& qp_of(self.hw) == qp_of(pre.hw)
         &&& self.pd == pre.pd
@@ -253,6 +253,16 @@ impl<C, N: Device> HwQp<C, N> {
         &&& self.spare_leases@.len() == 0
         &&& self.spare_wqes@.len() == 0 || self.spare_wqes@.len() == self.send.spec_max_wqes()
         &&& self.building@.len() <= MAX_SGES
+    }
+
+    /// [`HwQp::same_core`], its removal as it was too, taking no work it did not.
+    pub(super) open spec fn same_qp(&self, pre: Self) -> bool {
+        &&& self.same_core(pre)
+        &&& self.takes_work ==> pre.takes_work
+        &&& self.removed == pre.removed
+        &&& self.drain_pending == pre.drain_pending
+        &&& self.flushing == pre.flushing
+        &&& self.turned_down == pre.turned_down
     }
 
     /// Hands the completion `wc` of WQE `e.seq`, in flight, to the ring of its queue, which retires
@@ -287,11 +297,13 @@ impl<C, N: Device> HwQp<C, N> {
         }
     }
 
-    /// A change of the rings that leaves their requests kept leaves the QP coupled.
+    /// A change of the rings that leaves their requests kept leaves the QP coupled, and so does a
+    /// change of its removal that [`drain_ok`] allows.
     pub(super) proof fn lemma_kept(&self, pre: &Self, index: u16, m: Nic::State, sh: Share, written: Seq<SendWr>)
         requires
             pre.ok(index, m, sh, pre.started, written),
-            self.same_qp(*pre),
+            self.same_core(*pre),
+            self.same_qp(*pre) || drain_ok(*self, m.qps[pre.id()]),
             self.started == pre.started,
             self.send_tails == pre.send_tails,
             ring_kept(self.send, pre.send),
@@ -807,7 +819,8 @@ pub(super) proof fn lemma_table_kept<C, N: Device>(pre: Seq<Option<HwQp<C, N>>>,
         post.len() == pre.len(),
         forall|k: int| 0 <= k < pre.len() && k != i ==> #[trigger] post[k] == pre[k],
         post[i] is Some,
-        post[i]->0.same_qp(pre[i]->0),
+        post[i]->0.same_core(pre[i]->0),
+        post[i]->0.same_qp(pre[i]->0) || drain_ok(post[i]->0, m.qps[pre[i]->0.id()]),
         post[i]->0.started == pre[i]->0.started,
         post[i]->0.send_tails == pre[i]->0.send_tails,
         ring_kept(post[i]->0.send, pre[i]->0.send),
@@ -1462,7 +1475,8 @@ impl<C, N: Device> Hw<C, N> {
     {
     }
 
-    /// A change of entry `index` in what the coupling does not read leaves the invariant.
+    /// A change of entry `index` in what the coupling does not read leaves the invariant, and so
+    /// does a change of its removal that [`drain_ok`] allows.
     pub(super) proof fn lemma_flags_only(&self, pre: &Self, index: int)
         requires
             pre.inv(),
@@ -1470,7 +1484,9 @@ impl<C, N: Device> Hw<C, N> {
             self.qps@.len() == pre.qps@.len(),
             forall|k: int| 0 <= k < pre.qps@.len() && k != index ==> #[trigger] self.qps@[k] == pre.qps@[k],
             self.qps@[index] is Some,
-            self.qps@[index]->0.same_qp(pre.qps@[index]->0),
+            self.qps@[index]->0.same_core(pre.qps@[index]->0),
+            self.qps@[index]->0.same_qp(pre.qps@[index]->0)
+                || drain_ok(self.qps@[index]->0, pre.nic().qps[pre.qps@[index]->0.id()]),
             self.qps@[index]->0.started == pre.qps@[index]->0.started,
             self.qps@[index]->0.send_tails == pre.qps@[index]->0.send_tails,
             self.qps@[index]->0.send == pre.qps@[index]->0.send,

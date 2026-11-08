@@ -401,10 +401,9 @@ impl<C, N: Device> Hw<C, N> {
             && #[trigger] unexecuted(self.token@.nic(), w)
     }
 
-    /// **A wait for room that goes on is owed a step.** With every CQE read routed and nothing
-    /// written and not rung, a send queue without room has a signaled WQE out
-    /// (`Ring::lemma_room_or_signal`), which M holds signaled (`send_outcomes::signals_ok`), past
-    /// everything its ring heard of: the NIC has not executed it, or its CQE waits in the CQ.
+    /// **A wait for room that goes on is owed a step.** A send queue without room has a signaled
+    /// WQE out (`Ring::lemma_room_or_signal`), and so the device owes it a step
+    /// ([`Hw::lemma_signal_owed`]).
     pub(super) proof fn lemma_room_owed(&self, index: int, wqes: u32)
         requires
             self.inv(),
@@ -412,6 +411,25 @@ impl<C, N: Device> Hw<C, N> {
             self.rung(index),
             self.waits_for_room(index, wqes),
             1 <= wqes <= self.qps@[index]->0.send.spec_max_wqes(),
+        ensures
+            self.owed_send(index),
+    {
+        assert(qp_ok(self.qps@[index], index, self.token@, self.token@.nic()));
+        self.qps@[index]->0.send.lemma_room_or_signal();
+        self.lemma_signal_owed(index);
+    }
+
+    /// **A signaled WQE out is owed a step.** With every CQE read routed and nothing written and not
+    /// rung on QP `index`'s send queue, the request its ring signaled last, while out, is in flight
+    /// past everything the ring heard of, and M holds it signaled (`send_outcomes::signals_ok`): the
+    /// NIC has not executed it, or its CQE waits in the CQ.
+    pub(super) proof fn lemma_signal_owed(&self, index: int)
+        requires
+            self.inv(),
+            self.all_routed(),
+            self.rung(index),
+            self.has_qp(index),
+            self.qps@[index]->0.send.spec_signal_out(),
         ensures
             self.owed_send(index),
     {
@@ -425,7 +443,6 @@ impl<C, N: Device> Hw<C, N> {
         let r = e.send;
         reveal(send_outcomes::send_results);
         r.lemma_wqes();
-        r.lemma_room_or_signal();
         r.lemma_signal();
         r.lemma_view();
         // The request the ring signaled last is in flight, past all the ring heard of.
@@ -570,6 +587,210 @@ pub proof fn theorem_room_ends<C, N: Device>(passes: spec_fn(nat) -> (Hw<C, N>, 
         assert(b.moved_on(&a, index));
         b.lemma_ranked_rank(&a, index);
         assert(rank(k) == rank(settled) && rank(k + 1) == rank(settled));
+    }
+}
+
+// =============================================================================
+// The drain
+
+impl<C, N: Device> Hw<C, N> {
+    /// QP `index` is in M's error state and ready to take work there, as [`Hw::set_error`] leaves
+    /// it.
+    pub open(super) spec fn in_error(&self, index: int) -> bool {
+        &&& self.has_qp(index)
+        &&& self.token@.nic().qps[self.qps@[index]->0.id()].state is Err
+        &&& self.qps@[index]->0.phase == Phase::Ready
+    }
+
+    /// QP `index` is not being removed, and nothing is written on it and not rung.
+    pub open(super) spec fn unwritten(&self, index: int) -> bool {
+        &&& self.has_qp(index)
+        &&& !self.qps@[index]->0.removed
+        &&& !self.qps@[index]->0.started
+    }
+
+    /// QP `index`, if there is one, is being removed.
+    pub open(super) spec fn removed_at(&self, index: int) -> bool {
+        self.has_qp(index) ==> self.qps@[index]->0.removed
+    }
+
+    /// Nothing is written on QP `index`, if there is one, and not rung.
+    pub open(super) spec fn unstarted(&self, index: int) -> bool {
+        self.has_qp(index) ==> !self.qps@[index]->0.started
+    }
+
+    /// Calls on QP `index` since `older` left the other entries and the CQEs read as they were.
+    pub open(super) spec fn others_kept(&self, older: &Self, index: int) -> bool {
+        &&& self.qps@.len() == older.qps@.len()
+        &&& forall|i: int| 0 <= i < older.qps@.len() && i != index ==> #[trigger] self.qps@[i] == older.qps@[i]
+        &&& self.pending == older.pending
+    }
+
+    /// QP `index`'s removal is as it was in `older`.
+    pub open(super) spec fn removal_kept(&self, older: &Self, index: int) -> bool {
+        older.has_qp(index) ==> {
+            let (e, f) = (self.qps@[index]->0, older.qps@[index]->0);
+            &&& e.removed == f.removed
+            &&& e.drain_pending == f.drain_pending
+            &&& e.flushing == f.flushing
+            &&& e.turned_down == f.turned_down
+        }
+    }
+
+    /// QP `index`'s doorbell rang over `older`: what was written on its send queue is in flight, and
+    /// the request its ring signaled last is as it was.
+    pub open(super) spec fn rang_over(&self, older: &Self, index: int) -> bool {
+        older.has_qp(index) ==> {
+            let (r, r0) = (self.qps@[index]->0.send, older.qps@[index]->0.send);
+            &&& r.spec_wqe_committed() == r0.spec_wqe_posted()
+            &&& r.spec_sig_end() == r0.spec_sig_end()
+        }
+    }
+
+    /// QP `index`'s drain WQE is written and not rung: its removal moved it to the error state, and
+    /// the WQE is the last request written, signaled.
+    pub open(super) spec fn drain_written(&self, index: int) -> bool {
+        &&& self.has_qp(index)
+        &&& {
+            let e = self.qps@[index]->0;
+            &&& e.flushing@ && e.started && e.drain_pending
+            &&& e.send.spec_sig_end() == e.send.spec_wqe_posted()
+        }
+    }
+
+    /// QP `index`'s drain WQE was written over `older`, or before it, M as it was: what is left of
+    /// the QP's work rose at most by that WQE, written and not rung, and its ring not hearing of it.
+    pub open(super) spec fn drain_staged(&self, older: &Self, index: int) -> bool {
+        &&& self.others_kept(older, index)
+        &&& self.token@.nic() == older.token@.nic()
+        &&& older.has_qp(index)
+        &&& self.qps@[index]->0.id() == older.qps@[index]->0.id()
+        &&& self.qps@[index]->0.drain_pending == older.qps@[index]->0.drain_pending
+        &&& rank(self.qps@[index]->0, self.token@.nic()) <= rank(older.qps@[index]->0, older.token@.nic()) + 3
+    }
+
+    /// What a try at QP `index`'s drain WQE leaves ([`Hw::post_drain`]): nothing written and not
+    /// rung once its removal moved it to the error state, and a drain WQE that still waits has no
+    /// free slot or no room, or the device turned its doorbell down.
+    pub open(super) spec fn drain_tried(&self, index: int) -> bool {
+        self.has_qp(index) ==> {
+            let e = self.qps@[index]->0;
+            let r = e.send;
+            &&& e.flushing@ ==> !e.started
+            &&& e.drain_pending && !e.turned_down@ ==> !(r.spec_has_free_slot()
+                && r.spec_wqe_posted() - r.spec_wqe_retired() < r.spec_depth())
+        }
+    }
+
+    /// QP `index` is being removed and has work in flight, or its drain WQE to post: what
+    /// [`Hw::draining`] says, and what `Engine::drain` waits on.
+    pub open(super) spec fn drains_at(&self, index: int) -> bool {
+        &&& self.has_qp(index)
+        &&& {
+            let e = self.qps@[index]->0;
+            &&& e.removed
+            &&& e.drain_pending || e.send.spec_wqe_posted() > e.send.spec_wqe_retired()
+                || e.recv.spec_wqe_posted() > e.recv.spec_wqe_retired()
+        }
+    }
+
+    /// One of the QPs from `from` up to `to` drains.
+    pub open(super) spec fn drains(&self, from: int, to: int) -> bool {
+        exists|i: int| from <= i < to && #[trigger] self.drains_at(i)
+    }
+
+    /// QP `index` is being removed, with nothing in flight and nothing written: what
+    /// [`Hw::destroy`] destroys.
+    pub open(super) spec fn destroyable(&self, index: int) -> bool {
+        &&& self.has_qp(index)
+        &&& {
+            let e = self.qps@[index]->0;
+            &&& e.removed && !e.started
+            &&& e.send.spec_wqe_posted() == e.send.spec_wqe_retired()
+            &&& e.recv.spec_wqe_posted() == e.recv.spec_wqe_retired()
+        }
+    }
+
+    /// The device turned down a verb of QP `index`'s removal.
+    pub open(super) spec fn turned_down_at(&self, index: int) -> bool {
+        self.has_qp(index) && self.qps@[index]->0.turned_down@
+    }
+
+    /// The device turned down a verb of the removal of one of the QPs from `from` up to `to`.
+    pub open(super) spec fn turned_down_in(&self, from: int, to: int) -> bool {
+        exists|i: int| from <= i < to && #[trigger] self.turned_down_at(i)
+    }
+
+    /// QP `index`'s drain WQE waits for a slot of its send ring: none is free (they are held by
+    /// requests the device refused, behind work in flight, or its counters reached their end).
+    pub open(super) spec fn lacks_slot_at(&self, index: int) -> bool {
+        self.has_qp(index) && self.qps@[index]->0.drain_pending && !self.qps@[index]->0.send.spec_has_free_slot()
+    }
+
+    /// The drain WQE of one of the QPs from `from` up to `to` waits for a slot.
+    pub open(super) spec fn lacks_slot_in(&self, from: int, to: int) -> bool {
+        exists|i: int| from <= i < to && #[trigger] self.lacks_slot_at(i)
+    }
+
+    /// The device owes the drain of QP `index` a step: the engine's CQ holds a CQE for a poll to
+    /// return, or the QP, in the error state, holds a WQE the NIC has not executed.
+    pub open(super) spec fn owed_flush(&self, index: int) -> bool {
+        &&& self.has_qp(index)
+        &&& {
+            let (m, q) = (self.token@.nic(), self.qps@[index]->0.id());
+            ||| self.cq_holds()
+            ||| m.qps[q].state is Err && exists|w: WqeRef| w.qp == q && #[trigger] unexecuted(m, w)
+        }
+    }
+
+    /// The device owes the drain of one of the QPs from `from` up to `to` a step.
+    pub open(super) spec fn owed_in(&self, from: int, to: int) -> bool {
+        exists|i: int| from <= i < to && #[trigger] self.owed_flush(i)
+    }
+
+    /// The doorbell of QP `index`'s drain WQE rang: from `start` (the WQE written over it, `staged`,
+    /// then rung, `rung`) to `self` (it waits no more), what is left of the QP's work fell by two
+    /// for each WQE the NIC executed, and by one more.
+    pub(super) proof fn lemma_drain_rung(&self, rung: &Self, staged: &Self, start: &Self, index: int)
+        requires
+            staged.drain_staged(start, index),
+            staged.drain_written(index),
+            rung.ranked_from(staged),
+            rung.others_kept(staged, index),
+            rung.removal_kept(staged, index),
+            self.others_kept(rung, index),
+            self.token@.nic() == rung.token@.nic(),
+            self.has_qp(index),
+            ({
+                let (e, f) = (self.qps@[index]->0, rung.qps@[index]->0);
+                &&& e == HwQp { drain_pending: false, ..f }
+            }),
+        ensures
+            self.ranked_from(start),
+    {
+        let (m, n) = (start.token@.nic(), self.token@.nic());
+        assert forall|i: int| 0 <= i < self.qps@.len()
+            implies #[trigger] entry_ranked(self.qps@[i], start.qps@[i], n, m) by {
+            assert(entry_ranked(rung.qps@[i], staged.qps@[i], n, m));
+            if i != index {
+                assert(self.qps@[i] == rung.qps@[i]);
+                assert(staged.qps@[i] == start.qps@[i]);
+            }
+        }
+    }
+
+    /// A QP being removed that does not drain is one [`Hw::destroy`] destroys: nothing is written
+    /// on it ([`drain_ok`]).
+    pub proof fn lemma_drained(&self, index: int)
+        requires
+            self.inv(),
+            self.has_qp(index),
+            self.removed_at(index),
+            !self.drains_at(index),
+        ensures
+            self.destroyable(index),
+    {
+        assert(qp_ok(self.qps@[index], index, self.token@, self.token@.nic()));
     }
 }
 

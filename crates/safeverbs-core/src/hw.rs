@@ -205,6 +205,15 @@ pub struct HwQp<C, N: Device> {
     removed: bool,
     /// Removal waits to post the drain WQE on its send queue (for room).
     drain_pending: bool,
+    /// Its removal moved it to the error state, where it stays and the NIC flushes its work
+    /// (ghost, [`drain_ok`]).
+    #[allow(dead_code)]
+    flushing: Ghost<bool>,
+    /// The device turned down a verb of its removal: the move to the error state, or its drain
+    /// WQE's doorbell (ghost). The drain's end is proved for removals it turns nothing down of
+    /// (`live::theorem_drain_ends`).
+    #[allow(dead_code)]
+    turned_down: Ghost<bool>,
     /// Whether a doorbell was refused since the event loop last looked.
     refused: bool,
     caps: QpCaps,
@@ -833,6 +842,7 @@ impl<C, N: Device> HwQp<C, N> {
         &&& send_outcomes::send_implied(self.send, self.send_tails@)
         &&& send_outcomes::tail_bound(self.send, self.send_tails@, qp, written, m.retired, self.id())
         &&& send_outcomes::signals_ok(self.send, self.send_tails@)
+        &&& drain_ok(*self, qp)
         &&& ring_resources_ok(self.send)
         &&& ring_resources_ok(self.recv)
         &&& queued_outcomes_ok(m, self.id@)
@@ -847,6 +857,25 @@ impl<C, N: Device> HwQp<C, N> {
         &&& writing_ok(self.send, index, m, qp.attr, started, written)
         &&& self.building@.len() <= MAX_SGES
     }
+}
+
+/// What a QP's removal keeps true while it drains (see [`Hw::start_drain`]). Removed, it takes no
+/// work, and nothing but its drain WQE is written on it. Moved to the error state by its removal
+/// (`flushing`), it stays there; its drain WQE, while written and not rung, is the last request
+/// written, signaled; and once it is rung, or if the send queue had nothing in flight, nothing is
+/// written on it and its send queue has nothing in flight or ends with the request the ring
+/// signaled last (which M holds signaled, `send_outcomes::signals_ok`). Removed and not moved
+/// there, nothing is written on it, and it has nothing in flight unless the device turned the move
+/// down.
+spec fn drain_ok<C, N: Device>(e: HwQp<C, N>, qp: Qp) -> bool {
+    &&& e.removed ==> !e.takes_work
+    &&& e.drain_pending ==> e.flushing@
+    &&& e.flushing@ ==> qp.state is Err && e.removed && e.phase == Phase::Ready
+    &&& e.flushing@ && e.started ==> e.drain_pending && e.send.spec_sig_end() == e.send.spec_wqe_posted()
+    &&& e.flushing@ && !e.drain_pending ==> e.send.spec_wqe_committed() == e.send.spec_wqe_retired()
+        || e.send.spec_sig_end() == e.send.spec_wqe_committed()
+    &&& e.removed && !e.flushing@ ==> !e.started && (e.turned_down@
+        || e.send.spec_wqe_posted() == e.send.spec_wqe_retired() && e.recv.spec_wqe_posted() == e.recv.spec_wqe_retired())
 }
 
 /// Entry `i` of the table `qps` is coupled to M's state `m`, with token `t`'s share and writing.
@@ -1614,6 +1643,8 @@ impl<C, N: Device> Hw<C, N> {
             started: false,
             removed: false,
             drain_pending: false,
+            flushing: Ghost(false),
+            turned_down: Ghost(false),
             refused: false,
             caps,
             qp_type,
@@ -1930,6 +1961,8 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            r is Ok ==> final(self).in_error(index as int),
+            old(self).unwritten(index as int) ==> final(self).unwritten(index as int),
         no_unwind
     {
         if index >= self.qps.len() {
@@ -1948,7 +1981,7 @@ impl<C, N: Device> Hw<C, N> {
                 let r = to_error(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
                 if r.is_ok() {
                     e.phase = Phase::Ready;
-                    e.takes_work = true;
+                    e.takes_work = !e.removed;
                 }
                 r
             },
@@ -2117,7 +2150,7 @@ impl<C, N: Device> Hw<C, N> {
                 } else {
                     Phase::Broken
                 };
-                e.takes_work = r.is_ok();
+                e.takes_work = r.is_ok() && !e.removed;
                 r
             },
             None => {
@@ -2324,6 +2357,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& self.qps@[index] is Some
                 &&& e.same_qp(e0)
                 &&& e0.phase == Phase::Ready
+                &&& e0.takes_work
                 &&& e.started == e0.started
                 &&& e.send == e0.send
                 &&& e.send_tails == e0.send_tails
@@ -3188,6 +3222,7 @@ impl<C, N: Device> HwQp<C, N> {
             payload_ok(view.leases, view.detached),
             outcome matches Ok(done) ==> more.last().opcode.allows_outcome(total_len(more.last().sges), done.model()),
             outcome is Ok,
+            pre.removed ==> pre.drain_pending && more.last().signaled,
         ensures
             self.ok(index, m, sh, true, w0 + more),
     {
@@ -3332,6 +3367,7 @@ impl<C, N: Device> HwQp<C, N> {
     proof fn lemma_refused(&self, pre: &Self, index: u16, n: Nic::State, sh: Share, written: Seq<SendWr>, keep: int)
         requires
             pre.ok(index, n, sh, pre.started, written),
+            pre.started || !pre.removed,
             self.same_qp(*pre),
             !self.started,
             self.recv == pre.recv,
@@ -3379,6 +3415,10 @@ impl<C, N: Device> Hw<C, N> {
             final(self).moved_from(old(self)),
             final(self).ranked_from(old(self)),
             final(self).rung(index as int),
+            final(self).others_kept(old(self), index as int),
+            final(self).unstarted(index as int),
+            final(self).removal_kept(old(self), index as int),
+            r is Ok ==> final(self).rang_over(old(self), index as int),
             r matches Err((_, Some(kept))) ==> kept.leases.inv() && kept.leases.fully_recorded(),
             r matches Err((_, kept)) ==> (keep matches Some(seq) ==> (old(self).staged_ctx(index as int, seq as int) matches Some(ctx)
                 ==> (kept matches Some(payload) && payload.ctx == ctx))),
@@ -3685,6 +3725,7 @@ impl<C, N: Device> Hw<C, N> {
                 &&& self.qps@[index] is Some
                 &&& staged.same_qp(e0)
                 &&& e0.phase == Phase::Ready
+                &&& e0.takes_work
                 &&& staged.recv == e0.recv
                 &&& staged.send.just_staged(&e0.send, 1, crate::ring::ReqView::new(detached, resource), implied)
                 &&& staged.send.signaled_from(&e0.send, wr.signaled)
@@ -5478,6 +5519,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            final(self).removed_at(index as int),
         no_unwind
     {
         if index >= self.qps.len() {
@@ -5498,37 +5540,38 @@ impl<C, N: Device> Hw<C, N> {
         }
         let busy = self.discard(index);
         let ghost s1 = *self;
-        if busy {
-            // ERR is reachable from every state (M's `modify_qp`). A device
-            // that refuses it is left to the timeout: the QP is then kept.
-            if self.set_error(index).is_ok() {
-                let ghost s2 = *self;
-                self.set_flags(index, Some(true), false);
-                proof {
-                    lemma_same_table_trans(self, &s2, &s1);
-                }
+        // ERR is reachable from every state (M's `modify_qp`). A device that refuses it is left to
+        // the timeout: the QP is then kept.
+        let flushing = if busy {
+            self.set_error(index).is_ok()
+        } else {
+            proof {
+                s1.lemma_same_table_refl();
+                s1.lemma_moved_refl();
             }
-        }
-        let ghost s3 = *self;
-        self.set_flags(index, None, true);
+            false
+        };
+        let ghost s2 = *self;
+        self.mark_removed(index, flushing);
         proof {
-            lemma_same_table_trans(&s3, &s1, &start);
-            lemma_same_table_trans(self, &s3, &start);
+            lemma_same_table_trans(&s2, &s1, &start);
+            lemma_same_table_trans(self, &s2, &start);
         }
     }
 
-    /// Marks QP `index` as waiting to post its drain WQE (`Some(true)`: if
-    /// its send queue has WQEs in flight) or not (`Some(false)`), and as
-    /// removed (if `removed`).
+    /// Marks QP `index` as removed, taking no work: moved to the error state by its removal if
+    /// `flushing`, then with its drain WQE to post if its send queue has WQEs in flight.
     #[verifier::spinoff_prover]
-    fn set_flags(&mut self, index: usize, drain: Option<bool>, removed: bool)
+    fn mark_removed(&mut self, index: usize, flushing: bool)
         requires
             old(self).inv(),
-            old(self).has_qp(index as int),
+            old(self).unwritten(index as int),
+            flushing ==> old(self).in_error(index as int),
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            final(self).removed_at(index as int),
         no_unwind
     {
         let ghost start = *self;
@@ -5537,17 +5580,20 @@ impl<C, N: Device> Hw<C, N> {
         }
         match &mut self.qps[index] {
             Some(e) => {
-                match drain {
-                    Some(true) => e.drain_pending = e.send.in_flight_wqes() > 0,
-                    Some(false) => e.drain_pending = false,
-                    None => {},
+                let ghost y = *e;
+                let ghost down = !flushing && (y.send.spec_wqe_posted() > y.send.spec_wqe_retired()
+                    || y.recv.spec_wqe_posted() > y.recv.spec_wqe_retired());
+                if flushing {
+                    e.drain_pending = e.send.in_flight_wqes() > 0;
                 }
-                if removed {
-                    e.removed = true;
-                    e.takes_work = false;
-                    e.refused = false;
-                }
+                e.removed = true;
+                e.takes_work = false;
+                e.refused = false;
+                e.flushing = Ghost(flushing);
+                e.turned_down = Ghost(down);
                 proof {
+                    y.send.lemma_wqes();
+                    assert(drain_ok(*e, start.nic().qps[y.id()]));
                     self.lemma_flags_only(&start, index as int);
                 }
             },
@@ -5562,10 +5608,12 @@ impl<C, N: Device> Hw<C, N> {
         requires
             old(self).inv(),
             old(self).has_qp(index as int),
+            !old(self).qps@[index as int]->0.removed,
         ensures
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            final(self).unwritten(index as int),
         no_unwind
     {
         let ghost start = *self;
@@ -5681,9 +5729,11 @@ impl<C, N: Device> Hw<C, N> {
 
     /// Whether QP `index`, being removed, still has work in flight (or its
     /// drain WQE to post).
-    pub fn draining(&self, index: usize) -> bool
+    pub fn draining(&self, index: usize) -> (r: bool)
         requires
             self.inv(),
+        ensures
+            r == self.drains_at(index as int),
         no_unwind
     {
         if index >= self.qps.len() {
@@ -5701,9 +5751,9 @@ impl<C, N: Device> Hw<C, N> {
 }
 
 impl<C, N: Device> Hw<C, N> {
-    /// Writes QP `index`'s drain WQE, if it waits for one and has room: a
-    /// signaled SEND of nothing, without an owner. Whether it was written
-    /// (it goes out at the next doorbell).
+    /// Writes QP `index`'s drain WQE, if it waits for one and has room: a signaled SEND of
+    /// nothing, without an owner. Whether a drain WQE is written and not rung (it goes out at the
+    /// next doorbell): this one, or one written before, which goes out as it is.
     #[verifier::spinoff_prover]
     fn stage_drain(&mut self, index: usize) -> (written: bool)
         requires
@@ -5712,7 +5762,8 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
-            written ==> final(self).has_qp(index as int),
+            written ==> final(self).drain_written(index as int) && final(self).drain_staged(old(self), index as int),
+            !written ==> *final(self) == *old(self) && final(self).drain_tried(index as int),
         no_unwind
     {
         if index >= self.qps.len() {
@@ -5724,26 +5775,38 @@ impl<C, N: Device> Hw<C, N> {
         let ghost sh = t0.share();
         proof {
             assert(qp_ok(start.qps@[index as int], index as int, t0, m0));
+            if let Some(e) = start.qps@[index as int] {
+                e.send.lemma_wqes();
+            }
         }
         let ready = match &self.qps[index] {
-            Some(e) => e.removed && e.drain_pending && matches!(e.phase, Phase::Ready) && e.send.can_post(),
+            Some(e) => e.removed && e.drain_pending && matches!(e.phase, Phase::Ready)
+                && (e.started || e.send.can_post()),
             None => false,
         };
         if !ready {
+            proof {
+                if let Some(e) = start.qps@[index as int] {
+                    assert(drain_ok(e, m0.qps[e.id()]));
+                }
+            }
             return false;
         }
         match &mut self.qps[index] {
             Some(e) => {
+                if e.started {
+                    // Written before and not rung: nothing else is written on a QP being removed.
+                    proof {
+                        assert(self.qps@ =~= start.qps@);
+                        assert(drain_ok(*e, m0.qps[e.id()]));
+                    }
+                    return true;
+                }
                 let ghost q = e.id();
                 let ghost e0 = *e;
-                proof {
-                    e0.send.lemma_wqes();
-                }
                 let wqe = e.send.next_wqe();
-                if !e.started {
-                    crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
-                    e.started = true;
-                }
+                crate::trusted::start(&mut e.hw, Ghost(q), Tracked(self.token.borrow_mut()));
+                e.started = true;
                 let ghost w0 = self.token@.written(q);
                 let nothing: Vec<Sge> = vec_new();
                 let none = nothing.as_slice();
@@ -5773,6 +5836,7 @@ impl<C, N: Device> Hw<C, N> {
                     assert(self.entry_ok(index as int, t, m0));
                     self.lemma_one(&start, t0, t, m0, m0, index as int);
                     refines::lemma_linked_staged(start.qps@, self.qps@, m0, start.refined@, index as int, Queue::Send, 1, crate::ring::ReqView::new(true, resource), Ok(Completed::Sent));
+                    (*e).send.lemma_wqes();
                 }
             },
             None => {},
@@ -5785,6 +5849,7 @@ impl<C, N: Device> Hw<C, N> {
     /// it, with a flush error, and polling that completion retires them all,
     /// including unsignaled ones that succeeded before the error. A refused
     /// doorbell is tried again later.
+    #[verifier::spinoff_prover]
     pub fn post_drain(&mut self, index: usize)
         requires
             old(self).inv(),
@@ -5792,21 +5857,49 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            final(self).drain_tried(index as int),
+            final(self).others_kept(old(self), index as int),
+            final(self).turned_down_at(index as int) || final(self).ranked_from(old(self)),
         no_unwind
     {
         let ghost start = *self;
-        if self.stage_drain(index) {
-            let ghost s1 = *self;
-            if self.commit(index, None).is_ok() {
-                let ghost s2 = *self;
-                self.set_flags(index, Some(false), false);
-                proof {
-                    lemma_same_table_trans(self, &s2, &s1);
-                }
-            }
+        if !self.stage_drain(index) {
             proof {
-                lemma_same_table_trans(self, &s1, &start);
+                start.lemma_same_table_refl();
+                start.lemma_moved_refl();
+                start.lemma_ranked_refl();
             }
+            return;
+        }
+        let ghost staged = *self;
+        let rang = self.commit(index, None).is_ok();
+        let ghost rung = *self;
+        proof {
+            lemma_same_table_trans(&rung, &staged, &start);
+            assert(qp_ok(rung.qps@[index as int], index as int, rung.token@, rung.nic()));
+        }
+        match &mut self.qps[index] {
+            Some(e) => {
+                let ghost y = *e;
+                if rang {
+                    e.drain_pending = false;
+                } else {
+                    // The device turned the drain WQE's doorbell down: it waits again.
+                    e.turned_down = Ghost(true);
+                }
+                proof {
+                    y.send.lemma_wqes();
+                    assert(drain_ok(*e, rung.nic().qps[y.id()]));
+                    self.lemma_flags_only(&rung, index as int);
+                    if rang {
+                        self.lemma_drain_rung(&rung, &staged, &start, index as int);
+                    }
+                }
+            },
+            None => {},
+        }
+        proof {
+            lemma_same_table_trans(self, &rung, &start);
         }
     }
 
@@ -5908,6 +6001,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).moved_from(old(self)),
             !destroyed ==> *final(self) == *old(self),
+            old(self).destroyable(index as int) ==> destroyed,
         no_unwind
     {
         if index >= self.qps.len() {
