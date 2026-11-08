@@ -659,10 +659,11 @@ pub proof fn lemma_rely_fewer_pins(sh: Share, pins: ISet<Key>, fewer: ISet<Key>,
 // One device
 
 /// A step of the device the engine of share `sh` did not take: a verb of another engine on its own
-/// share, apart from `sh`, or a step of the NIC itself or of the control path (protection domains
-/// and memory regions).
+/// share, apart from `sh`, or the CQ of a new engine, or a step of the NIC itself or of the control
+/// path (protection domains and memory regions).
 pub open spec fn elsewhere(sh: Share, step: Nic::Step) -> bool {
     ||| exists|other: Share| #[trigger] disjoint(other, sh) && mine(other, ISet::full(), step)
+    ||| step matches Nic::Step::create_cq(c, _) && c != sh.cq
     ||| is_nic_step(step)
     ||| step is alloc_pd || step is reg_mr || step is dereg_mr
 }
