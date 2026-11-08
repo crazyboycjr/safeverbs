@@ -297,10 +297,11 @@ included:
   engine last saw it (`Hw::lemma_part`).
 - The engines it holds on a device and the buffers it exposed there stand for one state of A, reached
   from A's start, in which each engine's requests are as its own A has them, coupled to M at the latest
-  moment one of the engines saw the device (`theorem_1_device`). So S1, F1 and R1 hold against M for
-  the whole device, and the NIC writes no byte of a buffer the program holds, nor reads one of a
-  unique buffer (`lemma_device_s1`). For an engine alone on its device with nothing exposed this is
-  `theorem_1_alone`.
+  moment one of the engines saw the device (`theorem_1_device`, resting on the device's one history,
+  `one_history`, and on the regions open to a peer being the exposed buffers', `register_exposure`).
+  So S1, F1 and R1 hold against M for the whole device, and the NIC writes no byte of a buffer the
+  program holds, nor reads one of a unique buffer (`lemma_device_s1`). For an engine alone on its
+  device with nothing exposed, `theorem_1_alone` says so of the engine's own state of A.
 
 Stated with its exceptions, **a program that uses safeverbs and contains no `unsafe` has no undefined
 behaviour and never misuses the NIC**, as far as M and the trusted items go, except that:
