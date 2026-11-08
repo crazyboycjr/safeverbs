@@ -124,14 +124,21 @@ Start with [verification.md](verification.md), then:
    preconditions being assumed.
 4. [`refinement.rs`](../crates/safeverbs-spec/src/refinement.rs): the `Refines`
    obligations, the coupling of requests to WQE intervals and outcomes, and Theorem 1.
-5. [`examples.rs`](../crates/safeverbs-spec/src/examples.rs): concrete checked traces.
-6. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the steps of A behind each change
+5. [`compose.rs`](../crates/safeverbs-spec/src/compose.rs): several engines on one device and the
+   buffers exposed there as one state of A, coupled to M (`theorem_1_device`), and S1 of the buffers
+   the program holds on the device (`lemma_device_s1`). `share.rs` has what each engine says of its
+   own share (`coupled_on`) and the device's history as one engine sees it (`interleaved`).
+6. [`examples.rs`](../crates/safeverbs-spec/src/examples.rs): concrete checked traces.
+7. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the steps of A behind each change
    of a request, one request at a time, over any view of requests. Then
    [`hw/refines.rs`](../crates/safeverbs-core/src/hw/refines.rs): the view of an engine's rings,
    its ghost state, the invariant that ties them to A (`linked`), how a buffer comes to A
    (`lemma_adopt_loans`, `Hw::adopt`), and at the end `impl Refines`, the theorem, what it says of any
    engine a program holds (`theorem_1_held`), and a run of `Engine`'s methods on typed buffers under it
-   (`example_run`). `Engine::inv` in `engine.rs` is the type invariant that makes that so.
+   (`example_run`). `Engine::inv` in `engine.rs` is the type invariant that makes that so. What an
+   engine brings to its device is `Hw::part` and `Hw::lemma_part`; two engines are apart by
+   `Hw::separate_engines` (`hw/separation.rs`, with the traversals of rings and leases it uses), and
+   `example_device` puts them, an exposed buffer and the program's buffers into `theorem_1_device`.
    Return to `Hw::inv` and [`trusted.rs`](../crates/safeverbs-core/src/trusted.rs)
    for the hardware-facing contracts. `share.rs` provides the hardware side's framing
    rules. [`hw/send_outcomes.rs`](../crates/safeverbs-core/src/hw/send_outcomes.rs) and

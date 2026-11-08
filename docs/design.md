@@ -236,9 +236,13 @@ obligations (start states, every API call is zero or more steps of A and of M, t
 couples A and M). `theorem_1` proves, for every implementation meeting the obligations, that
 along any execution A's and M's invariants hold, every verb met its precondition, and A and
 M stay coupled. One engine with its buffers implements it (`EngineState` in `hw/refines.rs`), under
-one premise, which `verification.md` explains: that A gives whatever the NIC may touch beyond the
-engine's own queues. A buffer comes to A when it is lent, by A's own steps, and any buffer the program
-holds can.
+one premise: that A gives whatever the NIC may touch beyond the engine's own queues. A buffer comes to
+A when it is lent, by A's own steps, and any buffer the program holds can. A program with a CQ per
+thread has several engines on one device, and buffers it exposes to a peer: each engine is coupled to
+M on its own share, the device's history is the interleaving of their verbs and the NIC's steps, and
+their buffers are apart by their linear permissions, so together they stand for one state of A coupled
+to M for the whole device (`theorem_1_device` in `compose.rs`), which discharges the premise.
+`verification.md` says what of that is argument.
 
 **Theorem 2 (later; stated only)** covers two endpoints that both run SafeVerbs' protocol
 layer: credit-based flow control for sends and rkey leases for one-sided access. Each side
@@ -626,7 +630,7 @@ says.
 | CQ size unrelated to queue depths | attachment reserves CQ capacity |
 | everything `Send + Sync`, a CQ per queue pair | a CQ per thread, shared by its queue pairs, no locks; `SharedQp` when sharing is needed |
 | `unsafe` spread through the crate | all `unsafe` in `safeverbs-core`, the rest `forbid(unsafe_code)` |
-| no statement of the guarantee | a conditional Theorem 1 over M and A, proved of one engine and its buffers under the premise of `verification.md`; the layers around it are still being completed |
+| no statement of the guarantee | Theorem 1 over M and A, proved of one engine and its buffers, and of a device's engines and exposed buffers together, with what `verification.md` names as argument and trust |
 | a user-chosen `wr_id` looked up in a slab | a `wr_id` of any type in each request's slot, handed back once; the hardware's `wr_id` is the library's own |
 | `Wc` fields read by hand, some undefined | typed results with only what each operation defines; an error names the failing WQE |
 
@@ -636,10 +640,11 @@ async style of the API carry over.
 ## 12. Open questions
 
 - Theorem 1 beyond one engine: each engine's share of M is settled by rely and guarantee
-  (`safeverbs-spec/src/share.rs`), and the refinement is proved for an engine and the buffers it is
-  lent (`verification.md` says where that stands, with its premise). Open: exposure,
-  and how several engines compose. Undefined SEND/WRITE lengths are already projected out of outcomes; READ and
-  receive metadata have operation-specific contracts (section 8).
+  (`safeverbs-spec/src/share.rs`), and the engines of a device and its exposed buffers compose into
+  one state of A at each moment (`compose.rs`). Open: one run of A for the whole device rather than a
+  state at each moment, and a proof, rather than an argument, that a program's engines and exposed
+  buffers are all its device has. Undefined SEND/WRITE lengths are already projected out of
+  outcomes; READ and receive metadata have operation-specific contracts (section 8).
 - A thread-safe `Cq` and `Qp` in the same shape as the local ones. A whole `LocalCq` with all its
   QPs could also move between threads, since the engine is `Send` and `Rc::try_unwrap` proves no
   handle is left; one `LocalQp` alone cannot leave its CQ, since verbs has no way to change a QP's CQ.

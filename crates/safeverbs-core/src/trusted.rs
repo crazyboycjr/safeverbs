@@ -20,7 +20,9 @@
 //! The NIC's state is a ghost token, [`NicToken`], that only these wrappers
 //! make and change. A token is one engine's: it holds M's state as that
 //! engine last saw it, the engine's share of M (`safeverbs_spec::share`: its
-//! CQ and the names of its QPs) and the names it gives new QPs. Each verb is on the token's own share (`mine`),
+//! CQ and the names of its QPs), the names it gives new QPs, and its device
+//! and the moment of its view, which [`one_history`], the one statement about
+//! two tokens, compares. Each verb is on the token's own share (`mine`),
 //! so it is within what the other engines rely on, and its precondition,
 //! checked in the state the engine last saw, still holds when the verb
 //! happens (`safeverbs_spec::share::lemma_rely_keeps_enabled`): that is why

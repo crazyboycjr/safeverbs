@@ -21,7 +21,8 @@
 //!   rings, its share of the NIC model), verified against the trusted verbs:
 //!   every verb meets the model's precondition, the rings stay coupled to the
 //!   model's queues, QPs are destroyed only once drained, and its state refines the
-//!   abstract machine (Theorem 1, under the premise `docs/verification.md` states);
+//!   abstract machine (Theorem 1, and with the other engines of its device and the buffers exposed
+//!   there one state of the abstract machine, as `docs/verification.md` states);
 //! - [`engine`]: a completion queue and the queue pairs attached to it,
 //!   driven synchronously and by index ([`Engine`]): post requests into the rings and the
 //!   hardware queues, commit them with one doorbell, poll the CQ, and get

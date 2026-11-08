@@ -29,7 +29,10 @@
 //! the steps of the lemmas here, and says so (`Hw::moved_from`). What `Refines` asks of it is at the
 //! end (`EngineState`), with the theorem (`theorem_1_engine`) and a run of the operations under
 //! it (`example_run`). What the engine cannot see stays a premise: what the NIC may touch beyond its
-//! queues (`Hw::outside_ok`).
+//! queues (`Hw::outside_ok`). The engines of a device and its exposed buffers discharge it together:
+//! what an engine brings is its part (`Hw::part`, coupled on its share at any later state of the device,
+//! `Hw::lemma_part`), two engines' requests are apart (`Hw::lemma_parts_apart`), and `example_device`
+//! puts them into `safeverbs_spec::compose::theorem_1_device`.
 //!
 //! Everything here is ghost code: a plain build erases it.
 #![allow(unused_imports)]
@@ -4360,21 +4363,23 @@ pub open spec fn later<C, D, N: Device>(e: Hw<C, N>, f: Hw<D, N>) -> Nic::State 
     }
 }
 
-/// **Theorem 1, of two engines on one device, a buffer exposed to a peer and buffers the program
+/// **Theorem 1, of two engines on one device, buffers exposed to a peer and buffers the program
 /// holds.** The engines may have contexts of different types, as a program's do. What each says of
 /// itself (`Hw::lemma_part`), what their linear permissions and their device's one history say of the
 /// pair (`Hw::separate_engines`), and what the buffers' permissions say (`Exposed::separate_from`,
-/// `apart_from_engine`, `Exposed::separate_buf_mut`, `Exposed::separate_buf`) are what
+/// `Exposed::separate_exposed`, `apart_from_engine`, `Exposed::separate_buf_mut`,
+/// `Exposed::separate_buf`) are what
 /// [`theorem_1_device`] and [`lemma_device_s1`] ask; that M has nothing else (`accounted`) is what
 /// only the program as a whole can say. So the device stands for one state of A, reached from its
 /// start, coupled to M, with both engines' requests as their own A has them, and the NIC touches no
 /// byte of the program's buffers in a conflicting way. It exists in Verus builds alone.
 #[cfg(verus_keep_ghost)]
 #[allow(dead_code)]
-fn example_device<C, D, N: Device, T, U, V>(
+fn example_device<C, D, N: Device, T, W, U, V>(
     e: Hw<C, N>,
     f: Hw<D, N>,
     x: crate::buf::Exposed<T, N>,
+    y: crate::buf::Exposed<W, N>,
     unique: crate::buf::BufMut<U, N>,
     frozen: crate::buf::Buf<V, N>,
 )
@@ -4382,14 +4387,20 @@ fn example_device<C, D, N: Device, T, U, V>(
         e.inv(),
         f.inv(),
         e.token().device() == f.token().device(),
-        accounted(seq![e.part(), f.part()], seq![x.bytes()], later(e, f)),
+        accounted(seq![e.part(), f.part()], seq![x.bytes(), y.bytes()], later(e, f)),
 {
-    let ghost (start_e, start_f, start_x) = (e, f, x);
+    let ghost (start_e, start_f, start_x, start_y) = (e, f, x, y);
     let mut x = x;
+    let mut y = y;
+    x.separate_exposed(&y);
     x.separate_from(&e);
     x.separate_from(&f);
     x.separate_buf_mut(&unique);
     x.separate_buf(&frozen);
+    y.separate_from(&e);
+    y.separate_from(&f);
+    y.separate_buf_mut(&unique);
+    y.separate_buf(&frozen);
     let unique = unique.apart_from_engine(&e);
     let unique = unique.apart_from_engine(&f);
     frozen.apart_from_engine(&e);
@@ -4397,7 +4408,7 @@ fn example_device<C, D, N: Device, T, U, V>(
     let mut f = f;
     f.separate_engines(&e);
     proof {
-        let (e, f, x) = (start_e, start_f, start_x);
+        let (e, f, x, y) = (start_e, start_f, start_x, start_y);
         let h = later(e, f);
         if f.token().time() <= e.token().time() {
             lemma_interleaved_refl(e.token().share(), h);
@@ -4407,7 +4418,7 @@ fn example_device<C, D, N: Device, T, U, V>(
         let wrs = e.lemma_part(h);
         f.lemma_part(h);
         let parts = seq![e.part(), f.part()];
-        let exposed = seq![x.bytes()];
+        let exposed = seq![x.bytes(), y.bytes()];
         assert(disjoint(e.token().share(), f.token().share())) by {
             assert forall|q: QpId| #[trigger] e.token().share().owns.contains(q)
                 implies !f.token().share().owns.contains(q) by {
@@ -4420,10 +4431,15 @@ fn example_device<C, D, N: Device, T, U, V>(
             implies disjoint(parts[i].share, parts[j].share) && parts_apart(parts[i], parts[j]) by {
             assert(parts[0] == e.part() && parts[1] == f.part());
         }
+        assert(parts[0] == e.part() && parts[1] == f.part() && exposed[0] == x.bytes() && exposed[1] == y.bytes());
+        assert(y.bytes().disjoint(x.bytes())) by {
+            assert forall|b: int| !(y.bytes().contains(b) && x.bytes().contains(b)) by {
+                assert(!(x.bytes().contains(b) && y.bytes().contains(b)));
+            }
+        }
         assert(device_ok(parts, exposed, h));
         theorem_1_device(parts, exposed, h, wrs);
         // The buffers the program holds.
-        assert(parts[0] == e.part() && parts[1] == f.part() && exposed[0] == x.bytes());
         lemma_device_s1(parts, exposed, h, unique.byte_domain().to_iset(), true);
         lemma_device_s1(parts, exposed, h, frozen.byte_domain().to_iset(), false);
     }

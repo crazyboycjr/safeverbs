@@ -46,18 +46,50 @@ the NIC touches none of its bytes (`BufMut::apart_from_nic`, `Buf::apart_from_ni
 
 So the buffers carry no ghost name and take no step: a shared authority over A's leases would have
 to be opened by every buffer's `Drop`, which Verus does not allow, and tied to `Arc`'s counts on
-trust. And this composes: each engine has its A, what one adopts is apart from what the others hold
-by the same permissions, and what they owe each other is the one premise left.
+trust. And it composes: each engine has its A, and what one holds is apart from what the others
+hold by the same permissions.
 
-**The premise left: what the NIC may touch beyond the engine's queues, A gives it**
-(`outside_covered` in `share.rs`): the WQEs of other engines' queue pairs and the regions open to a
-peer are leases of A in the NIC's hands. For an engine alone on its device with no region open to a
-peer, there is nothing to say (`theorem_1_alone`). It is stated of each state, in `Refines::inv` and
-`Refines::step`.
+**One engine's theorem has a premise, and the device discharges it.** What the NIC may touch beyond
+an engine's queues, the WQEs of other engines' queue pairs and the regions open to a peer, must be
+A's to give (`outside_covered` in `share.rs`, stated of each state in `Refines::inv` and
+`Refines::step`). For an engine alone on its device with no region open to a peer there is nothing
+to say (`theorem_1_alone`). A program with a CQ per thread has several engines, and buffers it
+exposes; for it the engines and the exposed buffers compose into one state of A
+(`theorem_1_device` in `compose.rs`):
 
-**So what the theorem does not cover yet:** one device history shared by several engines, exposure
-and liveness (see "Remaining"). The handles of the `safeverbs` crate are covered
-by an argument, not by a theorem ("The public API").
+- Each engine is coupled to M on its own share (`share::coupled_on`): its requests own their WQEs
+  of its queue pairs, and what the NIC may touch for those is in their leases. That holds not only
+  where the engine last saw M but at any later state of the device that its engine did not move
+  (`Hw::lemma_part`).
+- The device has one history (`one_history`, trusted, the one statement about two tokens): the
+  interleaving of its engines' verbs, each on the engine's own share, with the steps of the NIC and
+  of the control path. So two engines' shares are apart, and from the view of the engine that saw
+  the device earlier it went to the other's view by steps that engine did not take
+  (`share::interleaved`), a run of M that keeps the engine's share as its rely says
+  (`lemma_interleaved`).
+- Their buffers are apart by their linear permissions (`Hw::separate_engines`): each keeper of one
+  engine's requests is borrowed exclusively in turn against the other's rings, so a unique lease of
+  one shares no byte with any lease of the other. So are the exposed buffers, from each engine and
+  from each other (`Exposed::separate_from`, `Exposed::separate_exposed`), and the buffers the
+  program holds (`apart_from_engine` of `BufMut` and `Buf`, `Exposed::separate_buf_mut`,
+  `Exposed::separate_buf`).
+- Then a state of A built from all of them, every engine's requests as its own A has them and every
+  exposed buffer a lease the peer holds, is reached from A's start (`lemma_assembled`) and coupled
+  to M at the latest moment one of the engines saw the device (`theorem_1_device`), and the NIC
+  touches no byte of a buffer the program holds in a conflicting way (`lemma_device_s1`).
+  `example_device` puts the pieces together for two engines of different context types, an exposed
+  buffer, and a unique and a frozen buffer of the program's.
+
+What stays an argument is that the engines and exposed buffers given are all the device has
+(`accounted`): a program's engines are not one Rust value, so that the ones given are all of them is
+said of the program, not proved ("The public API"). And the device's state of A is a snapshot: each engine's
+run is one of A, its own, and at each moment the device stands for a state of A, but one run of A
+for the whole device is not built, since it would need the shared record of A that a buffer's `Drop`
+cannot update.
+
+**So what the theorem does not cover:** liveness (see "Remaining"), and what the argument says of a
+program as a whole. The handles of the `safeverbs` crate are covered by an argument, not by a
+theorem ("The public API").
 
 `scripts/verify.sh` checks everything below that is called proved. The specification
 crate uses no `assume`, `admit`, `external_body` or assumed specification; the code of
@@ -66,8 +98,8 @@ only the items of `scripts/trusted.txt` (see "Trusted computing base"). It also 
 function of the core's public types with a precondition: a safe function that relies on being called
 correctly is a bug. The rest is ordinary Rust, not trusted by the proofs and not verified either:
 `pd.rs`, `verbs.rs`, `model.rs`, the `safeverbs` crate, and what is left outside `verus!` in `buf.rs`
-and `engine.rs`: the methods with zerocopy's bounds, `Region::whole`'s layout, `Exposed`, an iterator's
-loop in `Request::push_gather`, and the `Drop`s. They have no proof obligations to get
+and `engine.rs`: the methods with zerocopy's bounds, `Region::whole`'s layout, `Exposed`'s accessors,
+an iterator's loop in `Request::push_gather`, and the `Drop`s. They have no proof obligations to get
 wrong: they reach verified code only by calling it, and what they call asks nothing of them.
 
 ## The properties
@@ -104,6 +136,17 @@ conflicting ways.
   of A where it is a lease of the program's. A `BufMut` and a `Part` keep what they say as type
   invariants, `Peek` too, so no caller has to promise anything. This rests on Rust's ownership of
   the buffers, which is what their linear permissions model, and on `any_bytes`, below.
+- *The device.* Several engines and the buffers exposed on their device stand for one state of A,
+  coupled to M (`theorem_1_device`): a byte the NIC writes for any engine's WQE is in a unique lease
+  of that engine's request, apart from every other engine's leases and from the exposed buffers, and
+  a byte a peer may reach is an exposed buffer's, which the program holds no view of. A buffer the
+  program holds, apart from all of them by its permission, has no byte the NIC writes, and none it
+  reads if it is unique (`lemma_device_s1`).
+- *Exposure.* `BufMut::expose` registers the buffer's bytes and no others for remote access and moves
+  the buffer into the `Exposed`, which holds it for the peer (A's `expose`); `Exposed::try_reclaim`
+  deregisters them and gives back that buffer, or keeps both if the device refuses (A's `unexpose`).
+  Both are verified code with no `unsafe`; the registration and its end are the trusted
+  `register_exposure` and `close_exposure`.
 - *The one exception:* `Exposed::copy_to_slice` reads memory a peer may be writing. No
   reference to exposed memory is ever formed; it is read only through this copy, with volatile
   reads into a `T` that accepts any bytes, which is a trusted assumption (`volatile_copy`
@@ -114,7 +157,9 @@ conflicting ways.
 **S2, no local misuse.** Every verb the library calls meets M's precondition.
 - *Spec.* The preconditions are M's `require`s. The NIC's own steps never invalidate one
   (`lemma_nic_steps_keep_verbs_enabled`), and neither do other engines' verbs on their own
-  queues (`share.rs`: `lemma_rely_keeps_enabled`, `lemma_mine_is_foreign`).
+  queues (`share.rs`: `lemma_rely_keeps_enabled`, `lemma_mine_is_foreign`). The device's history is
+  one run of M, the interleaving of its engines' verbs and the NIC's steps (`one_history`,
+  `lemma_interleaved`).
 - *Engine.* Proved: every call into the NIC goes through a trusted wrapper whose
   precondition is M's, and Verus checks each call site: queue pair creation within the
   CQ's reservation, connection from `Reset`, doorbells on a queue pair in `Rts` or `Err`
@@ -242,31 +287,38 @@ could give it a slot.
 ### The claim
 
 Take a program that uses safeverbs and contains no `unsafe`, on a device that behaves as M says, with
-the trusted computing base below correct. Then, for every `Engine` it holds (directly, or under a
-`LocalCq`, an `AsyncCq` or a `SharedQp`), at every moment, whatever it did with it, a panic it caught
+the trusted computing base below correct. Then at every moment, whatever it did, a panic it caught
 included:
 
-- `Hw::inv` holds, and the engine's state is the end of a run of Theorem 1 from the device just opened
-  (the type invariant). Every verb it called met M's precondition, and every request's outcome, lease
-  and waker are what A says.
-- If what the NIC may touch beyond this engine's queues is A's to give (`outside_covered`), then A and
-  M are coupled there, so S1, F1 and R1 hold against M, of the buffers the program holds too. For an
-  engine alone on its device with nothing exposed, nothing beyond its queues exists to give
-  (`theorem_1_alone`).
+- For every `Engine` it holds (directly, or under a `LocalCq`, an `AsyncCq` or a `SharedQp`), `Hw::inv`
+  holds, and the engine's state is the end of a run of Theorem 1 from the device just opened (the type
+  invariant). Every verb it called met M's precondition, and every request's outcome, lease and waker
+  are what its A says. Its A is coupled to M on its own share wherever the device went since the
+  engine last saw it (`Hw::lemma_part`).
+- The engines it holds on a device and the buffers it exposed there stand for one state of A, reached
+  from A's start, in which each engine's requests are as its own A has them, coupled to M at the latest
+  moment one of the engines saw the device (`theorem_1_device`). So S1, F1 and R1 hold against M for
+  the whole device, and the NIC writes no byte of a buffer the program holds, nor reads one of a
+  unique buffer (`lemma_device_s1`). For an engine alone on its device with nothing exposed this is
+  `theorem_1_alone`.
 
 Stated with its exceptions, **a program that uses safeverbs and contains no `unsafe` has no undefined
 behaviour and never misuses the NIC**, as far as M and the trusted items go, except that:
 
-1. **Several engines on one device.** A safe program can make them, and each is covered by the theorem
-   above with `outside_covered` as a premise that nothing discharges. Their WQEs are apart by the
-   buffers' permissions, and each engine's verbs are foreign steps for the others (`share.rs`), but one
-   device history for all of them is not built.
-2. **Exposure.** A safe program can expose a buffer. No reference to it is ever formed, and a peer's
-   writes are read only through `copy_to_slice`, but `expose` and `try_reclaim` are not in the proof,
-   and an exposed region is the other thing `outside_covered` stands for. S1's one exception
-   (`volatile_copy`) is here too.
-3. **What Verus does not see:** an implicit drop ("What is assumed"), and what the references of `Deref`
+1. **`Exposed::copy_to_slice`** reads memory a peer may be writing: S1's one exception. It forms no
+   reference to the bytes and reads them with volatile reads into a type that accepts any bytes, which
+   is a trusted assumption (`volatile_copy`).
+2. **What Verus does not see:** an implicit drop ("What is assumed"), and what the references of `Deref`
    and `DerefMut` do with the bytes (rustc and zerocopy's contracts, in the table below).
+3. **From the theorem to a program is an argument.** A program's engines and exposed buffers are not
+   one Rust value, so that the ones `theorem_1_device` is given are all its device has (`accounted`:
+   each QP of M is of one of their shares, and each region open to a peer within one of the exposed
+   buffers) is argued, not proved. A QP is created only by an engine, on its own share (`create_qp`'s
+   contract), and goes only with its engine's drain; the only registration with remote access is an
+   `Exposed`'s (`register_exposure`), which ends before its buffer goes. An engine that went with a QP
+   the device did not flush leaves that QP and its buffers behind for good: the theorem then speaks of
+   the device with that engine's last state among the engines, which Verus does not see go
+   (`Hw::leak`).
 4. **Liveness is not claimed:** F1-live and R1-live. A device that never flushes keeps its QP and
    buffers; nothing wrong happens, and nothing more does.
 5. **The handles' own behaviour** is tested, not proved: that the right future gets the right result,
@@ -298,14 +350,15 @@ is about, and the zerocopy bound on many of them is what the last rows of the ta
 | `Part`: `len`, `is_empty`, `is_writable` (3); `Leases`: `new`, `is_many`, `len`, `is_empty` (4); `BufMut`: `len`, `is_empty`, `pd_id` (3); `Buf`: `len`, `is_empty`, `try_thaw`, `pd_id` (4) | proved |
 | `Ring`: `depth`, `max_wqes`, `head`, `posted`, `retired`, `committed`, `in_flight_wqes`, `has_staged`, `has_free_slot`, `wqe_retired`, `can_post`, `is_clogged`, `failed`, `state`, `wqe_room`, `next_wqe` (16) | proved, and they read and no more: a program can neither make nor change a `Ring` |
 | `Status::is_ok`, `CompletionError::status`, `Wc::result` (3) | proved |
+| `Exposed::try_reclaim` (1) | proved: the buffer given back is the one exposed, or the `Exposed` is returned with it (A's `unexpose`) |
 | `RingBuf`: `capacity`, `write_with` (2) | proved: a chunk is cut from its free permission, by where `place` says (`in_order`). `write_with`'s `requires` says that its closure takes anything, as a program's does. If it panics the ring takes no more |
 | `Drop` of `Engine` | proved but for its last lines: `Engine::end` (drains and destroys) and `Engine::close` (the CQ) are verified, through `hw_at_end`, trusted; `Hw::leak` is by reading ("What is assumed") |
 | `Engine`: `endpoint`, `send`, `send_imm`, `write`, `write_imm`, `read`, `recv` (7); `Request::push_gather` and its `Drop` (2); `PostError::buf_mut`, `Completion::qp_num`, `Completion::buf_mut` (3) | composed |
 | `Pd::alloc`; `BufMut`: `split_at`, `chunks`, `freeze`, `into_part`; `Chunks::next`; `Buf`: `slice`, `view`, `is_unique`, `into_part`, `try_into_part`, `clone`; `Lend` of `Buf`, `&Buf` and `BufView`; `Leases`: `into_buf_mut`, `take_buf_mut`, `from`, `default`; `Part::into_buf_mut`; `Pd::ring_buf`, `RingBuf::in_use`, `RingBuf::push` (26, with `Lend`'s 6) | composed |
+| `BufMut::expose`; `Exposed`: `remote`, `len`, `is_empty`, `reclaim`, its `Drop` (6) | composed: `expose` is the proved `BufMut::exposed` (A's `expose`); the rest read its buffer or end it through `try_reclaim` and `close_exposure` |
 | `BufMut`: `deref`, `deref_mut`, `as_bytes`, `try_ref`; `Buf`: `deref`, `as_bytes`, `try_ref` (7) | trusted: "references to buffers", `from_raw_parts` in the shell |
 | `Exposed::copy_to_slice` (1) | trusted: `volatile_copy` |
 | `verbs::devices`, `Verbs::open`, `Context::open` (3), and `Verbs`'s methods | trusted: rdma-core and the provider, as M's other side |
-| `BufMut::expose`; `Exposed`: `remote`, `len`, `is_empty`, `try_reclaim`, `reclaim`, its `Drop` (7) | not covered: exposure, the premise; tested |
 | `Context`: `new`, `nic`, `same_device`, `name`, `port`, `gids`, `default_gid_index`, `alloc_pd`; `Pd`: `context`, `id` (10) | not covered: the control path, ordinary Rust. What an engine learns of it is trusted (`pd_alive`, `same_device`) |
 | `Model`: `new`, `set_pace`, `halt`, `inject_error`, `refuse_doorbells`, `refuse_next_mr_registration`, `refuse_mr_closes`, `force_error`, `run`, `pending`, `registered` (11) | not covered: a backend for tests, whose fidelity to M is neither proved nor tested systematically |
 | `RemoteBuf`: `offset`, `slice`; `Access::contains`; `Gid::ipv4`; `Error`: `status`, `last_os_error`; `Status::name`; `Wc::probe_wr_id`; `Ring::invariant` (9) | not covered: plain values and debug helpers. They touch no NIC and no buffer |
@@ -315,8 +368,8 @@ is about, and the zerocopy bound on many of them is what the last rows of the ta
 | --- | --- |
 | `LocalCq` (6), `LocalQp` (22), `AsyncCq` (4), `AsyncQp` (23) and `SharedQp` (21), most from one macro, `QpState` (2), `Op` and `Flush` with their `Future`s, `Batch` (6), `WriteOp` (2), `WriteSink` and its `Sink`, `Receiver` (2) and its `Stream`, `QueuePairBuilder` (23), `PreparedQp` (2), `Context` (5), `Pd` (2) | not covered by the theorem: the argument above says they cannot break it, and their own behaviour is tested |
 
-In numbers, of the core's public functions: 101 proved, 38 composed, 11 trusted (by the three things
-named), 37 not covered. Of `safeverbs`, 121 functions and their `Future`, `Stream` and `Sink`: none in
+In numbers, of the core's public functions: 102 proved, 44 composed, 11 trusted (by the three things
+named), 30 not covered. Of `safeverbs`, 121 functions and their `Future`, `Stream` and `Sink`: none in
 the proof, and none able to get past it.
 
 ## Tested, not proved
@@ -438,7 +491,8 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `buf/lease.rs` `frozen_apart` | a frozen allocation and another real buffer are that one allocation or own different bytes. Linear permissions make it so, but vstd shows two permissions disjoint only with one of them borrowed exclusively, and a frozen allocation's is behind its `Arc`. An exclusive one needs no trust (`Lease::separate_input`) |
 | `trusted.rs` `ExNic`, `ExNicQp`, `ExNicCq` | the NIC traits may bound the wrappers' generics (declared without specifications) |
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's |
-| `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a fresh name, in a state M reaches from a start state (the device just opened), of which its invariants follow; the new engine's share is that CQ and queue pair names nobody uses (this is where tokens come from) |
+| `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a fresh name, in a state M reaches from a start state (the device just opened), of which its invariants follow; the new engine's share is that CQ and queue pair names nobody uses (this is where tokens come from), and its token is of the device of the context it was made on (`device_of`) |
+| `trusted.rs` `one_history` | **One device history.** A device's history is the interleaving of its engines' verbs, each on the engine's own share, with the steps of its NIC and of its control path, and a token holds that history as of its engine's last verb, at the moment its `time` names (a ghost value no other contract mentions). So two tokens of one device have disjoint shares, as `create_cq` gives them, and from the view of the one seen earlier the device went to the other's by steps the earlier one's engine did not take (`share::interleaved`). The exclusive borrow makes them two tokens: an engine has one token, never copied, and `destroy_cq`, its last verb, leaves nothing known of it, its device included |
 | `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these are M's `create_qp`, three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or nothing on error, after rely steps; a queue pair's thread domain changes which locks the driver takes, not what the NIC does; `destroy_cq` is called once, by the end of the engine |
 | `trusted.rs` `qp_num_of`, `qp_lock_free` | facts that mean nothing in M (no contract) |
 | `trusted.rs` `clone_context`, `alloc_td`, `alloc_domain` | handles and domains that mean nothing in M: which locks the driver takes. A parent domain is over the protection domain it was made for (`domain_over`), which `create_qp` asks of it |
@@ -447,6 +501,8 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `trusted.rs` `same_device` | `Context::same_device` says whether a protection domain is of the device an engine's M models |
 | `trusted.rs` `clone_pd` | a clone of a handle is a handle of the same protection domain |
 | `trusted.rs` `register_region` | `ibv_reg_mr` of the bytes given, with no contract of M's: what an engine learns of it is `registered` |
+| `trusted.rs` `register_exposure` | `ibv_reg_mr` of an exposed buffer's bytes, and no others, for remote reads, writes and atomics, with no contract of M's. **The regions open to a peer are exactly those of the live `Exposed` values:** this is the library's only registration with remote access, an `Exposed` holds it with its buffer, and it ends only through `close_exposure`, before the buffer goes or with the buffer kept (`try_reclaim`, `Drop`). It is the second half of the premise `accounted` |
+| `trusted.rs` `close_exposure` | `ibv_dereg_mr` of an exposed region: `Ok` once its remote key no longer works (M's `dereg_mr`), else the handle back, still registered |
 | `trusted.rs` `pd_alive` | a protection domain of the device exists in M as long as a handle to it does |
 | `trusted.rs` `registered`, `registered_all` | a part's region is registered in its domain (writable if the part is unique) and stays so while the part lives; `registered_all` says so of the inputs of a request being written, each kept alive by what the request holds (one that a `Peek` added is of the allocation of an input before it, which the request compared by its `Arc`, so of that input's domain) |
 | `trusted.rs` `start`, `post`, `abort` | `ibv_wr_start`, `ibv_wr_*`, `ibv_wr_abort`: writing WRs changes nothing in M until the doorbell, and an abort discards them |
@@ -480,19 +536,14 @@ data, so M sees a queue pair's inline limit as zero.
   (`bytes_back`). A deposit in a `RawMut`'s `Drop` would not remove that: Verus's `Drop` opens no
   invariant, and the last step would still be to trust that no `Arc` is left.
   The registration lifetime is trusted (`registered`, `registered_all`): saying more needs the
-  control path in one device history, as below.
-- **Several engines.** Each engine's view of M is proved under rely, and each engine's
-  verbs are foreign steps for the others, but one device history for all engines is not
-  built: `create_cq` makes each token rather than splitting one, and each engine's A has its own
-  `next_id`. `outside_covered`, a premise for one engine, is what they would owe each other.
-  Engine creation and destruction, and moving buffers between engines, are part of this. This will
-  be designed with the tokens.
-- **Exposure.** `BufMut::expose`, `Exposed` and `try_reclaim` are not in the proof, and they are what
-  `outside_covered` would be about for one engine. What keeps them out is not their code: A's lease of
-  an exposed buffer would have to be in the state of A an engine stands for, whatever the program does
-  away from the engine. `Hw::adopt` can reach such a state for a given buffer, but saying that M's
-  regions open to a peer are those of the `Exposed` values the program holds needs a shared record of
-  them, opened by a `Drop`, which is the shared authority Verus does not allow above.
+  control path's steps in the device's history, which `one_history` speaks of but no token sees.
+- **The device, from the theorem to a program.** That the engines and exposed buffers given to
+  `theorem_1_device` are all the device has (`accounted`) is an argument about the program ("The
+  public API"). Proving it would need a record of every engine and exposed buffer of a device, kept
+  by their creation and their `Drop`, which Verus does not let a `Drop` update; the same holds of one
+  run of A for the whole device, which the snapshot at each moment stands in for. One device history
+  rests on `one_history`; a shared authority over the tokens, kept in an atomic invariant that every
+  verb opens, would prove it at the price of a trusted atomicity for each verb instead.
 - **The WR of a request's last WQE.** `Refines::wrs` keeps every send WQE's WR from M's history
   (`wr_log`); the rings still keep each request's last one as well, from when it is written
   (`send_tails`), for what a result reports. One record could serve both.
@@ -523,8 +574,8 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 163 verified, 0 errors
-safeverbs-core: verification results:: 812 verified, 0 errors
+safeverbs-spec: verification results:: 187 verified, 0 errors
+safeverbs-core: verification results:: 838 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

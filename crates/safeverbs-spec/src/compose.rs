@@ -13,7 +13,13 @@
 //!   exposed buffers apart from them, stand for one state of A, reached from its start, in which
 //!   every engine's requests are as its own A has them, coupled to M for the whole device: so
 //!   [`crate::refinement::corollary_s1`], [`crate::refinement::corollary_f1`] and
-//!   [`crate::refinement::corollary_r1`] apply to the device as a whole.
+//!   [`crate::refinement::corollary_r1`] apply to the device as a whole, and a buffer the program
+//!   holds apart from them is apart from what the NIC touches ([`lemma_device_s1`]).
+//!
+//! What the composition asks of the engines ([`device_ok`]) the core shows of each engine and each
+//! pair from their ghost state, their buffers' linear permissions and the device's one history,
+//! all but that they and the exposed buffers are everything M has ([`accounted`]), which only the
+//! program as a whole can say.
 #![allow(unused_imports)]
 
 use crate::abs::*;
@@ -893,7 +899,8 @@ proof fn lemma_device_assembled(parts: Seq<EnginePart>, exposed: Seq<ISet<int>>,
         lemma_lease_at(parts, exposed, l);
         let (i, o) = (part_of(parts, l), offset_of(parts, l) as nat);
         assert forall|x: int| a.leases[l].mem.contains(x) implies bytes.contains(x) by {
-            assert(parts[i].abs.leases[o] == parts[i].abs.leases[o]);
+            // The witness of `shared_bytes`.
+            assert(lent(parts[i].abs, o) && !parts[i].abs.leases[o].unique);
         }
     }
     assert forall|l: LeaseId| #[trigger] a.leases.contains_key(l) && a.leases[l].unique

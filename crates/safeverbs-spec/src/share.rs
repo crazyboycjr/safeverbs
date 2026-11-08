@@ -24,6 +24,14 @@
 //! Both generalize M's `lemma_nic_steps_keep_verbs_enabled`, which is the case of no foreign
 //! verb ([`lemma_env_is_rely`]), and every rely run is a run of M ([`lemma_rely_is_nic_run`]),
 //! so the per-worker views compose into executions of M.
+//!
+//! - **One device** ([`interleaved`], [`lemma_interleaved`]): between two moments a worker saw, the
+//!   device's history is the interleaving of the others' verbs, each on its own share, with the
+//!   steps of the NIC and of the control path ([`elsewhere`]): one run of M, and a rely run for the
+//!   worker.
+//! - **What a worker's state of A says of M** ([`coupled_on`]): [`crate::refinement::coupled`] on its
+//!   own queue pairs. With what lies beyond them A's to give ([`outside_covered`]) it is `coupled`
+//!   ([`lemma_coupled_on`]); [`crate::compose`] puts several workers together.
 #![allow(unused_imports)]
 
 use crate::abs::*;

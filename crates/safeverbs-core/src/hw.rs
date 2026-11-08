@@ -47,7 +47,9 @@
 //!   the error state, which M sees in `Rts` or `Err`.
 //! - **A.** The engine stands for a state of the abstract machine, and each
 //!   public method moves it by A's own steps ([`refines`]): Theorem 1, for one
-//!   engine and the buffers it is lent.
+//!   engine and the buffers it is lent. With the other engines of its device
+//!   and the buffers exposed there it stands for one state of A coupled to M
+//!   (`refines::example_device`).
 //!
 //! An engine (`crate::engine`) drives a `Hw` through its public methods only; each requires and
 //! keeps the invariant, and that of the request being written it is given (`open`).
