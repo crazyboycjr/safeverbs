@@ -94,6 +94,7 @@ use crate::wc::{Completed, CompletionError, CompletionResult, Opcode, Received, 
 use crate::wr_id::*;
 
 mod completion;
+pub mod live;
 mod open;
 mod outcomes;
 pub mod refines;
@@ -2561,6 +2562,10 @@ impl<C, N: Device> Hw<C, N> {
             table_ok(final(qps)@, name, t, m, pending.drop_first()),
             same_qps(final(qps)@, old(qps)@),
             refines::linked(final(qps)@, m, g),
+            forall|i: int| 0 <= i < final(qps)@.len()
+                ==> #[trigger] live::entry_ranked(final(qps)@[i], old(qps)@[i], m, m),
+            live::table_rank(final(qps)@, m) < live::table_rank(old(qps)@, m),
+            forall|i: int| #[trigger] live::rung_in(old(qps)@, i) ==> live::rung_in(final(qps)@, i),
         no_unwind
     {
         let ghost start = qps@;
@@ -2580,6 +2585,19 @@ impl<C, N: Device> Hw<C, N> {
             completion::lemma_table_walked(start, qps@, name, t, m, pending, *wc, qps@[index as int]->0, true);
             assert(cqe_ok(start, m, pending[0]));
             refines::lemma_linked_walked(start, qps@, m, g, index as int, pending[0].queue, pending[0].seq as u64, *wc, true);
+            // Its ring heard of one more WQE: what is left of that QP's work fell.
+            let k = index as int;
+            assert forall|i: int| 0 <= i < qps@.len() implies #[trigger] live::entry_ranked(qps@[i], start[i], m, m) by {
+                if i != k {
+                    assert(qps@[i] == start[i]);
+                }
+            }
+            live::lemma_table_rank_one(qps@, start, m, k);
+            assert forall|i: int| #[trigger] live::rung_in(start, i) implies live::rung_in(qps@, i) by {
+                if i != k && 0 <= i < qps@.len() {
+                    assert(qps@[i] == start[i]);
+                }
+            }
         }
     }
 
@@ -2594,10 +2612,17 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            final(self).ranked_from(old(self)),
+            final(self).rank() + n <= old(self).rank(),
+            final(self).all_routed(),
+            forall|i: int| #[trigger] old(self).rung(i) ==> final(self).rung(i),
         no_unwind
     {
         let ghost start = *self;
         let mut n = self.polled_len - self.polled_at;
+        proof {
+            start.lemma_ranked_refl();
+        }
         while self.polled_at < self.polled_len
             invariant
                 self.inv(),
@@ -2606,6 +2631,11 @@ impl<C, N: Device> Hw<C, N> {
                 n <= POLL_MAX,
                 self.refined == start.refined,
                 self.token == start.token,
+                n == start.polled_len - start.polled_at,
+                self.polled_len == start.polled_len,
+                self.ranked_from(&start),
+                self.rank() + (n - (self.polled_len - self.polled_at)) <= start.rank(),
+                forall|i: int| #[trigger] start.rung(i) ==> self.rung(i),
             decreases self.polled_len - self.polled_at,
         {
             proof {
@@ -2619,6 +2649,8 @@ impl<C, N: Device> Hw<C, N> {
             proof {
                 completion::lemma_same_qps_trans(self.qps@, qps, start.qps@);
                 self.lemma_polled_moved(&before);
+                assert(self.ranked_from(&before));
+                self.lemma_ranked_trans(&before, &start);
             }
         }
         self.polled_at = 0;
@@ -2630,6 +2662,12 @@ impl<C, N: Device> Hw<C, N> {
         let ghost t = self.token@;
         let ghost m = t.nic();
         let ghost wcs = self.polled@.take(read as int);
+        proof {
+            // The NIC executed some WQEs meanwhile: what is left fell.
+            self.lemma_polled_ranked(&before_poll, wcs);
+            self.lemma_ranked_rank(&before_poll, -1);
+            self.lemma_ranked_trans(&before_poll, &start);
+        }
         let ghost cqes = completion::lemma_table_polled(self.qps@, self.next_name@, t0, m0, m, wcs, self.pending@);
         let ghost refined = refines::lemma_linked_polled(self.qps@, self.next_name@, t0, m0, m, wcs, self.pending@, self.refined@);
         proof {
@@ -2639,10 +2677,14 @@ impl<C, N: Device> Hw<C, N> {
             self.refined@ = refined;
             self.lemma_moved_trans(&before_poll, &start);
         }
+        let ghost after_poll = *self;
         let mut i = 0;
         while i < read
             invariant
                 0 <= i <= read <= POLL_BATCH,
+                self.ranked_from(&start),
+                self.rank() + n + i <= start.rank(),
+                forall|j: int| #[trigger] start.rung(j) ==> self.rung(j),
                 wcs == self.polled@.take(read as int),
                 cqes.len() == read,
                 forall|j: int| 0 <= j < cqes.len() ==> reports(wcs[j], #[trigger] cqes[j]),
@@ -2676,6 +2718,8 @@ impl<C, N: Device> Hw<C, N> {
             i += 1;
             proof {
                 completion::lemma_same_qps_trans(self.qps@, qps, start.qps@);
+                assert(self.ranked_from(&before));
+                self.lemma_ranked_trans(&before, &start);
             }
         }
         proof {
@@ -3333,12 +3377,17 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            final(self).ranked_from(old(self)),
+            final(self).rung(index as int),
             r matches Err((_, Some(kept))) ==> kept.leases.inv() && kept.leases.fully_recorded(),
             r matches Err((_, kept)) ==> (keep matches Some(seq) ==> (old(self).staged_ctx(index as int, seq as int) matches Some(ctx)
                 ==> (kept matches Some(payload) && payload.ctx == ctx))),
         no_unwind
     {
         if index >= self.qps.len() {
+            proof {
+                self.lemma_ranked_refl();
+            }
             return Err((Error::Invalid("no such QP"), None));
         }
         let ghost start = *self;
@@ -3353,6 +3402,8 @@ impl<C, N: Device> Hw<C, N> {
                 if !e.started {
                     proof {
                         assert(self.qps@ =~= start.qps@);
+                        start.lemma_ranked_refl();
+                        start.qps@[index as int]->0.send.lemma_wqes();
                     }
                     return Ok(());
                 }
@@ -3389,6 +3440,7 @@ impl<C, N: Device> Hw<C, N> {
                                 g2.lemma_extends_trans(g1, start.refined@);
                                 lemma_nic_reaches_trans(m0, mid, n);
                                 self.refined@ = g2;
+                                self.lemma_rang_ranked(&start, index as int, mid, wrs);
                             }
                             return Ok(());
                         },
@@ -3429,12 +3481,14 @@ impl<C, N: Device> Hw<C, N> {
                     let g2 = refines::lemma_linked_refused(start.qps@, self.qps@, n, g1, index as int, Queue::Send, kept_seq);
                     g2.lemma_extends_trans(g1, start.refined@);
                     self.refined@ = g2;
+                    self.lemma_refused_ranked(&start, index as int, kept_seq);
                 }
                 Err((refused, kept))
             },
             None => {
                 proof {
                     assert(self.qps@ =~= start.qps@);
+                    start.lemma_ranked_refl();
                 }
                 Err((Error::Invalid("no such QP"), None))
             },
@@ -4525,9 +4579,11 @@ impl<C, N: Device> Hw<C, N> {
     /// no completion gives it (its slots are twice its depth, so they are held by results nobody
     /// took, or its counters have reached their end), or if the doorbell is refused.
     ///
-    /// It waits only for a signaled WQE out (`Ring::lemma_room_or_signal`), whose completion makes
-    /// room: that the device completes it is the premise of liveness, and all that this loop's end
-    /// rests on.
+    /// It waits only while the device owes it a step: a signaled WQE is out
+    /// (`Ring::lemma_room_or_signal`), signaled in M too, and the NIC has not executed it or its CQE
+    /// waits in the CQ (`Hw::lemma_room_owed`). Each pass is a `Hw::room_pass`, and if the device
+    /// executes its send WQEs and a poll returns a CQE when the CQ holds one, the passes come to an
+    /// end (`live::theorem_room_ends`).
     #[verifier::exec_allows_no_decreases_clause]
     #[verifier::spinoff_prover]
     fn make_send_room(&mut self, index: usize, wqes: u32) -> (r: Result<()>)
@@ -4582,10 +4638,19 @@ impl<C, N: Device> Hw<C, N> {
                 },
             }
             let ghost s1 = *self;
-            self.progress();
+            let _found = self.progress() > 0;
             proof {
                 lemma_same_table_trans(&s1, &s0, &start);
                 lemma_same_table_trans(self, &s1, &start);
+                // A pass of the wait (`live::theorem_room_ends`).
+                self.lemma_ranked_trans(&s1, &s0);
+                s1.lemma_ranked_rank(&s0, -1);
+                if self.waits_for_room(index as int, wqes) {
+                    self.lemma_room_owed(index as int, wqes);
+                }
+                self.lemma_rank_nonneg();
+                self.lemma_holds_qp(index as int);
+                assert(s0.room_pass(self, _found, index as int, wqes));
             }
         }
     }

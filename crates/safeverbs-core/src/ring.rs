@@ -1405,8 +1405,8 @@ impl<L> Ring<L> {
     }
 
     /// A signaled WQE is out: written, and not retired.
-    pub closed spec fn spec_signal_out(&self) -> bool {
-        self.sig_end > self.wqe_retired
+    pub open spec fn spec_signal_out(&self) -> bool {
+        self.spec_sig_end() > self.spec_wqe_retired()
     }
 
     /// The queue has room for the longest request, or a signaled WQE is out. So who waits for room

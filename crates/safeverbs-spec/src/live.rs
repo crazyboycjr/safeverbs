@@ -27,6 +27,7 @@ use crate::nic::*;
 #[cfg(verus_keep_ghost)]
 use crate::nic_proofs::{history_ok, known, lemma_history_init, lemma_history_reaches};
 use crate::refinement::*;
+use crate::share::*;
 use crate::types::*;
 use vstd::prelude::*;
 
@@ -35,13 +36,26 @@ verus! {
 // =========================================================================================
 // The premise
 
+/// How many WQEs of queue `queue` the NIC has executed, since its queue pair was created.
+pub open spec fn executed_of(qp: Qp, queue: Queue) -> nat {
+    match queue {
+        Queue::Send => qp.sq_head + qp.sq_done,
+        Queue::Recv => qp.rq_head + qp.rq_done,
+    }
+}
+
+/// How many WQEs queue `queue` was given, since its queue pair was created.
+pub open spec fn posted_of(qp: Qp, queue: Queue) -> nat {
+    match queue {
+        Queue::Send => qp.sq_head + qp.sq.len(),
+        Queue::Recv => qp.rq_head + qp.rq.len(),
+    }
+}
+
 /// WQE `w` is posted in `m` and the NIC has not executed it.
 pub open spec fn unexecuted(m: Nic::State, w: WqeRef) -> bool {
     &&& posted(m, w)
-    &&& match w.queue {
-        Queue::Send => w.seq >= m.qps[w.qp].sq_head + m.qps[w.qp].sq_done,
-        Queue::Recv => w.seq >= m.qps[w.qp].rq_head + m.qps[w.qp].rq_done,
-    }
+    &&& w.seq >= executed_of(m.qps[w.qp], w.queue)
 }
 
 /// WQE `w` is posted in `m`, executed, and its CQE waits in its CQ: a receive, or a send that was
@@ -56,6 +70,13 @@ pub open spec fn completed(m: Nic::State, w: WqeRef) -> bool {
 /// executed is executed later.
 pub open spec fn executes(nic: spec_fn(nat) -> Nic::State) -> bool {
     forall|k: nat, w: WqeRef| #[trigger] unexecuted(nic(k), w)
+        ==> exists|l: nat| l >= k && !unexecuted(#[trigger] nic(l), w)
+}
+
+/// **The device executes the send WQEs it holds**: [`executes`] for send queues, which a wait for
+/// room needs.
+pub open spec fn executes_sends(nic: spec_fn(nat) -> Nic::State) -> bool {
+    forall|k: nat, w: WqeRef| #[trigger] unexecuted(nic(k), w) && w.queue is Send
         ==> exists|l: nat| l >= k && !unexecuted(#[trigger] nic(l), w)
 }
 
@@ -299,6 +320,96 @@ pub proof fn corollary_f1_live<C: Refines>(run: spec_fn(nat) -> C, i: nat, r: Re
 // =========================================================================================
 // For the library's waits
 
+/// How many WQEs QP `q`'s queues have been given, since it was created.
+pub open spec fn wqes_posted(m: Nic::State, q: QpId) -> nat {
+    posted_of(m.qps[q], Queue::Send) + posted_of(m.qps[q], Queue::Recv)
+}
+
+/// How many WQEs of QP `q`'s queues the NIC has executed, since it was created.
+pub open spec fn wqes_executed(m: Nic::State, q: QpId) -> nat {
+    executed_of(m.qps[q], Queue::Send) + executed_of(m.qps[q], Queue::Recv)
+}
+
+/// Queue pair `b` is queue pair `a` given more WQEs, perhaps, and having executed more.
+pub open spec fn counts_grow(a: Qp, b: Qp) -> bool {
+    &&& executed_of(a, Queue::Send) <= executed_of(b, Queue::Send)
+    &&& executed_of(a, Queue::Recv) <= executed_of(b, Queue::Recv)
+    &&& posted_of(a, Queue::Send) <= posted_of(b, Queue::Send)
+    &&& posted_of(a, Queue::Recv) <= posted_of(b, Queue::Recv)
+}
+
+/// Queue pair `b` is queue pair `a` having executed more, perhaps, and given no WQE.
+pub open spec fn executes_only(a: Qp, b: Qp) -> bool {
+    &&& counts_grow(a, b)
+    &&& posted_of(a, Queue::Send) == posted_of(b, Queue::Send)
+    &&& posted_of(a, Queue::Recv) == posted_of(b, Queue::Recv)
+}
+
+/// A WQE the NIC executed is counted: its queue pair's count of executed WQEs grows.
+pub proof fn lemma_executed_count(m: Nic::State, n: Nic::State, w: WqeRef)
+    requires
+        unexecuted(m, w),
+        !unexecuted(n, w),
+        n.qps.contains_key(w.qp),
+        counts_grow(m.qps[w.qp], n.qps[w.qp]),
+    ensures
+        wqes_executed(m, w.qp) < wqes_executed(n, w.qp),
+{
+}
+
+/// Polling a CQE retires executed WQEs: no queue pair is given or executes a WQE.
+pub proof fn lemma_poll_counts(pre: Nic::State, post: Nic::State, c: CqId)
+    requires
+        nic_inv(pre),
+        nic_step(pre, post, Nic::Step::poll_cq(c)),
+    ensures
+        post.qps.dom() == pre.qps.dom(),
+        forall|q: QpId| #[trigger] pre.qps.contains_key(q) ==> {
+            &&& executes_only(pre.qps[q], post.qps[q])
+            &&& wqes_executed(post, q) == wqes_executed(pre, q)
+            &&& post.qps[q].state == pre.qps[q].state
+        },
+{
+    let e = pre.cqs[c].entries[0];
+    crate::nic_proofs::lemma_head_is_first(pre, c);
+    assert(pre.qp_wf(pre.qps[e.qp]));
+    assert(post.qps.dom() =~= pre.qps.dom());
+}
+
+/// Posting send WRs on queue pair `q` gives it that many WQEs, none executed; no other queue pair
+/// changes.
+pub proof fn lemma_post_counts(pre: Nic::State, post: Nic::State, q: QpId, wrs: Seq<SendWr>)
+    requires
+        nic_step(pre, post, Nic::Step::post_send(q, wrs)),
+    ensures
+        post.qps.dom() == pre.qps.dom(),
+        counts_grow(pre.qps[q], post.qps[q]),
+        posted_of(post.qps[q], Queue::Send) == posted_of(pre.qps[q], Queue::Send) + wrs.len(),
+        posted_of(post.qps[q], Queue::Recv) == posted_of(pre.qps[q], Queue::Recv),
+        wqes_executed(post, q) == wqes_executed(pre, q),
+        post.qps[q].state == pre.qps[q].state,
+        forall|p: QpId| p != q && #[trigger] pre.qps.contains_key(p) ==> post.qps[p] == pre.qps[p],
+{
+    assert(post.qps.dom() =~= pre.qps.dom());
+}
+
+/// What the NIC and the other engines do between two calls of an engine leaves each of its queue
+/// pairs with the WQEs it was given, executes some, and keeps the error state.
+pub proof fn lemma_rely_counts(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State, q: QpId)
+    requires
+        nic_inv(m),
+        share_wf(m, sh),
+        rely_reaches(sh, pins, m, n),
+        sh.owns.contains(q),
+        m.qps.contains_key(q),
+    ensures
+        n.qps.contains_key(q),
+        executes_only(m.qps[q], n.qps[q]),
+        m.qps[q].state is Err ==> n.qps[q].state is Err,
+{
+    lemma_rely_frame(sh, pins, m, n);
+}
+
 /// A measure that never grows along a run stops falling: from some point on it stays as it is. So
 /// a wait whose every step that the device owes is followed by a fall, under the premise, ends.
 pub proof fn lemma_settles(rank: spec_fn(nat) -> nat) -> (k: nat)
@@ -325,6 +436,25 @@ proof fn lemma_settles_from(rank: spec_fn(nat) -> nat, start: nat) -> (k: nat)
         let j = choose|j: nat| j >= start && #[trigger] rank(j) != rank(start);
         lemma_falls(rank, start, j);
         lemma_settles_from(rank, j)
+    }
+}
+
+/// What holds at `a` and not at `b`, later, stops holding at some step between.
+pub proof fn lemma_stops(p: spec_fn(nat) -> bool, a: nat, b: nat) -> (k: nat)
+    requires
+        a <= b,
+        p(a),
+        !p(b),
+    ensures
+        a <= k < b,
+        p(k),
+        !p(k + 1),
+    decreases b - a,
+{
+    if p(a + 1) {
+        lemma_stops(p, a + 1, b)
+    } else {
+        a
     }
 }
 
