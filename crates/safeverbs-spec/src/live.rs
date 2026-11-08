@@ -7,7 +7,8 @@
 //!
 //! - **The device executes the WQEs it holds** ([`executes`]): a WQE posted and not executed is
 //!   executed later. A queue pair's removal needs less, that it flushes those of a queue pair in the
-//!   error state ([`flushes`]).
+//!   error state ([`flushes`]), and that the device takes the removal's verbs (the move to the error
+//!   state and the drain WQE's doorbell), which the core records.
 //! - **The CQEs are polled** ([`polls`]): a WQE with a CQE waiting retires later. That is the
 //!   program polling the CQ, and a poll returning a CQE when the CQ holds one.
 //!

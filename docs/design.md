@@ -182,19 +182,58 @@ any time, never post a receive, or crash; packets may be lost. Receiver-not-read
 access errors and retry exhaustion are allowed outcomes; the library reports them as typed
 errors and none of them affects S1 to L1 or S2.
 
-### 3.4 Liveness, under one premise
+### 3.4 Liveness, under a premise about the device
 
-F1 and R1 above are safety: they say nothing wrong happens, not that anything happens. Two
-statements complete them, with one premise between them: *the device finishes every posted WQE*.
-That is, it executes or flushes each one, and the completions that cover them reach a poll.
+F1 and R1 above are safety: they say nothing wrong happens, not that anything happens. M does not
+say that anything happens either: its NIC may execute a WQE at any time, never included. So
+liveness rests on a premise about the run, which is not a rule of M and enters only the theorems
+that use it (`crates/safeverbs-spec/src/live.rs`):
 
-- **F1-live.** If the device finishes every posted WQE, every request gets exactly one outcome.
-- **R1-live.** If the device finishes every posted WQE, nothing stays in flight after its queue
-  pair is dropped, and every buffer is returned or released.
+- **The device executes the WQEs it holds** (`executes`): a WQE posted and not executed is executed
+  later, with whatever outcome M allows it. A removal needs less, that the device flushes the WQEs
+  of a queue pair in the error state (`flushes`).
+- **A poll of a CQ that holds a CQE returns one.** For a request's outcome, the program must also
+  poll: every CQE is polled (`polls`).
+- **For a removal, the device takes the removal's verbs:** the move to the error state, which M
+  allows from every state, and the drain WQE's doorbell. A refusal of either is recorded with the
+  queue pair (`turned_down`, ghost state), and the theorem is about removals with none.
 
-Both are stated here and **not proved yet**. Without the premise neither is claimed: a device
-that never flushes keeps its requests in flight for good, and the engine keeps their queue pair
-and buffers (`Error::NotFlushed`). That is R1 at work: it frees nothing the NIC may still use.
+Under it:
+
+- **F1-live.** A request in flight gets its outcome once a WQE at or after its last one, on its
+  queue, completes with a CQE (`theorem_f1_live`). So a receive, or a signaled send request, gets
+  it once the device executes its last WQE (`corollary_f1_live`). An unsignaled send request gets
+  its outcome from a later CQE of its queue: a later signaled request (the ring signals one after at
+  most `depth - max_wqes` unsignaled WQEs), a WQE that failed, or its queue pair's drain WQE. While
+  nothing is posted after it, nothing comes of it. Each request gets exactly one outcome, since an
+  outcome never changes (`lemma_f1_one_outcome`).
+- **R1-live.** A removal's drain ends: no run of its passes goes on for ever if the device keeps the
+  premise and the drain WQE finds a slot of its ring (`theorem_drain_ends`, in
+  `crates/safeverbs-core/src/hw/live.rs`). A queue pair whose drain ended is destroyed, and its
+  buffers released (`Hw::lemma_drained`, `Hw::destroy`): `Engine::remove_qp` returns `Ok`, and an
+  engine's drop leaves no queue pair behind (`Engine::end`), unless the drain's clock ran out first.
+- **The engine's wait for room** ends too: `make_send_room` waits only while the device owes it a
+  step, so it ends if the device executes its send WQEs and polls return CQEs (`theorem_room_ends`).
+
+Both waits are proved the same way, by one measure of what is left of the engine's work: for each
+queue pair, the WQEs the NIC has not executed, those its rings have not heard of, and its drain WQE
+while it waits. No pass of a wait raises it, a poll that finds a completion lowers it, and a pass
+after which the wait goes on leaves the device owing a step that lowers it too.
+
+The drain's clock is what is left of time: after `DRAIN_TIMEOUT` without a completion, the drain
+gives up and the queue pair is kept (`Error::NotFlushed`). Each pass of the drain but its first is
+owed a step by the device: a CQE in the CQ for the poll to return, or a WQE of the queue pair, in
+the error state, that the NIC has not executed; or the device turned a verb of the removal down,
+or the drain WQE found no slot. So `NotFlushed` means that for that long the device did not do what
+it owed, or one of those. An engine that goes with such a queue pair leaks it, with its buffers and
+its CQ: R1 frees nothing the NIC may still use.
+
+The drain WQE's slot is a condition on the engine, not the device, and the theorem states it. A
+ring has twice its depth of slots, room for every request in flight and the drain WQE, so a drain
+WQE lacks one only if the device refused doorbells of that queue pair before, leaving the refused
+requests' slots behind work in flight, or if the queue pair wrote 2^62 requests, where its counters
+end; that reading is not proved. Nothing is promised to a program that stops polling, and a
+future's waking also needs the executor to poll woken tasks.
 
 ## 4. What is assumed
 
@@ -543,7 +582,9 @@ flushes is a fatal error that never frees memory the NIC may use: after `DRAIN_T
 second) without a completion, `remove_qp` fails with `Error::NotFlushed` and keeps the queue
 pair, its buffers, its index and its reservation; dropping the engine tries once more and
 otherwise leaks them, with the CQ and the thread domain (destroying those needs the queue pair
-gone). The cost is waiting for the NIC's flush when a queue pair or an engine is dropped. The
+gone). Under the device premise the drain ends (section 3.4). A queue pair being removed takes no
+request, not even one written before the removal. The cost is waiting for the NIC's flush when a
+queue pair or an engine is dropped. The
 `wr_id`s of requests not delivered yet are given up by the removal, before any poll, and their
 buffers follow once the NIC is done. A slot without an owner holds no `wr_id`, so a poll never runs a
 destructor of the user's and none can unwind through it with completions still to record. Nor does

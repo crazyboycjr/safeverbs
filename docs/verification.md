@@ -87,9 +87,9 @@ run is one of A, its own, and at each moment the device stands for a state of A,
 for the whole device is not built, since it would need the shared record of A that a buffer's `Drop`
 cannot update.
 
-**So what the theorem does not cover:** liveness (see "Remaining"), and what the argument says of a
-program as a whole. The handles of the `safeverbs` crate are covered by an argument, not by a
-theorem ("The public API").
+**So what the theorem does not cover:** liveness, which holds under a premise about the device
+("Liveness" below), and what the argument says of a program as a whole. The handles of the
+`safeverbs` crate are covered by an argument, not by a theorem ("The public API").
 
 `scripts/verify.sh` checks everything below that is called proved. The specification
 crate uses no `assume`, `admit`, `external_body` or assumed specification; the code of
@@ -274,13 +274,45 @@ been invoked.
   last WQE, so A's waker runs ahead of the ring's: L1 of the real wakers stays the ring's statement
   above, and a waker registered after M's pop is no step of A.
 
-**Liveness is stated, not proved.** F1-live (every request gets exactly one outcome) and R1-live
-(nothing stays in flight after its queue pair is dropped, and every buffer is returned or
-released) share one premise, that the device retires every posted WQE: `design.md`, section 3.4.
-Waking a future also needs the executor to poll woken tasks. One step of it is proved:
-`make_send_room` waits only for a signaled WQE out (`Ring::lemma_room_or_signal`), whose completion
-makes room, so that premise is all its end rests on; and it fails rather than wait when no completion
-could give it a slot.
+**Liveness, under a premise about the device.** F1-live: every request gets exactly one outcome
+(an unsignaled send request once a later WQE of its queue completes with a CQE). R1-live: nothing
+stays in flight after its queue pair is removed, and every buffer is returned or released. M lets its NIC wait for ever, so both rest on a premise about the run, a hypothesis of
+the theorems and not a rule of M (`design.md`, section 3.4): the device executes the WQEs it holds
+(`executes`; for a removal, that it flushes those of a queue pair in the error state, `flushes`), a
+poll of a CQ that holds a CQE returns one, and for a removal the device takes its verbs (the move to
+the error state and the drain WQE's doorbell).
+- *Spec* (`live.rs`). Along a run of any implementation of `Refines` in which every CQE is polled
+  (`polls`), a request in flight gets its outcome once a WQE at or after its last one, on its queue,
+  completes with a CQE (`theorem_f1_live`); a receive, or a signaled send request, once the device
+  executes its last WQE (`corollary_f1_live`). An unsignaled send request is retired by a later CQE
+  of its queue: nothing comes of it while nothing is posted after it. A measure that never grows
+  settles (`lemma_settles`), and a property that holds and later does not stops holding at some step
+  (`lemma_stops`): the core's two waits use both.
+- *Engine* (`hw/live.rs`). One measure of what is left of the engine's work (`table_rank`): for each
+  queue pair, twice the WQEs the NIC has not executed, with the send WQEs written and not rung, then
+  the WQEs its rings have not heard of, and four more while its drain WQE waits. No call raises it, a CQE
+  routed lowers it, and so does each WQE the NIC executes and a drain WQE posted (`Hw::ranked_from`).
+  The wait for room in `make_send_room` goes on only while the device owes it a step, a signaled WQE
+  out that M holds signaled and has not executed or whose CQE waits in the CQ (`Hw::lemma_room_owed`),
+  so it ends if the device executes its send WQEs and a poll returns a CQE when the CQ holds one
+  (`theorem_room_ends`). A removal keeps what its drain needs (`drain_ok`, part of the invariant): a
+  queue pair being removed takes no work and nothing but its drain WQE is written on it; moved to the
+  error state, it stays there, and once its drain WQE is rung its send queue ends with a signaled WQE.
+  Each pass of `Engine::drain` is a `Hw::drain_pass` from the one before: unless the device turned a
+  verb of a removal down, the measure does not rise and a found completion lowers it, and if the drain goes
+  on, the device owes it a step (`Hw::lemma_drain_owed`, `Hw::lemma_recv_owed`) or a drain WQE lacks
+  a slot. So the drain ends (`theorem_drain_ends`) if the device turns nothing down, flushes and
+  returns CQEs to polls, and no drain WQE lacks a slot. A queue pair whose drain ended is destroyed
+  with its buffers (`Hw::lemma_drained`, `Hw::destroy`), and after `Engine::end` every queue pair left
+  still drains.
+- *What a program may rely on.* `Error::NotFlushed` means that the drain's clock ran out
+  (`DRAIN_TIMEOUT` without a completion) while, at each of its passes after the first, the device owed
+  it a step, or had turned down a verb of the removal, or the drain WQE had no slot. A drain WQE lacks
+  a slot only if the device refused doorbells of that queue pair before, leaving the refused requests'
+  slots behind work in flight, or the queue pair wrote 2^62 requests (by the ring's sizing, not
+  proved). Dropping an engine leaks a queue pair only in that case. A program that stops polling is
+  promised nothing of its requests; a future's waking also needs the executor to poll woken tasks.
+  The clock itself is trusted and means nothing in M (`DrainClock`).
 
 ## The public API
 
@@ -320,8 +352,11 @@ behaviour and never misuses the NIC**, as far as M and the trusted items go, exc
    the device did not flush leaves that QP and its buffers behind for good: the theorem then speaks of
    the device with that engine's last state among the engines, which Verus does not see go
    (`Hw::leak`).
-4. **Liveness is not claimed:** F1-live and R1-live. A device that never flushes keeps its QP and
-   buffers; nothing wrong happens, and nothing more does.
+4. **Liveness holds under a premise about the device** ("Liveness" above): F1-live and R1-live, and
+   the ends of the engine's waits, are proved only for a device that executes (or for a removal
+   flushes) its WQEs, returns a CQE to a poll of a CQ that holds one, and takes a removal's verbs, and
+   for a program that polls. A device that never flushes keeps its QP and buffers; nothing wrong
+   happens, and nothing more does.
 5. **The handles' own behaviour** is tested, not proved: that the right future gets the right result,
    that no wakeup is lost at their level, a sink's item number.
 
@@ -531,8 +566,12 @@ data, so M sees a queue pair's inline limit as zero.
 
 ## Remaining
 
-- **F1-live and R1-live**, stated in `design.md` (section 3.4), with the device's retiring every
-  posted WQE as their premise.
+- **Liveness at its edges.** An unsignaled send request gets no outcome while nothing is posted
+  after it on its queue (`design.md`, section 3.4). The drain's theorem assumes that the drain WQE
+  finds a slot; reserving one for it would take that away. A verb of a removal the device turned down
+  is tried again (the doorbell) or left to the timeout (the move to the error state), and the theorem
+  speaks only of removals with none. The first pass of a drain is not tied to a step owed: CQEs read
+  before it may wait to be routed.
 - **Buffers.** A region's final cleanup trusts that the permissions split from it are back
   (`bytes_back`). A deposit in a `RawMut`'s `Drop` would not remove that: Verus's `Drop` opens no
   invariant, and the last step would still be to trust that no `Arc` is left.
@@ -575,8 +614,8 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 187 verified, 0 errors
-safeverbs-core: verification results:: 838 verified, 0 errors
+safeverbs-spec: verification results:: 202 verified, 0 errors
+safeverbs-core: verification results:: 872 verified, 0 errors
 ```
 
 The script first checks that neither crate assumes anything and that the core trusts only

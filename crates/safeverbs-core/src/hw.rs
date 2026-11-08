@@ -42,7 +42,9 @@
 //!   flight, so the CQ never overruns (M's `lemma_cq_never_overflows`).
 //! - **Teardown.** A QP is destroyed only when neither ring has a WQE in
 //!   flight, which the coupling turns into M's empty queues, `destroy_qp`'s
-//!   precondition, and no CQE read names it ([`Hw::destroy`]).
+//!   precondition, and no CQE read names it ([`Hw::destroy`]). A QP being
+//!   removed takes no work, and its drain WQE is the last thing written on it
+//!   (`drain_ok`).
 //! - **State.** The engine posts work only on a QP it connected or moved to
 //!   the error state, which M sees in `Rts` or `Err`.
 //! - **A.** The engine stands for a state of the abstract machine, and each
@@ -50,6 +52,8 @@
 //!   engine and the buffers it is lent. With the other engines of its device
 //!   and the buffers exposed there it stands for one state of A coupled to M
 //!   (`refines::example_device`).
+//! - **Liveness.** The engine's waits, for room on a send queue and for a
+//!   removal's drain, end if the device does its part ([`live`]).
 //!
 //! An engine (`crate::engine`) drives a `Hw` through its public methods only; each requires and
 //! keeps the invariant, and that of the request being written it is given (`open`).

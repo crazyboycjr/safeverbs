@@ -128,8 +128,12 @@ Start with [verification.md](verification.md), then:
    buffers exposed there as one state of A, coupled to M (`theorem_1_device`), and S1 of the buffers
    the program holds on the device (`lemma_device_s1`). `share.rs` has what each engine says of its
    own share (`coupled_on`) and the device's history as one engine sees it (`interleaved`).
-6. [`examples.rs`](../crates/safeverbs-spec/src/examples.rs): concrete checked traces.
-7. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the steps of A behind each change
+6. [`live.rs`](../crates/safeverbs-spec/src/live.rs): liveness under a premise about the device
+   (F1-live); the core's waits, for room and for a removal's drain, end under it in
+   [`hw/live.rs`](../crates/safeverbs-core/src/hw/live.rs) (`theorem_room_ends`,
+   `theorem_drain_ends`).
+7. [`examples.rs`](../crates/safeverbs-spec/src/examples.rs): concrete checked traces.
+8. [`refine.rs`](../crates/safeverbs-core/src/refine.rs): the steps of A behind each change
    of a request, one request at a time, over any view of requests. Then
    [`hw/refines.rs`](../crates/safeverbs-core/src/hw/refines.rs): the view of an engine's rings,
    its ghost state, the invariant that ties them to A (`linked`), how a buffer comes to A
