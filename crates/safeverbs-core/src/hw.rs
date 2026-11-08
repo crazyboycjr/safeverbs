@@ -2650,6 +2650,8 @@ impl<C, N: Device> Hw<C, N> {
             final(self).rank() + n <= old(self).rank(),
             final(self).all_routed(),
             forall|i: int| #[trigger] old(self).rung(i) ==> final(self).rung(i),
+            final(self).polled_from(old(self), n > 0),
+            forall|i: int| #[trigger] old(self).removed_at(i) ==> final(self).removed_at(i),
         no_unwind
     {
         let ghost start = *self;
@@ -2763,6 +2765,9 @@ impl<C, N: Device> Hw<C, N> {
         // Results wait in the rings, if the event loop wants them.
         self.kept = true;
         self.kept_at = 0;
+        proof {
+            self.lemma_ranked_removed(&start);
+        }
         n
     }
 
@@ -4445,6 +4450,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).inv(),
             final(self).same_table(old(self)),
             final(self).moved_from(old(self)),
+            forall|i: int| #[trigger] old(self).removed_at(i) ==> final(self).removed_at(i),
         no_unwind
     {
         let mut let_go = LetGo::new();
@@ -5860,6 +5866,7 @@ impl<C, N: Device> Hw<C, N> {
             final(self).drain_tried(index as int),
             final(self).others_kept(old(self), index as int),
             final(self).turned_down_at(index as int) || final(self).ranked_from(old(self)),
+            forall|i: int| #[trigger] old(self).removed_at(i) ==> final(self).removed_at(i),
         no_unwind
     {
         let ghost start = *self;

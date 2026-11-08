@@ -1480,6 +1480,46 @@ impl<L> Ring<L> {
         }
     }
 
+    /// WQEs in flight are a request's: one in flight that holds some.
+    pub proof fn lemma_in_flight(&self) -> (s: int)
+        requires
+            self.inv(),
+            self.spec_wqe_retired() < self.spec_wqe_committed(),
+        ensures
+            self.req(s) is Some && self.req(s)->0.phase is InFlight,
+            self.meta(s) is Some && self.meta(s)->0.first < self.meta(s)->0.end,
+    {
+        reveal(Ring::inv_slots_but);
+        reveal(Ring::inv_wqes);
+        self.lemma_view();
+        if forall|s: int| self.retired <= s < self.committed ==> #[trigger] self.is_void(s) {
+            self.lemma_voids_end(self.committed as int);
+        }
+        let s = choose|s: int| self.retired <= s < self.committed && !#[trigger] self.is_void(s);
+        assert(self.live_ok(s));
+        s
+    }
+
+    /// Refused requests hold no WQEs: if those from `retired` up to `k` all are, they end where the
+    /// retired WQEs do.
+    proof fn lemma_voids_end(&self, k: int)
+        requires
+            self.inv(),
+            self.retired < k <= self.committed,
+            forall|s: int| self.retired <= s < k ==> #[trigger] self.is_void(s),
+        ensures
+            self.slot(k - 1).end_wqe == self.wqe_retired,
+        decreases k - self.retired,
+    {
+        reveal(Ring::inv_slots_but);
+        reveal(Ring::inv_wqes);
+        assert(self.is_void(k - 1));
+        assert(self.live_ok(k - 1));
+        if k - 1 > self.retired {
+            self.lemma_voids_end(k - 1);
+        }
+    }
+
     /// Whether every slot is taken by a retired request whose owner has not
     /// taken it: waiting for completions would not free one.
     pub fn is_clogged(&self) -> bool

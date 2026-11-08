@@ -573,6 +573,7 @@ impl<C, N: Nic> Engine<C, N> {
         requires
             index < MAX_QPS,
             old(self).state().keeps_qp(index as int),
+            old(self).state().removed_at(index as int),
         ensures
             final(self).moved_from(old(self)),
             r is Err ==> final(self).state().keeps_qp(index as int),
@@ -583,11 +584,16 @@ impl<C, N: Nic> Engine<C, N> {
         let drained = self.drain(index, index + 1);
         proof {
             use_type_invariant(&*self);
+            // A QP drained is destroyed.
+            if drained {
+                self.hw.lemma_drained(index as int);
+            }
         }
         if drained && self.hw.destroy(index) {
             Ok(())
         } else {
             proof {
+                assert(!drained);
                 assert(self.state().keeps_qp(index as int));
             }
             Err(Error::NotFlushed)
@@ -597,11 +603,20 @@ impl<C, N: Nic> Engine<C, N> {
     /// Polls the CQ until the QPs being removed among those from `from` up to `to` have nothing in
     /// flight; `false` if no completion came for [`DRAIN_TIMEOUT`] while some still had. Neither
     /// answer frees anything: what frees a QP is [`Hw::destroy`], which looks at its rings itself.
+    ///
+    /// Each pass, taken just before its poll, is a `Hw::drain_pass` from the one before: it waits
+    /// only while the device owes the drain a step (or turned a verb of a removal down, or a drain
+    /// WQE lacks a slot), so under the device premise the passes come to an end
+    /// (`live::theorem_drain_ends`), and the time runs out only if the device does not flush.
     #[verifier::exec_allows_no_decreases_clause]
     fn drain(&mut self, from: usize, to: usize) -> (drained: bool)
+        requires
+            from <= to,
         ensures
             final(self).moved_from(old(self)),
             final(self).state().same_table(&old(self).state()),
+            drained ==> final(self).state().drained_in(from as int, to as int),
+            forall|i: int| #[trigger] old(self).state().removed_at(i) ==> final(self).state().removed_at(i),
     {
         let ghost start = self.state();
         proof {
@@ -610,29 +625,48 @@ impl<C, N: Nic> Engine<C, N> {
             start.lemma_same_table_refl();
         }
         let mut clock = clock_start();
+        // The state at the last poll, and whether that poll found a completion.
+        let ghost mut last: Option<(Hw<C, N>, bool)> = None;
         loop
             invariant
+                from <= to,
                 self.state().moved_from(&start),
                 self.state().same_table(&start),
                 start == old(self).state(),
+                forall|i: int| #[trigger] start.removed_at(i) ==> self.state().removed_at(i),
+                last matches Some((h, found)) ==> self.state().polled_from(&h, found),
         {
+            let ghost polled = self.state();
             let mut busy = false;
             let mut index = from;
+            proof {
+                polled.lemma_tried_none(from as int);
+            }
             while index < to
                 invariant
+                    from <= index <= to,
                     self.state().moved_from(&start),
                     self.state().same_table(&start),
                     start == old(self).state(),
+                    forall|i: int| #[trigger] start.removed_at(i) ==> self.state().removed_at(i),
+                    self.state().tried_from(&polled, from as int, index as int),
+                    busy ==> self.state().drains(from as int, index as int),
+                    !busy ==> self.state().drained_in(from as int, index as int),
                 decreases to - index,
             {
                 proof {
                     use_type_invariant(&*self);
                 }
+                let ghost mid = self.state();
                 self.hw.post_drain(index);
                 proof {
                     use_type_invariant(&*self);
                 }
-                if self.hw.draining(index) {
+                let draining = self.hw.draining(index);
+                proof {
+                    self.state().lemma_tried_one(&mid, &polled, from as int, index as int, busy, draining);
+                }
+                if draining {
                     busy = true;
                 }
                 index += 1;
@@ -642,8 +676,17 @@ impl<C, N: Nic> Engine<C, N> {
             }
             proof {
                 use_type_invariant(&*self);
+                if let Some((h, found)) = last {
+                    // The pass from the last poll to this one.
+                    self.state().lemma_drain_pass(&polled, &h, found, from as int, to as int);
+                }
             }
-            if self.hw.progress() > 0 {
+            let ghost before = self.state();
+            let found = self.hw.progress() > 0;
+            proof {
+                last = Some((before, found));
+            }
+            if found {
                 clock_renew(&mut clock);
             } else if clock_idle(&mut clock) {
                 return false;

@@ -50,13 +50,14 @@ pub open(super) spec fn table_rank<C, N: Device>(qps: Seq<Option<HwQp<C, N>>>, m
 }
 
 /// Entry `now` of a table is entry `then` of the table before, its QP given no WQE but what was
-/// written on it: what is left of its work fell by two for each WQE the NIC executed, and by one
-/// more if its drain WQE went out.
+/// written on it, and still being removed if it was: what is left of its work fell by two for
+/// each WQE the NIC executed, and by one more if its drain WQE went out.
 pub open(super) spec fn entry_ranked<C, N: Device>(now: Option<HwQp<C, N>>, then: Option<HwQp<C, N>>, n: Nic::State, m: Nic::State) -> bool {
     match (now, then) {
         (Some(e), Some(f)) => {
             let q = f.id();
             &&& e.id() == q
+            &&& f.removed ==> e.removed
             &&& counts_grow(m.qps[q], n.qps[q])
             &&& rank(e, n) + 2 * (wqes_executed(n, q) - wqes_executed(m, q))
                 + (if f.drain_pending && !e.drain_pending { 1int } else { 0int }) <= rank(f, m)
@@ -303,6 +304,7 @@ impl<C, N: Device> Hw<C, N> {
                 let t0 = start.token@;
                 &&& e1.id() == e0.id()
                 &&& e1.recv == e0.recv
+                &&& e1.removed == e0.removed
                 &&& e1.drain_pending == e0.drain_pending
                 &&& e1.send.just_committed(&e0.send)
                 &&& wrs == t0.written(e0.id())
@@ -346,6 +348,7 @@ impl<C, N: Device> Hw<C, N> {
                 let t0 = start.token@;
                 &&& e1.id() == e0.id()
                 &&& e1.recv == e0.recv
+                &&& e1.removed == e0.removed
                 &&& e1.drain_pending == e0.drain_pending
                 &&& e1.send.just_aborted(&e0.send, keep)
                 &&& rely_reaches(t0.share(), pinned(t0), t0.nic(), self.token@.nic())
@@ -665,6 +668,7 @@ impl<C, N: Device> Hw<C, N> {
         &&& self.token@.nic() == older.token@.nic()
         &&& older.has_qp(index)
         &&& self.qps@[index]->0.id() == older.qps@[index]->0.id()
+        &&& self.qps@[index]->0.removed == older.qps@[index]->0.removed
         &&& self.qps@[index]->0.drain_pending == older.qps@[index]->0.drain_pending
         &&& rank(self.qps@[index]->0, self.token@.nic()) <= rank(older.qps@[index]->0, older.token@.nic()) + 3
     }
@@ -784,13 +788,321 @@ impl<C, N: Device> Hw<C, N> {
     pub proof fn lemma_drained(&self, index: int)
         requires
             self.inv(),
-            self.has_qp(index),
+            self.keeps_qp(index),
             self.removed_at(index),
-            !self.drains_at(index),
+            self.drained_in(index, index + 1),
         ensures
             self.destroyable(index),
     {
+        assert(!self.drains_at(index));
         assert(qp_ok(self.qps@[index], index, self.token@, self.token@.nic()));
+    }
+
+    /// A QP being removed stays so along calls that rank.
+    pub proof fn lemma_ranked_removed(&self, older: &Self)
+        requires
+            self.ranked_from(older),
+        ensures
+            forall|i: int| #[trigger] older.removed_at(i) ==> self.removed_at(i),
+    {
+        assert forall|i: int| #[trigger] older.removed_at(i) implies self.removed_at(i) by {
+            if 0 <= i < self.qps@.len() {
+                assert(entry_ranked(self.qps@[i], older.qps@[i], self.token@.nic(), older.token@.nic()));
+            }
+        }
+    }
+}
+
+impl<C, N: Device> Hw<C, N> {
+    /// No QP from `from` up to `to` drains.
+    pub open(super) spec fn drained_in(&self, from: int, to: int) -> bool {
+        forall|i: int| from <= i < to ==> !#[trigger] self.drains_at(i)
+    }
+
+    /// `self` is `older` after tries at the drain WQEs of the QPs from `from` up to `to`
+    /// ([`Hw::post_drain`]): what is left of the engine's work did not rise, unless the device
+    /// turned down a verb of a removal; and the CQEs read are as they were.
+    pub open(super) spec fn tried_from(&self, older: &Self, from: int, to: int) -> bool {
+        &&& self.turned_down_in(from, to) || self.ranked_from(older)
+        &&& forall|i: int| from <= i < to ==> #[trigger] self.drain_tried(i)
+        &&& self.qps@.len() == older.qps@.len()
+        &&& self.pending == older.pending
+    }
+
+    /// `self` is `older` after a poll of the CQ, `found` if it routed a completion: what is left of
+    /// the engine's work fell then, and never rose; every CQE read is routed.
+    pub open(super) spec fn polled_from(&self, older: &Self, found: bool) -> bool {
+        &&& self.ranked_from(older)
+        &&& found ==> self.rank() < older.rank()
+        &&& self.all_routed()
+    }
+
+    /// A pass of `Engine::drain`'s wait on the QPs from `from` up to `to`, from `self` to `next`,
+    /// each just before a poll of the CQ, `found` if the poll of `self` routed a completion: unless
+    /// the device turned down a verb of a removal, what is left of the engine's work falls when one
+    /// is found and never rises, and if the drain goes on, the device owes it a step or a drain WQE
+    /// lacks a slot; and M keeps the QPs.
+    pub open(super) spec fn drain_pass(&self, next: &Self, found: bool, from: int, to: int) -> bool {
+        &&& next.turned_down_in(from, to) || {
+            &&& next.rank() >= 0
+            &&& next.ranked_from(self)
+            &&& found ==> next.rank() < self.rank()
+            &&& next.drains(from, to) ==> next.owed_in(from, to) || next.lacks_slot_in(from, to)
+        }
+        &&& forall|i: int| from <= i < to ==> #[trigger] next.holds_qp(i)
+    }
+
+    /// No try yet.
+    pub proof fn lemma_tried_none(&self, from: int)
+        ensures
+            self.tried_from(self, from, from),
+            self.drained_in(from, from),
+    {
+        self.lemma_ranked_refl();
+    }
+
+    /// One more try in a pass of `Engine::drain`: `self` is `mid` after [`Hw::post_drain`] of QP
+    /// `index`, which drains then if `draining`; `busy` says whether one before it drains.
+    pub proof fn lemma_tried_one(&self, mid: &Self, older: &Self, from: int, index: int, busy: bool, draining: bool)
+        requires
+            from <= index,
+            mid.tried_from(older, from, index),
+            busy ==> mid.drains(from, index),
+            !busy ==> mid.drained_in(from, index),
+            self.drain_tried(index),
+            self.others_kept(mid, index),
+            self.turned_down_at(index) || self.ranked_from(mid),
+            draining == self.drains_at(index),
+        ensures
+            self.tried_from(older, from, index + 1),
+            busy || draining ==> self.drains(from, index + 1),
+            !(busy || draining) ==> self.drained_in(from, index + 1),
+    {
+        assert forall|i: int| from <= i < index + 1 implies #[trigger] self.drain_tried(i) by {
+            if i < index {
+                assert(mid.drain_tried(i));
+            }
+        }
+        if mid.turned_down_in(from, index) {
+            let i = choose|i: int| from <= i < index && #[trigger] mid.turned_down_at(i);
+            assert(self.turned_down_at(i));
+        } else if !self.turned_down_at(index) {
+            self.lemma_ranked_trans(mid, older);
+        }
+        if busy {
+            let i = choose|i: int| from <= i < index && #[trigger] mid.drains_at(i);
+            assert(self.drains_at(i));
+        }
+        if !(busy || draining) {
+            assert forall|i: int| from <= i < index + 1 implies !#[trigger] self.drains_at(i) by {
+                if i < index {
+                    assert(!mid.drains_at(i));
+                }
+            }
+        }
+    }
+
+    /// **Receives in flight are owed a step.** With every CQE read routed, a receive queue with WQEs
+    /// in flight has a request in flight past everything its ring heard of
+    /// (`Ring::lemma_in_flight`), so its WQE is in M's queue: the NIC has not executed it, or its
+    /// CQE waits in the CQ (every receive has one).
+    pub(super) proof fn lemma_recv_owed(&self, index: int)
+        requires
+            self.inv(),
+            self.all_routed(),
+            self.has_qp(index),
+            self.qps@[index]->0.recv.spec_wqe_posted() > self.qps@[index]->0.recv.spec_wqe_retired(),
+        ensures
+            self.cq_holds() || exists|w: WqeRef| w.qp == self.qps@[index]->0.id()
+                && #[trigger] unexecuted(self.token@.nic(), w),
+    {
+        let (t, m) = (self.token@, self.token@.nic());
+        let sh = t.share();
+        let e = self.qps@[index]->0;
+        let q = e.id();
+        assert(qp_ok(self.qps@[index], index, t, m));
+        assert(e.ok(index as u16, m, sh, t.started(q), t.written(q)));
+        let qp = m.qps[q];
+        let r = e.recv;
+        reveal(outcomes::recv_outcomes);
+        r.lemma_wqes();
+        let s = r.lemma_in_flight();
+        r.lemma_meta(s);
+        assert(outcomes::recv_result(r, m, q, s));
+        assert(lag_ok(e, m, Queue::Recv, self.pending@));
+        let x = r.meta(s)->0.first as nat;
+        assert(qp.rq_head <= x < qp.rq_head + qp.rq.len());
+        let w = WqeRef { qp: q, queue: Queue::Recv, seq: x };
+        if unexecuted(m, w) {
+            assert(w.qp == q && unexecuted(m, w));
+        } else {
+            // Executed: its CQE waits.
+            assert(m.qp_wf(qp));
+            assert(m.cqes_present(q));
+            let k = x - qp.rq_head;
+            assert(0 <= k < qp.rq_done);
+            assert(qp.rq[k].outcome is Some);
+            assert(qp.attr.recv_cq == sh.cq);
+        }
+    }
+
+    /// **A drain that goes on is owed a step**, unless the device turned down a verb of the removal
+    /// or its drain WQE lacks a slot. With every CQE read routed and QP `index`'s drain WQE tried:
+    /// a QP its removal did not move to the error state has nothing in flight unless the device
+    /// turned the move down ([`drain_ok`]); one moved there has nothing written and not rung, so a
+    /// drain WQE waiting for room has a signaled WQE out (`Ring::lemma_room_or_signal`), once rung
+    /// its send queue ends with a signaled WQE ([`drain_ok`]), and its receives are owed a step
+    /// ([`Hw::lemma_recv_owed`]).
+    pub(super) proof fn lemma_drain_owed(&self, index: int)
+        requires
+            self.inv(),
+            self.all_routed(),
+            self.drain_tried(index),
+            self.drains_at(index),
+        ensures
+            self.owed_flush(index) || self.turned_down_at(index) || self.lacks_slot_at(index),
+    {
+        let (t, m) = (self.token@, self.token@.nic());
+        let e = self.qps@[index]->0;
+        let q = e.id();
+        assert(qp_ok(self.qps@[index], index, t, m));
+        assert(e.ok(index as u16, m, t.share(), t.started(q), t.written(q)));
+        assert(drain_ok(e, m.qps[q]));
+        e.send.lemma_wqes();
+        e.recv.lemma_wqes();
+        if e.flushing@ && !e.turned_down@ && !self.lacks_slot_at(index) {
+            // Nothing is written and not rung.
+            assert(self.rung(index));
+            if e.drain_pending {
+                e.send.lemma_room_or_signal();
+                self.lemma_signal_owed(index);
+            } else if e.send.spec_wqe_posted() > e.send.spec_wqe_retired() {
+                self.lemma_signal_owed(index);
+            } else {
+                self.lemma_recv_owed(index);
+            }
+        }
+    }
+
+    /// What `Engine::drain` knows at the poll of a pass makes the pass before a
+    /// [`Hw::drain_pass`]: `polled` is `before`, the state at that pass's poll, after it, and `self`
+    /// is `polled` after tries at the drain WQEs of the QPs from `from` up to `to`.
+    pub proof fn lemma_drain_pass(&self, polled: &Self, before: &Self, found: bool, from: int, to: int)
+        requires
+            self.inv(),
+            polled.polled_from(before, found),
+            self.tried_from(polled, from, to),
+        ensures
+            before.drain_pass(self, found, from, to),
+    {
+        assert forall|i: int| from <= i < to implies #[trigger] self.holds_qp(i) by {
+            self.lemma_holds_qp(i);
+        }
+        if !self.turned_down_in(from, to) {
+            self.lemma_rank_nonneg();
+            self.lemma_ranked_trans(polled, before);
+            self.lemma_ranked_rank(polled, -1);
+            if self.drains(from, to) {
+                let i = choose|i: int| from <= i < to && #[trigger] self.drains_at(i);
+                assert(self.drain_tried(i));
+                self.lemma_drain_owed(i);
+                if self.lacks_slot_at(i) {
+                    assert(self.lacks_slot_in(from, to));
+                } else {
+                    assert(self.owed_flush(i));
+                    assert(self.owed_in(from, to));
+                }
+            }
+        }
+    }
+}
+
+/// What a pass of the drain leaves, the device turning nothing down.
+proof fn lemma_drain_step<C, N: Device>(passes: spec_fn(nat) -> (Hw<C, N>, bool), from: int, to: int, k: nat)
+    requires
+        forall|j: nat| #[trigger] passes(j).0.drain_pass(&passes(j + 1).0, passes(j).1, from, to),
+        !passes(k + 1).0.turned_down_in(from, to),
+    ensures
+        passes(k + 1).0.ranked_from(&passes(k).0),
+        passes(k + 1).0.rank() >= 0,
+        passes(k + 1).0.rank() <= passes(k).0.rank(),
+        passes(k).1 ==> passes(k + 1).0.rank() < passes(k).0.rank(),
+        passes(k + 1).0.drains(from, to) ==> passes(k + 1).0.owed_in(from, to) || passes(k + 1).0.lacks_slot_in(from, to),
+        forall|i: int| from <= i < to ==> #[trigger] passes(k + 1).0.holds_qp(i),
+{
+    assert(passes(k).0.drain_pass(&passes(k + 1).0, passes(k).1, from, to));
+    passes(k + 1).0.lemma_ranked_rank(&passes(k).0, -1);
+}
+
+/// **The drain ends.** Take the passes of `Engine::drain`'s wait on the QPs from `from` up to `to`
+/// without end, each just before its poll: each a [`Hw::drain_pass`], each with a QP still
+/// draining. Suppose that the device turns down no verb of their removals, that no drain WQE
+/// lacks a slot, that the device flushes the WQEs of every QP in the error state (`flushes`), and
+/// that a poll of a CQ that holds a CQE returns one. That is impossible: what is left of the
+/// engine's work never rises, so it settles, and the next step the device owes the drain lowers
+/// it.
+pub proof fn theorem_drain_ends<C, N: Device>(passes: spec_fn(nat) -> (Hw<C, N>, bool), from: int, to: int)
+    requires
+        passes(0).0.rank() >= 0,
+        forall|k: nat| #[trigger] passes(k).0.drain_pass(&passes(k + 1).0, passes(k).1, from, to),
+        forall|k: nat| #[trigger] passes(k).0.drains(from, to),
+        forall|k: nat| !(#[trigger] passes(k).0.turned_down_in(from, to)),
+        forall|k: nat| !(#[trigger] passes(k).0.lacks_slot_in(from, to)),
+        flushes(|k: nat| passes(k).0.nic()),
+        forall|k: nat| #[trigger] passes(k).0.cq_holds() ==> passes(k).1,
+    ensures
+        false,
+{
+    let hs = |k: nat| passes(k).0;
+    let nic = |k: nat| passes(k).0.nic();
+    assert forall|k: nat| #[trigger] hs(k + 1).ranked_from(&hs(k)) by {
+        assert(!passes(k + 1).0.turned_down_in(from, to));
+        lemma_drain_step(passes, from, to, k);
+    }
+    let rank = |k: nat| passes(k).0.rank() as nat;
+    assert forall|k: nat| #[trigger] rank(k + 1) <= rank(k) by {
+        assert(!passes(k + 1).0.turned_down_in(from, to));
+        lemma_drain_step(passes, from, to, k);
+        if k > 0 {
+            assert(!passes(k).0.turned_down_in(from, to));
+            lemma_drain_step(passes, from, to, (k - 1) as nat);
+        }
+    }
+    let settled = lemma_settles(rank);
+    let k0 = settled + 1;
+    let h = passes(k0).0;
+    assert(!passes(k0).0.turned_down_in(from, to));
+    assert(!passes(k0 + 1).0.turned_down_in(from, to));
+    lemma_drain_step(passes, from, to, settled);
+    lemma_drain_step(passes, from, to, k0);
+    assert(h.drains(from, to));
+    assert(!h.lacks_slot_in(from, to));
+    assert(h.owed_in(from, to));
+    let i = choose|i: int| from <= i < to && #[trigger] h.owed_flush(i);
+    assert(rank(k0) == rank(settled) && rank(k0 + 1) == rank(settled));
+    if h.cq_holds() {
+        // The poll of this pass returns it, and the measure falls.
+        assert(passes(k0).0.cq_holds());
+    } else {
+        let q = h.qps@[i]->0.id();
+        let w = choose|w: WqeRef| w.qp == q && #[trigger] unexecuted(h.token@.nic(), w);
+        assert(unexecuted(nic(k0), w) && nic(k0).qps[w.qp].state is Err);
+        let l = choose|l: nat| l >= k0 && !unexecuted(#[trigger] nic(l), w);
+        let k = lemma_stops(|k: nat| unexecuted(nic(k), w), k0, l);
+        let (a, b) = (passes(k).0, passes(k + 1).0);
+        lemma_qp_kept(hs, i, k0, k);
+        lemma_qp_kept(hs, i, k0, k + 1);
+        assert(!passes(k + 1).0.turned_down_in(from, to));
+        assert(!passes(k).0.turned_down_in(from, to));
+        assert((k - 1) as nat + 1 == k);
+        lemma_drain_step(passes, from, to, k);
+        lemma_drain_step(passes, from, to, (k - 1) as nat);
+        assert(entry_ranked(b.qps@[i], a.qps@[i], b.token@.nic(), a.token@.nic()));
+        assert(b.holds_qp(i));
+        lemma_executed_count(a.token@.nic(), b.token@.nic(), w);
+        assert(b.moved_on(&a, i));
+        b.lemma_ranked_rank(&a, i);
+        assert(rank(k) == rank(settled) && rank(k + 1) == rank(settled));
     }
 }
 
