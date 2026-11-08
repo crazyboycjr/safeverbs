@@ -930,9 +930,7 @@ impl<T, N: Nic> Exposed<T, N> {
             None => {},
         }
     }
-}
 
-impl<T, N: Nic> Exposed<T, N> {
     /// The exposed buffer owns no byte that `other` owns: their linear permissions, its own borrowed
     /// exclusively. It changes nothing, and exists in Verus builds alone.
     #[cfg(verus_keep_ghost)]
@@ -1026,7 +1024,7 @@ impl<T, N: Nic> Exposed<T, N> {
 }
 
 impl<T, N: Nic> BufMut<T, N> {
-    /// Registers the buffer for remote access, all of its bytes and none other, and hands it to the
+    /// Registers the buffer for remote access, all of its bytes and no others, and hands it to the
     /// peer: A's `expose`. The program keeps no way to its bytes but the volatile copy.
     pub(crate) fn exposed(self) -> (r: Result<Exposed<T, N>, BufError<BufMut<T, N>>>)
         ensures

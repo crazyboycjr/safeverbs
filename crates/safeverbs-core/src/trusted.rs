@@ -798,8 +798,9 @@ pub fn register_region<N: Device>(pd: &Pd<N>, address: *mut u8, bytes: usize) ->
 /// `ibv_reg_mr` of `bytes` bytes at `address` in `pd`, for remote reads, writes and atomics: the
 /// region a peer may reach by its key, its handle and remote key, or nothing. No contract of M's,
 /// as for [`register_region`]: this is the library's only registration with remote access, of an
-/// exposed buffer's bytes and no others, and [`close_exposure`] the only one of its ends. What a
-/// peer may reach in M is so the exposed buffers the program holds (`docs/verification.md`).
+/// exposed buffer's bytes and no others, and [`close_exposure`] the only one of its ends, so the
+/// regions a peer may reach in M are those of the `Exposed` values the program holds
+/// (`docs/verification.md`).
 #[verifier::external_body]
 pub fn register_exposure<N: Device>(pd: &Pd<N>, address: *mut u8, bytes: usize) -> (r: Result<(N::Mr, u32)>) {
     let access = Access::LOCAL_WRITE | Access::REMOTE_WRITE | Access::REMOTE_READ | Access::REMOTE_ATOMIC;
