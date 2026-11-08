@@ -4457,6 +4457,7 @@ impl<C, N: Device> Hw<C, N> {
 impl<C, N: Device> HwQp<C, N> {
     /// It takes what `open` was written for, see [`HwQp::takes`].
     spec fn spec_takes(&self, open: Writing<N>) -> bool {
+        &&& !self.removed
         &&& open.pd_id == self.pd_id
         &&& open.max_len == self.max_len
         &&& open.n <= self.send.spec_max_wqes()
@@ -4466,8 +4467,9 @@ impl<C, N: Device> HwQp<C, N> {
     }
 
     /// Whether it takes what `open` was written for, which is a value of its own: of its protection
-    /// domain, as long as its messages, in as many WQEs as a request of it may have. Anything else
-    /// a WQE asks of a QP is out of the common.
+    /// domain, as long as its messages, in as many WQEs as a request of it may have; and whether it
+    /// takes anything, not being removed (a request written before the removal stays out of it).
+    /// Anything else a WQE asks of a QP is out of the common.
     #[inline(always)]
     fn takes(&self, open: &Writing<N>) -> (takes: bool)
         requires
@@ -4479,7 +4481,8 @@ impl<C, N: Device> HwQp<C, N> {
             takes == self.spec_takes(*open),
         no_unwind
     {
-        open.pd_id == self.pd_id && open.max_len == self.max_len && open.n <= self.send.max_wqes() as usize
+        !self.removed && open.pd_id == self.pd_id && open.max_len == self.max_len
+            && open.n <= self.send.max_wqes() as usize
             && (!(open.reads || open.max_sges > 1) || self.takes_other(open))
     }
 

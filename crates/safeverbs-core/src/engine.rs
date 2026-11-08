@@ -2252,6 +2252,35 @@ mod tests {
         }
     }
 
+    /// A request written before its QP's removal does not go on the QP afterwards: a removal the
+    /// device did not flush leaves the QP taking nothing, and once the device moves again, dropping
+    /// the engine drains and releases it. (A request closed there used to be written on the QP and
+    /// never rung, so the drop's drain waited on it until its timeout and leaked the QP.)
+    #[test]
+    fn a_qp_being_removed_takes_no_request() {
+        let model = Model::new(29);
+        let pd = Context::new(model.clone()).alloc_pd().unwrap();
+        let mut w = Engine::new(pd.context(), 64).unwrap();
+        let (a, _b) = connected_pair(&mut w, &pd, 8, 4);
+        let buf = pd.alloc::<u8>(64).unwrap();
+        w.post_recv(a, buf.into_part(), ()).unwrap();
+        let frozen = pd.alloc::<u8>(64).unwrap().freeze();
+        let mut open = w.open_request(a);
+        assert!(
+            open.try_push(WrOp::Send, frozen.clone().into_part())
+                .is_ok()
+        );
+        model.halt(true);
+        assert_eq!(w.remove_qp(a), Err(Error::NotFlushed));
+        assert!(w.close_open(a, &mut open, true, None).is_err());
+        drop(open);
+        model.halt(false);
+        drop(w);
+        assert!(frozen.try_thaw().is_ok(), "the buffer is back");
+        drop(pd);
+        assert_eq!(model.registered(), 0);
+    }
+
     /// A request handed back to its QP while it has WQEs keeps them, and they still go out.
     #[test]
     fn giving_back_leaves_the_wqes_written() {
