@@ -260,8 +260,14 @@ impl Qp {
     /// which lists every error a requester detects, has each of them "NA" but for RC and RD.
     /// The abort of `RemoteOther` is in 11.6.2 an RD error, or a responder's own for UD and UC
     /// with an SRQ, which a UC or UD requester never hears of.
+    ///
+    /// **M3.** `RemoteAccess` only on an RDMA WRITE, with or without immediate, or an RDMA
+    /// READ (M's atomics are READs). IB 11.6.2, "Remote Access Error": "This error is reported
+    /// only on RDMA operations or atomic operations"; the R_Key violations of 9.7.4.1.5 are
+    /// those of an RDMA READ, an RDMA WRITE or an atomic.
     pub open spec fn allows_send_status(self, wr: SendWr, s: Status) -> bool {
-        (s.is_remote() || s is RetryExceeded || s is RnrRetryExceeded) ==> self.attr.transport is Rc
+        &&& (s.is_remote() || s is RetryExceeded || s is RnrRetryExceeded) ==> self.attr.transport is Rc
+        &&& s is RemoteAccess ==> (wr.opcode is Write || wr.opcode is WriteImm || wr.opcode is Read)
     }
 }
 
