@@ -4,7 +4,8 @@
 //! precondition is accidentally unsatisfiable, which would make the lemmas about them
 //! vacuous): a buffer's lease moves into a request and back, a waker is invoked on completion,
 //! a dropped future keeps its lease in flight, a batch of READs succeeds whole through one
-//! completion, a batch fails at position 1, and a refused post changes nothing.
+//! completion, a batch fails at position 1, a refused post changes nothing, and the rules for
+//! a send's statuses admit some and rule out others.
 #![allow(unused_imports)]
 
 use crate::abs::*;
@@ -40,6 +41,27 @@ pub proof fn example_operation_metadata() {
     let failed = Outcome { status: Status::RemoteAccess, ..ack };
     assert(Opcode::Read.allows_outcome(64, failed));
     assert(empty.allows_outcome(failed));
+}
+
+/// M's rules for the statuses of a send WQE (M2 to M4) admit some and rule out others: none of
+/// them is vacuous or contradictory.
+pub proof fn example_send_status_rules() {
+    let send = SendWr { wr_id: 0, opcode: Opcode::Send, sges: Seq::empty(), signaled: true, inline: false };
+    let write = SendWr { opcode: Opcode::Write, ..send };
+    let rc = qp7();
+    let uc = Qp { attr: QpAttr { transport: Transport::Uc, ..rc.attr }, ..rc };
+    // M2: what the other end reports, and the retries, only on RC.
+    assert(rc.allows_send_status(send, Status::RemoteInvalidRequest));
+    assert(!uc.allows_send_status(send, Status::RemoteInvalidRequest));
+    assert(!uc.allows_send_status(write, Status::RetryExceeded));
+    assert(uc.allows_send_status(send, Status::LocalErr));
+    // M3: a remote access error only on an RDMA operation.
+    assert(rc.allows_send_status(write, Status::RemoteAccess));
+    assert(!rc.allows_send_status(send, Status::RemoteAccess));
+    // M4: receiver-not-ready only below 7, and for a QP never connected.
+    assert(!rc.allows_send_status(send, Status::RnrRetryExceeded));
+    assert(Qp { rnr_retry: Some(0), ..rc }.allows_send_status(send, Status::RnrRetryExceeded));
+    assert(Qp { rnr_retry: None, ..rc }.allows_send_status(send, Status::RnrRetryExceeded));
 }
 
 /// A request that has just been posted.
@@ -157,6 +179,7 @@ spec fn qp7() -> Qp {
         state: QpState::Rts,
         sq: Seq::empty(), sq_head: 0, sq_done: 0,
         rq: Seq::empty(), rq_head: 0, rq_done: 0,
+        rnr_retry: Some(7),
     }
 }
 
@@ -202,7 +225,7 @@ proof fn lemma_connected()
     let m3 = Nic::State { cqs: Map::empty().insert(3, cq), ..m2 };
     assert(Nic::State::create_cq(m2, m3, 3, 16));
     lemma_create_cq(m2, m3, 3, 16);
-    let qp = qp7().with_state(QpState::Reset);
+    let qp = Qp { rnr_retry: None, ..qp7().with_state(QpState::Reset) };
     let cqs1 = m3.cqs.insert(3, m3.cqs[3].reserve(7, 4));
     assert(cqs1.insert(3, cqs1[3].reserve(7, 4)) =~= s.cqs);
     lemma_copies(7, 4);
@@ -210,14 +233,14 @@ proof fn lemma_connected()
     assert(Nic::State::create_qp(m3, m4, 7, qp.attr));
     lemma_create_qp(m3, m4, 7, qp.attr);
     let m5 = Nic::State { qps: m4.qps.insert(7, qp.with_state(QpState::Init)), ..m4 };
-    assert(Nic::State::modify_qp(m4, m5, 7, QpState::Init));
-    lemma_modify_qp(m4, m5, 7, QpState::Init);
+    assert(Nic::State::modify_qp(m4, m5, 7, QpState::Init, None));
+    lemma_modify_qp(m4, m5, 7, QpState::Init, None);
     let m6 = Nic::State { qps: m5.qps.insert(7, qp.with_state(QpState::Rtr)), ..m5 };
-    assert(Nic::State::modify_qp(m5, m6, 7, QpState::Rtr));
-    lemma_modify_qp(m5, m6, 7, QpState::Rtr);
+    assert(Nic::State::modify_qp(m5, m6, 7, QpState::Rtr, None));
+    lemma_modify_qp(m5, m6, 7, QpState::Rtr, None);
     let m7 = Nic::State { qps: m6.qps.insert(7, qp7()), ..m6 };
-    assert(Nic::State::modify_qp(m6, m7, 7, QpState::Rts));
-    lemma_modify_qp(m6, m7, 7, QpState::Rts);
+    assert(Nic::State::modify_qp(m6, m7, 7, QpState::Rts, Some(7)));
+    lemma_modify_qp(m6, m7, 7, QpState::Rts, Some(7));
     assert(m7.qps =~= s.qps);
     assert(m7 == s);
 }

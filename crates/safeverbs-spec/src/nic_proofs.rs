@@ -315,8 +315,8 @@ pub proof fn lemma_create_qp(pre: Nic::State, post: Nic::State, q: QpId, attr: Q
     }
 }
 
-pub proof fn lemma_modify_qp(pre: Nic::State, post: Nic::State, q: QpId, to: QpState)
-    requires pre.invariant(), Nic::State::modify_qp(pre, post, q, to),
+pub proof fn lemma_modify_qp(pre: Nic::State, post: Nic::State, q: QpId, to: QpState, rnr_retry: Option<nat>)
+    requires pre.invariant(), Nic::State::modify_qp(pre, post, q, to, rnr_retry),
     ensures post.invariant(),
 {
 }
@@ -1030,7 +1030,7 @@ pub proof fn lemma_next(pre: Nic::State, post: Nic::State)
         Nic::Step::create_cq(c, cap) => lemma_create_cq(pre, post, c, cap),
         Nic::Step::destroy_cq(c) => lemma_destroy_cq(pre, post, c),
         Nic::Step::create_qp(q, attr) => lemma_create_qp(pre, post, q, attr),
-        Nic::Step::modify_qp(q, to) => lemma_modify_qp(pre, post, q, to),
+        Nic::Step::modify_qp(q, to, rnr) => lemma_modify_qp(pre, post, q, to, rnr),
         Nic::Step::destroy_qp(q) => lemma_destroy_qp(pre, post, q),
         Nic::Step::post_send(q, wrs) => lemma_post_send(pre, post, q, wrs),
         Nic::Step::post_recv(q, wrs) => lemma_post_recv(pre, post, q, wrs),

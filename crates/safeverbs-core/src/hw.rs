@@ -1771,8 +1771,9 @@ impl<C, N: Device> Hw<C, N> {
 // =============================================================================
 // Changing one QP
 
-/// QP `b` is QP `a` with maybe another state: the same attributes, the same
-/// WQEs, the executed ones with the same outcomes, maybe more executed.
+/// QP `b` is QP `a` with maybe another state (and RNR retry count): the same
+/// attributes, the same WQEs, the executed ones with the same outcomes, maybe
+/// more executed.
 pub open spec fn kept_but_state(a: Qp, b: Qp) -> bool {
     &&& b.attr == a.attr
     &&& b.sq_head == a.sq_head && b.sq.len() == a.sq.len() && a.sq_done <= b.sq_done
@@ -1805,13 +1806,21 @@ pub open spec fn framed_but(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::S
 /// What `modify_qp` steps of the engine's own QP `q` (to states other than
 /// `Reset`), with rely in between, keep: the share as `framed_but` says, and
 /// `q` in the last state asked for, or `Err`.
-proof fn lemma_modified(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State, q: QpId, tos: Seq<QpState>)
+proof fn lemma_modified(
+    sh: Share,
+    pins: ISet<Key>,
+    m: Nic::State,
+    n: Nic::State,
+    q: QpId,
+    tos: Seq<QpState>,
+    rnr: Option<nat>,
+)
     requires
         nic_inv(m),
         share_wf(m, sh),
         sh.owns.contains(q),
         m.qps.contains_key(q),
-        modified(sh, pins, m, n, q, tos),
+        modified(sh, pins, m, n, q, tos, rnr),
         forall|i: int| 0 <= i < tos.len() ==> !(#[trigger] tos[i] is Reset),
     ensures
         nic_inv(n),
@@ -1830,24 +1839,25 @@ proof fn lemma_modified(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State
         }
     } else {
         let to = tos.last();
+        let step = Nic::Step::modify_qp(q, to, sets_rnr(to, rnr));
         let (mid, before) = choose|mid: Nic::State, before: Nic::State|
-            modified(sh, pins, m, mid, q, tos.drop_last()) && rely_reaches(sh, pins, mid, before)
-                && nic_step(before, n, Nic::Step::modify_qp(q, to));
+            modified(sh, pins, m, mid, q, tos.drop_last(), rnr) && rely_reaches(sh, pins, mid, before)
+                && nic_step(before, n, step);
         assert forall|i: int| 0 <= i < tos.drop_last().len() implies !(#[trigger] tos.drop_last()[i] is Reset) by {
             assert(tos.drop_last()[i] == tos[i]);
         }
-        lemma_modified(sh, pins, m, mid, q, tos.drop_last());
+        lemma_modified(sh, pins, m, mid, q, tos.drop_last(), rnr);
         lemma_rely_frame(sh, pins, mid, before);
         assert(tos[tos.len() - 1] == to);
-        lemma_nic_step_is_next(before, n, Nic::Step::modify_qp(q, to));
+        lemma_nic_step_is_next(before, n, step);
         lemma_nic_reaches_next(before, n);
         lemma_nic_reaches_trans(m, mid, before);
         lemma_nic_reaches_trans(m, before, n);
         lemma_step_keeps_invariant(before, n);
-        lemma_mine_keeps_share_wf(sh, pins, before, n, Nic::Step::modify_qp(q, to));
+        lemma_mine_keeps_share_wf(sh, pins, before, n, step);
         assert forall|p: QpId| #[trigger] queued_outcomes_ok(m, p) implies queued_outcomes_ok(n, p) by {
             lemma_queued_outcomes_rely(sh, pins, mid, before, p);
-            lemma_queued_outcomes_step(before, n, Nic::Step::modify_qp(q, to), p);
+            lemma_queued_outcomes_step(before, n, step, p);
         }
         // Compose: m to mid (framed but q), mid to before (framed), before to
         // n (only q's state).
@@ -1870,7 +1880,7 @@ proof fn lemma_modified(sh: Share, pins: ISet<Key>, m: Nic::State, n: Nic::State
         }
         let (a, b, c, d) = (m.qps[q], mid.qps[q], before.qps[q], n.qps[q]);
         assert(kept_but_state(a, b) && qp_kept(b, c));
-        assert(d == c.with_state(d.state));
+        assert(d == Qp { rnr_retry: d.rnr_retry, ..c.with_state(d.state) });
         assert forall|k: int| 0 <= k < a.sq.len() implies (#[trigger] d.sq[k]).wr == a.sq[k].wr by {
             assert(b.sq[k].wr == a.sq[k].wr && c.sq[k].wr == b.sq[k].wr);
         }
@@ -2003,19 +2013,19 @@ impl<C, N: Device> Hw<C, N> {
             let e0 = start.qps@[index as int]->0;
             let q = e0.id();
             if r is Ok {
-                let mid = choose|mid: Nic::State| rely_reaches(sh, pinned(t0), m0, mid) && nic_step(mid, n, Nic::Step::modify_qp(q, QpState::Err));
+                let mid = choose|mid: Nic::State| rely_reaches(sh, pinned(t0), m0, mid) && nic_step(mid, n, Nic::Step::modify_qp(q, QpState::Err, None));
                 start.lemma_rely(t0, m0, mid);
                 start.lemma_same_token(t0, t, mid);
-                lemma_nic_step_is_next(mid, n, Nic::Step::modify_qp(q, QpState::Err));
+                lemma_nic_step_is_next(mid, n, Nic::Step::modify_qp(q, QpState::Err, None));
                 lemma_step_keeps_invariant(mid, n);
-                lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::modify_qp(q, QpState::Err));
+                lemma_mine_keeps_share_wf(sh, pinned(t0), mid, n, Nic::Step::modify_qp(q, QpState::Err, None));
                 assert(qp_ok(start.qps@[index as int], index as int, t, mid));
                 let e = self.qps@[index as int]->0;
                 let written = t.written(q);
                 assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(n.qps[q].attr, #[trigger] written[j]) by {
                     assert(mid.send_wr_ok(mid.qps[q].attr, written[j]));
                 }
-                lemma_queued_outcomes_step(mid, n, Nic::Step::modify_qp(q, QpState::Err), q);
+                lemma_queued_outcomes_step(mid, n, Nic::Step::modify_qp(q, QpState::Err, None), q);
                 outcomes::lemma_recv_framed(e.recv, mid, n, q);
                 send_outcomes::lemma_results_framed(e.send, mid, n, q);
                 send_outcomes::lemma_bound_kept(e.send, e.send, e.send_tails@, mid.qps[q], n.qps[q], written, mid.retired, n.retired, q);
@@ -2023,7 +2033,7 @@ impl<C, N: Device> Hw<C, N> {
                 self.lemma_one(&start, t, t, mid, n, index as int);
                 let g1 = refines::lemma_linked_rely(start.qps@, start.next_name@, t0, m0, mid, start.pending@, pinned(t0), start.refined@);
                 refines::lemma_verb_keeps(start.qps@, start.next_name@, t, mid, n, start.pending@, q);
-                let g2 = refines::lemma_linked_verb(start.qps@, mid, n, Nic::Step::modify_qp(q, QpState::Err), g1);
+                let g2 = refines::lemma_linked_verb(start.qps@, mid, n, Nic::Step::modify_qp(q, QpState::Err, None), g1);
                 refines::lemma_linked_same_rings(start.qps@, self.qps@, n, g2);
                 g2.lemma_extends_trans(g1, start.refined@);
                 lemma_nic_reaches_trans(m0, mid, n);
@@ -2166,16 +2176,17 @@ impl<C, N: Device> Hw<C, N> {
             let t = self.token@;
             let n = t.nic();
             let q = start.qps@[index as int]->0.id();
+            let rnr = connect_rnr(m0, q, *attr);
             let tos = if r is Ok {
                 connect_states()
             } else {
-                let k = choose|k: int| 0 <= k < 3 && modified(sh, pinned(t0), m0, n, q, connect_states().take(k));
+                let k = choose|k: int| 0 <= k < 3 && modified(sh, pinned(t0), m0, n, q, connect_states().take(k), rnr);
                 connect_states().take(k)
             };
             assert forall|i: int| 0 <= i < tos.len() implies !(#[trigger] tos[i] is Reset) by {
                 assert(tos[i] == connect_states()[i]);
             }
-            lemma_modified(sh, pinned(t0), m0, n, q, tos);
+            lemma_modified(sh, pinned(t0), m0, n, q, tos, rnr);
             let written = t0.written(q);
             let (a, b) = (m0.qps[q], n.qps[q]);
             assert forall|j: int| 0 <= j < written.len() implies n.send_wr_ok(b.attr, #[trigger] written[j]) by {

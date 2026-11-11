@@ -101,11 +101,15 @@ pub struct ExError(Error);
 #[verifier::reject_recursive_types(B)]
 pub struct ExBufError<B>(BufError<B>);
 
-/// [`ConnectAttr`], opaque (only the device reads it).
+/// [`ConnectAttr`], as defined: `connect`'s contract reads its RNR retry count.
 #[cfg(verus_keep_ghost)]
 #[verifier::external_type_specification]
-#[verifier::external_body]
 pub struct ExConnectAttr(ConnectAttr);
+
+/// [`Access`], as defined (a field of [`ConnectAttr`]).
+#[cfg(verus_keep_ghost)]
+#[verifier::external_type_specification]
+pub struct ExAccess(Access);
 
 /// [`Endpoint`], opaque (only the device reads it).
 #[cfg(verus_keep_ghost)]
@@ -392,9 +396,9 @@ pub open spec fn polled(sh: Share, pins: ISet<Key>, m: Nic::State, m2: Nic::Stat
     }
 }
 
-/// `modified(sh, pins, m, m2, q, tos)`: queue pair `q` was moved to each
-/// state of `tos` in turn (M's `modify_qp`), with steps that do not touch
-/// the share around them.
+/// `modified(sh, pins, m, m2, q, tos, rnr)`: queue pair `q` was moved to each
+/// state of `tos` in turn (M's `modify_qp`), the move to `Rts` setting the RNR
+/// retry count `rnr`, with steps that do not touch the share around them.
 pub open spec fn modified(
     sh: Share,
     pins: ISet<Key>,
@@ -402,6 +406,7 @@ pub open spec fn modified(
     m2: Nic::State,
     q: QpId,
     tos: Seq<QpState>,
+    rnr: Option<nat>,
 ) -> bool
     decreases tos.len(),
 {
@@ -410,10 +415,31 @@ pub open spec fn modified(
     } else {
         exists|mid: Nic::State, before: Nic::State|
             {
-                &&& modified(sh, pins, m, mid, q, tos.drop_last())
+                &&& modified(sh, pins, m, mid, q, tos.drop_last(), rnr)
                 &&& rely_reaches(sh, pins, mid, before)
-                &&& nic_step(before, m2, Nic::Step::modify_qp(q, tos.last()))
+                &&& nic_step(before, m2, Nic::Step::modify_qp(q, tos.last(), sets_rnr(tos.last(), rnr)))
             }
+    }
+}
+
+/// The RNR retry count a move to `to` sets: `rnr` for the move to `Rts`, none
+/// for the others.
+pub open spec fn sets_rnr(to: QpState, rnr: Option<nat>) -> Option<nat> {
+    if to is Rts {
+        rnr
+    } else {
+        None
+    }
+}
+
+/// The RNR retry count `connect` sets on queue pair `q` of `m` with `attr`, as
+/// M records it: the attribute's on a reliable connection, none on another
+/// (verbs sets it only for RC).
+pub open spec fn connect_rnr(m: Nic::State, q: QpId, attr: ConnectAttr) -> Option<nat> {
+    if m.qps[q].attr.transport is Rc {
+        Some(attr.rnr_retry as nat)
+    } else {
+        None
     }
 }
 
@@ -617,7 +643,8 @@ pub fn create_qp<N: Device>(
 }
 
 /// `ibv_modify_qp` to INIT, RTR and RTS: M's three `modify_qp` steps, or on
-/// error the first ones.
+/// error the first ones. The move to RTS sets `attr`'s RNR retry count on a
+/// reliable connection, which M records (`connect_rnr`).
 #[verifier::external_body]
 pub fn connect<Q: NicQp>(
     qp: &mut Q,
@@ -644,6 +671,7 @@ pub fn connect<Q: NicQp>(
             final(token).nic(),
             q,
             connect_states(),
+            connect_rnr(old(token).nic(), q, *attr),
         ),
         r is Err ==> exists|k: int|
             0 <= k < 3 && modified(
@@ -653,6 +681,7 @@ pub fn connect<Q: NicQp>(
                 final(token).nic(),
                 q,
                 connect_states().take(k),
+                connect_rnr(old(token).nic(), q, *attr),
             ),
     no_unwind
 {
@@ -669,14 +698,14 @@ pub fn to_error<Q: NicQp>(qp: &mut Q, Ghost(q): Ghost<QpId>, Tracked(token): Tra
         nic_inv(old(token).nic()),
         share_wf(old(token).nic(), old(token).share()),
         old(token).share().owns.contains(q),
-        nic_enabled(old(token).nic(), Nic::Step::modify_qp(q, QpState::Err)),
+        nic_enabled(old(token).nic(), Nic::Step::modify_qp(q, QpState::Err, None)),
     ensures
         qp_of(*final(qp)) == q,
         final(token).same_engine(old(token)),
         final(token).same_writings(old(token)),
         r is Ok ==> exists|mid: Nic::State|
             rely_reaches(old(token).share(), pinned(*old(token)), old(token).nic(), mid)
-                && nic_step(mid, final(token).nic(), Nic::Step::modify_qp(q, QpState::Err)),
+                && nic_step(mid, final(token).nic(), Nic::Step::modify_qp(q, QpState::Err, None)),
         r is Err ==> rely_reaches(
             old(token).share(),
             pinned(*old(token)),

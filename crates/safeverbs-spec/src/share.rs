@@ -207,7 +207,7 @@ pub open spec fn foreign(sh: Share, pins: ISet<Key>, step: Nic::Step) -> bool {
         Nic::Step::destroy_cq(c) => c != sh.cq,
         Nic::Step::create_qp(q, attr) => !sh.owns.contains(q) && attr.send_cq != sh.cq
             && attr.recv_cq != sh.cq,
-        Nic::Step::modify_qp(q, _) => !sh.owns.contains(q),
+        Nic::Step::modify_qp(q, _, _) => !sh.owns.contains(q),
         Nic::Step::destroy_qp(q) => !sh.owns.contains(q),
         Nic::Step::post_send(q, _) => !sh.owns.contains(q),
         Nic::Step::post_recv(q, _) => !sh.owns.contains(q),
@@ -224,7 +224,7 @@ pub open spec fn mine(sh: Share, pins: ISet<Key>, verb: Nic::Step) -> bool {
     match verb {
         Nic::Step::create_qp(q, attr) => sh.owns.contains(q) && attr.send_cq == sh.cq
             && attr.recv_cq == sh.cq,
-        Nic::Step::modify_qp(q, _) => sh.owns.contains(q),
+        Nic::Step::modify_qp(q, _, _) => sh.owns.contains(q),
         Nic::Step::destroy_qp(q) => sh.owns.contains(q),
         Nic::Step::post_send(q, wrs) => sh.owns.contains(q) && send_keys(wrs).subset_of(pins),
         Nic::Step::post_recv(q, wrs) => sh.owns.contains(q) && recv_keys(wrs).subset_of(pins),
@@ -457,7 +457,7 @@ pub proof fn lemma_foreign_step_keeps_enabled(
         Nic::Step::poll_cq(c) => {
             assert(post.cqs[c].entries[0] == pre.cqs[c].entries[0]);
         },
-        Nic::Step::modify_qp(q, to) => {},
+        Nic::Step::modify_qp(q, to, _) => {},
         Nic::Step::destroy_qp(q) => {},
         _ => {},
     }

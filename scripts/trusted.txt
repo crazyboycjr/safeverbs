@@ -29,8 +29,11 @@ crates/safeverbs-core/src/trusted.rs ExDeviceCaps
 crates/safeverbs-core/src/trusted.rs ExQpType
 crates/safeverbs-core/src/trusted.rs ExError
 crates/safeverbs-core/src/trusted.rs ExBufError
-# Device and allocation payload types: opaque.
+# The connection's attributes, as written: connect's contract tells M the RNR retry count it
+# sets (M4), and its access flags are a field of them.
 crates/safeverbs-core/src/trusted.rs ExConnectAttr
+crates/safeverbs-core/src/trusted.rs ExAccess
+# Device and allocation payload types: opaque.
 crates/safeverbs-core/src/trusted.rs ExEndpoint
 crates/safeverbs-core/src/trusted.rs ExContext
 crates/safeverbs-core/src/trusted.rs ExPd
@@ -82,6 +85,7 @@ crates/safeverbs-core/src/trusted.rs create_cq
 # Two engines' tokens are views of their device's one history.
 crates/safeverbs-core/src/trusted.rs one_history
 crates/safeverbs-core/src/trusted.rs create_qp
+# Its move to RTS sets the RNR retry count of a reliable connection, which M records (M4).
 crates/safeverbs-core/src/trusted.rs connect
 crates/safeverbs-core/src/trusted.rs to_error
 crates/safeverbs-core/src/trusted.rs destroy_qp

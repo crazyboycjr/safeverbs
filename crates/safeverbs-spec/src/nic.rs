@@ -236,6 +236,9 @@ pub struct Qp {
     pub rq: Seq<RecvSlot>,
     pub rq_head: nat,
     pub rq_done: nat,
+    /// The RNR NAK retry count it was connected with (`IBV_QP_RNR_RETRY`, which verbs sets on
+    /// the move from `Rtr` to `Rts`); none until then. See M4 in [`Qp::allows_send_status`].
+    pub rnr_retry: Option<nat>,
 }
 
 impl Qp {
@@ -265,9 +268,17 @@ impl Qp {
     /// READ (M's atomics are READs). IB 11.6.2, "Remote Access Error": "This error is reported
     /// only on RDMA operations or atomic operations"; the R_Key violations of 9.7.4.1.5 are
     /// those of an RDMA READ, an RDMA WRITE or an atomic.
+    ///
+    /// **M4.** `RnrRetryExceeded` only if the RNR retry count the queue pair was connected with
+    /// is below 7. IB C9-132: an RC requester keeps a 3-bit RNR NAK retry counter, loaded when
+    /// the connection is established, and on an RNR NAK decrements it "if the RNR NAK retry
+    /// counter is not equal to 7 (indicates infinite retry)"; 9.9.2.1.1: "if the RNR NAK retry
+    /// counter is set to 7. This value indicates infinite retry and the counter is not
+    /// decremented." A queue pair that recorded no count (never connected) is not constrained.
     pub open spec fn allows_send_status(self, wr: SendWr, s: Status) -> bool {
         &&& (s.is_remote() || s is RetryExceeded || s is RnrRetryExceeded) ==> self.attr.transport is Rc
         &&& s is RemoteAccess ==> (wr.opcode is Write || wr.opcode is WriteImm || wr.opcode is Read)
+        &&& s is RnrRetryExceeded ==> (self.rnr_retry is Some ==> self.rnr_retry->0 < 7)
     }
 }
 
@@ -545,6 +556,7 @@ state_machine! {
                     attr, state: QpState::Reset,
                     sq: Seq::empty(), sq_head: 0, sq_done: 0,
                     rq: Seq::empty(), rq_head: 0, rq_done: 0,
+                    rnr_retry: None,
                 });
             }
         }
@@ -552,14 +564,20 @@ state_machine! {
         /// Changing a queue pair's state. The library must ask for a legal change from the
         /// state it knows; the NIC may have moved to `Err` meanwhile, and then a change other
         /// than to `Err` or `Reset` fails and nothing happens. Going to `Reset` (which would
-        /// discard WQEs) needs empty queues.
+        /// discard WQEs) needs empty queues. `rnr_retry` is the RNR retry count the change sets,
+        /// if any: the move from `Rtr` to `Rts` records it (M4); no other change sets one.
         transition! {
-            modify_qp(q: QpId, to: QpState) {
+            modify_qp(q: QpId, to: QpState, rnr_retry: Option<nat>) {
                 require pre.qps.contains_key(q);
                 let qp = pre.qps[q];
                 require legal(qp.state, to) || qp.state is Err;
                 require to is Reset ==> qp.sq.len() == 0 && qp.rq.len() == 0;
-                update qps = pre.qps.insert(q, qp.with_state(if legal(qp.state, to) { to } else { qp.state }));
+                let moved = qp.with_state(if legal(qp.state, to) { to } else { qp.state });
+                update qps = pre.qps.insert(q, if qp.state is Rtr && to is Rts {
+                    Qp { rnr_retry, ..moved }
+                } else {
+                    moved
+                });
             }
         }
 
@@ -834,8 +852,8 @@ state_machine! {
         }
 
         #[inductive(modify_qp)]
-        pub fn modify_qp_inductive(pre: Self, post: Self, q: QpId, to: QpState) {
-            crate::nic_proofs::lemma_modify_qp(pre, post, q, to);
+        pub fn modify_qp_inductive(pre: Self, post: Self, q: QpId, to: QpState, rnr_retry: Option<nat>) {
+            crate::nic_proofs::lemma_modify_qp(pre, post, q, to, rnr_retry);
         }
 
         #[inductive(destroy_qp)]
@@ -909,7 +927,7 @@ pub open spec fn nic_step(pre: Nic::State, post: Nic::State, step: Nic::Step) ->
         Nic::Step::create_cq(c, cap) => Nic::State::create_cq(pre, post, c, cap),
         Nic::Step::destroy_cq(c) => Nic::State::destroy_cq(pre, post, c),
         Nic::Step::create_qp(q, attr) => Nic::State::create_qp(pre, post, q, attr),
-        Nic::Step::modify_qp(q, to) => Nic::State::modify_qp(pre, post, q, to),
+        Nic::Step::modify_qp(q, to, rnr) => Nic::State::modify_qp(pre, post, q, to, rnr),
         Nic::Step::destroy_qp(q) => Nic::State::destroy_qp(pre, post, q),
         Nic::Step::post_send(q, wrs) => Nic::State::post_send(pre, post, q, wrs),
         Nic::Step::post_recv(q, wrs) => Nic::State::post_recv(pre, post, q, wrs),
@@ -930,7 +948,7 @@ pub open spec fn nic_enabled(pre: Nic::State, step: Nic::Step) -> bool {
         Nic::Step::create_cq(c, cap) => Nic::State::create_cq_enabled(pre, c, cap),
         Nic::Step::destroy_cq(c) => Nic::State::destroy_cq_enabled(pre, c),
         Nic::Step::create_qp(q, attr) => Nic::State::create_qp_enabled(pre, q, attr),
-        Nic::Step::modify_qp(q, to) => Nic::State::modify_qp_enabled(pre, q, to),
+        Nic::Step::modify_qp(q, to, rnr) => Nic::State::modify_qp_enabled(pre, q, to, rnr),
         Nic::Step::destroy_qp(q) => Nic::State::destroy_qp_enabled(pre, q),
         Nic::Step::post_send(q, wrs) => Nic::State::post_send_enabled(pre, q, wrs),
         Nic::Step::post_recv(q, wrs) => Nic::State::post_recv_enabled(pre, q, wrs),
