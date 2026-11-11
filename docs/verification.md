@@ -648,6 +648,9 @@ data, so M sees a queue pair's inline limit as zero.
   to come.
 - **M.** Gather evidence that real NICs conform (differential tests on hardware; soft-RoCE has
   some), and give out-of-order transports and shared receive queues their own rules.
+- **A QP's RNR retry count under rely.** `qp_kept` (`share.rs`) does not say that the count a QP
+  recorded (`Qp::rnr_retry`, M4) stays as it was while other engines and the NIC step; theorem 1
+  does not need it, theorem 2's joint model will.
 - **Performance.** Compare the CPU paths with native ibverbs on real NICs; soft-RoCE is
   functional evidence only.
 
