@@ -61,14 +61,22 @@ impl Status {
     }
 
     /// The status as the formal model names it (`safeverbs_spec::types::Status`): success,
-    /// a flush, the responder's refusal, the two retry counters, or else a local error.
+    /// a flush, the responder's remote access, invalid request or operation error, the rest
+    /// of what the other end reported (a bad response, an abort), the two retry counters, or
+    /// else a local error.
     pub open spec fn model(self) -> safeverbs_spec::types::Status {
         if self.0 == 0 {
             safeverbs_spec::types::Status::Success
         } else if self.0 == 5 {
             safeverbs_spec::types::Status::FlushErr
-        } else if self.0 == 7 || self.0 == 9 || self.0 == 10 || self.0 == 11 || self.0 == 16 {
-            safeverbs_spec::types::Status::RemoteErr
+        } else if self.0 == 10 {
+            safeverbs_spec::types::Status::RemoteAccess
+        } else if self.0 == 9 {
+            safeverbs_spec::types::Status::RemoteInvalidRequest
+        } else if self.0 == 11 {
+            safeverbs_spec::types::Status::RemoteOperation
+        } else if self.0 == 7 || self.0 == 16 {
+            safeverbs_spec::types::Status::RemoteOther
         } else if self.0 == 13 {
             safeverbs_spec::types::Status::RnrRetryExceeded
         } else if self.0 == 12 || self.0 == 20 {

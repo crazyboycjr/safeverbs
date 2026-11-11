@@ -54,8 +54,21 @@ pub enum Status {
     FlushErr,
     /// Local errors: length, protection (bad lkey or range), QP operation.
     LocalErr,
-    /// The responder rejected the request: remote access (bad rkey or range) or invalid request.
-    RemoteErr,
+    /// The responder found a protection error on the remote buffer of an RDMA operation: a
+    /// bad rkey, a range outside its region, or rights the region does not give
+    /// (`IBV_WC_REM_ACCESS_ERR`; IB 11.6.2, "Remote Access Error").
+    RemoteAccess,
+    /// The responder found the request invalid: an operation its receive queue does not
+    /// support, too many RDMA READs or atomics outstanding, or a message longer than its
+    /// receive (`IBV_WC_REM_INV_REQ_ERR`; IB 11.6.2, "Remote Invalid Request Error").
+    RemoteInvalidRequest,
+    /// The responder could not complete the request for a reason of its own, such as a
+    /// malformed receive WQE (`IBV_WC_REM_OP_ERR`; IB 11.6.2, "Remote Operation Error").
+    RemoteOperation,
+    /// The rest of what comes from the other end: a response with an unexpected opcode
+    /// (`IBV_WC_BAD_RESP_ERR`, IB 11.6.2 "Bad Response Error") or an operation aborted
+    /// (`IBV_WC_REM_ABORT_ERR`, IB 11.6.2 "Aborted Error").
+    RemoteOther,
     /// The responder had no receive posted and the RNR retries ran out (RC).
     RnrRetryExceeded,
     /// No acknowledgement after the transport retries (peer gone, link down).

@@ -37,7 +37,7 @@ pub proof fn example_operation_metadata() {
     let payload = Outcome { kind: CompletionKind::Receive, ..notify };
     reveal(total_len);
     assert(!empty.allows_outcome(payload));
-    let failed = Outcome { status: Status::RemoteErr, ..ack };
+    let failed = Outcome { status: Status::RemoteAccess, ..ack };
     assert(Opcode::Read.allows_outcome(64, failed));
     assert(empty.allows_outcome(failed));
 }
@@ -365,7 +365,7 @@ proof fn lemma_batch_error_run() -> (r: (Nic::State, Nic::State))
             let (middle, end) = r;
             let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 3 };
             let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
-            let remote = Outcome { status: Status::RemoteErr, ..ok };
+            let remote = Outcome { status: Status::RemoteAccess, ..ok };
             let flush = Outcome { status: Status::FlushErr, ..ok };
             &&& middle.invariant()
             &&& range.pending_at(middle, 2)
@@ -391,7 +391,7 @@ proof fn lemma_batch_error_run() -> (r: (Nic::State, Nic::State))
     reveal_with_fuel(total_len, 2);
     reveal(retires);
     let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
-    let remote = Outcome { status: Status::RemoteErr, ..ok };
+    let remote = Outcome { status: Status::RemoteAccess, ..ok };
     let flush = Outcome { status: Status::FlushErr, ..ok };
     let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 3 };
     let (m0, wrs) = (connected(), write_read_write());
@@ -464,7 +464,7 @@ pub proof fn example_batch_error_at_position_1() {
     let (middle, end) = lemma_batch_error_run();
     let wrs = write_read_write();
     let ok = Outcome { status: Status::Success, kind: CompletionKind::StatusOnly, byte_len: 0, imm: None };
-    let remote = Outcome { status: Status::RemoteErr, ..ok };
+    let remote = Outcome { status: Status::RemoteAccess, ..ok };
     let range = WqeRange { qp: 7, queue: Queue::Send, first: 0, end: 3 };
     let log = IMap::new(|w: WqeRef| w.qp == 7 && w.queue is Send && w.seq < 3, |w: WqeRef| wrs[w.seq as int]);
     let ranges = Map::empty().insert(3nat, range);
