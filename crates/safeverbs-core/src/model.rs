@@ -8,10 +8,13 @@
 //! random) and with random delays. Data really moves between the registered
 //! buffers, and the NIC's checks are modeled: keys, protection domains,
 //! bounds and access rights, receive buffers too small, receivers not ready
-//! (RC waits, UC drops), the error state flushing every outstanding WQE
-//! (signaled or not) with its own completion. Errors, flushes and refused
-//! doorbells can be injected ([`Model::inject_error`],
-//! [`Model::force_error`], [`Model::refuse_doorbells`]).
+//! (RC retries as its RNR retry count says, 7 for ever; UC drops), more RDMA
+//! READs and atomics than the responder takes, a responder's QP going to the
+//! error state on the errors IB's Table 58 puts in its Class C, the error
+//! state flushing every outstanding WQE (signaled or not) with its own
+//! completion. Errors, flushes and refused doorbells can be injected
+//! ([`Model::inject_error`], [`Model::force_error`],
+//! [`Model::refuse_doorbells`]).
 //! MR close refusals can be injected with [`Model::refuse_mr_closes`].
 //! The next registration can be refused with [`Model::refuse_next_mr_registration`].
 //!
@@ -22,7 +25,10 @@
 //! library must meet: work is posted only on a QP that left RESET, a QP is
 //! destroyed only when every WQE posted on it was retired by a polled
 //! completion (its own or a later one of its queue, as M's `poll_cq`
-//! retires them), and a CQ only when no QP is attached to it.
+//! retires them), and a CQ only when no QP is attached to it. Every status a
+//! send WQE fails with, an injected one included, is one M allows for it
+//! (`Qp::allows_send_status`: by its transport, its operation and its RNR
+//! retry count); the model panics otherwise.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -76,6 +82,18 @@ struct QpRec {
     access: Access,
     sq: VecDeque<SendWqe>,
     rq: VecDeque<RecvWqe>,
+    /// The RNR retry count it was connected with (7: for ever).
+    rnr_retry: u8,
+    /// RNR NAKs the WQE at the head of the send queue may still take.
+    rnr_left: u8,
+    /// RDMA READs and atomics it sends back to back (its initiator depth).
+    max_rd_atomic: u8,
+    /// RDMA READs and atomics of its peer it takes at once (its responder depth).
+    max_dest_rd_atomic: u8,
+    /// The READs and atomics sent together that the head of the send queue
+    /// belongs to, and how many of them are still to execute.
+    reads_sent: u32,
+    reads_left: u32,
     /// Errors to inject into the next WQEs this QP processes.
     inject: VecDeque<Status>,
     /// The `wr_id`s of the send WQEs posted and not retired by a polled
@@ -290,11 +308,14 @@ impl Fabric {
                 if !qp.inject.is_empty() || qp.qp_type == QpType::Uc {
                     return true;
                 }
-                // An RC SEND or WRITE with immediate waits for a receive.
+                // An RC SEND or WRITE with immediate waits for a receive, for
+                // ever with an RNR retry count of 7, else through its RNR NAKs.
                 match wqe.op {
                     WrOp::Send | WrOp::SendImm(_) | WrOp::WriteImm(..) => {
                         match self.qps.get(&qp.remote) {
-                            Some(peer) if peer.state == QpState::Ready => !peer.rq.is_empty(),
+                            Some(peer) if peer.state == QpState::Ready => {
+                                !peer.rq.is_empty() || qp.rnr_retry < 7
+                            }
                             _ => true,
                         }
                     }
@@ -369,6 +390,28 @@ impl Fabric {
         self.push_cqe(cq, error_wc(wr_id, status), num, recv);
     }
 
+    /// Send WQE `wqe` of QP `num` fails with `status`, which M must allow it.
+    fn fail_send(&mut self, num: u32, cq: u32, wqe: &SendWqe, status: Status) {
+        let qp = self.qps.get(&num).expect("model: QP");
+        assert!(
+            allows_send_status(qp, &wqe.op, status),
+            "model: a {:?} WQE of a {:?} QP with RNR retry {} cannot fail with {status:?} (M)",
+            wqe.op,
+            qp.qp_type,
+            qp.rnr_retry
+        );
+        self.fail(num, cq, wqe.wr_id, status, false);
+    }
+
+    /// The responder QP `num` meets an error of IB's Responder Class C
+    /// (Table 58: an R_Key violation, a SEND longer than its receive, more
+    /// RDMA READs or atomics than it takes): it goes to the error state.
+    fn responder_error(&mut self, num: u32) {
+        if let Some(qp) = self.qps.get_mut(&num) {
+            qp.state = QpState::Error;
+        }
+    }
+
     fn process(&mut self, num: u32) {
         let qp = self.qps.get_mut(&num).expect("model: QP");
         let (send_cq, recv_cq, pd, qp_type, remote) =
@@ -394,7 +437,7 @@ impl Fabric {
         let injected = qp.inject.pop_front();
         let wqe = qp.sq.pop_front().expect("model: a ready QP has a WQE");
         if let Some(status) = injected {
-            self.fail(num, send_cq, wqe.wr_id, status, false);
+            self.fail_send(num, send_cq, &wqe, status);
             return;
         }
         let local_write = matches!(
@@ -402,25 +445,73 @@ impl Fabric {
             WrOp::Read(_) | WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. }
         );
         let Some(len) = self.check_local(pd, &wqe.sges, local_write) else {
-            self.fail(num, send_cq, wqe.wr_id, Status::LOC_PROT_ERR, false);
+            self.fail_send(num, send_cq, &wqe, Status::LOC_PROT_ERR);
             return;
         };
         let peer = match self.qps.get(&remote) {
             Some(p) if p.state == QpState::Ready && p.remote == num => {
-                Some((p.pd, p.recv_cq, p.access))
+                Some((p.pd, p.recv_cq, p.access, p.max_dest_rd_atomic))
             }
             _ => None,
         };
-        let Some((peer_pd, peer_cq, peer_access)) = peer else {
+        let Some((peer_pd, peer_cq, peer_access, peer_depth)) = peer else {
             // Nobody answers: RC runs out of retries, UC loses the message.
             if qp_type == QpType::Rc {
-                self.fail(num, send_cq, wqe.wr_id, Status::RETRY_EXC_ERR, false);
+                self.fail_send(num, send_cq, &wqe, Status::RETRY_EXC_ERR);
             } else {
                 self.done(num, send_cq, &wqe, len);
             }
             return;
         };
         let reliable = qp_type == QpType::Rc;
+        if reliable && matches!(wqe.op, WrOp::Send | WrOp::SendImm(_) | WrOp::WriteImm(..)) {
+            let peer = self.qps.get(&remote).expect("model: peer");
+            if peer.rq.is_empty() {
+                // Not ready: an RNR NAK, retried while the count allows
+                // (`ready` waits instead when it is 7).
+                let qp = self.qps.get_mut(&num).expect("model: QP");
+                if qp.rnr_left == 0 {
+                    self.fail_send(num, send_cq, &wqe, Status::RNR_RETRY_EXC_ERR);
+                } else {
+                    qp.rnr_left -= 1;
+                    qp.sq.push_front(wqe);
+                }
+                return;
+            }
+        }
+        if reliable
+            && matches!(
+                wqe.op,
+                WrOp::Read(_) | WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. }
+            )
+        {
+            // The READs and atomics at the head go out together, up to the
+            // initiator depth; the responder takes as many as its own depth
+            // and answers the next with an invalid request (IB C9-86).
+            let qp = self.qps.get_mut(&num).expect("model: QP");
+            if qp.reads_left == 0 {
+                let more = qp
+                    .sq
+                    .iter()
+                    .take_while(|w| {
+                        matches!(
+                            w.op,
+                            WrOp::Read(_) | WrOp::FetchAdd { .. } | WrOp::CompareSwap { .. }
+                        )
+                    })
+                    .count() as u32;
+                qp.reads_sent = (1 + more).min(u32::from(qp.max_rd_atomic.max(1)));
+                qp.reads_left = qp.reads_sent;
+            }
+            let at = qp.reads_sent - qp.reads_left;
+            qp.reads_left -= 1;
+            if at >= u32::from(peer_depth) {
+                qp.reads_left = 0;
+                self.responder_error(remote);
+                self.fail_send(num, send_cq, &wqe, Status::REM_INV_REQ_ERR);
+                return;
+            }
+        }
         match wqe.op {
             WrOp::Send | WrOp::SendImm(_) => {
                 let imm = match wqe.op {
@@ -453,7 +544,7 @@ impl Fabric {
                     Some(_) => {
                         self.fail(remote, peer_cq, recv.wr_id, Status::LOC_LEN_ERR, true);
                         if reliable {
-                            self.fail(num, send_cq, wqe.wr_id, Status::REM_INV_REQ_ERR, false);
+                            self.fail_send(num, send_cq, &wqe, Status::REM_INV_REQ_ERR);
                         } else {
                             self.done(num, send_cq, &wqe, len);
                         }
@@ -461,7 +552,7 @@ impl Fabric {
                     None => {
                         self.fail(remote, peer_cq, recv.wr_id, Status::LOC_PROT_ERR, true);
                         if reliable {
-                            self.fail(num, send_cq, wqe.wr_id, Status::REM_OP_ERR, false);
+                            self.fail_send(num, send_cq, &wqe, Status::REM_OP_ERR);
                         } else {
                             self.done(num, send_cq, &wqe, len);
                         }
@@ -473,7 +564,8 @@ impl Fabric {
                     && self.check_remote(peer_pd, r.rkey, r.addr, len, Access::REMOTE_WRITE);
                 if !ok {
                     if reliable {
-                        self.fail(num, send_cq, wqe.wr_id, Status::REM_ACCESS_ERR, false);
+                        self.responder_error(remote);
+                        self.fail_send(num, send_cq, &wqe, Status::REM_ACCESS_ERR);
                     } else {
                         self.done(num, send_cq, &wqe, len);
                     }
@@ -517,7 +609,8 @@ impl Fabric {
                 let ok = peer_access.contains(Access::REMOTE_READ)
                     && self.check_remote(peer_pd, r.rkey, r.addr, len, Access::REMOTE_READ);
                 if !ok {
-                    self.fail(num, send_cq, wqe.wr_id, Status::REM_ACCESS_ERR, false);
+                    self.responder_error(remote);
+                    self.fail_send(num, send_cq, &wqe, Status::REM_ACCESS_ERR);
                     return;
                 }
                 let mut data = vec![0u8; len];
@@ -532,7 +625,8 @@ impl Fabric {
                     && peer_access.contains(Access::REMOTE_ATOMIC)
                     && self.check_remote(peer_pd, r.rkey, r.addr, 8, Access::REMOTE_ATOMIC);
                 if !ok {
-                    self.fail(num, send_cq, wqe.wr_id, Status::REM_ACCESS_ERR, false);
+                    self.responder_error(remote);
+                    self.fail_send(num, send_cq, &wqe, Status::REM_ACCESS_ERR);
                     return;
                 }
                 let target = r.addr as usize as *mut u64;
@@ -557,8 +651,12 @@ impl Fabric {
         }
     }
 
-    /// A WQE succeeded: its completion, if signaled.
+    /// A WQE succeeded: its completion, if signaled. An acknowledgement
+    /// other than an RNR NAK reloads the RNR retry counter (IB 9.9.2.1.1).
     fn done(&mut self, num: u32, cq: u32, wqe: &SendWqe, len: usize) {
+        if let Some(qp) = self.qps.get_mut(&num) {
+            qp.rnr_left = qp.rnr_retry;
+        }
         if wqe.signaled {
             let opcode = match wqe.op {
                 WrOp::Send | WrOp::SendImm(_) => Opcode::SEND,
@@ -599,6 +697,26 @@ impl Fabric {
             at += n;
         }
     }
+}
+
+/// Whether M lets a send WQE doing `op` on `qp` fail with `status`: a remote
+/// status or a retry counter's only on RC (M2), a remote access error only on
+/// an RDMA operation or an atomic (M3), the RNR retry counter only below 7
+/// (M4). What `Qp::allows_send_status` says, on `Status::model`'s map.
+fn allows_send_status(qp: &QpRec, op: &WrOp, status: Status) -> bool {
+    let remote = matches!(status.0, 7 | 9 | 10 | 11 | 16);
+    let retries = matches!(status.0, 12 | 13 | 20);
+    let rdma = matches!(
+        op,
+        WrOp::Write(_)
+            | WrOp::WriteImm(..)
+            | WrOp::Read(_)
+            | WrOp::FetchAdd { .. }
+            | WrOp::CompareSwap { .. }
+    );
+    (!(remote || retries) || qp.qp_type == QpType::Rc)
+        && (status != Status::REM_ACCESS_ERR || rdma)
+        && (status != Status::RNR_RETRY_EXC_ERR || qp.rnr_retry < 7)
 }
 
 fn error_wc(wr_id: u64, status: Status) -> Wc {
@@ -745,6 +863,10 @@ impl NicQp for ModelQp {
         }
         qp.remote = remote.qp_num;
         qp.access = attr.access;
+        qp.rnr_retry = attr.rnr_retry;
+        qp.rnr_left = attr.rnr_retry;
+        qp.max_rd_atomic = attr.max_rd_atomic;
+        qp.max_dest_rd_atomic = attr.max_dest_rd_atomic;
         qp.state = QpState::Ready;
         Ok(())
     }
@@ -963,6 +1085,12 @@ unsafe impl Nic for Model {
                 access: Access::default(),
                 sq: VecDeque::new(),
                 rq: VecDeque::new(),
+                rnr_retry: 7,
+                rnr_left: 7,
+                max_rd_atomic: 0,
+                max_dest_rd_atomic: 0,
+                reads_sent: 0,
+                reads_left: 0,
                 inject: VecDeque::new(),
                 unretired_send: VecDeque::new(),
                 unretired_recv: VecDeque::new(),
