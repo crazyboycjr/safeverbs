@@ -23,12 +23,30 @@
 //! The wrappers' bodies call rdma-core and are trusted, not verified: they are where M meets
 //! the real NIC (see `docs/verification.md`).
 //!
-//! **Theorem 2**, for two endpoints that both run safeverbs' protocol layer (credit-based
-//! flow control for sends, rkey leases for one-sided access), each refining A under M, with
-//! the network the only nondeterminism left. Assume-guarantee: each side assumes the other
-//! honours the credits and leases it granted and guarantees the same. Then no completion is
-//! `RnrRetryExceeded` or `RemoteErr`, and every error completion is attributable to a fault
-//! step of M (link down, peer crash, retry timeout).
+//! **Theorem 2** (stated, not proved yet). Two endpoints run safeverbs with its protocol layer
+//! (a credit channel for messages, leases for one-sided access) over RC connections the
+//! protocol set up, on devices that conform to M and to the joint rules of a model W of the two
+//! devices, the link and its faults. Then in every run of W, for every connection, at every
+//! moment:
+//!
+//! 1. **No receive is missing.** No SEND, SEND_WITH_IMM, SEND_WITH_INV or WRITE_WITH_IMM
+//!    executes at a responder whose receive queue holds no WQE for it. So no RNR NAK is sent
+//!    for want of a receive, and no completion is `RnrRetryExceeded`.
+//! 2. **No request is refused.** No request fails the responder's R_Key, length, opcode or
+//!    resource checks: no completion is `RemoteAccess` or `RemoteInvalidRequest` at either end,
+//!    and no responder QP goes to `Err` for such a reason.
+//! 3. **Every error has a fault.** Every error completion at either end is a flush after an
+//!    earlier error, fault or orderly close of that connection, or `RetryExceeded`,
+//!    `RemoteOperation` or a local device error, each of which W enables only after a fault step
+//!    on that connection.
+//!
+//! At each end the run projects to a run of M, so Theorem 1 holds there unchanged. Its premises:
+//! both devices conform to M and to W's joint rules; both endpoints run the protocol layer,
+//! proved at each end to post only what the protocol allows; the handshake connected the two
+//! QPs to each other; and the channel's QPs use an RNR retry count of 7 (infinite, M's rule M4),
+//! no on-demand paging and no shared receive queue, with a local ACK timeout times retry count
+//! above the network's worst round trip. It promises nothing about a peer that does not run the
+//! protocol, or runs it on a device outside M and W, nor liveness, nor which fault it was.
 #![allow(unused_imports)]
 
 use crate::abs::*;
