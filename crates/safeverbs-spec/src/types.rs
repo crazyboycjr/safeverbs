@@ -79,6 +79,13 @@ impl Status {
     pub open spec fn is_err(self) -> bool {
         !(self is Success)
     }
+
+    /// What the other end reported (IB 11.6.2): its refusal of the request, or a response the
+    /// requester could not use.
+    pub open spec fn is_remote(self) -> bool {
+        self is RemoteAccess || self is RemoteInvalidRequest || self is RemoteOperation
+            || self is RemoteOther
+    }
 }
 
 /// What a completion reports besides its status.

@@ -247,6 +247,22 @@ impl Qp {
     pub open spec fn sq_cqes(self) -> nat {
         count_generating(self.sq.take(self.sq_done as int))
     }
+
+    /// The statuses a send WQE `wr` of this queue pair may complete with, by the rules below
+    /// (`execute_send`). They hold against any peer, in `Rts` and in `Err` alike, and say
+    /// nothing of receive WQEs.
+    ///
+    /// **M2.** Only a reliable connection reports what the other end did or that its retries
+    /// ran out: the remote statuses, `RetryExceeded` and `RnrRetryExceeded`. IB 11.6.2: "The
+    /// following errors are reported only for Reliable QPs" (bad response, remote invalid
+    /// request, remote access, remote operation, the transport and RNR retry counters);
+    /// 9.9.2.2: "Remotely detected errors are unique to reliable classes of service"; Table 56,
+    /// which lists every error a requester detects, has each of them "NA" but for RC and RD.
+    /// The abort of `RemoteOther` is in 11.6.2 an RD error, or a responder's own for UD and UC
+    /// with an SRQ, which a UC or UD requester never hears of.
+    pub open spec fn allows_send_status(self, wr: SendWr, s: Status) -> bool {
+        (s.is_remote() || s is RetryExceeded || s is RnrRetryExceeded) ==> self.attr.transport is Rc
+    }
 }
 
 pub enum Queue {
@@ -609,10 +625,11 @@ state_machine! {
         // NIC steps: they happen by themselves, with outcomes chosen by the peer and network.
 
         /// The NIC executes the oldest unexecuted send WQE. In `Rts` any outcome but
-        /// `FlushErr` may happen (the peer may refuse, vanish, never post a receive); an
-        /// error moves the queue pair to `Err`. In `Err` it completes with an error,
-        /// normally `FlushErr`. A CQE appears if the WQE was signaled or failed; the CQ
-        /// always has room.
+        /// `FlushErr` may happen (the peer may refuse, vanish, never post a receive), within
+        /// what the WQE's operation (`Opcode::allows_outcome`) and the queue pair
+        /// (`Qp::allows_send_status`) allow; an error moves the queue pair to `Err`. In `Err`
+        /// it completes with an error, normally `FlushErr`. A CQE appears if the WQE was
+        /// signaled or failed; the CQ always has room.
         transition! {
             execute_send(q: QpId, o: Outcome) {
                 require pre.qps.contains_key(q);
@@ -622,6 +639,7 @@ state_machine! {
                 require o.status is FlushErr ==> qp.state is Err;
                 let slot = qp.sq[qp.sq_done as int];
                 require slot.wr.opcode.allows_outcome(total_len(slot.wr.sges), o);
+                require qp.allows_send_status(slot.wr, o.status);
                 let done = SendSlot { wr: slot.wr, outcome: Some(o) };
                 update qps = pre.qps.insert(q, Qp {
                     sq: qp.sq.update(qp.sq_done as int, done),
