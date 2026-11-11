@@ -172,7 +172,8 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
   its own QP and request once, with its own buffer, and that the simulated
   NIC's CQ is never overrun. The simulated NIC also checks M's rules the
   library must follow: no QP destroyed with a WQE not retired by a polled
-  completion, no CQ destroyed with a QP attached, no work posted in RESET.
+  completion, no CQ destroyed with a QP attached, no work posted in RESET;
+  and that every status a send WQE fails with is one M allows it.
   Also on the simulated NIC (`crates/safeverbs-core/tests/`): an error
   stays within its own request's WQE interval (`outcome.rs`), a batch of
   READs reports its last READ's length (`read_batch.rs`), the order an engine's
@@ -210,6 +211,14 @@ SAFEVERBS_TEST_DEVICE=svrxe0 SAFEVERBS_TEST_GID_INDEX=1 cargo test --workspace
   requests; a remote WRITE with immediate read with the safe copy, with the
   same rkey after it; and QPs removed, and an engine dropped, with work in
   flight, among it unsignaled WQEs that only the drain WQE retires.
+- `safeverbs` (`crates/safeverbs/tests/rules.rs`): M's rules for error
+  completions (M2 to M4), each case once on the simulated NIC and once on a
+  device, every status a send gets checked against what M allows it: the RNR
+  retry count (0 gives up at once, 7 waits for a receive), a WRITE with a bad
+  rkey or out of bounds, a SEND longer than its receive, a WRITE to a peer QP
+  destroyed, READs past the responder's depth, and UC, which hears nothing
+  from the other end; with what the responder does, which only the joint
+  model of theorem 2 will say.
 - The crate documentation of `safeverbs` runs its examples on the model
   and has `compile_fail` tests for what the types rule out.
 

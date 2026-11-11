@@ -179,8 +179,10 @@ buffers, and its leases are released when the NIC completes it. A has a worked e
 Theorem 1 is single-ended. The peer and the network are fully nondeterministic in M: the
 peer may send any bytes, write any exposed memory within the bounds of an rkey it holds at
 any time, never post a receive, or crash; packets may be lost. Receiver-not-ready, remote
-access errors and retry exhaustion are allowed outcomes; the library reports them as typed
-errors and none of them affects S1 to L1 or S2.
+access errors and retry exhaustion are allowed outcomes, within what IB says of where each can
+arise (section 8: only on RC, a remote access error only on an RDMA operation, receiver-not-ready
+only with an RNR retry count below 7); the library reports them as typed errors and none of them
+affects S1 to L1 or S2.
 
 ### 3.4 Liveness, under a premise about the device
 
@@ -284,11 +286,19 @@ to M for the whole device (`theorem_1_device` in `compose.rs`), which discharges
 `verification.md` says what of that is argument.
 
 **Theorem 2 (later; stated only)** covers two endpoints that both run SafeVerbs' protocol
-layer: credit-based flow control for sends and rkey leases for one-sided access. Each side
-refines A under M with only the network left nondeterministic, and by assume-guarantee
-reasoning (each side assumes the other honours the credits and leases it granted, and
-guarantees the same) no completion is receiver-not-ready or a remote access error; every
-error completion is attributable to a fault step of M (link down, peer crash, timeout).
+layer, a credit channel for messages and leases for one-sided access, over RC connections the
+protocol set up, on devices that conform to M and to the joint rules of a model W of the two
+devices, their link and its faults. In every run of W, for every connection, at every moment: no
+receive is missing (no SEND, SEND_WITH_IMM, SEND_WITH_INV or WRITE_WITH_IMM executes at a
+responder with no receive for it, so no completion is `RnrRetryExceeded`); no request is refused
+(no completion is `RemoteAccess` or `RemoteInvalidRequest`, and no responder's QP goes to the
+error state for such a reason); and every error has a fault (a flush after an earlier error, a
+fault or an orderly close, or `RetryExceeded`, `RemoteOperation` or a local device error, which W
+enables only after a fault on that connection). At each end the run projects to a run of M, so
+Theorem 1 holds there unchanged. The premises are that the channel's QPs use an RNR retry count of
+7, which IB defines as infinite (M4), no on-demand paging and no shared receive queue, and an ACK
+timeout times retry count above the network's worst round trip; it says nothing of a peer that
+does not run the protocol, nor of liveness. `refinement.rs` states it; its proof is to come.
 
 ## 6. The API
 
@@ -448,6 +458,17 @@ failed or, if none did, the success of its last WQE: a batch of READs reports th
 of its last READ, not a sum. An error completion's opcode, length and immediate are
 undefined, so an error reports its status, with the vendor's code and the position of that
 WQE in the request, which the library knows from the WQE's number.
+
+M names the statuses as IB's 11.6.2 does (`Status` in the specification, from
+`ibv_wc_status` by `Status::model`): success, a flush, a local error, the responder's remote
+access error, invalid request and operation error, the rest of what the other end reports (a bad
+response, an abort), and the transport and RNR retry counters. Three rules of M say where a send
+WQE may meet them, against any peer: the remote statuses and both retry counters only on RC (UC
+and UD hear nothing from the other end); a remote access error only on an RDMA WRITE, WRITE with
+immediate or READ (an atomic is a READ in M); and the RNR retry counter only for a QP connected
+with an RNR retry count below 7, 7 being infinite. The library's `Status` is the raw
+`ibv_wc_status`, with its constants (`REM_ACCESS_ERR`, `REM_INV_REQ_ERR`, ...). Receive outcomes
+are not constrained by these rules: devices differ there.
 
 A WRITE_WITH_IMM notification length describes the remote write. It is independent of
 receive SGE capacity and never a length to use when slicing the returned receive buffer,

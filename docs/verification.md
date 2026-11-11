@@ -438,9 +438,34 @@ the proof, and none able to get past it.
   the model and rxe). A remote WRITE with immediate is read with the safe copy, the same rkey
   still valid after it (`tests/rxe.rs`).
 - A sink's item number, in unverified code (`sink.rs`), tested on the model and rxe.
+- M's rules for send statuses against the devices (`crates/safeverbs/tests/rules.rs`): each case on
+  the model and on Soft-RoCE, every status a send got checked against M2 to M4. Both agree with M:
+  - a SEND with no receive posted, from a QP connected with an RNR retry count of 0, fails with
+    `RNR_RETRY_EXC_ERR`; with 7 it stays pending (500 ms) and succeeds once a receive is posted;
+  - a WRITE with a bad rkey, or out of its region's bounds, gets `REM_ACCESS_ERR`, and the
+    responder's QP goes to the error state: the receive it had posted flushes, and so does its next
+    SEND. The affiliated asynchronous event (`IBV_EVENT_QP_ACCESS_ERR`, which Soft-RoCE raises) is
+    not read: the library reads none, and reading it would need a verb outside the trusted list;
+  - a WRITE to a peer QP that was destroyed gets `RETRY_EXC_ERR`, after 10 ms on Soft-RoCE with an
+    ACK timeout of 2^10 × 4.096 µs and one retry;
+  - a READ to a responder that takes none (depth 0) gets `REM_INV_REQ_ERR` on both; four READs to
+    a responder that takes one, on the model only (the second refused, the rest flushed), since
+    Soft-RoCE does not enforce C9-86 above 0 (`check_resource` recycles its resources);
+  - on UC a SEND with no receive and a WRITE with a bad rkey both succeed (nothing remote is
+    reported), and the responder still takes the next SEND;
+  - a SEND longer than its receive fails at both ends. The model does what IB says
+    (`REM_INV_REQ_ERR`, and `LOC_LEN_ERR` on the receive); Soft-RoCE treats it as a malformed
+    receive WQE (`REM_OP_ERR`, and `LOC_QP_OP_ERR` on the receive), which M allows, but which the
+    joint rules of theorem 2 must allow too. And Soft-RoCE does not flush a receive posted after
+    its QP went to the error state until the QP is moved there again (its provider posts receives
+    with no system call): the liveness premise `flushes` holds for a removal, whose drain moves the
+    QP to the error state, not for a receive posted to a QP the device failed earlier.
+
+  A link going down is not tested: it needs `CAP_NET_ADMIN` on the device's interface.
 - The simulated NIC (`model.rs`) checks some of M's rules at run time: no queue pair
   destroyed with WQEs not retired, no CQ destroyed with a queue pair attached, no work
-  posted in `Reset`. That it behaves within M is neither tested systematically nor proved.
+  posted in `Reset`, and no send WQE failing with a status M does not allow it (M2 to M4, an
+  injected one included). That it behaves within M is neither tested systematically nor proved.
 - The asynchronous API of the `safeverbs` crate, on the model and on soft-RoCE, and random
   operation sequences with injected errors and flushes on the ring, the engine and the
   public API (`docs/dev-setup.md` lists the tests).
@@ -461,8 +486,31 @@ completions and registration deserve a note:
 - `reg_mr` asks for local write whenever it asks for remote write (a precondition of M
   that the library's unverified control path meets).
 
-Errors report their status only: their opcode, length and immediate are undefined. Evidence
-that real NICs conform to M will come from differential testing on hardware and soft-RoCE.
+Errors report their status only: their opcode, length and immediate are undefined. M names nine
+statuses (`Status` in `types.rs`): success, a flush, a local error, the four the other end reports
+(`RemoteAccess`, `RemoteInvalidRequest`, `RemoteOperation`, and `RemoteOther` for a bad response or
+an abort: M1, as IB 11.6.2 names them) and the two retry counters. Which of them a send WQE may
+complete with is said by three rules (`Qp::allows_send_status`, required by `execute_send`), each
+with its source in IB 1.2.1, in `Rts` and in `Err` alike:
+
+- **M2.** The remote statuses, `RetryExceeded` and `RnrRetryExceeded` only on RC: 11.6.2 reports
+  them "only for Reliable QPs", 9.9.2.2 says "remotely detected errors are unique to reliable
+  classes of service", and Table 56, every error a requester detects, has them "NA" for UC and UD.
+- **M3.** `RemoteAccess` only on an RDMA WRITE, a WRITE with immediate or an RDMA READ (M's
+  atomics are READs): 11.6.2 reports it "only on RDMA operations or atomic operations", and the
+  R_Key violations of 9.7.4.1.5 are those of RDMA and atomic requests.
+- **M4.** A connected QP records the RNR retry count it was connected with (`Qp::rnr_retry`, set by
+  `modify_qp` on the move from `Rtr` to `Rts`), and `RnrRetryExceeded` happens only below 7: C9-132
+  and 9.9.2.1.1, "This value indicates infinite retry and the counter is not decremented." A QP that
+  recorded none (never connected) is not constrained. The core's `connect` tells M the count it
+  sets, on RC (`connect_rnr`): the one change to a trusted contract these rules made.
+
+Receive outcomes are not constrained beyond what they were: Soft-RoCE reports a receive whose
+SEND_WITH_INV failed with `REM_INV_REQ_ERR` (`rxe_resp.c`), and one that a SEND too long for it
+met with `LOC_QP_OP_ERR`, where IB has a local length error. The rules hold against any peer; what one end
+does to the other (an RNR NAK for want of a receive, a responder's QP going to the error state) is
+for the joint model of theorem 2. Evidence that real NICs conform to M comes from differential
+tests on soft-RoCE ("Tested, not proved"), and will come from hardware.
 
 Nothing outside `verus!` is assumed by the proofs. What it calls has no precondition, and what would
 be one is said by the types:
@@ -510,8 +558,8 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `buf/lease.rs` `capacity_of` | `Vec::capacity` is at least its length |
 | `buf/lease.rs` `swap_in` | `slice::swap` swaps the two elements, in bounds |
 | `hw/open.rs` `one_of` | `core::slice::from_ref` is a list of that one element |
-| `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError` | the definitions of these plain data types, as written |
-| `trusted.rs` `ExConnectAttr`, `ExEndpoint`, `ExContext`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
+| `trusted.rs` `ExSge`, `ExRemoteBuf`, `ExWrOp`, `ExQpCaps`, `ExDeviceCaps`, `ExQpType`, `ExError`, `ExBufError`, `ExConnectAttr`, `ExAccess` | the definitions of these plain data types, as written (`connect`'s contract reads a `ConnectAttr`'s RNR retry count, and its access flags are an `Access`) |
+| `trusted.rs` `ExEndpoint`, `ExContext`, `ExPd` | these types are opaque (only the device or `pd.rs` reads them) |
 | `buf.rs` `bytes_back` | when a region goes, the permissions split from it are its own again: each lives in a `RawMut` or a `RingBuf`, which hold an `Arc` of the region its range belongs to (a type invariant), so none is left when the last `Arc` goes. The rest of freeing it is verified (`Region::free_memory`, vstd's `deallocate` with the allocation's `Dealloc`) |
 | `buf.rs` `chunk_held` | whether anything but its ring holds a chunk, with no contract: what frees one is `thaw` |
 | `buf.rs` `bytes_to_fill` | the reference to a unique buffer's bytes that `DerefMut` makes (the row "references to buffers"), and that filling them changes nothing the proofs read |
@@ -531,7 +579,7 @@ their kin) anywhere in the core's sources, inside `verus!` or not, outside a lis
 | `trusted.rs` `device_caps` | the device's limits as the library reads them are M's |
 | `trusted.rs` `create_cq` | `ibv_create_cq_ex` is M's `create_cq` of a fresh name, in a state M reaches from a start state (the device just opened), of which its invariants follow; the new engine's share is that CQ and queue pair names nobody uses (this is where tokens come from), and its token is of the device of the context it was made on (`device_of`) |
 | `trusted.rs` `one_history` | **One device history.** A device's history is the interleaving of its engines' verbs, each on the engine's own share, with the steps of its NIC and of its control path, and a token holds that history as of its engine's last verb, at the moment its `time` names (a ghost value no other contract mentions). So two tokens of one device have disjoint shares, as `create_cq` gives them, and from the view of the one seen earlier the device went to the other's by steps the earlier one's engine did not take (`share::interleaved`). The exclusive borrow makes them two tokens: an engine has one token, never copied, and `destroy_cq`, its last verb, leaves nothing known of it, its device included |
-| `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these are M's `create_qp`, three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or nothing on error, after rely steps; a queue pair's thread domain changes which locks the driver takes, not what the NIC does; `destroy_cq` is called once, by the end of the engine |
+| `trusted.rs` `create_qp`, `connect`, `to_error`, `destroy_qp`, `destroy_cq` | these are M's `create_qp`, three `modify_qp` steps, `modify_qp` to `Err`, `destroy_qp` and `destroy_cq`, or nothing on error, after rely steps; the move to RTS sets the connection's RNR retry count on RC, which M records (`connect_rnr`, M4), and none on UC, where verbs sets none; a queue pair's thread domain changes which locks the driver takes, not what the NIC does; `destroy_cq` is called once, by the end of the engine |
 | `trusted.rs` `qp_num_of`, `qp_lock_free` | facts that mean nothing in M (no contract) |
 | `trusted.rs` `clone_context`, `alloc_td`, `alloc_domain` | handles and domains that mean nothing in M: which locks the driver takes. A parent domain is over the protection domain it was made for (`domain_over`), which `create_qp` asks of it |
 | `trusted.rs` `no_qp`, `no_context` | a key that names no queue pair, or a refused request whose context the program took out of what it was handed back, panics and never returns |
@@ -562,7 +610,8 @@ rely steps (the NIC's own, and other engines' on their own queues) and then by t
 The rely pins the regions the engine's written WRs name, whose leases the engine holds.
 Some modelling choices sit in these contracts: M has no atomics, and the contracts treat a
 fetch-and-add or compare-and-swap like an RDMA READ (the NIC writes the local buffer); a
-`Wc`'s status maps onto M's six as `Status::model` says; M has one scatter/gather limit per
+`Wc`'s status maps onto M's nine as `Status::model` says (`RESP_TIMEOUT_ERR`, which IB does not
+name, with the transport retries); M has one scatter/gather limit per
 queue pair, the smaller of its send and receive limits; and the library posts no inline
 data, so M sees a queue pair's inline limit as zero.
 
@@ -592,10 +641,13 @@ data, so M sees a queue pair's inline limit as zero.
 - **The handles.** What `LocalCq`, `AsyncCq`, the futures, sinks and streams add (the right future gets
   the right result, no lost wakeup at their level) stays tested ("The public API"). Keep conditional
   release distinct from leak freedom.
-- **Theorem 2**, for two endpoints that both run SafeVerbs, is stated in `refinement.rs`
-  and `design.md` only.
-- **M.** Gather evidence that real NICs conform (differential tests on hardware and
-  soft-RoCE), and give out-of-order transports and shared receive queues their own rules.
+- **Theorem 2**, for two endpoints that both run SafeVerbs' protocol layer, is stated in
+  `refinement.rs` and `design.md` only: no receive is missing, no request is refused, and every
+  error has a fault, in every run of a joint model of the two devices and their link. M's rules
+  for it (M1 to M4) are in M and tested; the joint model, the credit channel and the leases are
+  to come.
+- **M.** Gather evidence that real NICs conform (differential tests on hardware; soft-RoCE has
+  some), and give out-of-order transports and shared receive queues their own rules.
 - **Performance.** Compare the CPU paths with native ibverbs on real NICs; soft-RoCE is
   functional evidence only.
 
@@ -616,7 +668,7 @@ Verus
 $ rustup toolchain install 1.99.1
 $ scripts/verify.sh
 ...
-safeverbs-spec: verification results:: 202 verified, 0 errors
+safeverbs-spec: verification results:: 203 verified, 0 errors
 safeverbs-core: verification results:: 872 verified, 0 errors
 ```
 
