@@ -611,7 +611,7 @@ The rely pins the regions the engine's written WRs name, whose leases the engine
 Some modelling choices sit in these contracts: M has no atomics, and the contracts treat a
 fetch-and-add or compare-and-swap like an RDMA READ (the NIC writes the local buffer); a
 `Wc`'s status maps onto M's nine as `Status::model` says (`RESP_TIMEOUT_ERR`, which IB does not
-name, with the transport retries); M has one scatter/gather limit per
+name, as a local error, so that no rule of M without a citation applies to it); M has one scatter/gather limit per
 queue pair, the smaller of its send and receive limits; and the library posts no inline
 data, so M sees a queue pair's inline limit as zero.
 

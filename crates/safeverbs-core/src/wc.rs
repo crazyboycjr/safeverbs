@@ -63,7 +63,8 @@ impl Status {
     /// The status as the formal model names it (`safeverbs_spec::types::Status`): success,
     /// a flush, the responder's remote access, invalid request or operation error, the rest
     /// of what the other end reported (a bad response, an abort), the two retry counters, or
-    /// else a local error.
+    /// else a local error. `RESP_TIMEOUT_ERR`, which IB does not name, is a local error too:
+    /// nothing says it arises only on RC, as M2 says of the transport retries.
     pub open spec fn model(self) -> safeverbs_spec::types::Status {
         if self.0 == 0 {
             safeverbs_spec::types::Status::Success
@@ -79,7 +80,7 @@ impl Status {
             safeverbs_spec::types::Status::RemoteOther
         } else if self.0 == 13 {
             safeverbs_spec::types::Status::RnrRetryExceeded
-        } else if self.0 == 12 || self.0 == 20 {
+        } else if self.0 == 12 {
             safeverbs_spec::types::Status::RetryExceeded
         } else {
             safeverbs_spec::types::Status::LocalErr

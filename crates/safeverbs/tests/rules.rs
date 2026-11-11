@@ -97,12 +97,7 @@ fn m_allows(rc: bool, op: Op, rnr_retry: u8, status: Status) -> bool {
         Status::REM_ABORT_ERR,
     ]
     .contains(&status);
-    let retries = [
-        Status::RETRY_EXC_ERR,
-        Status::RNR_RETRY_EXC_ERR,
-        Status::RESP_TIMEOUT_ERR,
-    ]
-    .contains(&status);
+    let retries = [Status::RETRY_EXC_ERR, Status::RNR_RETRY_EXC_ERR].contains(&status);
     let m2 = !(remote || retries) || rc;
     let m3 = status != Status::REM_ACCESS_ERR || matches!(op, Op::Write | Op::Read);
     let m4 = status != Status::RNR_RETRY_EXC_ERR || rnr_retry < 7;

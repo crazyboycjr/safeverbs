@@ -705,7 +705,7 @@ impl Fabric {
 /// (M4). What `Qp::allows_send_status` says, on `Status::model`'s map.
 fn allows_send_status(qp: &QpRec, op: &WrOp, status: Status) -> bool {
     let remote = matches!(status.0, 7 | 9 | 10 | 11 | 16);
-    let retries = matches!(status.0, 12 | 13 | 20);
+    let retries = matches!(status.0, 12 | 13);
     let rdma = matches!(
         op,
         WrOp::Write(_)
